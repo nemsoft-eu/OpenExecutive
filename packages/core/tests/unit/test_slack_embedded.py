@@ -8,6 +8,7 @@ wiring, and the async message path, without a real Slack connection.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Iterator
 from typing import Any
@@ -71,6 +72,39 @@ async def test_create_slack_app_propagates_rejected_app_token(slack_tokens: None
         pytest.raises(RuntimeError, match="not_allowed_token_type"),
     ):
         await slack_bot.create_slack_app()
+
+
+# --------------------------------------------------------------------------
+# message event routing
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"bot_id": "B1", "channel_type": "im", "text": "hi"}, None),
+        ({"subtype": "message_changed", "channel_type": "im", "text": "hi"}, None),
+        ({"channel_type": "im", "text": "hi", "ts": "1.0"}, "dm"),
+        ({"text": "<@UBOT> hi", "ts": "2.0", "thread_ts": "1.0"}, None),
+        ({"text": "hi", "ts": "1.0"}, None),
+        ({"text": "hi", "ts": "1.0", "thread_ts": "1.0"}, None),
+        ({"text": "hi", "ts": "2.0", "thread_ts": "1.0"}, "thread_continuation"),
+    ],
+    ids=[
+        "bot-message",
+        "edit",
+        "dm",
+        "mention-left-to-app_mention",
+        "top-level-channel-message",
+        "thread-starter",
+        "threaded-reply",
+    ],
+)
+def test_message_event_mode(
+    monkeypatch: pytest.MonkeyPatch, event: dict[str, Any], expected: str | None
+) -> None:
+    monkeypatch.setattr(slack_bot, "_bot_user_id", "UBOT")
+    assert slack_bot._message_event_mode(event) == expected
 
 
 # --------------------------------------------------------------------------
@@ -381,6 +415,41 @@ def _lifespan_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
     monkeypatch.delenv("OE_PUBLIC_DEPLOYMENT", raising=False)
     return TestClient(create_app())
+
+
+@pytest.mark.asyncio
+async def test_log_bot_crash_reports_only_real_crashes(caplog: pytest.LogCaptureFixture) -> None:
+    from openexecutive.api.main import _log_bot_crash
+
+    async def _crash() -> None:
+        raise RuntimeError("gateway 4004")
+
+    async def _finish() -> None:
+        return None
+
+    async def _block() -> None:
+        await asyncio.Event().wait()
+
+    crashed = asyncio.create_task(_crash())
+    finished = asyncio.create_task(_finish())
+    cancelled = asyncio.create_task(_block())
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    await asyncio.wait({crashed, finished, cancelled})
+
+    # the API's logging setup turns off propagation on this logger, so
+    # capture on it directly rather than through the root handler
+    app_logger = logging.getLogger("openexecutive")
+    app_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("ERROR", logger="openexecutive"):
+            for task, name in ((crashed, "Crashy"), (finished, "Clean"), (cancelled, "Stopped")):
+                _log_bot_crash(name)(task)
+    finally:
+        app_logger.removeHandler(caplog.handler)
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "openexecutive"]
+    assert messages == ["Crashy bot exited unexpectedly"]
 
 
 # cold lifespan boot seeds the knowledge store, so the overall test deadline

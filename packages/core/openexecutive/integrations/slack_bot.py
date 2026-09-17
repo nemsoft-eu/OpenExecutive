@@ -427,34 +427,39 @@ async def create_slack_app() -> AsyncApp:
 
     @app.event("message")
     async def handle_message(event: dict, say: Any, client: Any) -> None:
-        # Slack delivers BOTH a generic `message` event AND `app_mention`
-        # when the bot is mentioned in a channel/thread. Filter early so
-        # only one handler fires.
-        if event.get("bot_id") or event.get("subtype"):
-            return  # bot messages, channel joins, edits, etc.
-
-        channel_type = event.get("channel_type")
-        if channel_type == "im":
-            await _handle_message(event, say, client=client, mode="dm")
-            return
-
-        # If the bot is @-mentioned, `app_mention` will handle it. Skip
-        # here to avoid double-firing.
-        text = event.get("text", "")
-        if _bot_user_id and f"<@{_bot_user_id}>" in text:
-            return
-
-        # Auto-continuation only fires inside a thread the bot has
-        # previously engaged in. The "has the bot replied here?" check
-        # happens inside _handle_message where conversations_replies
-        # is already being fetched; we only filter the cheap signals here.
-        thread_ts = event.get("thread_ts")
-        if not thread_ts or str(thread_ts) == str(event.get("ts") or ""):
-            return  # not a threaded reply (thread starters go through app_mention)
-
-        await _handle_message(event, say, client=client, mode="thread_continuation")
+        mode = _message_event_mode(event)
+        if mode is not None:
+            await _handle_message(event, say, client=client, mode=mode)
 
     return app
+
+
+def _message_event_mode(event: dict) -> str | None:
+    """Which ``_handle_message`` mode a generic ``message`` event gets, or None to ignore it."""
+    # Slack delivers BOTH a generic `message` event AND `app_mention`
+    # when the bot is mentioned in a channel/thread. Filter early so
+    # only one handler fires.
+    if event.get("bot_id") or event.get("subtype"):
+        return None  # bot messages, channel joins, edits, etc.
+
+    if event.get("channel_type") == "im":
+        return "dm"
+
+    # If the bot is @-mentioned, `app_mention` will handle it. Skip
+    # here to avoid double-firing.
+    text = event.get("text", "")
+    if _bot_user_id and f"<@{_bot_user_id}>" in text:
+        return None
+
+    # Auto-continuation only fires inside a thread the bot has
+    # previously engaged in. The "has the bot replied here?" check
+    # happens inside _handle_message where conversations_replies
+    # is already being fetched; we only filter the cheap signals here.
+    thread_ts = event.get("thread_ts")
+    if not thread_ts or str(thread_ts) == str(event.get("ts") or ""):
+        return None  # not a threaded reply (thread starters go through app_mention)
+
+    return "thread_continuation"
 
 
 def _socket_mode_handler(app: AsyncApp, app_token: str | None) -> AsyncSocketModeHandler:
