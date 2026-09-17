@@ -37,7 +37,7 @@ def slack_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_create_slack_app_verifies_both_tokens(
     slack_tokens: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # restored afterwards: test_slack_bot pins the module default
+    # restored afterwards so the resolved id does not leak into other tests
     monkeypatch.setattr(slack_bot, "_bot_user_id", None)
     with (
         patch(
@@ -57,9 +57,13 @@ async def test_create_slack_app_verifies_both_tokens(
 
 
 @pytest.mark.asyncio
-async def test_create_slack_app_propagates_rejected_app_token(slack_tokens: None) -> None:
+async def test_create_slack_app_propagates_rejected_app_token(
+    slack_tokens: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The Socket Mode client would retry this forever without raising, so the
     probe must surface it."""
+    # auth_test succeeds before the app token is rejected and sets the cache
+    monkeypatch.setattr(slack_bot, "_bot_user_id", None)
     with (
         patch(
             "slack_sdk.web.async_client.AsyncWebClient.auth_test",
