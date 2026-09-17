@@ -61,8 +61,7 @@ system:
       reason on every call at the server default; LOCAL_REASONING_EFFORT
       (none / low / medium / high, unset = send nothing) is passed only to
       the local provider and emitted as the flat OpenAI-format
-      ``reasoning_effort`` body field. It is never added when the body
-      already carries OpenRouter's nested ``reasoning`` object. This makes
+      ``reasoning_effort`` body field. This makes
       ANTHROPIC_API_KEY optional: a deployment with only local (or
       OpenRouter) models configured boots with no Anthropic key — the
       Settings validator just requires that at least one provider is

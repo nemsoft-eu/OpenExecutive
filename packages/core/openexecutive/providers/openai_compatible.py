@@ -84,9 +84,7 @@ class OpenAICompatibleProvider:
         reasoning_effort: str | None = None,
     ) -> None:
         self._api_key = api_key
-        # Flat OpenAI-format ``reasoning_effort`` added to every request body.
-        # Only the local backend sets it; OpenRouter expresses effort through
-        # its nested ``reasoning`` object instead, built by the translator.
+        # only the local backend sets this; OpenRouter uses the translator's nested `reasoning`
         self._reasoning_effort = reasoning_effort
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
@@ -134,9 +132,7 @@ class OpenAICompatibleProvider:
         slug, spec = self._resolve(model)
         gated = apply_feature_gates(spec, kwargs)
         body = to_openai_request(slug, gated)
-        # An explicit nested ``reasoning`` (a reasoning-capable model on the
-        # OpenRouter path) already carries the effort; never send both.
-        if self._reasoning_effort is not None and "reasoning" not in body:
+        if self._reasoning_effort is not None:
             body["reasoning_effort"] = self._reasoning_effort
         _announce_reasoning(slug, body)
         return slug, body

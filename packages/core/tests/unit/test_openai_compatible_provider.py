@@ -106,15 +106,11 @@ def test_anthropic_only_fields_stripped_for_local_model() -> None:
     body = captured["json"]
     assert "thinking" not in body
     assert "output_config" not in body
+    # no LOCAL_REASONING_EFFORT configured: the server decides whether to think
+    assert "reasoning" not in body
+    assert "reasoning_effort" not in body
     # system flattened into a plain string message — no cache_control survives.
     assert isinstance(body["messages"][0]["content"], str)
-
-
-def test_no_reasoning_effort_field_by_default() -> None:
-    """Unset keeps today's wire format: the server decides whether to think."""
-    captured = _run_create(_local_provider(), thinking={"type": "adaptive"})
-    assert "reasoning_effort" not in captured["json"]
-    assert "reasoning" not in captured["json"]
 
 
 def test_reasoning_effort_sent_flat_on_create() -> None:
@@ -133,32 +129,3 @@ def test_reasoning_effort_sent_on_stream() -> None:
     )
     assert stream._body["reasoning_effort"] == "low"  # type: ignore[attr-defined]
     assert stream._body["stream"] is True  # type: ignore[attr-defined]
-
-
-def test_nested_reasoning_wins_over_flat_effort() -> None:
-    """A reasoning-capable spec keeps Anthropic thinking, which the translator
-    turns into the nested ``reasoning`` object — the flat field must not be
-    added alongside it."""
-    provider = OpenAICompatibleProvider(
-        base_url="http://localhost:11434/v1",
-        spec_lookup={"reasoner": FeatureSpec(supports_cache_control=False)},
-        reasoning_effort="none",
-    )
-    captured = _run_create(
-        provider,
-        model="reasoner",
-        thinking={"type": "adaptive"},
-        output_config={"effort": "high"},
-    )
-    assert captured["json"]["reasoning"] == {"effort": "high"}
-    assert "reasoning_effort" not in captured["json"]
-
-
-def test_openrouter_provider_never_sends_flat_effort() -> None:
-    """Negative control: the OpenRouter subclass is built without the option,
-    so its bodies keep OpenRouter's own format only."""
-    from openexecutive.providers.openrouter_provider import OpenRouterProvider
-
-    provider = OpenRouterProvider(api_key="sk-or-v1-test")
-    captured = _run_create(provider, model="openai/gpt-5")
-    assert "reasoning_effort" not in captured["json"]

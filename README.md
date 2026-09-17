@@ -328,9 +328,9 @@ specialists to a local model per-agent.
 caching / extended thinking have no local equivalent and are automatically
 disabled for local models. Thinking models still reason server-side by
 default, which adds latency to every call; set `LOCAL_REASONING_EFFORT=none`
-to turn that off, or `low` to keep a little. Multi-agent routing leans heavily on tool use, so
-pick a model that's strong at it (e.g. Llama 3.3 70B, Qwen2.5) — small models
-may route poorly. `LOCAL_API_KEY` is only needed if your server (vLLM, or a
+to turn that off, or `low` to keep a little. Multi-agent routing leans
+heavily on tool use, so pick a model that's strong at it (e.g. Llama 3.3 70B,
+Qwen2.5) — small models may route poorly. `LOCAL_API_KEY` is only needed if your server (vLLM, or a
 gateway) requires a bearer token; Ollama and LM Studio need none.
 
 ### Using a hosted OpenAI-compatible gateway

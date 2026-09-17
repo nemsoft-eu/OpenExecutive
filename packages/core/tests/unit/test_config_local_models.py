@@ -48,10 +48,6 @@ def test_local_defaults_off_and_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
     assert s.local_models_enabled is False
     assert s.local_models == []
-
-
-def test_local_reasoning_effort_defaults_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
     assert s.local_reasoning_effort is None
 
 

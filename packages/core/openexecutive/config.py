@@ -224,11 +224,8 @@ class Settings(BaseSettings):
     # Local generation (especially CPU inference) can be far slower than a
     # hosted API. Default generous so a slow first token doesn't time out.
     local_timeout_s: float = Field(300.0, alias="LOCAL_TIMEOUT_S")
-    # Sent as the OpenAI-format `reasoning_effort` field on every local call.
-    # The feature gate strips Anthropic `thinking` for local backends, so
-    # without this a thinking model (qwen3.x, deepseek-r1) reasons on every
-    # call at the server's default effort — `none` turns that off on Ollama.
-    # Unset sends no field and keeps the server default.
+    # OpenAI-format `reasoning_effort` for local calls; the gate strips
+    # Anthropic thinking, so this is the only reasoning control there.
     local_reasoning_effort: Literal["none", "low", "medium", "high"] | None = Field(
         None, alias="LOCAL_REASONING_EFFORT"
     )
@@ -237,13 +234,6 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
         return _parse_csv_list(v)
-
-    @field_validator("local_reasoning_effort", mode="before")
-    @classmethod
-    def _parse_local_reasoning_effort(cls, v: Any) -> Any:
-        if _blank_or_comment(v):
-            return None
-        return v
 
     @model_validator(mode="after")
     def _validate_local_models(self) -> "Settings":
@@ -375,9 +365,9 @@ class Settings(BaseSettings):
         True, alias="DISCORD_THREAD_RESPONSE_GATE_ENABLED"
     )
 
-    @field_validator("discord_notify_channel_id", mode="before")
+    @field_validator("discord_notify_channel_id", "local_reasoning_effort", mode="before")
     @classmethod
-    def _parse_notify_channel_id(cls, v: Any) -> Any:
+    def _blank_to_none(cls, v: Any) -> Any:
         if _blank_or_comment(v):
             return None
         return v
