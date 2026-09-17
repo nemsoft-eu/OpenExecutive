@@ -494,7 +494,7 @@ data: {"type": "error", "message": "..."}
 ### Slack Bot
 `integrations/slack_bot.py`
 
-Slack Bolt app in socket mode. Listens for `@OpenExecutive` mentions and direct messages. Calls `Executive.chat()` synchronously via `asyncio.run()`. Runs as a separate process alongside FastAPI.
+Async Slack Bolt app (`AsyncApp`) in socket mode. Listens for `@OpenExecutive` mentions, direct messages, and continuations in threads it has joined. Starts inside the FastAPI lifespan when both tokens are set, like the Discord bot, so it shares the API's single process with SQLite and ChromaDB. Listeners run as asyncio tasks on the API event loop, where the MCP gateway lives, and await `Executive.chat()` directly. The standalone `python -m openexecutive.integrations.slack_bot` entry point remains for development, but must not run while an API with the Slack tokens is up, or every message is answered twice.
 
 Required env vars: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
 

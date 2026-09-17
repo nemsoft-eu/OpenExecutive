@@ -193,7 +193,7 @@ The built-in knowledge base is **trusted by default** — the Executive can use 
 | Interface | How to Use |
 |-----------|-----------|
 | **Web UI** | `http://localhost:3000` |
-| **Slack** | Mention `@OpenExecutive` or DM the app |
+| **Slack** | Mention `@OpenExecutive` or DM the app (Socket Mode; runs inside the API when `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set) |
 | **Email** | CC or email the configured address (IMAP/SMTP poller) |
 | **Telegram** | Message the configured bot |
 | **Google Chat** | Mention the app in a space |
