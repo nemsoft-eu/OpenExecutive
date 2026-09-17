@@ -86,6 +86,14 @@ with "no company profile" on a fresh volume is expected, not a fault.
 Integrations (Slack, Discord, email, Google Workspace) are all optional and off
 unless their variables are set. [.env.example](../.env.example) is the full list.
 
+The Slack and Discord bots run inside the API container, so there is no extra
+service to deploy. Slack uses Socket Mode, an outbound WebSocket, so it needs no
+public URL. Set both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (an
+app-level `xapp-…` token with `connections:write`), then restart the API. Slack
+connects in the background, so it never delays boot. A network failure is
+retried with backoff; a rejected token logs one `Slack bot disabled` error and
+the API runs without Slack.
+
 ### `OE_PUBLIC_DEPLOYMENT`
 
 If `BACKEND_SHARED_SECRET` is unset the API serves every route unauthenticated.

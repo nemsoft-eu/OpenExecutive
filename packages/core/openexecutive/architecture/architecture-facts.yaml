@@ -2929,6 +2929,45 @@ auth:
     (audit/today filters etc.) can read the same signal.
 
 integrations:
+  slack_runtime: |
+    The Slack bot (integrations.slack_bot) runs on async Bolt (AsyncApp +
+    AsyncSocketModeHandler over aiohttp) on the API event loop, embedded in
+    the lifespan like Discord because SQLite and the embedded Chroma store
+    under /data are single-process. Listeners are asyncio tasks on that
+    loop, so Executive.chat, the inbound resolver and the response gate are
+    awaited directly and the MCP gateway (bound to the API loop) works.
+    It starts only when BOTH SLACK_BOT_TOKEN and SLACK_APP_TOKEN are set, as
+    a background task (slack_bot.EmbeddedSlackBot.start), so Slack never
+    delays boot. create_slack_app() probes both tokens before any socket
+    session exists: auth.test for the bot token (AsyncApp does not verify it
+    at construction) and apps.connections.open for the app token (the Socket
+    Mode client would retry a rejected app token forever without raising).
+    Transient probe failures retry with backoff 5 s doubling to 300 s;
+    permanent ones (invalid_auth, not_authed, account_inactive,
+    token_revoked, token_expired, not_allowed_token_type, missing_scope)
+    disable Slack with one ERROR log; only a SlackApiError carrying one of
+    those codes counts as permanent. After the probes pass, the Socket Mode
+    client owns connect retries and reconnects: a connect that keeps failing
+    (e.g. wss blocked by a proxy) retries every 10 s inside slack_sdk
+    indefinitely, logging ERROR tracebacks on the slack_bolt logger rather
+    than returning to the backoff loop. Its handler (which opens an aiohttp
+    session at construction) is closed if connect is cancelled.
+    Shutdown runs right after Discord: EmbeddedSlackBot.stop() cancels a
+    start still in progress (which closes its half-built handler) and then
+    calls close_async(), all under one bound, _BOT_SHUTDOWN_TIMEOUT_S (10 s,
+    shared with Discord). Listener tasks
+    already running are not tracked: one still inside Executive.chat can hit
+    the MCP gateway after it closes later in shutdown and reply with the
+    generic error message; the rest are cancelled with the loop.
+    Sync helpers stay inline on the loop as in the Discord bot, except
+    knowledge retrieval (Chroma embedding + query), which runs via
+    asyncio.to_thread so Socket Mode keeps acknowledging other events. The
+    thread-history fetch (conversations.replies) is bounded locally by
+    asyncio.wait_for at 5 s.
+    The standalone ``python -m openexecutive.integrations.slack_bot`` entry
+    point (asyncio.run + start_async) remains for development but must not
+    run alongside an API that has the Slack tokens, or every message is
+    answered twice.
   channel_access: |
     Channel access splits into INBOUND (does the message reach the
     Executive at all?) and OUTBOUND (can the Executive reply via the

@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Slack runs inside the API.** Nothing used to start the Slack bot. It now
+  starts in the FastAPI lifespan whenever both `SLACK_BOT_TOKEN` and
+  `SLACK_APP_TOKEN` are set, like the Discord bot, so it shares the
+  single-process SQLite and ChromaDB state under `/data` and needs no extra
+  service. It runs on async Bolt on the API event loop, so Slack turns can use
+  the MCP gateway (Google Workspace and other tools). It connects in the
+  background, so Slack never delays boot. Transient failures are retried with
+  backoff, and a rejected or wrong-type token disables Slack with one
+  `Slack bot disabled` error. Shutdown is bounded at 10 s, shared with Discord.
+
+  Design notes: both tokens are probed before any socket session exists
+  (`auth.test`, `apps.connections.open`). `AsyncApp` does not verify the bot
+  token, and the Socket Mode client retries a rejected app token forever
+  without raising. The thread-history fetch is now bounded locally: the old
+  `timeout=5` was sent to Slack as a query parameter. The standalone
+  `python -m openexecutive.integrations.slack_bot` entry point remains for
+  development only; running it next to an API with the tokens answers every
+  message twice.
 - **Conversational onboarding.** `/onboard` now opens with "tell me about your
   company" instead of a 12-step form. The user writes a paragraph (and can
   attach a deck, one-pager or brief), the new `onboarding_interviewer` agent

@@ -6,9 +6,9 @@ import hmac
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +51,29 @@ from openexecutive.api.routes import (
 )
 from openexecutive.integrations.google_chat import router as google_chat_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
+
+if TYPE_CHECKING:
+    from openexecutive.integrations.slack_bot import EmbeddedSlackBot
+
+# Upper bound on each embedded chat bot's shutdown (Discord, Slack): a close
+# handshake that stalls during a reconnect must not hold the lifespan open.
+_BOT_SHUTDOWN_TIMEOUT_S = 10.0
+
+
+def _log_bot_crash(bot_name: str) -> Callable[[asyncio.Task[None]], None]:
+    """Done-callback that surfaces an embedded bot's crash (invalid token,
+    gateway error, network) when it happens instead of at shutdown."""
+
+    def _on_done(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logging.getLogger("openexecutive").error(
+                "%s bot exited unexpectedly", bot_name, exc_info=exc
+            )
+
+    return _on_done
 
 
 class _OELogFormatter(logging.Formatter):
@@ -442,24 +465,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     discord_bot.start(settings.discord_bot_token)
                 )
 
-                # Surface bot crashes (invalid token, gateway 4004, network)
-                # immediately instead of waiting for shutdown to discover them.
-                def _on_discord_done(task: asyncio.Task[None]) -> None:
-                    if task.cancelled():
-                        return
-                    exc = task.exception()
-                    if exc is not None:
-                        _discord_log.error(
-                            "Discord bot exited unexpectedly", exc_info=exc
-                        )
-
-                discord_bot_task.add_done_callback(_on_discord_done)
+                discord_bot_task.add_done_callback(_log_bot_crash("Discord"))
             except Exception:
                 _discord_log.exception(
                     "Failed to start Discord bot; continuing without it"
                 )
                 discord_bot = None
                 discord_bot_task = None
+
+    # Slack Socket Mode bot (see EmbeddedSlackBot). Needs both tokens: the bot
+    # token for the Web API, the app token for the Socket Mode connection.
+    slack_bot: EmbeddedSlackBot | None = None
+    if settings.slack_bot_token and settings.slack_app_token:
+        from openexecutive.integrations.slack_bot import EmbeddedSlackBot
+
+        slack_bot = EmbeddedSlackBot()
+        slack_bot.start().add_done_callback(_log_bot_crash("Slack"))
 
     # Run the MCP Streamable-HTTP session manager for the life of the app.
     # Mounting the sub-app does NOT run its lifespan, so without this every
@@ -486,10 +507,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await discord_bot_task
 
         try:
-            await asyncio.wait_for(_shutdown_discord(), timeout=10.0)
+            await asyncio.wait_for(_shutdown_discord(), timeout=_BOT_SHUTDOWN_TIMEOUT_S)
         except TimeoutError:
             logging.getLogger("openexecutive").warning(
-                "Discord shutdown exceeded 10s; cancelling task"
+                "Discord shutdown exceeded %.0fs; cancelling task", _BOT_SHUTDOWN_TIMEOUT_S
             )
             if discord_bot_task is not None and not discord_bot_task.done():
                 discord_bot_task.cancel()
@@ -497,6 +518,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     asyncio.CancelledError, Exception
                 ):
                     await discord_bot_task
+
+    # Slack next, for the same reason, within the same bound. stop() also
+    # cancels a start still in progress, whose cleanup closes a half-built
+    # Socket Mode handler that can stall like any other close.
+    if slack_bot is not None:
+        try:
+            await asyncio.wait_for(slack_bot.stop(), timeout=_BOT_SHUTDOWN_TIMEOUT_S)
+        except Exception:
+            logging.getLogger("openexecutive").warning(
+                "Slack shutdown failed or exceeded %.0fs; continuing",
+                _BOT_SHUTDOWN_TIMEOUT_S,
+                exc_info=True,
+            )
 
     if email_poller_task is not None:
         email_poller_task.cancel()
