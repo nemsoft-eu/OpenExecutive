@@ -15,6 +15,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
+from slack_sdk.errors import SlackApiError
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
@@ -33,11 +35,12 @@ def slack_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
 
 
-@pytest.mark.asyncio
-async def test_create_slack_app_verifies_both_tokens(
+@pytest.fixture
+def token_probes(
     slack_tokens: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # restored afterwards so the resolved id does not leak into other tests
+) -> Iterator[tuple[AsyncMock, AsyncMock]]:
+    """Mock the two Slack Web API calls create_slack_app() probes with."""
+    # create_slack_app() caches the resolved id; restored afterwards
     monkeypatch.setattr(slack_bot, "_bot_user_id", None)
     with (
         patch(
@@ -49,7 +52,16 @@ async def test_create_slack_app_verifies_both_tokens(
             new=AsyncMock(return_value={"url": "wss://example"}),
         ) as connections_open,
     ):
-        await slack_bot.create_slack_app()
+        yield auth_test, connections_open
+
+
+@pytest.mark.asyncio
+async def test_create_slack_app_verifies_both_tokens(
+    token_probes: tuple[AsyncMock, AsyncMock],
+) -> None:
+    auth_test, connections_open = token_probes
+
+    await slack_bot.create_slack_app()
 
     auth_test.assert_awaited_once()
     connections_open.assert_awaited_once_with(app_token="xapp-test")
@@ -58,23 +70,13 @@ async def test_create_slack_app_verifies_both_tokens(
 
 @pytest.mark.asyncio
 async def test_create_slack_app_propagates_rejected_app_token(
-    slack_tokens: None, monkeypatch: pytest.MonkeyPatch
+    token_probes: tuple[AsyncMock, AsyncMock],
 ) -> None:
-    """The Socket Mode client would retry this forever without raising, so the
-    probe must surface it."""
-    # auth_test succeeds before the app token is rejected and sets the cache
-    monkeypatch.setattr(slack_bot, "_bot_user_id", None)
-    with (
-        patch(
-            "slack_sdk.web.async_client.AsyncWebClient.auth_test",
-            new=AsyncMock(return_value={"user_id": "UBOT"}),
-        ),
-        patch(
-            "slack_sdk.web.async_client.AsyncWebClient.apps_connections_open",
-            new=AsyncMock(side_effect=RuntimeError("not_allowed_token_type")),
-        ),
-        pytest.raises(RuntimeError, match="not_allowed_token_type"),
-    ):
+    """The Socket Mode client would retry this forever without raising."""
+    _, connections_open = token_probes
+    connections_open.side_effect = _slack_error("not_allowed_token_type")
+
+    with pytest.raises(SlackApiError):
         await slack_bot.create_slack_app()
 
 
@@ -116,15 +118,16 @@ def test_message_event_mode(
 # --------------------------------------------------------------------------
 
 
+def _slack_error(code: str) -> SlackApiError:
+    return SlackApiError("The request to the Slack API failed.", {"ok": False, "error": code})
+
+
 class _FakeHandler:
-    def __init__(self, connect_error: BaseException | None = None) -> None:
-        self.connect_error = connect_error
+    def __init__(self) -> None:
         self.connected = False
         self.closed = False
 
     async def connect_async(self) -> None:
-        if self.connect_error is not None:
-            raise self.connect_error
         self.connected = True
 
     async def close_async(self) -> None:
@@ -136,26 +139,25 @@ def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(slack_bot, "_CONNECT_RETRY_INITIAL_S", 0.0)
 
 
-def _script_app(monkeypatch: pytest.MonkeyPatch, outcomes: list[BaseException | None]) -> list[int]:
+def _script_app(monkeypatch: pytest.MonkeyPatch, outcomes: list[BaseException]) -> list[int]:
     """create_slack_app raises each exception in turn, then succeeds."""
     calls: list[int] = []
 
     async def _fake_create() -> str:
         calls.append(1)
-        outcome = outcomes.pop(0) if outcomes else None
-        if outcome is not None:
-            raise outcome
+        if outcomes:
+            raise outcomes.pop(0)
         return "app"
 
     monkeypatch.setattr(slack_bot, "create_slack_app", _fake_create)
     return calls
 
 
-def _script_handler(monkeypatch: pytest.MonkeyPatch, handler: _FakeHandler) -> list[tuple[Any, Any]]:
-    built: list[tuple[Any, Any]] = []
+def _script_handler(monkeypatch: pytest.MonkeyPatch, handler: _FakeHandler) -> list[Any]:
+    built: list[Any] = []
 
-    def _factory(app: Any, token: Any) -> _FakeHandler:
-        built.append((app, token))
+    def _factory(app: Any) -> _FakeHandler:
+        built.append(app)
         return handler
 
     monkeypatch.setattr(slack_bot, "_socket_mode_handler", _factory)
@@ -163,16 +165,14 @@ def _script_handler(monkeypatch: pytest.MonkeyPatch, handler: _FakeHandler) -> l
 
 
 @pytest.mark.asyncio
-async def test_run_connects_and_stop_closes(
-    monkeypatch: pytest.MonkeyPatch, slack_tokens: None
-) -> None:
+async def test_start_connects_and_stop_closes(monkeypatch: pytest.MonkeyPatch) -> None:
     _script_app(monkeypatch, [])
     handler = _FakeHandler()
     built = _script_handler(monkeypatch, handler)
     bot = slack_bot.EmbeddedSlackBot()
 
-    await bot.run()
-    assert built == [("app", "xapp-test")]
+    await bot.start()
+    assert built == ["app"]
     assert handler.connected
 
     await bot.stop()
@@ -181,16 +181,18 @@ async def test_run_connects_and_stop_closes(
 
 
 @pytest.mark.asyncio
-async def test_run_retries_transient_token_check_failure(
-    monkeypatch: pytest.MonkeyPatch, slack_tokens: None, fast_retry: None
+async def test_run_retries_transient_failures(
+    monkeypatch: pytest.MonkeyPatch, fast_retry: None
 ) -> None:
-    calls = _script_app(monkeypatch, [ConnectionError("slack.com unreachable")])
+    calls = _script_app(
+        monkeypatch, [ConnectionError("slack.com unreachable"), _slack_error("ratelimited")]
+    )
     handler = _FakeHandler()
     built = _script_handler(monkeypatch, handler)
 
     await slack_bot.EmbeddedSlackBot().run()
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert len(built) == 1  # no socket session until the tokens are verified
     assert handler.connected
 
@@ -198,11 +200,9 @@ async def test_run_retries_transient_token_check_failure(
 @pytest.mark.parametrize("code", slack_bot._FATAL_AUTH_ERRORS)
 @pytest.mark.asyncio
 async def test_run_gives_up_on_permanent_errors(
-    monkeypatch: pytest.MonkeyPatch, slack_tokens: None, fast_retry: None, code: str
+    monkeypatch: pytest.MonkeyPatch, fast_retry: None, code: str
 ) -> None:
-    calls = _script_app(
-        monkeypatch, [RuntimeError(f"The server responded with: {{'ok': False, 'error': '{code}'}}")]
-    )
+    calls = _script_app(monkeypatch, [_slack_error(code)])
     built = _script_handler(monkeypatch, _FakeHandler())
 
     await slack_bot.EmbeddedSlackBot().run()
@@ -212,9 +212,20 @@ async def test_run_gives_up_on_permanent_errors(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_connect_closes_handler(
-    monkeypatch: pytest.MonkeyPatch, slack_tokens: None
+async def test_error_code_text_outside_a_slack_error_is_retried(
+    monkeypatch: pytest.MonkeyPatch, fast_retry: None
 ) -> None:
+    """Only Slack's structured error code counts, not text that happens to match."""
+    calls = _script_app(monkeypatch, [RuntimeError("proxy said: not_authed")])
+    _script_handler(monkeypatch, _FakeHandler())
+
+    await slack_bot.EmbeddedSlackBot().run()
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_a_start_still_connecting(monkeypatch: pytest.MonkeyPatch) -> None:
     _script_app(monkeypatch, [])
     connecting = asyncio.Event()
 
@@ -226,14 +237,45 @@ async def test_cancelled_connect_closes_handler(
     handler = _Hanging()
     _script_handler(monkeypatch, handler)
     bot = slack_bot.EmbeddedSlackBot()
-
-    task = asyncio.create_task(bot.run())
+    task = bot.start()
     await asyncio.wait_for(connecting.wait(), timeout=5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
-    assert handler.closed
+    await asyncio.wait_for(bot.stop(), timeout=5)
+
+    assert task.cancelled()
+    assert handler.closed  # the half-built handler is closed by the cancelled start
+
+
+@pytest.mark.asyncio
+async def test_caller_bound_holds_when_cancelled_start_cleanup_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _script_app(monkeypatch, [])
+    connecting = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class _StuckClose(_FakeHandler):
+        async def connect_async(self) -> None:
+            connecting.set()
+            await asyncio.Event().wait()
+
+        async def close_async(self) -> None:
+            # a close that ignores cancellation until released
+            await asyncio.shield(release_close.wait())
+
+    _script_handler(monkeypatch, _StuckClose())
+    bot = slack_bot.EmbeddedSlackBot()
+    task = bot.start()
+    await asyncio.wait_for(connecting.wait(), timeout=5)
+
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(bot.stop(), timeout=0.2)
+    finally:
+        # let the stalled cleanup finish so loop teardown cannot hang on it
+        release_close.set()
+        task.cancel()
+        await asyncio.wait({task}, timeout=5)
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +307,7 @@ def chat_path() -> Iterator[dict[str, Any]]:
         ),
     ):
         profile.return_value.is_empty.return_value = True
+        find_person.return_value = MagicMock(id=7, display_name="Nick")
         yield {
             "find_person": find_person,
             "audit": audit,
@@ -274,13 +317,25 @@ def chat_path() -> Iterator[dict[str, Any]]:
         }
 
 
+def _dm_event(text: str = "hello", user: str = "U1") -> dict[str, Any]:
+    return {"text": text, "user": user, "channel": "D1", "ts": "1.0", "channel_type": "im"}
+
+
+def _audit_outcomes(audit: MagicMock) -> list[Any]:
+    return [c.kwargs.get("details", {}).get("outcome") for c in audit.call_args_list]
+
+
+def _thread_client(messages: list[dict[str, Any]]) -> MagicMock:
+    client = MagicMock()
+    client.conversations_replies = AsyncMock(return_value={"messages": messages})
+    return client
+
+
 @pytest.mark.asyncio
 async def test_rostered_dm_is_answered(chat_path: dict[str, Any]) -> None:
-    chat_path["find_person"].return_value = MagicMock(id=7)
     say = AsyncMock()
-    event = {"text": "hello", "user": "U1", "channel": "D1", "ts": "1.0", "channel_type": "im"}
 
-    await slack_bot._handle_message(event, say, client=None, mode="dm")
+    await slack_bot._handle_message(_dm_event(), say, client=None, mode="dm")
 
     assert chat_path["executive"].chat.await_args.kwargs["person_id"] == 7
     chat_path["retrieve"].assert_called_once_with(query="hello")
@@ -292,24 +347,18 @@ async def test_rostered_dm_is_answered(chat_path: dict[str, Any]) -> None:
 async def test_unrostered_sender_is_rejected_before_any_work(chat_path: dict[str, Any]) -> None:
     chat_path["find_person"].return_value = None
     say = AsyncMock()
-    event = {"text": "hello", "user": "UX", "channel": "D1", "ts": "1.0", "channel_type": "im"}
 
-    await slack_bot._handle_message(event, say, client=None, mode="dm")
+    await slack_bot._handle_message(_dm_event(user="UX"), say, client=None, mode="dm")
 
     chat_path["executive"].chat.assert_not_awaited()
     chat_path["schedule"].assert_not_called()
     say.assert_not_awaited()
-    outcomes = [
-        c.kwargs.get("details", {}).get("outcome") for c in chat_path["audit"].call_args_list
-    ]
-    assert "rejected_unknown_sender" in outcomes
+    assert "rejected_unknown_sender" in _audit_outcomes(chat_path["audit"])
 
 
 @pytest.mark.asyncio
 async def test_workflow_reply_is_recorded_without_a_chat_turn(chat_path: dict[str, Any]) -> None:
-    chat_path["find_person"].return_value = MagicMock(id=7)
     say = AsyncMock()
-    event = {"text": "approved", "user": "U1", "channel": "D1", "ts": "1.0", "channel_type": "im"}
 
     with (
         patch(
@@ -320,7 +369,7 @@ async def test_workflow_reply_is_recorded_without_a_chat_turn(chat_path: dict[st
             "openexecutive.workflows.resumer.apply_resolution", new=AsyncMock(return_value=True)
         ) as apply_resolution,
     ):
-        await slack_bot._handle_message(event, say, client=None, mode="dm")
+        await slack_bot._handle_message(_dm_event("approved"), say, client=None, mode="dm")
 
     apply_resolution.assert_awaited_once()
     say.assert_awaited_once_with(text="Got it — your response has been recorded.", thread_ts="1.0")
@@ -333,10 +382,7 @@ async def test_thread_continuation_ignored_where_bot_never_replied(
     chat_path: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(slack_bot, "_bot_user_id", "UBOT")
-    client = MagicMock()
-    client.conversations_replies = AsyncMock(
-        return_value={"messages": [{"user": "U1", "text": "start"}, {"user": "U2", "text": "hm"}]}
-    )
+    client = _thread_client([{"user": "U1", "text": "start"}, {"user": "U2", "text": "hm"}])
     say = AsyncMock()
     event = {"text": "anyone?", "user": "U2", "channel": "C1", "ts": "2.0", "thread_ts": "1.0"}
 
@@ -352,16 +398,12 @@ async def test_response_gate_can_skip_a_multi_person_thread(
     chat_path: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(slack_bot, "_bot_user_id", "UBOT")
-    chat_path["find_person"].return_value = MagicMock(id=7, display_name="Nick")
-    client = MagicMock()
-    client.conversations_replies = AsyncMock(
-        return_value={
-            "messages": [
-                {"user": "U1", "text": "question"},
-                {"user": "UBOT", "text": "answer"},
-                {"user": "U2", "text": "side remark"},
-            ]
-        }
+    client = _thread_client(
+        [
+            {"user": "U1", "text": "question"},
+            {"user": "UBOT", "text": "answer"},
+            {"user": "U2", "text": "side remark"},
+        ]
     )
     say = AsyncMock()
     event = {"text": "thanks U1", "user": "U2", "channel": "C1", "ts": "3.0", "thread_ts": "1.0"}
@@ -375,10 +417,7 @@ async def test_response_gate_can_skip_a_multi_person_thread(
     should_respond.assert_awaited_once()
     chat_path["executive"].chat.assert_not_awaited()
     say.assert_not_awaited()
-    outcomes = [
-        c.kwargs.get("details", {}).get("outcome") for c in chat_path["audit"].call_args_list
-    ]
-    assert "skipped_gate" in outcomes
+    assert "skipped_gate" in _audit_outcomes(chat_path["audit"])
 
 
 @pytest.mark.asyncio
@@ -388,7 +427,6 @@ async def test_thread_history_fetch_is_bounded(
     """A hung conversations.replies degrades to no history instead of stalling
     the reply; the timeout is local, not a parameter sent to Slack."""
     monkeypatch.setattr(slack_bot, "_REPLIES_TIMEOUT_S", 0.05)
-    chat_path["find_person"].return_value = MagicMock(id=7)
     client = MagicMock()
 
     async def _hang(**kwargs: Any) -> dict[str, Any]:
@@ -411,14 +449,6 @@ async def test_thread_history_fetch_is_bounded(
 # --------------------------------------------------------------------------
 # lifespan wiring
 # --------------------------------------------------------------------------
-
-
-def _lifespan_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    from openexecutive.api.main import create_app
-
-    monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
-    monkeypatch.delenv("OE_PUBLIC_DEPLOYMENT", raising=False)
-    return TestClient(create_app())
 
 
 @pytest.mark.asyncio
@@ -456,38 +486,29 @@ async def test_log_bot_crash_reports_only_real_crashes(caplog: pytest.LogCapture
     assert messages == ["Crashy bot exited unexpectedly"]
 
 
-# cold lifespan boot seeds the knowledge store, so the overall test deadline
-# is generous; shutdown itself is measured against the real bound
-_LIFESPAN_TEST_DEADLINE_S = 120.0
+def _app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    from openexecutive.api.main import create_app
+
+    monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
+    return create_app()
 
 
 class _RecordingBot:
     instances: list[_RecordingBot] = []
-    run_error: Exception | None = None
-    run_blocks = False
-    cancel_cleanup_stalls = False
+    stop_stalls = False
 
     def __init__(self) -> None:
-        self.ran = False
-        self.run_cancelled = False
+        self.started = False
         self.stopped = False
         _RecordingBot.instances.append(self)
 
-    async def run(self) -> None:
-        self.ran = True
-        if _RecordingBot.run_error is not None:
-            raise _RecordingBot.run_error
-        if _RecordingBot.run_blocks:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                self.run_cancelled = True
-                if _RecordingBot.cancel_cleanup_stalls:
-                    # a Socket Mode close that never returns
-                    await asyncio.shield(asyncio.Event().wait())
-                raise
+    def start(self) -> asyncio.Task[None]:
+        self.started = True
+        return asyncio.create_task(asyncio.sleep(0))
 
     async def stop(self) -> None:
+        if _RecordingBot.stop_stalls:
+            await asyncio.shield(asyncio.Event().wait())
         self.stopped = True
 
 
@@ -496,83 +517,20 @@ def recording_bot(
     monkeypatch: pytest.MonkeyPatch, slack_tokens: None
 ) -> type[_RecordingBot]:
     _RecordingBot.instances = []
-    _RecordingBot.run_error = None
-    _RecordingBot.run_blocks = False
-    _RecordingBot.cancel_cleanup_stalls = False
+    _RecordingBot.stop_stalls = False
     monkeypatch.setattr(slack_bot, "EmbeddedSlackBot", _RecordingBot)
     return _RecordingBot
 
 
-async def _measure_lifespan_shutdown(
-    monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot]
-) -> float:
-    """Boot the real lifespan until the Slack run has started, then return
-    how long its shutdown takes."""
-    from openexecutive.api.main import create_app
-
-    monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
-    monkeypatch.delenv("OE_PUBLIC_DEPLOYMENT", raising=False)
-    app = create_app()
-    loop = asyncio.get_running_loop()
-    shutdown_started: list[float] = []
-
-    async def _boot_and_shut_down() -> None:
-        async with app.router.lifespan_context(app):
-            while not recording_bot.instances or not recording_bot.instances[0].ran:
-                await asyncio.sleep(0.01)
-            shutdown_started.append(loop.time())
-
-    # driven directly with a deadline: a teardown that never finishes would
-    # otherwise hang the test client instead of failing
-    await asyncio.wait_for(_boot_and_shut_down(), timeout=_LIFESPAN_TEST_DEADLINE_S)
-    return loop.time() - shutdown_started[0]
-
-
-def test_lifespan_runs_and_stops_slack_when_both_tokens_set(
+def test_lifespan_starts_and_stops_slack_when_both_tokens_set(
     monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot]
 ) -> None:
-    with _lifespan_client(monkeypatch) as client:
+    with TestClient(_app(monkeypatch)) as client:
         assert client.get("/health").status_code == 200
         (bot,) = recording_bot.instances
-        assert bot.ran
+        assert bot.started
         assert not bot.stopped
     assert bot.stopped
-
-
-@pytest.mark.asyncio
-async def test_lifespan_cancels_a_run_still_retrying_at_shutdown(
-    monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot]
-) -> None:
-    from openexecutive.api import main
-
-    recording_bot.run_blocks = True
-
-    shutdown_s = await _measure_lifespan_shutdown(monkeypatch, recording_bot)
-
-    (bot,) = recording_bot.instances
-    # an uncancelled run would hold the Slack shutdown until the bound fires
-    assert shutdown_s < main._BOT_SHUTDOWN_TIMEOUT_S
-    assert bot.run_cancelled
-    assert bot.stopped
-
-
-@pytest.mark.asyncio
-async def test_lifespan_bounds_a_stalled_slack_teardown(
-    monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot]
-) -> None:
-    from openexecutive.api import main
-
-    bound_s = 0.5
-    monkeypatch.setattr(main, "_BOT_SHUTDOWN_TIMEOUT_S", bound_s)
-    recording_bot.run_blocks = True
-    recording_bot.cancel_cleanup_stalls = True
-
-    shutdown_s = await _measure_lifespan_shutdown(monkeypatch, recording_bot)
-
-    (bot,) = recording_bot.instances
-    assert bot.run_cancelled
-    # the rest of the lifespan teardown still ran, within a few bounds
-    assert shutdown_s < bound_s * 10
 
 
 @pytest.mark.parametrize("missing", ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"])
@@ -580,17 +538,32 @@ def test_lifespan_skips_slack_without_both_tokens(
     monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot], missing: str
 ) -> None:
     monkeypatch.delenv(missing)
-    with _lifespan_client(monkeypatch) as client:
+    with TestClient(_app(monkeypatch)) as client:
         assert client.get("/health").status_code == 200
     assert recording_bot.instances == []
 
 
-def test_lifespan_boots_and_stops_cleanly_when_slack_run_fails(
+@pytest.mark.asyncio
+async def test_lifespan_bounds_a_stalled_slack_stop(
     monkeypatch: pytest.MonkeyPatch, recording_bot: type[_RecordingBot]
 ) -> None:
-    recording_bot.run_error = RuntimeError("boom")
-    with _lifespan_client(monkeypatch) as client:
-        assert client.get("/health").status_code == 200
+    from openexecutive.api import main
+
+    bound_s = 0.5
+    monkeypatch.setattr(main, "_BOT_SHUTDOWN_TIMEOUT_S", bound_s)
+    recording_bot.stop_stalls = True
+    app = _app(monkeypatch)
+    loop = asyncio.get_running_loop()
+    shutdown_started: list[float] = []
+
+    async def _boot_and_shut_down() -> None:
+        async with app.router.lifespan_context(app):
+            shutdown_started.append(loop.time())
+
+    # cold boot seeds the knowledge store, hence the generous outer deadline
+    await asyncio.wait_for(_boot_and_shut_down(), timeout=120)
+
     (bot,) = recording_bot.instances
-    assert bot.ran
-    assert bot.stopped
+    assert not bot.stopped
+    # the rest of the lifespan teardown still ran, within a few bounds
+    assert loop.time() - shutdown_started[0] < bound_s * 10

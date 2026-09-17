@@ -8,7 +8,7 @@ import os
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +51,9 @@ from openexecutive.api.routes import (
 )
 from openexecutive.integrations.google_chat import router as google_chat_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
+
+if TYPE_CHECKING:
+    from openexecutive.integrations.slack_bot import EmbeddedSlackBot
 
 # Upper bound on each embedded chat bot's shutdown (Discord, Slack): a close
 # handshake that stalls during a reconnect must not hold the lifespan open.
@@ -470,18 +473,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 discord_bot = None
                 discord_bot_task = None
 
-    # Slack Socket Mode bot, embedded for the same single-process /data reason
-    # as Discord. Needs both tokens: the bot token for the Web API, the app
-    # token for the Socket Mode connection. Starts in a background task that
-    # verifies the tokens with backoff, so an unreachable Slack never delays boot.
-    slack_bot: Any = None
-    slack_bot_task: asyncio.Task[None] | None = None
+    # Slack Socket Mode bot (see EmbeddedSlackBot). Needs both tokens: the bot
+    # token for the Web API, the app token for the Socket Mode connection.
+    slack_bot: EmbeddedSlackBot | None = None
     if settings.slack_bot_token and settings.slack_app_token:
         from openexecutive.integrations.slack_bot import EmbeddedSlackBot
 
         slack_bot = EmbeddedSlackBot()
-        slack_bot_task = asyncio.create_task(slack_bot.run())
-        slack_bot_task.add_done_callback(_log_bot_crash("Slack"))
+        slack_bot.start().add_done_callback(_log_bot_crash("Slack"))
 
     # Run the MCP Streamable-HTTP session manager for the life of the app.
     # Mounting the sub-app does NOT run its lifespan, so without this every
@@ -520,22 +519,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ):
                     await discord_bot_task
 
-    # Slack next, for the same reason. Cancelling a start still in progress and
-    # disconnecting share one bound: the cancelled task closes its half-built
-    # Socket Mode handler, and that close can stall like any other.
+    # Slack next, for the same reason, within the same bound. stop() also
+    # cancels a start still in progress, whose cleanup closes a half-built
+    # Socket Mode handler that can stall like any other close.
     if slack_bot is not None:
-        async def _shutdown_slack() -> None:
-            if slack_bot_task is not None and not slack_bot_task.done():
-                slack_bot_task.cancel()
-                # asyncio.wait, not a suppressed await: suppressing
-                # CancelledError would also swallow wait_for's timeout
-                # cancellation, and teardown would carry on into stop()
-                # past the bound
-                await asyncio.wait({slack_bot_task})
-            await slack_bot.stop()
-
         try:
-            await asyncio.wait_for(_shutdown_slack(), timeout=_BOT_SHUTDOWN_TIMEOUT_S)
+            await asyncio.wait_for(slack_bot.stop(), timeout=_BOT_SHUTDOWN_TIMEOUT_S)
         except Exception:
             logging.getLogger("openexecutive").warning(
                 "Slack shutdown failed or exceeded %.0fs; continuing",

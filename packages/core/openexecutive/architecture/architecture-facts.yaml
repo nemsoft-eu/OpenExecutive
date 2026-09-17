@@ -2936,10 +2936,8 @@ integrations:
     under /data are single-process. Listeners are asyncio tasks on that
     loop, so Executive.chat, the inbound resolver and the response gate are
     awaited directly and the MCP gateway (bound to the API loop) works.
-    The previous sync Bolt design needed a thread-to-loop bridge whose
-    shutdown edges kept producing hangs; async Bolt has no threads to join.
     It starts only when BOTH SLACK_BOT_TOKEN and SLACK_APP_TOKEN are set, as
-    a background task (slack_bot.EmbeddedSlackBot.run), so Slack never
+    a background task (slack_bot.EmbeddedSlackBot.start), so Slack never
     delays boot. create_slack_app() probes both tokens before any socket
     session exists: auth.test for the bot token (AsyncApp does not verify it
     at construction) and apps.connections.open for the app token (the Socket
@@ -2947,15 +2945,17 @@ integrations:
     Transient probe failures retry with backoff 5 s doubling to 300 s;
     permanent ones (invalid_auth, not_authed, account_inactive,
     token_revoked, token_expired, not_allowed_token_type, missing_scope)
-    disable Slack with one ERROR log. After the probes pass, the Socket Mode
+    disable Slack with one ERROR log; only a SlackApiError carrying one of
+    those codes counts as permanent. After the probes pass, the Socket Mode
     client owns connect retries and reconnects: a connect that keeps failing
     (e.g. wss blocked by a proxy) retries every 10 s inside slack_sdk
     indefinitely, logging ERROR tracebacks on the slack_bolt logger rather
     than returning to the backoff loop. Its handler (which opens an aiohttp
     session at construction) is closed if connect is cancelled.
-    Shutdown runs right after Discord: cancelling a run still in progress
-    (which closes its half-built handler) and close_async() share one bound,
-    _BOT_SHUTDOWN_TIMEOUT_S (10 s, shared with Discord). Listener tasks
+    Shutdown runs right after Discord: EmbeddedSlackBot.stop() cancels a
+    start still in progress (which closes its half-built handler) and then
+    calls close_async(), all under one bound, _BOT_SHUTDOWN_TIMEOUT_S (10 s,
+    shared with Discord). Listener tasks
     already running are not tracked: one still inside Executive.chat can hit
     the MCP gateway after it closes later in shutdown and reply with the
     generic error message; the rest are cancelled with the loop.

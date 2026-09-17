@@ -462,12 +462,20 @@ def _message_event_mode(event: dict) -> str | None:
     return "thread_continuation"
 
 
-def _socket_mode_handler(app: AsyncApp, app_token: str | None) -> AsyncSocketModeHandler:
+def _socket_mode_handler(app: AsyncApp) -> AsyncSocketModeHandler:
     # constructing it opens an aiohttp session and starts a task, so it needs
     # a running loop and must be closed on every path
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-    return AsyncSocketModeHandler(app, app_token)
+    from openexecutive.config import get_settings
+
+    return AsyncSocketModeHandler(app, get_settings().slack_app_token)
+
+
+def _is_permanent_slack_error(exc: Exception) -> bool:
+    from slack_sdk.errors import SlackApiError
+
+    return isinstance(exc, SlackApiError) and exc.response.get("error") in _FATAL_AUTH_ERRORS
 
 
 class EmbeddedSlackBot:
@@ -475,25 +483,28 @@ class EmbeddedSlackBot:
 
     Embedded rather than a sibling process for the same reason as the Discord
     bot: SQLite and the embedded Chroma store under /data are single-process.
-    The API starts ``run()`` as a background task, so a slow or unreachable
-    Slack never delays boot, and calls ``stop()`` on shutdown. Listeners are
-    asyncio tasks on the same loop, so shutdown needs no thread handling.
+    ``start()`` runs the connect in a background task, so a slow or
+    unreachable Slack never delays boot; ``stop()`` tears it down.
     """
 
     def __init__(self) -> None:
         self._handler: AsyncSocketModeHandler | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> asyncio.Task[None]:
+        """Run ``run()`` as a background task on the running loop and return the task."""
+        self._task = asyncio.create_task(self.run())
+        return self._task
 
     async def run(self) -> None:
         """Verify the tokens (retrying transient failures), then connect."""
-        from openexecutive.config import get_settings
-
         delay = _CONNECT_RETRY_INITIAL_S
         while True:
             try:
                 app = await create_slack_app()
                 break
             except Exception as exc:
-                if any(code in str(exc) for code in _FATAL_AUTH_ERRORS):
+                if _is_permanent_slack_error(exc):
                     logger.error("Slack bot disabled: Slack rejected the tokens (%s)", exc)
                     return
                 logger.warning(
@@ -504,7 +515,7 @@ class EmbeddedSlackBot:
 
         # Tokens verified: from here the Socket Mode client retries and
         # reconnects on its own, so a connect that keeps failing stays inside it.
-        handler = _socket_mode_handler(app, get_settings().slack_app_token)
+        handler = _socket_mode_handler(app)
         try:
             await handler.connect_async()
         except BaseException:
@@ -515,7 +526,18 @@ class EmbeddedSlackBot:
         logger.info("Slack bot connected in socket mode (embedded in the API)")
 
     async def stop(self) -> None:
-        """Disconnect. Listener tasks already running finish or are cancelled with the loop."""
+        """Cancel a start still in progress, then disconnect.
+
+        Listener tasks already running are not tracked; they finish or are
+        cancelled with the loop.
+        """
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            # asyncio.wait, not a suppressed await: suppressing CancelledError
+            # would also swallow a caller's wait_for timeout, and teardown
+            # would carry on into close_async past that bound
+            await asyncio.wait({task})
         handler, self._handler = self._handler, None
         if handler is not None:
             await handler.close_async()
@@ -527,11 +549,10 @@ def run_slack_bot() -> None:
     Must not run while an API with the Slack tokens is up, or every message
     is answered twice.
     """
-    from openexecutive.config import get_settings
 
     async def _main() -> None:
         app = await create_slack_app()
-        handler = _socket_mode_handler(app, get_settings().slack_app_token)
+        handler = _socket_mode_handler(app)
         logger.info("Starting Slack bot in socket mode...")
         await handler.start_async()
 
