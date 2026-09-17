@@ -81,8 +81,13 @@ class OpenAICompatibleProvider:
         slug_lookup: dict[str, str] | None = None,
         spec_lookup: dict[str, FeatureSpec] | None = None,
         model_resolver: Callable[[str], tuple[str, FeatureSpec] | None] | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._api_key = api_key
+        # Flat OpenAI-format ``reasoning_effort`` added to every request body.
+        # Only the local backend sets it; OpenRouter expresses effort through
+        # its nested ``reasoning`` object instead, built by the translator.
+        self._reasoning_effort = reasoning_effort
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
@@ -124,6 +129,18 @@ class OpenAICompatibleProvider:
         )
         return slug, spec
 
+    def _build_body(self, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        model = kwargs.pop("model", "")
+        slug, spec = self._resolve(model)
+        gated = apply_feature_gates(spec, kwargs)
+        body = to_openai_request(slug, gated)
+        # An explicit nested ``reasoning`` (a reasoning-capable model on the
+        # OpenRouter path) already carries the effort; never send both.
+        if self._reasoning_effort is not None and "reasoning" not in body:
+            body["reasoning_effort"] = self._reasoning_effort
+        _announce_reasoning(slug, body)
+        return slug, body
+
     def _auth_headers(self) -> dict[str, str]:
         # Local backends (Ollama, LM Studio) typically need no auth — omit
         # the header entirely rather than send a bogus ``Bearer None``.
@@ -142,11 +159,7 @@ class OpenAICompatibleProvider:
         # Strip the SDK's own ``timeout`` kwarg — httpx already has it from
         # the client; passing it into the body would break the request.
         request_timeout = kwargs.pop("timeout", None)
-        model = kwargs.pop("model", "")
-        slug, spec = self._resolve(model)
-        gated = apply_feature_gates(spec, kwargs)
-        body = to_openai_request(slug, gated)
-        _announce_reasoning(slug, body)
+        slug, body = self._build_body(kwargs)
 
         try:
             resp = await self._client.post(
@@ -168,11 +181,7 @@ class OpenAICompatibleProvider:
 
     def messages_stream(self, **kwargs: Any) -> AbstractAsyncContextManager[Any]:
         request_timeout = kwargs.pop("timeout", None)
-        model = kwargs.pop("model", "")
-        slug, spec = self._resolve(model)
-        gated = apply_feature_gates(spec, kwargs)
-        body = to_openai_request(slug, gated)
-        _announce_reasoning(slug, body)
+        _, body = self._build_body(kwargs)
         body["stream"] = True
         return _OpenAICompatibleStream(
             client=self._client,

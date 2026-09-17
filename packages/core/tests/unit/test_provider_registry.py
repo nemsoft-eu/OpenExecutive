@@ -166,6 +166,7 @@ def _settings_stub(
     local_models: list[str] | None = None,
     local_api_key: str | None = None,
     local_timeout_s: float = 300.0,
+    local_reasoning_effort: str | None = None,
 ) -> Any:
     return SimpleNamespace(
         anthropic_api_key=anthropic_key,
@@ -180,6 +181,7 @@ def _settings_stub(
         local_models=local_models or [],
         local_api_key=local_api_key,
         local_timeout_s=local_timeout_s,
+        local_reasoning_effort=local_reasoning_effort,
     )
 
 
@@ -323,6 +325,24 @@ def test_local_model_routes_to_local_provider(monkeypatch: pytest.MonkeyPatch) -
     assert not isinstance(provider, OpenRouterProvider)
     # Cached singleton — same object across calls.
     assert get_provider("qwen2.5") is provider
+
+
+def test_local_provider_carries_configured_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_stub(monkeypatch, enabled=False, local_reasoning_effort="none")
+    provider = get_provider("llama3.3")
+    assert provider._reasoning_effort == "none"  # type: ignore[attr-defined]
+
+
+def test_openrouter_provider_ignores_local_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The setting is scoped to the local backend; OpenRouter keeps its own
+    nested ``reasoning`` format."""
+    _local_stub(monkeypatch, enabled=True, local_reasoning_effort="none")
+    provider = get_provider("openai/gpt-5")
+    assert provider._reasoning_effort is None  # type: ignore[attr-defined]
 
 
 def test_local_provider_distinct_from_openrouter_singleton(

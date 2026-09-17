@@ -18,6 +18,7 @@ _PROVIDER_VARS = (
     "LOCAL_BASE_URL",
     "LOCAL_MODELS",
     "LOCAL_API_KEY",
+    "LOCAL_REASONING_EFFORT",
 )
 
 
@@ -47,6 +48,33 @@ def test_local_defaults_off_and_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
     assert s.local_models_enabled is False
     assert s.local_models == []
+
+
+def test_local_reasoning_effort_defaults_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
+    assert s.local_reasoning_effort is None
+
+
+def test_local_reasoning_effort_accepts_none_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "none" is a real effort level (thinking off), distinct from unset.
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT="none")
+    assert s.local_reasoning_effort == "none"
+
+
+@pytest.mark.parametrize("raw", ["   ", "# server default"])
+def test_local_reasoning_effort_blank_or_comment_is_unset(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT=raw)
+    assert s.local_reasoning_effort is None
+
+
+def test_local_reasoning_effort_rejects_unknown_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Anthropic-only levels (xhigh / max) are not valid for OpenAI-format servers.
+    with pytest.raises(ValueError, match="local_reasoning_effort|LOCAL_REASONING_EFFORT"):
+        _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT="max")
 
 
 def test_local_enabled_requires_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
