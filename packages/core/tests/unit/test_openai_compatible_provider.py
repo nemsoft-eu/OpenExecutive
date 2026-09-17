@@ -23,11 +23,14 @@ _LOCAL_SPEC = FeatureSpec(
 )
 
 
-def _local_provider(api_key: str | None = None) -> OpenAICompatibleProvider:
+def _local_provider(
+    api_key: str | None = None, reasoning_effort: str | None = None
+) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(
         base_url="http://localhost:11434/v1",
         api_key=api_key,
         spec_lookup={"llama3.3": _LOCAL_SPEC},
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -103,5 +106,26 @@ def test_anthropic_only_fields_stripped_for_local_model() -> None:
     body = captured["json"]
     assert "thinking" not in body
     assert "output_config" not in body
+    # no LOCAL_REASONING_EFFORT configured: the server decides whether to think
+    assert "reasoning" not in body
+    assert "reasoning_effort" not in body
     # system flattened into a plain string message — no cache_control survives.
     assert isinstance(body["messages"][0]["content"], str)
+
+
+def test_reasoning_effort_sent_flat_on_create() -> None:
+    """Ollama's /v1 endpoint reads the flat OpenAI field, not a nested object."""
+    captured = _run_create(_local_provider(reasoning_effort="none"))
+    assert captured["json"]["reasoning_effort"] == "none"
+    assert "reasoning" not in captured["json"]
+
+
+def test_reasoning_effort_sent_on_stream() -> None:
+    """The Executive streams — the streaming body must carry the field too."""
+    stream = _local_provider(reasoning_effort="low").messages_stream(
+        model="llama3.3",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert stream._body["reasoning_effort"] == "low"  # type: ignore[attr-defined]
+    assert stream._body["stream"] is True  # type: ignore[attr-defined]

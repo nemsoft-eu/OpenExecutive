@@ -224,6 +224,11 @@ class Settings(BaseSettings):
     # Local generation (especially CPU inference) can be far slower than a
     # hosted API. Default generous so a slow first token doesn't time out.
     local_timeout_s: float = Field(300.0, alias="LOCAL_TIMEOUT_S")
+    # OpenAI-format `reasoning_effort` for local calls; the gate strips
+    # Anthropic thinking, so this is the only reasoning control there.
+    local_reasoning_effort: Literal["none", "low", "medium", "high"] | None = Field(
+        None, alias="LOCAL_REASONING_EFFORT"
+    )
 
     @field_validator("local_models", mode="before")
     @classmethod
@@ -360,9 +365,9 @@ class Settings(BaseSettings):
         True, alias="DISCORD_THREAD_RESPONSE_GATE_ENABLED"
     )
 
-    @field_validator("discord_notify_channel_id", mode="before")
+    @field_validator("discord_notify_channel_id", "local_reasoning_effort", mode="before")
     @classmethod
-    def _parse_notify_channel_id(cls, v: Any) -> Any:
+    def _blank_to_none(cls, v: Any) -> Any:
         if _blank_or_comment(v):
             return None
         return v

@@ -315,6 +315,7 @@ def _local() -> OpenAICompatibleProvider:
             api_key=getattr(settings, "local_api_key", None),
             timeout_s=getattr(settings, "local_timeout_s", 300.0),
             spec_lookup=spec_lookup,
+            reasoning_effort=getattr(settings, "local_reasoning_effort", None),
         )
     return _local_provider
 

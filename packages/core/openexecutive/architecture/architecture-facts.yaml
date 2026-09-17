@@ -56,7 +56,12 @@ system:
       reusing the OpenRouter request/response/stream translator. Those slugs
       are added to the Council UI dropdown and get the tools-only local
       feature spec (no cache_control / thinking / web_search — a
-      self-hosted server has no search plugin). This makes
+      self-hosted server has no search plugin). Because Anthropic thinking
+      is stripped, a thinking model (qwen3.x, deepseek-r1) would otherwise
+      reason on every call at the server default; LOCAL_REASONING_EFFORT
+      (none / low / medium / high, unset = send nothing) is passed only to
+      the local provider and emitted as the flat OpenAI-format
+      ``reasoning_effort`` body field. This makes
       ANTHROPIC_API_KEY optional: a deployment with only local (or
       OpenRouter) models configured boots with no Anthropic key — the
       Settings validator just requires that at least one provider is
@@ -82,7 +87,7 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin. Callers do NOT need to know which model they're routing to.
+    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin. Callers do NOT need to know which model they're routing to.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.

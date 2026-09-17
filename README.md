@@ -276,6 +276,7 @@ the app refuses to start.
 | `LOCAL_API_KEY` | No | — | Optional bearer token (vLLM / gateways); Ollama & LM Studio need none |
 | `LOCAL_MODELS` | No | — | Comma-separated local model slugs to surface in the Council UI and route locally, e.g. `llama3.3,qwen2.5` |
 | `LOCAL_TIMEOUT_S` | No | `300` | Per-call timeout for local generation, in seconds |
+| `LOCAL_REASONING_EFFORT` | No | — | `none` / `low` / `medium` / `high`, sent to the local server as `reasoning_effort`. `none` stops thinking models (e.g. qwen3) from reasoning on every call; unset keeps the server default |
 | `HONCHO_ENABLED` | No | `false` | Per-person memory layer ([honcho.dev](https://honcho.dev)) — a peer card shared across all channels |
 | `HONCHO_API_KEY` | No | — | Required when `HONCHO_ENABLED=true` |
 | `HONCHO_BASE_URL` | No | — | Self-hosted Honcho endpoint |
@@ -325,9 +326,11 @@ specialists to a local model per-agent.
 
 **Caveats.** Server-side web search (`ENABLE_WEB_SEARCH`) and Anthropic prompt
 caching / extended thinking have no local equivalent and are automatically
-disabled for local models. Multi-agent routing leans heavily on tool use, so
-pick a model that's strong at it (e.g. Llama 3.3 70B, Qwen2.5) — small models
-may route poorly. `LOCAL_API_KEY` is only needed if your server (vLLM, or a
+disabled for local models. Thinking models still reason server-side by
+default, which adds latency to every call; set `LOCAL_REASONING_EFFORT=none`
+to turn that off, or `low` to keep a little. Multi-agent routing leans
+heavily on tool use, so pick a model that's strong at it (e.g. Llama 3.3 70B,
+Qwen2.5) — small models may route poorly. `LOCAL_API_KEY` is only needed if your server (vLLM, or a
 gateway) requires a bearer token; Ollama and LM Studio need none.
 
 ### Using a hosted OpenAI-compatible gateway
