@@ -299,3 +299,42 @@ def test_every_generation_is_billed_to_usage(rounds: int) -> None:
         rounds=rounds,
     )
     assert usage.call_count == rounds
+
+
+def test_timeout_bounds_the_whole_loop_not_each_round() -> None:
+    """Rounds that each fit the timeout must not add up past it.
+
+    Each generation takes 0.3s against a 0.5s timeout: a per-round bound
+    would let all three rounds (0.9s) through; the loop-wide one must not.
+    """
+    search = _message(_tool_use("web_search", "tu_s", query="x"))
+
+    class _SlowProvider(_FakeProvider):
+        async def messages_create(self, **kwargs: Any) -> Any:
+            message = await super().messages_create(**kwargs)
+            await asyncio.sleep(0.3)
+            return message
+
+    provider = _SlowProvider([search])
+
+    async def handler(_inp: dict) -> ToolOutcome:
+        return ToolOutcome("{}")
+
+    agent = _Agent()
+    with (
+        patch("openexecutive.agents.base.get_provider", return_value=provider),
+        patch("openexecutive.agents.base.log_model_usage"),
+        pytest.raises(TimeoutError),
+    ):
+        asyncio.run(
+            agent.analyze_with_tools(
+                "CONTENT",
+                tools=TOOLS,
+                timeout_seconds=0.5,
+                client_tool_handlers={"web_search": handler},
+                terminal_tool_names={"emit_findings"},
+                max_client_tool_rounds=3,
+            )
+        )
+    # The second generation was cancelled mid-flight; a third never started.
+    assert len(provider.calls) == 2

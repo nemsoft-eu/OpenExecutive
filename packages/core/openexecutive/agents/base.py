@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
@@ -232,7 +233,8 @@ class BaseAgent(ABC):
         Empty or None keeps the historical single-shot behaviour exactly.
         ``terminal_tool_names`` names the output tools the caller extracts
         from the returned message — they have no handler and reaching one
-        ends the loop. ``max_client_tool_rounds`` bounds the generations.
+        ends the loop. ``max_client_tool_rounds`` bounds the generations,
+        and ``timeout_seconds`` bounds the loop as a whole, not each round.
         """
         settings = get_settings()
         system_prompt = self.effective_system_prompt() + (
@@ -275,15 +277,20 @@ class BaseAgent(ABC):
             log_model_usage(message, model=model, actor=actor)
             return message
 
-        return await self._run_client_tool_loop(
-            provider,
-            create_kwargs,
-            model=model,
-            actor=actor,
-            client_tool_handlers=client_tool_handlers,
-            terminal_tool_names=set(terminal_tool_names or ()),
-            max_rounds=max_client_tool_rounds,
-        )
+        # ``timeout`` in create_kwargs bounds each generation; this bounds the
+        # whole loop. Without it a caller's timeout_seconds silently becomes
+        # rounds × timeout_seconds (plus search time), which can outlast an
+        # enclosing deadline such as the research scheduler's run timeout.
+        async with asyncio.timeout(timeout_seconds):
+            return await self._run_client_tool_loop(
+                provider,
+                create_kwargs,
+                model=model,
+                actor=actor,
+                client_tool_handlers=client_tool_handlers,
+                terminal_tool_names=set(terminal_tool_names or ()),
+                max_rounds=max_client_tool_rounds,
+            )
 
     async def _run_client_tool_loop(
         self,
