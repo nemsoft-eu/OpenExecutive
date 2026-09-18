@@ -129,3 +129,23 @@ def test_reasoning_effort_sent_on_stream() -> None:
     )
     assert stream._body["reasoning_effort"] == "low"  # type: ignore[attr-defined]
     assert stream._body["stream"] is True  # type: ignore[attr-defined]
+
+
+def test_stream_options_sent_on_stream() -> None:
+    """A plain OpenAI-compatible backend omits the usage block entirely on a
+    streamed response without this opt-in — confirmed out of band against
+    Ollama 0.34.0. This test pins only that we send the flag."""
+    stream = _local_provider().messages_stream(
+        model="llama3.3",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert stream._body["stream_options"] == {"include_usage": True}  # type: ignore[attr-defined]
+
+
+def test_stream_options_absent_on_non_streaming_call() -> None:
+    """``stream_options`` is only valid alongside ``stream: true`` — an
+    OpenAI-spec server 400s it otherwise. This pins the flag to
+    ``messages_stream`` and keeps it out of the shared body builder."""
+    captured = _run_create(_local_provider())
+    assert "stream_options" not in captured["json"]

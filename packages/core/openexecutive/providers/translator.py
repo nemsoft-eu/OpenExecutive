@@ -446,6 +446,11 @@ def to_openai_request(model_slug: str, anthropic_kwargs: dict[str, Any]) -> dict
     # the cached system blocks, or the cache key, so prompt caching is
     # unaffected. The cost surfaces as `usage.cost` (USD) and is captured into
     # the per-call `cache_event` audit row downstream.
+    #
+    # Sibling flag: `OpenAICompatibleProvider.messages_stream` sets the standard
+    # `stream_options: {"include_usage": true}` on streamed calls, which is what
+    # makes a plain (non-OpenRouter) backend report usage at all. Only this one
+    # carries `cost`, so neither replaces the other.
     body["usage"] = {"include": True}
 
     return body

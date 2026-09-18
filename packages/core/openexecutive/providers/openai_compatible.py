@@ -179,6 +179,19 @@ class OpenAICompatibleProvider:
         request_timeout = kwargs.pop("timeout", None)
         _, body = self._build_body(kwargs)
         body["stream"] = True
+        # Opt in to the usage block: without it a plain OpenAI-compatible
+        # backend (Ollama, LM Studio, vLLM) sends no usage at all on a streamed
+        # response, and StreamAccumulator.finalize then reports prompt_tokens 0
+        # rather than "unknown" — so the Executive's own chat turn, the call
+        # carrying the full system prompt and RAG context, logged a fabricated
+        # zero. This makes the number exist on backends that honour the flag;
+        # it does not fix the fabrication itself, which lives in finalize.
+        # Set here rather than in `to_openai_request` because that builder is
+        # shared with the non-streaming path and the OpenAI spec rejects
+        # `stream_options` when `stream` is false. The sibling accounting flag
+        # `usage: {"include": true}` is set there; see the audit invariant in
+        # architecture-facts.yaml for how the two relate.
+        body["stream_options"] = {"include_usage": True}
         return _OpenAICompatibleStream(
             client=self._client,
             body=body,
