@@ -236,8 +236,8 @@ async def test_query_empty_when_web_search_disabled(
 ) -> None:
     # No provider stub needed — poll() must bail before any call.
     monkeypatch.setattr(
-        "openexecutive.monitoring.sources.query.build_web_search_tool",
-        lambda: None,
+        "openexecutive.monitoring.sources.query.select_web_search_tool",
+        lambda *_a, **_kw: None,
     )
     src = QuerySource()
     assert await src.poll(_make_query_item()) == []

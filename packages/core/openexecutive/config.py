@@ -484,6 +484,46 @@ class Settings(BaseSettings):
         default_factory=list, alias="WEB_SEARCH_BLOCKED_DOMAINS"
     )
 
+    # Base URL of a SearXNG instance, used as the CLIENT-side web_search tool
+    # for models whose provider has no server-side search (the self-hosted
+    # OpenAI-compatible backend — see providers.registry._LOCAL_FEATURE_SPEC).
+    # Unset = local models simply have no search, which is the behaviour
+    # before this knob existed. Normally an internal address such as
+    # http://searxng:8080; the SSRF validator used for watchlist fetches is
+    # deliberately NOT applied, because it rejects private hosts by design.
+    searxng_url: str = Field("", alias="SEARXNG_URL")
+    searxng_timeout_s: float = Field(10.0, alias="SEARXNG_TIMEOUT_S")
+    # Results kept per search after domain filtering. Each one costs context
+    # in the tool_result, and a local model's window is the binding
+    # constraint, so this is deliberately smaller than a browser's page 1.
+    searxng_max_results: int = Field(5, alias="SEARXNG_MAX_RESULTS")
+
+    @field_validator("searxng_url")
+    @classmethod
+    def _validate_searxng_url(cls, v: str) -> str:
+        """Reject anything the search handler must never be asked to fetch.
+
+        The handler joins a fixed ``/search`` path onto this value, so the
+        model can influence neither host nor path. What it cannot defend
+        against is a malformed base URL, so that is caught here at startup
+        rather than on the first search.
+        """
+        from urllib.parse import urlparse
+
+        v = (v or "").strip().rstrip("/")
+        if not v:
+            return ""
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("SEARXNG_URL must be an http:// or https:// URL")
+        if not parsed.hostname:
+            raise ValueError("SEARXNG_URL must include a hostname")
+        if parsed.username or parsed.password:
+            raise ValueError("SEARXNG_URL must not carry credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("SEARXNG_URL must not carry a query string or fragment")
+        return v
+
     @field_validator(
         "web_search_allowed_domains", "web_search_blocked_domains",
         "research_specialists", mode="before",
@@ -506,6 +546,10 @@ class Settings(BaseSettings):
             raise ValueError("WEB_SEARCH_MAX_USES must be >= 1")
         if self.research_web_search_max_uses < 1:
             raise ValueError("RESEARCH_WEB_SEARCH_MAX_USES must be >= 1")
+        if self.searxng_timeout_s <= 0:
+            raise ValueError("SEARXNG_TIMEOUT_S must be > 0")
+        if self.searxng_max_results < 1:
+            raise ValueError("SEARXNG_MAX_RESULTS must be >= 1")
         return self
 
     # Base URL of the UI, used when the Executive composes deep links

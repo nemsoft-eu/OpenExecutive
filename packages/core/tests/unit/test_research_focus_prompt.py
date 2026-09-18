@@ -14,6 +14,9 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
 from openexecutive.agents import overrides as ov_mod  # noqa: E402
 from openexecutive.monitoring.research import prompts as rp  # noqa: E402
+from openexecutive.orchestrator.web_search_tool import (  # noqa: E402
+    WebSearchSelection,
+)
 
 
 @pytest.fixture
@@ -71,7 +74,7 @@ def test_specialist_research_passes_resolved_knobs(
 
     agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
     # Web search off so the tool list is deterministic.
-    monkeypatch.setattr(sr, "build_web_search_tool", lambda **_kw: None)
+    monkeypatch.setattr(sr, "select_web_search_tool", lambda *_a, **_kw: None)
 
     asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
 
@@ -91,11 +94,20 @@ def test_specialist_research_uses_the_research_search_cap(
     monkeypatch.setenv("RESEARCH_WEB_SEARCH_MAX_USES", "2")
     seen: dict = {}
 
-    def fake_build(**kwargs: object) -> dict:
+    def fake_select(model: str, **kwargs: object) -> object:
         seen.update(kwargs)
-        return {"type": "web_search_20250305", "name": "web_search", **kwargs}
+        max_uses = kwargs["max_uses"]
+        return WebSearchSelection(
+            kind="server",
+            tool={
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": max_uses,
+            },
+            max_uses=max_uses,  # type: ignore[arg-type]
+        )
 
-    monkeypatch.setattr(sr, "build_web_search_tool", fake_build)
+    monkeypatch.setattr(sr, "select_web_search_tool", fake_select)
     tools_seen: dict = {}
 
     async def fake_analyze_with_tools(user_content: str, **kwargs: object) -> object:

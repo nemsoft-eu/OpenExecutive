@@ -71,6 +71,7 @@ from openexecutive.orchestrator.schedule_tools import (
     SCHEDULE_TOOLS,
     current_session,
 )
+from openexecutive.orchestrator.searxng_search import ToolOutcome
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
 from openexecutive.orchestrator.talent_tools import (
@@ -83,7 +84,8 @@ from openexecutive.orchestrator.watchlist_tools import (
 )
 from openexecutive.orchestrator.web_search_tool import (
     WEB_SEARCH_TOOL_NAME,
-    build_web_search_tool,
+    client_search_handlers,
+    select_web_search_tool,
 )
 from openexecutive.orchestrator.workflow_authoring_tools import (
     WORKFLOW_AUTHORING_TOOL_HANDLERS,
@@ -520,6 +522,7 @@ class Executive:
             mcp_enabled=self._mcp_gateway is not None,
             persona_override=persona_override,
             voice_persona_body=voice_persona_body,
+            web_search_available=select_web_search_tool(effective_model) is not None,
         )
         # turn_id ties every downstream audit row (knowledge_retrieval,
         # specialist_consult, tool_invocation, cache_event, peer_memory)
@@ -722,11 +725,16 @@ class Executive:
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
 
+        # Gated on the DRAFT pass, which is the one that carries tools. The
+        # revision pass below reuses these exact blocks on purpose — a second
+        # variant would miss the draft's cached prefix on every committee
+        # turn — so the addendum is as accurate there as it has always been.
         system_blocks = build_system_blocks(
             session.company_profile,
             mcp_enabled=self._mcp_gateway is not None,
             persona_override=persona_override,
             voice_persona_body=voice_persona_body,
+            web_search_available=select_web_search_tool(effective_model) is not None,
         )
         # turn_id covers both the draft and (later) the revision pass so a
         # committee-reviewed turn renders as one flow chart, not two.
@@ -1093,6 +1101,17 @@ class Executive:
         last_full_text = ""
         specialists_consulted: list[str] = []
 
+        # Search wiring is resolved ONCE per turn, before the loop.
+        # The budget especially: rebuilding it per iteration would reset the
+        # counter on every model round trip, allowing WEB_SEARCH_MAX_USES
+        # searches per iteration instead of per turn.
+        stream_model = model or self._settings.default_model
+        search = select_web_search_tool(stream_model)
+        turn_skill_handlers = {
+            **_ALL_SKILL_HANDLERS,
+            **client_search_handlers(search),
+        }
+
         for iteration in range(1, max_iterations + 1):
             logger.info(
                 "iter %d/%d", iteration, max_iterations,
@@ -1115,18 +1134,22 @@ class Executive:
             # last one carries the cache_control marker. Anthropic server-side
             # tools (e.g. web_search) are appended after — they use a `type`
             # field instead of input_schema and cannot accept cache_control.
+            # The SearXNG search tool is an ordinary client tool and joins the
+            # sorted list; only the server variant is appended.
+            extra_client_tools = (
+                [search.tool] if search is not None and search.kind == "client" else []
+            )
             client_tools = sorted(
-                [*SPECIALIST_TOOLS, *_ALL_SKILL_TOOLS, *self._mcp_tools],
+                [*SPECIALIST_TOOLS, *_ALL_SKILL_TOOLS, *self._mcp_tools,
+                 *extra_client_tools],
                 key=lambda t: t["name"],
             )
             tools_with_cache: list[dict[str, Any]] = [
                 *client_tools[:-1],
                 {**client_tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}},
             ]
-            web_search_tool = build_web_search_tool()
-            if web_search_tool is not None:
-                tools_with_cache.append(web_search_tool)
-            stream_model = model or self._settings.default_model
+            if search is not None and search.kind == "server":
+                tools_with_cache.append(search.tool)
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
                 max_tokens=8192,
@@ -1217,7 +1240,7 @@ class Executive:
                 return
 
             specialist_tool_uses = [tu for tu in tool_uses if tu["name"] == "consult_specialist"]
-            skill_tool_uses = [tu for tu in tool_uses if tu["name"] in _ALL_SKILL_HANDLERS]
+            skill_tool_uses = [tu for tu in tool_uses if tu["name"] in turn_skill_handlers]
             mcp_tool_uses = [tu for tu in tool_uses if tu["name"] in MCP_TOOL_NAMES]
 
             specialist_calls = [
@@ -1282,6 +1305,11 @@ class Executive:
             yield self._THINKING
 
             results_by_id: dict[str, str] = {}
+            # tool_use ids whose handler reported a failure; their tool_result
+            # carries is_error, the correct Anthropic shape. The OpenAI-
+            # compatible translator drops the flag, so on the local path the
+            # handler's error wording is what the model actually reads.
+            error_tool_use_ids: set[str] = set()
 
             event_cursor = len(debug_collector._events) if debug_collector else 0
             session_id = getattr(current_session.get(), "session_id", None)
@@ -1344,9 +1372,21 @@ class Executive:
             if skill_tool_uses:
                 for tu in skill_tool_uses:
                     logger.info("→ skill:%s  input=%s", tu["name"], _trunc(tu["input"]))
-                skill_results = await asyncio.gather(
-                    *(_ALL_SKILL_HANDLERS[tu["name"]](tu["input"]) for tu in skill_tool_uses)
+                raw_skill_results = await asyncio.gather(
+                    *(turn_skill_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses)
                 )
+                # Most skill handlers return a plain string. The client-side
+                # web_search handler returns a ToolOutcome so a failed search
+                # can be flagged with is_error on the outer tool_result —
+                # unwrap it here so everything downstream still sees a string.
+                skill_results: list[str] = []
+                for tu, raw in zip(skill_tool_uses, raw_skill_results, strict=True):
+                    if isinstance(raw, ToolOutcome):
+                        skill_results.append(raw.content)
+                        if raw.is_error:
+                            error_tool_use_ids.add(tu["id"])
+                    else:
+                        skill_results.append(raw)
                 for tu, result in zip(skill_tool_uses, skill_results, strict=True):
                     logger.info("← skill:%s  result=%s", tu["name"], _trunc(result))
                     results_by_id[tu["id"]] = result
@@ -1388,7 +1428,16 @@ class Executive:
                         actor="executive",
                         details={
                             "tool": tu["name"],
-                            "kind": "skill",
+                            # web_search dispatched here is the client-side
+                            # SearXNG tool; the server-side one audits
+                            # separately as kind="server_tool". Same tool
+                            # name, different execution site — the audit
+                            # view has to be able to tell them apart.
+                            "kind": (
+                                "client_tool"
+                                if tu["name"] == WEB_SEARCH_TOOL_NAME
+                                else "skill"
+                            ),
                             "iteration": iteration,
                             "result_preview": audit_tool_result(tu["name"], result),
                         },
@@ -1456,16 +1505,18 @@ class Executive:
                     yield debug_collector.to_sse_dict(evt)
 
             current_messages.append({"role": "assistant", "content": response_content})
-            tool_results = [
-                {
+            tool_results: list[dict[str, Any]] = []
+            for tu in tool_uses:
+                result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
                     "content": results_by_id.get(
                         tu["id"], f"Unknown tool: {tu['name']}"
                     ),
                 }
-                for tu in tool_uses
-            ]
+                if tu["id"] in error_tool_use_ids:
+                    result_block["is_error"] = True
+                tool_results.append(result_block)
             current_messages.append({"role": "user", "content": tool_results})
 
         logger.warning("max_iterations=%d reached — returning partial result", max_iterations)

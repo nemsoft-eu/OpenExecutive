@@ -387,6 +387,46 @@ def get_provider(model: str) -> LLMProvider:
     return _openrouter()
 
 
+def feature_spec_for(model: str) -> FeatureSpec:
+    """Return the ``FeatureSpec`` the provider will apply to ``model``.
+
+    Mirrors ``get_provider``'s precedence exactly — local slugs first, then
+    the Claude family, then everything else on OpenRouter — so callers that
+    need to know a capability *before* building the request read the same
+    decision the gate will later enforce. Deriving capability separately
+    would drift the moment routing changes.
+
+    Unlike ``get_provider`` this never raises: an unroutable slug (non-Claude
+    with OpenRouter off) reports the default non-Claude spec rather than a
+    400, because the caller is asking about capability, not requesting a
+    call. The 400 still comes from ``get_provider`` when the call is made.
+    """
+    settings = get_settings()
+    if model in _local_models(settings):
+        return _LOCAL_FEATURE_SPEC
+    # Claude keeps its spec on both backends: Anthropic direct serves the
+    # features natively, and ``_openrouter_model_resolver`` returns the same
+    # Claude spec because OpenRouter forwards them through to Anthropic.
+    if _is_claude(model):
+        return _CLAUDE_FEATURE_SPEC
+    # The resolver's signature permits None (it is handed to the provider as
+    # a generic callback); today it always resolves, so the fallback is the
+    # conservative non-Claude default rather than an error.
+    resolved = _openrouter_model_resolver(model)
+    return resolved[1] if resolved is not None else _DEFAULT_NON_CLAUDE_SPEC
+
+
+def supports_server_web_search(model: str) -> bool:
+    """Whether ``model``'s provider runs web search inside the generation.
+
+    True for Claude (Anthropic's ``web_search_20250305``) and for anything
+    routed via OpenRouter (the translator swaps in ``openrouter:web_search``).
+    False for the self-hosted OpenAI-compatible backend, which has no server
+    tool — those models need the client-side SearXNG tool instead.
+    """
+    return feature_spec_for(model).supports_web_search
+
+
 def _reset_for_tests() -> None:
     """Drop cached provider singletons. Test-only — pytest fixtures call this."""
     global _anthropic_provider, _openrouter_provider, _local_provider

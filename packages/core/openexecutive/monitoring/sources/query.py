@@ -52,7 +52,10 @@ from openexecutive.alerts.models import AlertSeverity
 from openexecutive.config import get_settings
 from openexecutive.monitoring.models import SOURCE_KIND_QUERY, Signal, WatchlistItem
 from openexecutive.monitoring.sources._http import strip_url_query, validate_target_url
-from openexecutive.orchestrator.web_search_tool import build_web_search_tool
+from openexecutive.orchestrator.web_search_tool import (
+    client_search_handlers,
+    select_web_search_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,17 +173,22 @@ class QuerySource:
             )
             return []
 
-        web_search = build_web_search_tool()
-        if web_search is None:
+        # Selection is against the RESEARCH model — the one the call below
+        # is made with — so a local model reaches the SearXNG client tool
+        # instead of being told it has no search.
+        research_model = get_research_model()
+        search = select_web_search_tool(research_model)
+        if search is None:
             # No web search → the model would answer from stale memory with no
             # provenance. Refuse rather than emit unverifiable Signals.
             logger.warning(
-                "query: web search disabled (enable_web_search=False) — "
-                "skipping watchlist %r", item.slug,
+                "query: no web search available for model %r (ENABLE_WEB_SEARCH "
+                "off, or a local model with no SEARXNG_URL) — skipping "
+                "watchlist %r", research_model, item.slug,
             )
             return []
 
-        tools: list[dict[str, Any]] = [EMIT_QUERY_RESULTS_TOOL, web_search]
+        tools: list[dict[str, Any]] = [EMIT_QUERY_RESULTS_TOOL, search.tool]
         max_results = _coerce_max_results(item.config_json.get("max_results"))
         user_content = _build_user_content(query, item.config_json, max_results)
 
@@ -191,8 +199,12 @@ class QuerySource:
                 actor="query_watch",
                 tools=tools,
                 timeout_seconds=_QUERY_TIMEOUT_SECONDS,
-                model_override=get_research_model(),
+                model_override=research_model,
                 deep_reasoning_override=get_research_use_deep_reasoning(),
+                client_tool_handlers=client_search_handlers(search),
+                terminal_tool_names={"emit_query_results"},
+                # One round per search plus the emit round.
+                max_client_tool_rounds=search.max_uses + 1,
             )
         except Exception:
             logger.exception(
