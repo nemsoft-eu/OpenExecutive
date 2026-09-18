@@ -100,6 +100,7 @@ def _run_loop(provider: _ScriptedProvider) -> list[Any]:
                 system_blocks=[],
                 messages=[{"role": "user", "content": "fill the form"}],
                 model="claude-test",
+                search=None,
             ):
                 items.append(item)
         return items

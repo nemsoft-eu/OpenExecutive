@@ -23,43 +23,29 @@ from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
     SearchBudget,
-    ToolOutcome,
     _host_matches,
     _normalise_host,
     make_search_handler,
 )
+from openexecutive.orchestrator.tool_outcome import ToolOutcome
 from openexecutive.orchestrator.web_search_tool import (
     client_search_handlers,
+    client_tool_rounds,
     select_web_search_tool,
 )
+
+from ._search_helpers import clear_search_env, use_local_model
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test states the search config it depends on."""
-    for k in (
-        "ENABLE_WEB_SEARCH",
-        "WEB_SEARCH_MAX_USES",
-        "WEB_SEARCH_ALLOWED_DOMAINS",
-        "WEB_SEARCH_BLOCKED_DOMAINS",
-        "SEARXNG_URL",
-        "SEARXNG_TIMEOUT_S",
-        "SEARXNG_MAX_RESULTS",
-        "LOCAL_MODELS",
-        "LOCAL_MODELS_ENABLED",
-        "LOCAL_BASE_URL",
-        "OPENROUTER_ENABLED",
-        "OPENROUTER_API_KEY",
-    ):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
+    clear_search_env(monkeypatch)
 
 
 def _enable_local_model(monkeypatch: pytest.MonkeyPatch, slug: str) -> None:
-    """Route ``slug`` to the local backend. LOCAL_BASE_URL is mandatory there."""
-    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_MODELS", slug)
-    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+    """Local routing only; each test sets SEARXNG_URL itself when it needs it."""
+    use_local_model(monkeypatch, slug, searxng=False)
 
 
 class _FakeStream:
@@ -587,6 +573,18 @@ def test_client_search_handlers_only_for_the_client_variant(
     assert set(first) == {"web_search"}
     # A fresh handler, and so a fresh budget, on every call.
     assert first["web_search"] is not second["web_search"]
+
+
+def test_client_tool_rounds_is_one_per_search_plus_the_emit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the client variant loops; server and absent search are one call."""
+    assert client_tool_rounds(None) == 1
+    assert client_tool_rounds(select_web_search_tool("claude-sonnet-5")) == 1
+
+    _enable_local_model(monkeypatch, "qwen-local")
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    assert client_tool_rounds(select_web_search_tool("qwen-local", max_uses=3)) == 4
 
 
 def test_selector_returns_none_when_search_is_disabled(

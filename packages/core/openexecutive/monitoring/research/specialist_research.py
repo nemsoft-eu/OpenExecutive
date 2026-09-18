@@ -22,6 +22,7 @@ from openexecutive.monitoring.research.tools import (
 )
 from openexecutive.orchestrator.web_search_tool import (
     client_search_handlers,
+    client_tool_rounds,
     select_web_search_tool,
 )
 
@@ -80,8 +81,7 @@ async def research_one_specialist(
             deep_reasoning_override=get_research_use_deep_reasoning(),
             client_tool_handlers=client_search_handlers(search),
             terminal_tool_names={"emit_research_findings"},
-            # One round per search plus the emit round.
-            max_client_tool_rounds=search.max_uses + 1 if search is not None else 1,
+            max_client_tool_rounds=client_tool_rounds(search),
         )
     except Exception:
         logger.exception(

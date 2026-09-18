@@ -100,17 +100,11 @@ def build_system_blocks(
     else:
         base_persona = base_persona.replace(_VOICE_PERSONA_PLACEHOLDER, "")
 
+    if web_search_available is None:
+        web_search_available = settings.enable_web_search
     persona = (
         base_persona
-        + (
-            WEB_SEARCH_ADDENDUM
-            if (
-                settings.enable_web_search
-                if web_search_available is None
-                else web_search_available
-            )
-            else ""
-        )
+        + (WEB_SEARCH_ADDENDUM if web_search_available else "")
         + (MCP_ADDENDUM if mcp_enabled else "")
         + identity_addendum
         + tz_addendum

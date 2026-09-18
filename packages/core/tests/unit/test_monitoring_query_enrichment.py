@@ -38,6 +38,8 @@ from openexecutive.monitoring.sources.query import (
     _QueryResearchAgent,
 )
 
+from ._search_helpers import use_local_model
+
 # --------------------------------------------------------------------- #
 # Fakes
 # --------------------------------------------------------------------- #
@@ -250,13 +252,7 @@ def _route_research_to_local_model(
     """Point the research model at a local slug, optionally with SearXNG."""
     monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
     monkeypatch.setenv("WEB_SEARCH_MAX_USES", "2")
-    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_MODELS", "qwen-local")
-    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
-    if searxng:
-        monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
-    else:
-        monkeypatch.delenv("SEARXNG_URL", raising=False)
+    use_local_model(monkeypatch, searxng=searxng)
     monkeypatch.setattr(
         "openexecutive.agents.research_council.get_research_model",
         lambda: "qwen-local",

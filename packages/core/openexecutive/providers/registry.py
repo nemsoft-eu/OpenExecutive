@@ -237,7 +237,7 @@ def _is_claude(model: str) -> bool:
     return _CLAUDE_ID_RE.match(model) is not None
 
 
-def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
+def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec]:
     """Slug + feature spec for a model on the OpenRouter path.
 
     * Anthropic id (``claude-sonnet-5``) → derived OpenRouter slug, Claude spec.
@@ -401,19 +401,12 @@ def feature_spec_for(model: str) -> FeatureSpec:
     400, because the caller is asking about capability, not requesting a
     call. The 400 still comes from ``get_provider`` when the call is made.
     """
-    settings = get_settings()
-    if model in _local_models(settings):
+    if model in _local_models(get_settings()):
         return _LOCAL_FEATURE_SPEC
-    # Claude keeps its spec on both backends: Anthropic direct serves the
-    # features natively, and ``_openrouter_model_resolver`` returns the same
-    # Claude spec because OpenRouter forwards them through to Anthropic.
-    if _is_claude(model):
-        return _CLAUDE_FEATURE_SPEC
-    # The resolver's signature permits None (it is handed to the provider as
-    # a generic callback); today it always resolves, so the fallback is the
-    # conservative non-Claude default rather than an error.
-    resolved = _openrouter_model_resolver(model)
-    return resolved[1] if resolved is not None else _DEFAULT_NON_CLAUDE_SPEC
+    # The resolver already returns the Claude spec for any Claude id (it
+    # matches the same regex as ``_is_claude``), and Anthropic direct serves
+    # exactly those features natively — so one lookup covers both backends.
+    return _openrouter_model_resolver(model)[1]
 
 
 def supports_server_web_search(model: str) -> bool:

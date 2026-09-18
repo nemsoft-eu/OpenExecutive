@@ -22,53 +22,26 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
 import pytest
 
-from openexecutive.orchestrator.searxng_search import ToolOutcome
+from openexecutive.orchestrator.tool_outcome import ToolOutcome
+
+from ._search_helpers import (
+    clear_search_env,
+    msg,
+    stream_cm,
+    tool_use_block,
+    use_local_model,
+)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for k in (
-        "ENABLE_WEB_SEARCH",
-        "WEB_SEARCH_MAX_USES",
-        "SEARXNG_URL",
-        "LOCAL_MODELS",
-        "LOCAL_MODELS_ENABLED",
-        "LOCAL_BASE_URL",
-        "OPENROUTER_ENABLED",
-    ):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
+    clear_search_env(monkeypatch)
 
 
-def _use_local_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_MODELS", "qwen-local")
-    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+def _use_local_model(monkeypatch: pytest.MonkeyPatch, *, searxng: bool = True) -> None:
+    """A local default model — the Executive's model comes from DEFAULT_MODEL."""
+    use_local_model(monkeypatch, searxng=searxng)
     monkeypatch.setenv("DEFAULT_MODEL", "qwen-local")
-    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
-
-
-def _stream_cm(final_msg: Any) -> MagicMock:
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=cm)
-    cm.__aexit__ = AsyncMock(return_value=None)
-
-    async def _aiter():
-        if False:  # pragma: no cover
-            yield None
-
-    cm.__aiter__ = lambda self=cm: _aiter()
-    cm.get_final_message = AsyncMock(return_value=final_msg)
-    return cm
-
-
-def _tool_use_block(name: str, block_id: str, **inp: Any) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=block_id, name=name, input=inp)
-
-
-def _msg(*blocks: Any, stop: str = "tool_use") -> SimpleNamespace:
-    return SimpleNamespace(content=list(blocks), stop_reason=stop)
-
 
 def _drive(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> dict[str, Any]:
     """Run one Executive turn against a scripted provider. Returns captures."""
@@ -81,7 +54,7 @@ def _drive(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> dict[str, An
     def fake_stream(**kwargs: Any) -> MagicMock:
         captured["tools"].append(kwargs["tools"])
         captured["messages"].append(kwargs["messages"])
-        return _stream_cm(remaining[min(len(captured["tools"]) - 1,
+        return stream_cm(remaining[min(len(captured["tools"]) - 1,
                                         len(remaining) - 1)])
 
     exec_ = Executive()
@@ -103,7 +76,7 @@ def test_searxng_tool_sorts_into_the_cached_client_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_local_model(monkeypatch)
-    captured = _drive(monkeypatch, [_msg(
+    captured = _drive(monkeypatch, [msg(
         SimpleNamespace(type="text", text="done"), stop="end_turn"
     )])
     tools = captured["tools"][0]
@@ -133,7 +106,7 @@ def test_claude_keeps_only_the_server_tool_even_with_searxng_configured(
     """
     monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
     monkeypatch.setenv("DEFAULT_MODEL", "claude-sonnet-5")
-    captured = _drive(monkeypatch, [_msg(
+    captured = _drive(monkeypatch, [msg(
         SimpleNamespace(type="text", text="done"), stop="end_turn"
     )])
     tools = captured["tools"][0]
@@ -155,8 +128,8 @@ def test_client_search_is_audited_as_a_client_tool(
     """
     _use_local_model(monkeypatch)
     messages = [
-        _msg(_tool_use_block("web_search", "tu_1", query="ciao pricing")),
-        _msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
+        msg(tool_use_block("web_search", "tu_1", query="ciao pricing")),
+        msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
     ]
     audit_calls: list[dict[str, Any]] = []
 
@@ -186,11 +159,8 @@ def test_client_search_is_audited_as_a_client_tool(
 def test_local_model_without_searxng_gets_no_search_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_MODELS", "qwen-local")
-    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
-    monkeypatch.setenv("DEFAULT_MODEL", "qwen-local")
-    captured = _drive(monkeypatch, [_msg(
+    _use_local_model(monkeypatch, searxng=False)
+    captured = _drive(monkeypatch, [msg(
         SimpleNamespace(type="text", text="done"), stop="end_turn"
     )])
     assert "web_search" not in {t.get("name") for t in captured["tools"][0]}
@@ -206,8 +176,8 @@ def test_client_search_is_dispatched_and_its_result_returned(
     """
     _use_local_model(monkeypatch)
     messages = [
-        _msg(_tool_use_block("web_search", "tu_1", query="ciao pricing")),
-        _msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
+        msg(tool_use_block("web_search", "tu_1", query="ciao pricing")),
+        msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
     ]
     with patch(
         "openexecutive.orchestrator.searxng_search._run_search",
@@ -242,9 +212,9 @@ def test_budget_is_per_turn_not_per_iteration(
     _use_local_model(monkeypatch)
     monkeypatch.setenv("WEB_SEARCH_MAX_USES", "1")
     messages = [
-        _msg(_tool_use_block("web_search", "tu_1", query="first")),
-        _msg(_tool_use_block("web_search", "tu_2", query="second")),
-        _msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
+        msg(tool_use_block("web_search", "tu_1", query="first")),
+        msg(tool_use_block("web_search", "tu_2", query="second")),
+        msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
     ]
     run_search = AsyncMock(return_value=ToolOutcome('{"results": []}'))
     with patch(

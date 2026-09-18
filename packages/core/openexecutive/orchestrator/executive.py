@@ -71,19 +71,20 @@ from openexecutive.orchestrator.schedule_tools import (
     SCHEDULE_TOOLS,
     current_session,
 )
-from openexecutive.orchestrator.searxng_search import ToolOutcome
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
 from openexecutive.orchestrator.talent_tools import (
     TALENT_TOOL_HANDLERS,
     TALENT_TOOLS,
 )
+from openexecutive.orchestrator.tool_outcome import unwrap_tool_outcome
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
 )
 from openexecutive.orchestrator.web_search_tool import (
     WEB_SEARCH_TOOL_NAME,
+    WebSearchSelection,
     client_search_handlers,
     select_web_search_tool,
 )
@@ -517,12 +518,15 @@ class Executive:
             voice_persona_body = _get_voice_body(_ov.voice_persona_slug if _ov else None)
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
+        # Resolved once and handed to both the prompt and the tool loop, so
+        # the persona can never promise a search tool the request lacks.
+        search = select_web_search_tool(effective_model)
         system_blocks = build_system_blocks(
             session.company_profile,
             mcp_enabled=self._mcp_gateway is not None,
             persona_override=persona_override,
             voice_persona_body=voice_persona_body,
-            web_search_available=select_web_search_tool(effective_model) is not None,
+            web_search_available=search is not None,
         )
         # turn_id ties every downstream audit row (knowledge_retrieval,
         # specialist_consult, tool_invocation, cache_event, peer_memory)
@@ -581,6 +585,7 @@ class Executive:
                 system_blocks,
                 messages,
                 model=effective_model,
+                search=search,
                 max_iterations=max_iterations,
                 episodic_context=episodic_context,
                 debug_collector=debug_collector,
@@ -729,12 +734,13 @@ class Executive:
         # revision pass below reuses these exact blocks on purpose — a second
         # variant would miss the draft's cached prefix on every committee
         # turn — so the addendum is as accurate there as it has always been.
+        search = select_web_search_tool(effective_model)
         system_blocks = build_system_blocks(
             session.company_profile,
             mcp_enabled=self._mcp_gateway is not None,
             persona_override=persona_override,
             voice_persona_body=voice_persona_body,
-            web_search_available=select_web_search_tool(effective_model) is not None,
+            web_search_available=search is not None,
         )
         # turn_id covers both the draft and (later) the revision pass so a
         # committee-reviewed turn renders as one flow chart, not two.
@@ -811,6 +817,7 @@ class Executive:
             system_blocks,
             messages,
             model=effective_model,
+            search=search,
             max_iterations=max_iterations,
             episodic_context=episodic_context,
             debug_collector=debug_collector,
@@ -1084,6 +1091,8 @@ class Executive:
         system_blocks: list[dict[str, Any]],
         messages: list[dict[str, Any]],
         model: str = "",
+        *,
+        search: WebSearchSelection | None,
         max_iterations: int = 15,
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
@@ -1101,12 +1110,9 @@ class Executive:
         last_full_text = ""
         specialists_consulted: list[str] = []
 
-        # Search wiring is resolved ONCE per turn, before the loop.
-        # The budget especially: rebuilding it per iteration would reset the
-        # counter on every model round trip, allowing WEB_SEARCH_MAX_USES
-        # searches per iteration instead of per turn.
         stream_model = model or self._settings.default_model
-        search = select_web_search_tool(stream_model)
+        # Built before the loop: see client_search_handlers on why the budget
+        # must not be rebuilt per iteration.
         turn_skill_handlers = {
             **_ALL_SKILL_HANDLERS,
             **client_search_handlers(search),
@@ -1306,9 +1312,8 @@ class Executive:
 
             results_by_id: dict[str, str] = {}
             # tool_use ids whose handler reported a failure; their tool_result
-            # carries is_error, the correct Anthropic shape. The OpenAI-
-            # compatible translator drops the flag, so on the local path the
-            # handler's error wording is what the model actually reads.
+            # carries is_error (see ToolOutcome for what that does and does
+            # not reach on the local path).
             error_tool_use_ids: set[str] = set()
 
             event_cursor = len(debug_collector._events) if debug_collector else 0
@@ -1375,19 +1380,12 @@ class Executive:
                 raw_skill_results = await asyncio.gather(
                     *(turn_skill_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses)
                 )
-                # Most skill handlers return a plain string. The client-side
-                # web_search handler returns a ToolOutcome so a failed search
-                # can be flagged with is_error on the outer tool_result —
-                # unwrap it here so everything downstream still sees a string.
-                skill_results: list[str] = []
                 for tu, raw in zip(skill_tool_uses, raw_skill_results, strict=True):
-                    if isinstance(raw, ToolOutcome):
-                        skill_results.append(raw.content)
-                        if raw.is_error:
-                            error_tool_use_ids.add(tu["id"])
-                    else:
-                        skill_results.append(raw)
-                for tu, result in zip(skill_tool_uses, skill_results, strict=True):
+                    # Any handler may return a ToolOutcome to report failure;
+                    # everything downstream of this line sees a plain string.
+                    result, is_error = unwrap_tool_outcome(raw)
+                    if is_error:
+                        error_tool_use_ids.add(tu["id"])
                     logger.info("← skill:%s  result=%s", tu["name"], _trunc(result))
                     results_by_id[tu["id"]] = result
                     # Inline action chip for side-effecting tools. None
@@ -1428,15 +1426,15 @@ class Executive:
                         actor="executive",
                         details={
                             "tool": tu["name"],
-                            # web_search dispatched here is the client-side
-                            # SearXNG tool; the server-side one audits
-                            # separately as kind="server_tool". Same tool
-                            # name, different execution site — the audit
-                            # view has to be able to tell them apart.
+                            # Handlers overlaid for this turn only (today the
+                            # client-side web_search) audit as client_tool, so
+                            # the view can tell them from the module-wide
+                            # skills and from the server-side web_search,
+                            # which audits separately as kind="server_tool".
                             "kind": (
-                                "client_tool"
-                                if tu["name"] == WEB_SEARCH_TOOL_NAME
-                                else "skill"
+                                "skill"
+                                if tu["name"] in _ALL_SKILL_HANDLERS
+                                else "client_tool"
                             ),
                             "iteration": iteration,
                             "result_preview": audit_tool_result(tu["name"], result),

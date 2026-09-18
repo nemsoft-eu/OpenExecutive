@@ -99,13 +99,14 @@ def select_web_search_tool(
 
     if supports_server_web_search(model):
         server_tool = build_web_search_tool(max_uses=effective_max)
-        if server_tool is None:  # pragma: no cover - enable flag checked above
-            return None
+        assert server_tool is not None  # the enable flag was checked above
         return WebSearchSelection("server", server_tool, effective_max)
 
     if not settings.searxng_url:
         return None
 
+    # searxng_search imports WEB_SEARCH_TOOL_NAME from this module, so a
+    # module-level import here would be circular.
     from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL
 
     return WebSearchSelection("client", SEARXNG_WEB_SEARCH_TOOL, effective_max)
@@ -117,7 +118,8 @@ def client_search_handlers(selection: WebSearchSelection | None) -> dict[str, An
     Only the client variant needs a handler; the server variant runs inside
     the provider's generation. Each call builds a FRESH budget, so call it
     once per turn (or per research call) — never inside a tool-use loop,
-    where a new budget per iteration would multiply the cap.
+    where a new budget per iteration would reset on every model round trip
+    and multiply the cap.
     """
     if selection is None or selection.kind != "client":
         return {}
@@ -131,3 +133,14 @@ def client_search_handlers(selection: WebSearchSelection | None) -> dict[str, An
             SearchBudget(max_uses=selection.max_uses)
         )
     }
+
+
+def client_tool_rounds(selection: WebSearchSelection | None) -> int:
+    """Generations a client-tool loop may take for ``selection``.
+
+    One round per search plus the round that emits the caller's output. A
+    server or absent selection needs no loop: the single call is the answer.
+    """
+    if selection is None or selection.kind != "client":
+        return 1
+    return selection.max_uses + 1

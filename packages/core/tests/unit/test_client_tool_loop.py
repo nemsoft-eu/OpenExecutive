@@ -20,7 +20,10 @@ os.environ.setdefault("EXEC_EMAIL_ADDRESS", "exec@example.com")
 import pytest
 
 from openexecutive.agents.base import BaseAgent
-from openexecutive.orchestrator.searxng_search import ToolOutcome
+from openexecutive.orchestrator.tool_outcome import ToolOutcome
+
+from ._search_helpers import msg as _message
+from ._search_helpers import tool_use_block as _tool_use
 
 TOOLS: list[dict[str, Any]] = [
     {"name": "emit_findings", "input_schema": {"type": "object", "properties": {}}},
@@ -35,14 +38,6 @@ class _Agent(BaseAgent):
 
     def get_system_prompt(self) -> str:
         return "SYSTEM"
-
-
-def _tool_use(name: str, block_id: str = "tu_1", **inp: Any) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=block_id, name=name, input=inp)
-
-
-def _message(*blocks: Any) -> SimpleNamespace:
-    return SimpleNamespace(content=list(blocks), stop_reason="tool_use")
 
 
 class _FakeProvider:
@@ -111,6 +106,39 @@ def test_search_then_emit_feeds_the_result_back_and_returns_the_emit() -> None:
     assert second[-2]["role"] == "assistant"
     assert second[-2]["content"][0]["id"] == "tu_s"
     assert second[-1]["content"][0]["tool_use_id"] == "tu_s"
+
+
+def test_assistant_turn_replays_text_and_reasoning_not_just_tool_use() -> None:
+    """Dropping the preamble or an OpenRouter reasoning block breaks continuity.
+
+    Every other tool loop replays the whole turn; this one must too.
+    """
+    reasoning = SimpleNamespace(
+        type="openrouter_reasoning",
+        reasoning_details=[{"type": "reasoning.text", "text": "think"}],
+    )
+    search_msg = _message(
+        reasoning,
+        SimpleNamespace(type="text", text="Let me look that up."),
+        _tool_use("web_search", "tu_s", query="prices"),
+    )
+    emit_msg = _message(_tool_use("emit_findings", "tu_e"))
+    provider = _FakeProvider([search_msg, emit_msg])
+
+    async def handler(_inp: dict) -> ToolOutcome:
+        return ToolOutcome('{"results": []}')
+
+    _run(provider, handlers={"web_search": handler}, terminal={"emit_findings"})
+
+    replayed = provider.calls[1]["messages"][-2]
+    assert replayed["role"] == "assistant"
+    assert [b["type"] for b in replayed["content"]] == [
+        "openrouter_reasoning", "text", "tool_use",
+    ]
+    assert replayed["content"][0]["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "think"}
+    ]
+    assert replayed["content"][1]["text"] == "Let me look that up."
 
 
 def test_terminal_tool_wins_when_it_arrives_alongside_a_search() -> None:

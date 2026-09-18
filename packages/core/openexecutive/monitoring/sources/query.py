@@ -54,6 +54,7 @@ from openexecutive.monitoring.models import SOURCE_KIND_QUERY, Signal, Watchlist
 from openexecutive.monitoring.sources._http import strip_url_query, validate_target_url
 from openexecutive.orchestrator.web_search_tool import (
     client_search_handlers,
+    client_tool_rounds,
     select_web_search_tool,
 )
 
@@ -203,8 +204,7 @@ class QuerySource:
                 deep_reasoning_override=get_research_use_deep_reasoning(),
                 client_tool_handlers=client_search_handlers(search),
                 terminal_tool_names={"emit_query_results"},
-                # One round per search plus the emit round.
-                max_client_tool_rounds=search.max_uses + 1,
+                max_client_tool_rounds=client_tool_rounds(search),
             )
         except Exception:
             logger.exception(

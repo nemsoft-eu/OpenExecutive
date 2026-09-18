@@ -7,25 +7,38 @@ from typing import Any
 
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
+from openexecutive.orchestrator.tool_outcome import unwrap_tool_outcome
 from openexecutive.providers import get_provider, model_supports_deep_reasoning
+from openexecutive.providers.translator import reasoning_replay_block
 
 _SPECIALIST_TIMEOUT = 180.0
 
 logger = logging.getLogger(__name__)
 
 
-def _unwrap_tool_outcome(outcome: Any) -> tuple[str, bool]:
-    """Normalise a handler's return to ``(content, is_error)``.
+def _replay_assistant_turn(message: Any) -> list[dict[str, Any]]:
+    """The assistant turn to echo back before this round's tool_results.
 
-    Handlers may return a plain string (every skill tool does) or a
-    ``ToolOutcome`` when they need to flag failure. Keeping the content a
-    string matters on the local path: the OpenAI-compatible translator only
-    converts string or text-block tool_result content.
+    Replays text and reasoning as well as the tool_use blocks, the way every
+    other tool loop in the codebase does: dropping the preamble text loses
+    what the model said it was doing, and dropping an OpenRouter reasoning
+    block breaks reasoning continuity across rounds on that path.
     """
-    content = getattr(outcome, "content", None)
-    if content is not None and hasattr(outcome, "is_error"):
-        return str(content), bool(outcome.is_error)
-    return str(outcome), False
+    turn: list[dict[str, Any]] = []
+    for block in getattr(message, "content", None) or []:
+        block_type = getattr(block, "type", "")
+        if block_type == "text":
+            turn.append({"type": "text", "text": getattr(block, "text", "")})
+        elif block_type == "tool_use":
+            turn.append({
+                "type": "tool_use",
+                "id": getattr(block, "id", ""),
+                "name": getattr(block, "name", ""),
+                "input": getattr(block, "input", None) or {},
+            })
+        elif (replay := reasoning_replay_block(block)) is not None:
+            turn.append(replay)
+    return turn
 
 
 class BaseAgent(ABC):
@@ -369,12 +382,12 @@ class BaseAgent(ABC):
                 # result no later generation can read.
                 break
 
-            assistant_content, tool_results = await self._dispatch_tool_uses(
+            tool_results = await self._dispatch_tool_uses(
                 tool_uses, client_tool_handlers
             )
             kwargs["messages"] = [
                 *kwargs["messages"],
-                {"role": "assistant", "content": assistant_content},
+                {"role": "assistant", "content": _replay_assistant_turn(message)},
                 {"role": "user", "content": tool_results},
             ]
 
@@ -388,8 +401,8 @@ class BaseAgent(ABC):
         self,
         tool_uses: list[Any],
         client_tool_handlers: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Run one round's tool calls; return the assistant turn and its results.
+    ) -> list[dict[str, Any]]:
+        """Run one round's tool calls and return one tool_result per call.
 
         Every tool_use gets exactly one tool_result, including a tool with
         no handler — an unanswered tool_use makes the next request's
@@ -397,18 +410,9 @@ class BaseAgent(ABC):
         more than one search, and the search budget is enforced inside each
         handler either way.
         """
-        assistant_content: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
         for block in tool_uses:
             name = getattr(block, "name", "")
-            block_id = getattr(block, "id", "")
-            block_input = getattr(block, "input", None) or {}
-            assistant_content.append({
-                "type": "tool_use",
-                "id": block_id,
-                "name": name,
-                "input": block_input,
-            })
             handler = client_tool_handlers.get(name)
             if handler is None:
                 logger.warning(
@@ -417,15 +421,15 @@ class BaseAgent(ABC):
                 )
                 result_content, is_error = f"Unknown tool: {name}", True
             else:
-                result_content, is_error = _unwrap_tool_outcome(
-                    await handler(block_input)
+                result_content, is_error = unwrap_tool_outcome(
+                    await handler(getattr(block, "input", None) or {})
                 )
             result_block: dict[str, Any] = {
                 "type": "tool_result",
-                "tool_use_id": block_id,
+                "tool_use_id": getattr(block, "id", ""),
                 "content": result_content,
             }
             if is_error:
                 result_block["is_error"] = True
             tool_results.append(result_block)
-        return assistant_content, tool_results
+        return tool_results

@@ -30,10 +30,10 @@ from urllib.parse import urlparse
 import httpx
 
 from openexecutive.config import get_settings
+from openexecutive.orchestrator.tool_outcome import ToolOutcome
+from openexecutive.orchestrator.web_search_tool import WEB_SEARCH_TOOL_NAME
 
 logger = logging.getLogger(__name__)
-
-WEB_SEARCH_TOOL_NAME = "web_search"
 
 # Cap on the bytes we will read from SearXNG. A compromised or misconfigured
 # instance must not be able to exhaust memory through a single tool call;
@@ -118,33 +118,11 @@ class SearchBudget:
         return True
 
 
-@dataclass(frozen=True)
-class ToolOutcome:
-    """A handler's result plus whether it reports a failure.
-
-    The content is always a string: the OpenAI-compatible translator only
-    converts string or text-block ``tool_result`` content, so a dict here
-    would be silently flattened on the very path this tool exists to serve.
-
-    ``is_error`` is stamped onto the outer Anthropic ``tool_result`` block
-    by the caller. Be clear about what that buys: the OpenAI-compatible
-    translator forwards only ``tool_call_id`` and ``content``, so on the
-    local path — the only one that selects this tool — the flag is dropped
-    and the model learns of the failure from the wording of ``content``
-    alone. Error text must therefore read unmistakably as an error on its
-    own; the flag is correct Anthropic shape, not the signal.
-    """
-
-    content: str
-    is_error: bool = False
-
-
 def make_search_handler(budget: SearchBudget) -> Any:
     """Return an async ``web_search`` handler bound to ``budget``.
 
-    One budget per turn, created by the caller *outside* its tool-use loop —
-    a budget created per iteration would reset on every model round trip and
-    permit ``max_uses`` searches per iteration instead of per turn.
+    Callers go through ``web_search_tool.client_search_handlers``, which
+    explains when a fresh budget must — and must not — be created.
     """
 
     async def handle_web_search(tool_input: dict[str, Any]) -> ToolOutcome:

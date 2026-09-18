@@ -155,46 +155,37 @@ def test_persona_omits_addendum_when_the_caller_has_no_search_tool() -> None:
     """
     _reset_settings_cache()
     os.environ["ENABLE_WEB_SEARCH"] = "true"
-    try:
-        from openexecutive.prompts.cache_manager import build_system_blocks
-        blocks = build_system_blocks(
-            company_profile=None, mcp_enabled=False, web_search_available=False
-        )
-        assert "web_search" not in blocks[0]["text"]
-    finally:
-        _reset_settings_cache()
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    blocks = build_system_blocks(
+        company_profile=None, mcp_enabled=False, web_search_available=False
+    )
+    assert "web_search" not in blocks[0]["text"]
 
 
 def test_persona_includes_addendum_when_the_caller_has_a_search_tool() -> None:
     """The client-side tool counts, even though the global flag alone would too."""
     _reset_settings_cache()
     os.environ["ENABLE_WEB_SEARCH"] = "false"
-    try:
-        from openexecutive.prompts.cache_manager import build_system_blocks
-        blocks = build_system_blocks(
-            company_profile=None, mcp_enabled=False, web_search_available=True
-        )
-        assert "web_search" in blocks[0]["text"]
-    finally:
-        _reset_settings_cache()
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    blocks = build_system_blocks(
+        company_profile=None, mcp_enabled=False, web_search_available=True
+    )
+    assert "web_search" in blocks[0]["text"]
 
 
 def test_addendum_gate_keeps_the_block_byte_stable() -> None:
     """Two stable variants, not per-request text — the block is cached for 1h."""
     _reset_settings_cache()
     os.environ["ENABLE_WEB_SEARCH"] = "true"
-    try:
-        from openexecutive.prompts.cache_manager import build_system_blocks
-        a = build_system_blocks(company_profile=None, mcp_enabled=False,
-                                web_search_available=True)
-        b = build_system_blocks(company_profile=None, mcp_enabled=False,
-                                web_search_available=True)
-        assert a[0]["text"] == b[0]["text"]
-        off = build_system_blocks(company_profile=None, mcp_enabled=False,
-                                  web_search_available=False)
-        assert off[0]["text"] != a[0]["text"]
-    finally:
-        _reset_settings_cache()
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    a = build_system_blocks(company_profile=None, mcp_enabled=False,
+                            web_search_available=True)
+    b = build_system_blocks(company_profile=None, mcp_enabled=False,
+                            web_search_available=True)
+    assert a[0]["text"] == b[0]["text"]
+    off = build_system_blocks(company_profile=None, mcp_enabled=False,
+                              web_search_available=False)
+    assert off[0]["text"] != a[0]["text"]
 
 
 # ---------------------------------------------------------------------------
