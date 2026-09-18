@@ -131,13 +131,10 @@ def test_reasoning_effort_sent_on_stream() -> None:
     assert stream._body["stream"] is True  # type: ignore[attr-defined]
 
 
-def test_stream_opts_in_to_usage_reporting() -> None:
-    """Without this opt-in an OpenAI-compatible backend omits the usage block
-    entirely on a streamed response, and the cache_event row for the
-    Executive's own chat turn records prompt_tokens=0 — indistinguishable
-    from a genuine zero. (That the backend actually behaves this way was
-    confirmed out of band against Ollama 0.34.0; this test only pins that
-    we send the flag.)"""
+def test_stream_options_sent_on_stream() -> None:
+    """A plain OpenAI-compatible backend omits the usage block entirely on a
+    streamed response without this opt-in — confirmed out of band against
+    Ollama 0.34.0. This test pins only that we send the flag."""
     stream = _local_provider().messages_stream(
         model="llama3.3",
         max_tokens=8,

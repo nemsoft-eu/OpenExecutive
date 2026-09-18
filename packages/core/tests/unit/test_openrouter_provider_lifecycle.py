@@ -210,3 +210,17 @@ def test_messages_create_strips_anthropic_only_fields_for_non_claude() -> None:
     # thinking / output_config never reach the wire.
     assert "thinking" not in body
     assert "output_config" not in body
+
+
+def test_stream_body_carries_both_usage_accounting_flags() -> None:
+    """OpenRouter inherits ``messages_stream``, so the standard opt-in must
+    coexist with the proprietary ``usage.include`` — the only one of the two
+    carrying ``cost``."""
+    stream = _provider().messages_stream(
+        model="claude-sonnet-4-6",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    body = stream._body  # type: ignore[attr-defined]
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["usage"] == {"include": True}
