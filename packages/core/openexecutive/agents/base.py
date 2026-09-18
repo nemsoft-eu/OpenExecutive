@@ -5,9 +5,9 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from openexecutive.agents.tool_outcome import unwrap_tool_outcome
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
-from openexecutive.orchestrator.tool_outcome import unwrap_tool_outcome
 from openexecutive.providers import get_provider, model_supports_deep_reasoning
 from openexecutive.providers.translator import reasoning_replay_block
 

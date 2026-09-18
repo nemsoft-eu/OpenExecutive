@@ -9,7 +9,6 @@ Executive's and ``BaseAgent.analyze_with_tools``) both go through
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,7 @@ class ToolOutcome:
     is_error: bool = False
 
 
-def unwrap_tool_outcome(result: Any) -> tuple[str, bool]:
+def unwrap_tool_outcome(result: str | ToolOutcome) -> tuple[str, bool]:
     """``(content, is_error)`` for any handler result, ToolOutcome or string."""
     if isinstance(result, ToolOutcome):
         return result.content, result.is_error

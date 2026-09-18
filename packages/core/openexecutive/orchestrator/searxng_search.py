@@ -23,14 +23,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-from openexecutive.config import get_settings
-from openexecutive.orchestrator.tool_outcome import ToolOutcome
+from openexecutive.agents.tool_outcome import ToolOutcome
+from openexecutive.config import Settings, get_settings
 from openexecutive.orchestrator.web_search_tool import WEB_SEARCH_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,9 @@ class SearchBudget:
         return True
 
 
-def make_search_handler(budget: SearchBudget) -> Any:
+def make_search_handler(
+    budget: SearchBudget,
+) -> Callable[[dict[str, Any]], Awaitable[ToolOutcome]]:
     """Return an async ``web_search`` handler bound to ``budget``.
 
     Callers go through ``web_search_tool.client_search_handlers``, which
@@ -253,7 +256,9 @@ async def _run_search(query: str) -> ToolOutcome:
     }))
 
 
-def _shape_results(raw_results: list[Any], settings: Any) -> list[dict[str, str]]:
+def _shape_results(
+    raw_results: list[Any], settings: Settings
+) -> list[dict[str, str]]:
     """Filter by domain, then trim to the result cap.
 
     Order matters: capping first and filtering second can return zero

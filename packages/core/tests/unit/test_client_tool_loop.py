@@ -20,7 +20,7 @@ os.environ.setdefault("EXEC_EMAIL_ADDRESS", "exec@example.com")
 import pytest
 
 from openexecutive.agents.base import BaseAgent
-from openexecutive.orchestrator.tool_outcome import ToolOutcome
+from openexecutive.agents.tool_outcome import ToolOutcome
 
 from ._search_helpers import msg as _message
 from ._search_helpers import tool_use_block as _tool_use

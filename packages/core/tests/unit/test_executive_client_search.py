@@ -22,7 +22,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
 import pytest
 
-from openexecutive.orchestrator.tool_outcome import ToolOutcome
+from openexecutive.agents.tool_outcome import ToolOutcome
 
 from ._search_helpers import (
     clear_search_env,
@@ -42,6 +42,7 @@ def _use_local_model(monkeypatch: pytest.MonkeyPatch, *, searxng: bool = True) -
     """A local default model — the Executive's model comes from DEFAULT_MODEL."""
     use_local_model(monkeypatch, searxng=searxng)
     monkeypatch.setenv("DEFAULT_MODEL", "qwen-local")
+
 
 def _drive(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> dict[str, Any]:
     """Run one Executive turn against a scripted provider. Returns captures."""

@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from openexecutive.agents.tool_outcome import unwrap_tool_outcome
 from openexecutive.audit import bind_turn, clear_turn, set_turn
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.redaction import (
@@ -77,7 +78,6 @@ from openexecutive.orchestrator.talent_tools import (
     TALENT_TOOL_HANDLERS,
     TALENT_TOOLS,
 )
-from openexecutive.orchestrator.tool_outcome import unwrap_tool_outcome
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,

@@ -19,6 +19,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 import httpx
 import pytest
 
+from openexecutive.agents.tool_outcome import ToolOutcome
 from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
@@ -27,7 +28,6 @@ from openexecutive.orchestrator.searxng_search import (
     _normalise_host,
     make_search_handler,
 )
-from openexecutive.orchestrator.tool_outcome import ToolOutcome
 from openexecutive.orchestrator.web_search_tool import (
     client_search_handlers,
     client_tool_rounds,
