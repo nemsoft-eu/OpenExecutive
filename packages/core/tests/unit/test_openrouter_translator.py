@@ -965,6 +965,36 @@ def test_stream_accumulator_finalize_extracts_cache_tokens_from_nested_usage() -
     assert final.usage.cache_creation_input_tokens == 0
 
 
+def test_stream_accumulator_reads_usage_from_terminal_choiceless_chunk() -> None:
+    """With ``stream_options: {"include_usage": true}`` the backend appends a
+    separate final chunk whose ``choices`` array is EMPTY and which carries
+    only ``usage`` — the shape Ollama 0.34.0 actually sends, and the one the
+    other accumulator tests don't exercise (they hang usage off the
+    finish_reason chunk). ``feed`` must merge that usage *before* its
+    empty-choices early return, or the counters are dropped and every
+    streamed turn keeps logging prompt_tokens=0."""
+    acc = StreamAccumulator()
+    list(acc.feed({"choices": [{"delta": {"content": "x"}}]}))
+    list(acc.feed({"choices": [{"delta": {}, "finish_reason": "length"}]}))
+    # No events come out of a chunk that carries no delta, but the usage must stick.
+    assert list(
+        acc.feed(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                    "completion_tokens": 1,
+                    "total_tokens": 12,
+                },
+            }
+        )
+    ) == []
+    final = acc.finalize()
+    assert final.usage.input_tokens == 11
+    assert final.usage.output_tokens == 1
+
+
 def test_stream_accumulator_finalize_surfaces_cost() -> None:
     """Streamed turns (most turns) carry cost in the final usage chunk; it must
     reach Message.usage.cost so the cache_event row records the charge."""
