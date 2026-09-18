@@ -25,9 +25,13 @@ from openexecutive.orchestrator.searxng_search import (
     SearchBudget,
     ToolOutcome,
     _host_matches,
+    _normalise_host,
     make_search_handler,
 )
-from openexecutive.orchestrator.web_search_tool import select_web_search_tool
+from openexecutive.orchestrator.web_search_tool import (
+    client_search_handlers,
+    select_web_search_tool,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +49,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "LOCAL_MODELS_ENABLED",
         "LOCAL_BASE_URL",
         "OPENROUTER_ENABLED",
+        "OPENROUTER_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
@@ -290,6 +295,76 @@ def test_unexpected_exception_is_contained_by_the_handler(
     assert "unexpectedly" in outcome.content
 
 
+def test_unconfigured_searxng_is_an_error() -> None:
+    """Reachable if SEARXNG_URL is cleared after the tool was selected."""
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    outcome = asyncio.run(handler({"query": "q"}))
+    assert outcome.is_error
+    assert "not configured" in outcome.content
+
+
+def test_connection_failure_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(httpx.ConnectError("refused"))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert outcome.is_error
+    assert "unreachable" in outcome.content
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"<html>not json</html>", "unreadable"),
+        (b'["a", "list", "not", "an", "object"]', "unexpected payload"),
+    ],
+)
+def test_malformed_payload_is_an_error(
+    body: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(_FakeStream([body]))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert outcome.is_error
+    assert expected in outcome.content
+
+
+def test_results_that_are_not_a_list_mean_no_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dict without a usable results list is an answer, not a failure."""
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(_response({"results": "oops"}))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert not outcome.is_error
+    assert json.loads(outcome.content)["results"] == []
+
+
+def test_malformed_entries_are_skipped_and_fields_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(_response({"results": [
+        "not a dict",
+        {"url": "https://ok.example/\nsplit", "title": "t", "content": "c"},
+        {"url": "https://ok.example/long", "title": "T" * 1000,
+         "content": "S" * 5000},
+    ]}))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    results = json.loads(outcome.content)["results"]
+    # The string entry and the control-character URL are both dropped.
+    assert [r["url"] for r in results] == ["https://ok.example/long"]
+    assert len(results[0]["title"]) == 200
+    assert len(results[0]["snippet"]) == 400
+
+
 def test_non_200_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
     patcher, _ = _patch_http(_response({"results": []}, status=502))
@@ -410,13 +485,29 @@ def test_blocklist_matches_internationalised_domains_in_either_form(
         ("news.example.com", "example.com", True),
         ("evil-example.com", "example.com", False),
         ("example.com.attacker.net", "example.com", False),
-        ("EXAMPLE.com", "example.com", True),
         ("", "example.com", False),
         ("example.com", "", False),
     ],
 )
 def test_host_matches(host: str, domain: str, expected: bool) -> None:
-    assert _host_matches(host.lower(), domain) is expected
+    """Boundary logic only; both inputs arrive pre-normalised."""
+    assert _host_matches(host, domain) is expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("EXAMPLE.com", "example.com"),
+        ("example.com.", "example.com"),
+        (" example.com ", "example.com"),
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+        # A label over 63 chars cannot be IDNA-encoded: compared verbatim.
+        ("ü" + "a" * 70 + ".example", "ü" + "a" * 70 + ".example"),
+    ],
+)
+def test_normalise_host(raw: str, expected: str) -> None:
+    assert _normalise_host(raw) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +553,42 @@ def test_selector_keeps_server_search_for_a_local_slug_that_looks_like_claude(
     assert selection.kind == "client"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["openai/gpt-6-astra", "anthropic/claude-opus-4.8", "claude-sonnet-5"],
+)
+def test_selector_keeps_server_search_on_openrouter(
+    model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenRouter swaps the server tool for openrouter:web_search, Claude or not.
+
+    SEARXNG_URL is set to prove it is ignored where server search exists.
+    """
+    monkeypatch.setenv("OPENROUTER_ENABLED", "true")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-used")
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    selection = select_web_search_tool(model)
+    assert selection is not None
+    assert selection.kind == "server"
+
+
+def test_client_search_handlers_only_for_the_client_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert client_search_handlers(None) == {}
+    server = select_web_search_tool("claude-sonnet-5")
+    assert client_search_handlers(server) == {}
+
+    _enable_local_model(monkeypatch, "qwen-local")
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    client = select_web_search_tool("qwen-local")
+    first = client_search_handlers(client)
+    second = client_search_handlers(client)
+    assert set(first) == {"web_search"}
+    # A fresh handler, and so a fresh budget, on every call.
+    assert first["web_search"] is not second["web_search"]
+
+
 def test_selector_returns_none_when_search_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,6 +629,24 @@ def test_config_rejects_unusable_searxng_urls(
     from openexecutive.config import get_settings
 
     monkeypatch.setenv("SEARXNG_URL", bad_url)
+    with pytest.raises(ValueError):
+        get_settings()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("SEARXNG_TIMEOUT_S", "0"),
+        ("SEARXNG_TIMEOUT_S", "-1"),
+        ("SEARXNG_MAX_RESULTS", "0"),
+    ],
+)
+def test_config_rejects_non_positive_searxng_bounds(
+    key: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.config import get_settings
+
+    monkeypatch.setenv(key, value)
     with pytest.raises(ValueError):
         get_settings()
 

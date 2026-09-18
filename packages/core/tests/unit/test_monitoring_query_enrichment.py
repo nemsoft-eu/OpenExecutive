@@ -90,6 +90,7 @@ def _stub_query_agent(monkeypatch: pytest.MonkeyPatch, message: Any) -> dict[str
         captured["user_content"] = user_content
         captured["tools"] = kwargs.get("tools")
         captured["model_override"] = kwargs.get("model_override")
+        captured["kwargs"] = kwargs
         if isinstance(message, Exception):
             raise message
         return message
@@ -241,6 +242,68 @@ async def test_query_empty_when_web_search_disabled(
     )
     src = QuerySource()
     assert await src.poll(_make_query_item()) == []
+
+
+def _route_research_to_local_model(
+    monkeypatch: pytest.MonkeyPatch, *, searxng: bool
+) -> None:
+    """Point the research model at a local slug, optionally with SearXNG."""
+    monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
+    monkeypatch.setenv("WEB_SEARCH_MAX_USES", "2")
+    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_MODELS", "qwen-local")
+    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+    if searxng:
+        monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    else:
+        monkeypatch.delenv("SEARXNG_URL", raising=False)
+    monkeypatch.setattr(
+        "openexecutive.agents.research_council.get_research_model",
+        lambda: "qwen-local",
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_polls_on_a_local_model_when_searxng_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local model used to have no search, so poll() refused outright.
+
+    With SEARXNG_URL set it now polls, handing analyze_with_tools the
+    client-side tool, its budgeted handler, and the terminal-tool contract.
+    """
+    _route_research_to_local_model(monkeypatch, searxng=True)
+    captured = _stub_query_agent(
+        monkeypatch,
+        _query_results_message([
+            {"title": "Acme news", "url": "https://news.example/a", "summary": "s"},
+        ]),
+    )
+    _allow_all_urls(monkeypatch)
+
+    signals = await QuerySource().poll(_make_query_item())
+
+    assert len(signals) == 1
+    kwargs = captured["kwargs"]
+    assert kwargs["model_override"] == "qwen-local"
+    web = [t for t in kwargs["tools"] if t["name"] == "web_search"]
+    assert len(web) == 1
+    assert "input_schema" in web[0], "expected the client tool, not the server one"
+    assert set(kwargs["client_tool_handlers"]) == {"web_search"}
+    assert kwargs["terminal_tool_names"] == {"emit_query_results"}
+    # One round per search (WEB_SEARCH_MAX_USES=2) plus the emit round.
+    assert kwargs["max_client_tool_rounds"] == 3
+
+
+@pytest.mark.asyncio
+async def test_query_still_refuses_on_a_local_model_without_searxng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control: no SEARXNG_URL means no search, so no unverifiable Signals."""
+    _route_research_to_local_model(monkeypatch, searxng=False)
+    captured = _stub_query_agent(monkeypatch, _query_results_message([]))
+    assert await QuerySource().poll(_make_query_item()) == []
+    assert "kwargs" not in captured, "poll() reached the provider without search"
 
 
 @pytest.mark.asyncio

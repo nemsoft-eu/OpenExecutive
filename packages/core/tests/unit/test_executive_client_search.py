@@ -122,6 +122,67 @@ def test_searxng_tool_sorts_into_the_cached_client_list(
     assert tools[-1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
 
 
+def test_claude_keeps_only_the_server_tool_even_with_searxng_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The collision the per-turn wiring exists to prevent.
+
+    Registering the SearXNG tool module-wide would offer Claude a client
+    ``web_search`` next to the server tool of the same name. SEARXNG_URL
+    being set must change nothing on a model with server search.
+    """
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv("DEFAULT_MODEL", "claude-sonnet-5")
+    captured = _drive(monkeypatch, [_msg(
+        SimpleNamespace(type="text", text="done"), stop="end_turn"
+    )])
+    tools = captured["tools"][0]
+    web = [t for t in tools if t.get("name") == "web_search"]
+    assert len(web) == 1
+    assert web[0]["type"] == "web_search_20250305"
+    assert tools[-1] == web[0], "server tool must stay appended last"
+    assert "cache_control" not in tools[-1]
+    assert tools[-2].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_client_search_is_audited_as_a_client_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same tool name as the server variant, different execution site.
+
+    The server tool audits as kind="server_tool"; the client one must be
+    distinguishable, not lumped in with ordinary skills.
+    """
+    _use_local_model(monkeypatch)
+    messages = [
+        _msg(_tool_use_block("web_search", "tu_1", query="ciao pricing")),
+        _msg(SimpleNamespace(type="text", text="done"), stop="end_turn"),
+    ]
+    audit_calls: list[dict[str, Any]] = []
+
+    def _capture(event_type: str, summary: str, **kwargs: Any) -> None:
+        audit_calls.append({"event_type": event_type, **kwargs})
+
+    with (
+        patch(
+            "openexecutive.orchestrator.searxng_search._run_search",
+            new=AsyncMock(return_value=ToolOutcome('{"results": []}')),
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.audit_log", side_effect=_capture
+        ),
+    ):
+        _drive(monkeypatch, messages)
+
+    search_rows = [
+        c for c in audit_calls
+        if c["event_type"] == "tool_invocation"
+        and (c.get("details") or {}).get("tool") == "web_search"
+    ]
+    assert len(search_rows) == 1
+    assert search_rows[0]["details"]["kind"] == "client_tool"
+
+
 def test_local_model_without_searxng_gets_no_search_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
