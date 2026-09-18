@@ -402,3 +402,38 @@ def test_claude_without_key_or_openrouter_raises_actionable_400(
         get_provider("claude-sonnet-4-6")
     assert exc_info.value.status_code == 400
     assert "ANTHROPIC_API_KEY" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    ("openrouter", "model"),
+    [
+        (False, "llama3.3"),  # local
+        (False, "claude-sonnet-5"),  # Anthropic direct
+        (True, "llama3.3"),  # local wins even with OpenRouter on
+        (True, "claude-sonnet-5"),  # Claude id via OpenRouter
+        (True, "anthropic/claude-opus-4.8"),  # catalog Claude slug
+        (True, "openai/gpt-6-astra"),  # non-Claude via OpenRouter
+    ],
+)
+def test_feature_spec_for_matches_the_routed_providers_gate(
+    openrouter: bool, model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``feature_spec_for`` mirrors ``get_provider``'s precedence; pin the mirror.
+
+    It exists so callers can learn a capability (server-side search) before
+    building a request. If routing changes and it does not follow, a local
+    model is offered no search or a server tool reaches a backend that
+    strips it. The spec a provider actually enforces is what its ``_resolve``
+    returns; Anthropic direct enforces none, which is the full Claude spec.
+    """
+    from openexecutive.providers.anthropic_provider import AnthropicProvider
+    from openexecutive.providers.openai_compatible import OpenAICompatibleProvider
+
+    _local_stub(monkeypatch, enabled=openrouter)
+    provider = get_provider(model)
+    if isinstance(provider, OpenAICompatibleProvider):
+        enforced = provider._resolve(model)[1]
+    else:
+        assert isinstance(provider, AnthropicProvider)
+        enforced = registry_mod._CLAUDE_FEATURE_SPEC
+    assert registry_mod.feature_spec_for(model) == enforced

@@ -21,6 +21,7 @@ def build_system_blocks(
     mcp_enabled: bool = False,
     persona_override: str | None = None,
     voice_persona_body: str | None = None,
+    web_search_available: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Build system prompt blocks with correct cache_control ordering.
 
@@ -37,6 +38,17 @@ def build_system_blocks(
     voice_persona_body is substituted into the {VOICE_PERSONA} placeholder in
     the assembled base prompt. If the placeholder is absent (user removed it),
     the body is appended at the end of the prompt so it is never silently dropped.
+
+    web_search_available decides whether WEB_SEARCH_ADDENDUM is included. The
+    caller passes what its request will actually carry, because
+    ENABLE_WEB_SEARCH alone does not answer the question: a local model with
+    no SEARXNG_URL gets no search tool despite the flag, and the committee's
+    revision pass sends no tools at all. Promising a tool the model has not
+    been given produces confident claims that it searched. None falls back to
+    the flag, preserving the behaviour of callers that pass nothing.
+
+    The value is a deterministic bit, so the 1h-TTL block stays cacheable —
+    it yields two stable persona variants rather than per-request text.
     """
     # Inject user_timezone so the Executive can resolve relative times
     # ("tomorrow 9am") to ISO8601 UTC when calling schedule_followup.
@@ -88,9 +100,11 @@ def build_system_blocks(
     else:
         base_persona = base_persona.replace(_VOICE_PERSONA_PLACEHOLDER, "")
 
+    if web_search_available is None:
+        web_search_available = settings.enable_web_search
     persona = (
         base_persona
-        + (WEB_SEARCH_ADDENDUM if settings.enable_web_search else "")
+        + (WEB_SEARCH_ADDENDUM if web_search_available else "")
         + (MCP_ADDENDUM if mcp_enabled else "")
         + identity_addendum
         + tz_addendum

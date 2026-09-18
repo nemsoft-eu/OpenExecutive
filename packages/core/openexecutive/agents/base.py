@@ -1,16 +1,44 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from openexecutive.agents.tool_outcome import unwrap_tool_outcome
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.providers import get_provider, model_supports_deep_reasoning
+from openexecutive.providers.translator import reasoning_replay_block
 
 _SPECIALIST_TIMEOUT = 180.0
 
 logger = logging.getLogger(__name__)
+
+
+def _replay_assistant_turn(message: Any) -> list[dict[str, Any]]:
+    """The assistant turn to echo back before this round's tool_results.
+
+    Replays text and reasoning as well as the tool_use blocks, the way every
+    other tool loop in the codebase does: dropping the preamble text loses
+    what the model said it was doing, and dropping an OpenRouter reasoning
+    block breaks reasoning continuity across rounds on that path.
+    """
+    turn: list[dict[str, Any]] = []
+    for block in getattr(message, "content", None) or []:
+        block_type = getattr(block, "type", "")
+        if block_type == "text":
+            turn.append({"type": "text", "text": getattr(block, "text", "")})
+        elif block_type == "tool_use":
+            turn.append({
+                "type": "tool_use",
+                "id": getattr(block, "id", ""),
+                "name": getattr(block, "name", ""),
+                "input": getattr(block, "input", None) or {},
+            })
+        elif (replay := reasoning_replay_block(block)) is not None:
+            turn.append(replay)
+    return turn
 
 
 class BaseAgent(ABC):
@@ -178,6 +206,9 @@ class BaseAgent(ABC):
         model_override: str | None = None,
         deep_reasoning_override: bool | None = None,
         actor: str = "specialist_tools",
+        client_tool_handlers: dict[str, Any] | None = None,
+        terminal_tool_names: set[str] | None = None,
+        max_client_tool_rounds: int = 3,
     ) -> Any:
         """Tool-use variant of ``analyze`` — returns the raw provider Message.
 
@@ -207,6 +238,16 @@ class BaseAgent(ABC):
         ``actor`` names the caller on the ``cache_event`` usage row recorded
         for the call (``specialist_research``, ``query_watch``, …), which is
         what the per-source usage breakdown groups on.
+
+        ``client_tool_handlers`` turns the single call into a bounded tool
+        loop: any tool in the map is executed here and fed back, so a model
+        whose provider has no server-side search (the local backend, using
+        the SearXNG ``web_search`` tool) can still search before answering.
+        Empty or None keeps the historical single-shot behaviour exactly.
+        ``terminal_tool_names`` names the output tools the caller extracts
+        from the returned message — they have no handler and reaching one
+        ends the loop. ``max_client_tool_rounds`` bounds the generations,
+        and ``timeout_seconds`` bounds the loop as a whole, not each round.
         """
         settings = get_settings()
         system_prompt = self.effective_system_prompt() + (
@@ -244,6 +285,151 @@ class BaseAgent(ABC):
             create_kwargs["max_tokens"] = max(max_tokens, 16000)
 
         provider = get_provider(model)
-        message = await provider.messages_create(**create_kwargs)
-        log_model_usage(message, model=model, actor=actor)
+        if not client_tool_handlers:
+            message = await provider.messages_create(**create_kwargs)
+            log_model_usage(message, model=model, actor=actor)
+            return message
+
+        # ``timeout`` in create_kwargs bounds each generation; this bounds the
+        # whole loop. Without it a caller's timeout_seconds silently becomes
+        # rounds × timeout_seconds (plus search time), which can outlast an
+        # enclosing deadline such as the research scheduler's run timeout.
+        async with asyncio.timeout(timeout_seconds):
+            return await self._run_client_tool_loop(
+                provider,
+                create_kwargs,
+                model=model,
+                actor=actor,
+                client_tool_handlers=client_tool_handlers,
+                terminal_tool_names=set(terminal_tool_names or ()),
+                max_rounds=max_client_tool_rounds,
+            )
+
+    async def _run_client_tool_loop(
+        self,
+        provider: Any,
+        create_kwargs: dict[str, Any],
+        *,
+        model: str,
+        actor: str,
+        client_tool_handlers: dict[str, Any],
+        terminal_tool_names: set[str],
+        max_rounds: int,
+    ) -> Any:
+        """Run generations until the model produces its terminal output.
+
+        Callers of ``analyze_with_tools`` advertise an output tool that has
+        no handler (``emit_research_findings``, ``emit_query_results``) and
+        then read it off the returned raw message. So a handler map alone
+        cannot classify a tool_use block — ``terminal_tool_names`` is what
+        separates "the model has answered" from "the model called a tool I
+        must run" from "the model hallucinated a tool".
+
+        Termination, in priority order:
+
+          * A terminal tool appears — return that message immediately, even
+            if a search appeared alongside it. Running a search whose result
+            cannot reach the already-emitted output is pure cost.
+          * No tool_use at all — return the message. The caller's extractor
+            will find nothing, which is logged here because a specialist
+            that answers in prose has silently produced no findings.
+          * Only handled tools — run them, append the assistant turn plus one
+            tool_result per tool_use, and go again.
+          * An unknown tool — answer it with an error tool_result so the
+            transcript stays valid (every tool_use must be answered) and let
+            the model correct itself on the next round.
+
+        On the final round the handled tools are withdrawn and only the
+        terminal tools are offered, so a model that would otherwise keep
+        searching is forced to emit. Without that, a search on the last
+        generation leaves the caller with an unusable message.
+        """
+        kwargs = dict(create_kwargs)
+        all_tools = list(kwargs.get("tools") or [])
+        # At least one generation, always: with zero rounds the loop body
+        # never runs and there is no message to return.
+        max_rounds = max(1, max_rounds)
+
+        for round_number in range(1, max_rounds + 1):
+            if round_number == max_rounds and terminal_tool_names:
+                # Last chance: withdraw the handled tools so the only move
+                # left is the terminal one.
+                kwargs["tools"] = [
+                    t for t in all_tools
+                    if t.get("name") not in client_tool_handlers
+                ] or all_tools
+
+            message = await provider.messages_create(**kwargs)
+            # Every generation is billed, so every generation is accounted.
+            log_model_usage(message, model=model, actor=actor)
+
+            tool_uses = [
+                b for b in (getattr(message, "content", None) or [])
+                if getattr(b, "type", "") == "tool_use"
+            ]
+            if not tool_uses:
+                logger.warning(
+                    "%s: model returned no tool_use block on round %d/%d — "
+                    "the caller's extractor will find nothing",
+                    self.name, round_number, max_rounds,
+                )
+                return message
+            if any(getattr(b, "name", "") in terminal_tool_names for b in tool_uses):
+                return message
+            if round_number == max_rounds:
+                # A model that ignored the withdrawn tool list and searched
+                # anyway: running that search now would spend budget on a
+                # result no later generation can read.
+                break
+
+            tool_results = await self._dispatch_tool_uses(
+                tool_uses, client_tool_handlers
+            )
+            kwargs["messages"] = [
+                *kwargs["messages"],
+                {"role": "assistant", "content": _replay_assistant_turn(message)},
+                {"role": "user", "content": tool_results},
+            ]
+
+        logger.warning(
+            "%s: client tool loop exhausted %d rounds without a terminal tool",
+            self.name, max_rounds,
+        )
         return message
+
+    async def _dispatch_tool_uses(
+        self,
+        tool_uses: list[Any],
+        client_tool_handlers: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Run one round's tool calls and return one tool_result per call.
+
+        Every tool_use gets exactly one tool_result, including a tool with
+        no handler — an unanswered tool_use makes the next request's
+        transcript invalid. Handlers run sequentially: a round rarely holds
+        more than one search, and the search budget is enforced inside each
+        handler either way.
+        """
+        tool_results: list[dict[str, Any]] = []
+        for block in tool_uses:
+            name = getattr(block, "name", "")
+            handler = client_tool_handlers.get(name)
+            if handler is None:
+                logger.warning(
+                    "%s: model called unknown tool %r — returning an error",
+                    self.name, name,
+                )
+                result_content, is_error = f"Unknown tool: {name}", True
+            else:
+                result_content, is_error = unwrap_tool_outcome(
+                    await handler(getattr(block, "input", None) or {})
+                )
+            result_block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": getattr(block, "id", ""),
+                "content": result_content,
+            }
+            if is_error:
+                result_block["is_error"] = True
+            tool_results.append(result_block)
+        return tool_results

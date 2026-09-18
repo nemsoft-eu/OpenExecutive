@@ -56,7 +56,9 @@ system:
       reusing the OpenRouter request/response/stream translator. Those slugs
       are added to the Council UI dropdown and get the tools-only local
       feature spec (no cache_control / thinking / web_search — a
-      self-hosted server has no search plugin). Because Anthropic thinking
+      self-hosted server has no search plugin; SEARXNG_URL restores search
+      on these slugs via the client-side tool, see chat.web_search).
+      Because Anthropic thinking
       is stripped, a thinking model (qwen3.x, deepseek-r1) would otherwise
       reason on every call at the server default; LOCAL_REASONING_EFFORT
       (none / low / medium / high, unset = send nothing) is passed only to
@@ -87,7 +89,7 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin. Callers do NOT need to know which model they're routing to.
+    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. Callers do NOT need to know which model they're routing to.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -346,11 +348,60 @@ routing:
     this bounds per-turn search spend and, multiplied across the
     7-specialist research fan-out, is a primary cost control.
 
-    When the selected model is non-Claude (routed via OpenRouter), the
-    feature gate strips this server tool from the request before it
-    leaves the process — OpenRouter has no equivalent server-tool
-    primitive. The Council UI does not surface this to the user; the
-    capability simply does not fire on non-Anthropic turns.
+    Exactly one search implementation is offered per call, chosen by
+    `orchestrator.web_search_tool.select_web_search_tool(model)` against the
+    model the request is actually sent with (the Council override, or the
+    research model — not an agent's chat default):
+
+      - Claude, direct or via OpenRouter → the Anthropic server tool above.
+        On the OpenRouter path the translator swaps it for
+        `openrouter:web_search`, carrying max_uses and the domain lists
+        across unchanged.
+      - Any other OpenRouter model → the same swap. Both non-Claude specs
+        set supports_web_search=True, so search does fire on non-Anthropic
+        turns.
+      - A slug in LOCAL_MODELS → the CLIENT-side SearXNG tool from
+        `orchestrator.searxng_search`, when SEARXNG_URL is set. A
+        self-hosted OpenAI-compatible server has no search plugin, so the
+        feature gate strips the Anthropic entry and this fills the gap.
+        With SEARXNG_URL unset a local model has no search at all.
+
+    The SearXNG tool is an ordinary client tool (it has an input_schema), so
+    unlike the server variant it sorts into the cached client-tool list and
+    may carry the cache_control marker like any other. Its handler runs in
+    our process: it streams `<SEARXNG_URL>/search?format=json` with
+    redirects disabled, a byte cap enforced during the read (not after a
+    buffered one), and a total deadline (httpx's own timeout is per network
+    operation, so a slow-drip backend would never trip it). It filters
+    results by WEB_SEARCH_ALLOWED_DOMAINS / WEB_SEARCH_BLOCKED_DOMAINS on a
+    subdomain boundary, after reducing each entry to a bare host (so
+    `https://x.com`, `x.com:443` and `x.com/blog` all mean `x.com` — raw,
+    they would silently block nothing). It is a post-filter: the query still
+    reaches every configured engine, so this is enforcement, not privacy.
+    Results are trimmed to SEARXNG_MAX_RESULTS and wrapped with a constant
+    notice marking them as untrusted third-party text, never instructions —
+    they share a tool loop with side-effecting tools, and unlike the server
+    tool's typed result blocks a client tool_result carries no such marking.
+    Zero results is a normal, successful empty payload. A failure sets
+    `is_error` on the tool_result, but the OpenAI-compatible translator
+    forwards only `tool_call_id` and `content`, so on the local path — the
+    only one that selects this tool — the model learns of the failure from
+    the error wording alone.
+
+    The per-turn cap is enforced by `searxng_search.SearchBudget`, created
+    once per turn OUTSIDE the tool-use loop (per-iteration creation would
+    silently allow WEB_SEARCH_MAX_USES searches per round trip). It reserves
+    synchronously before its first await, so concurrent searches dispatched
+    in one `asyncio.gather` batch cannot collectively exceed the cap, and a
+    timeout or HTTP error still consumes budget — otherwise a failing
+    SearXNG would permit unlimited retries.
+
+    WEB_SEARCH_ADDENDUM (the persona text telling the Executive it can
+    search) is gated on what the request actually carries, not on
+    ENABLE_WEB_SEARCH alone: `build_system_blocks(web_search_available=...)`.
+    A local model with no SEARXNG_URL would otherwise be told it has a tool
+    it was never given. The value is a deterministic bit, so the 1h-TTL
+    persona block stays cacheable as two stable variants.
   channel_tools: |
     `lookup_person`, `send_discord_dm`, `send_telegram_message`,
     `send_slack_dm`, and `schedule_followup` are exposed as tools so the

@@ -237,7 +237,7 @@ def _is_claude(model: str) -> bool:
     return _CLAUDE_ID_RE.match(model) is not None
 
 
-def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
+def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec]:
     """Slug + feature spec for a model on the OpenRouter path.
 
     * Anthropic id (``claude-sonnet-5``) → derived OpenRouter slug, Claude spec.
@@ -385,6 +385,39 @@ def get_provider(model: str) -> LLMProvider:
             ),
         )
     return _openrouter()
+
+
+def feature_spec_for(model: str) -> FeatureSpec:
+    """Return the ``FeatureSpec`` the provider will apply to ``model``.
+
+    Mirrors ``get_provider``'s precedence exactly — local slugs first, then
+    the Claude family, then everything else on OpenRouter — so callers that
+    need to know a capability *before* building the request read the same
+    decision the gate will later enforce. Deriving capability separately
+    would drift the moment routing changes.
+
+    Unlike ``get_provider`` this never raises: an unroutable slug (non-Claude
+    with OpenRouter off) reports the default non-Claude spec rather than a
+    400, because the caller is asking about capability, not requesting a
+    call. The 400 still comes from ``get_provider`` when the call is made.
+    """
+    if model in _local_models(get_settings()):
+        return _LOCAL_FEATURE_SPEC
+    # The resolver already returns the Claude spec for any Claude id (it
+    # matches the same regex as ``_is_claude``), and Anthropic direct serves
+    # exactly those features natively — so one lookup covers both backends.
+    return _openrouter_model_resolver(model)[1]
+
+
+def supports_server_web_search(model: str) -> bool:
+    """Whether ``model``'s provider runs web search inside the generation.
+
+    True for Claude (Anthropic's ``web_search_20250305``) and for anything
+    routed via OpenRouter (the translator swaps in ``openrouter:web_search``).
+    False for the self-hosted OpenAI-compatible backend, which has no server
+    tool — those models need the client-side SearXNG tool instead.
+    """
+    return feature_spec_for(model).supports_web_search
 
 
 def _reset_for_tests() -> None:

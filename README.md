@@ -292,10 +292,11 @@ See [.env.example](.env.example) for the full list.
 > ² The application default is on, but **[.env.example](.env.example) ships
 > `ENABLE_WEB_SEARCH=false`** so a fresh setup incurs no per-search charges —
 > if the agents tell you they can't search the web or read the news, flip it
-> to `true` in your `.env` and restart. Uses Anthropic's server-side
-> `web_search` tool, so it applies to Claude models (local models can't use
-> it). `WEB_SEARCH_ALLOWED_DOMAINS` / `WEB_SEARCH_BLOCKED_DOMAINS` scope where
-> it may look (set at most one).
+> to `true` in your `.env` and restart. Claude and OpenRouter models use their
+> provider's server-side `web_search` tool; local models have no such tool and
+> use a self-hosted SearXNG instance instead — see [Running on Local
+> Models](#running-on-local-models). `WEB_SEARCH_ALLOWED_DOMAINS` /
+> `WEB_SEARCH_BLOCKED_DOMAINS` scope where it may look (set at most one).
 
 ## Running on Local Models
 
@@ -324,9 +325,26 @@ The listed slugs appear in the **Council UI** model dropdown, so you can also ru
 a hybrid setup — keep the Executive on Claude while flipping individual
 specialists to a local model per-agent.
 
-**Caveats.** Server-side web search (`ENABLE_WEB_SEARCH`) and Anthropic prompt
-caching / extended thinking have no local equivalent and are automatically
-disabled for local models. Thinking models still reason server-side by
+### Web search on local models
+
+A self-hosted server has no search plugin, so the Anthropic `web_search` tool is
+stripped for local slugs. Point Open Executive at a [SearXNG](https://docs.searxng.org)
+instance and it offers a client-side `web_search` tool instead — the model asks,
+the backend searches in-process, and the results come back as a tool result:
+
+```bash
+ENABLE_WEB_SEARCH=true
+SEARXNG_URL=http://searxng:8080   # your own instance; enable its JSON format
+```
+
+Leave `SEARXNG_URL` unset and local models simply have no search — and are no
+longer told they do, so they stop claiming to have looked things up.
+`WEB_SEARCH_MAX_USES` caps searches per turn as it does on the hosted paths,
+and the domain lists apply as a filter on the results.
+
+**Caveats.** Anthropic prompt caching and extended thinking have no local
+equivalent and are automatically disabled for local models. Thinking models
+still reason server-side by
 default, which adds latency to every call; set `LOCAL_REASONING_EFFORT=none`
 to turn that off, or `low` to keep a little. Multi-agent routing leans
 heavily on tool use, so pick a model that's strong at it (e.g. Llama 3.3 70B,

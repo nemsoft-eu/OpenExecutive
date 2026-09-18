@@ -14,6 +14,9 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
 from openexecutive.agents import overrides as ov_mod  # noqa: E402
 from openexecutive.monitoring.research import prompts as rp  # noqa: E402
+from openexecutive.orchestrator.web_search_tool import (  # noqa: E402
+    WebSearchSelection,
+)
 
 
 @pytest.fixture
@@ -71,7 +74,7 @@ def test_specialist_research_passes_resolved_knobs(
 
     agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
     # Web search off so the tool list is deterministic.
-    monkeypatch.setattr(sr, "build_web_search_tool", lambda **_kw: None)
+    monkeypatch.setattr(sr, "select_web_search_tool", lambda *_a, **_kw: None)
 
     asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
 
@@ -91,11 +94,20 @@ def test_specialist_research_uses_the_research_search_cap(
     monkeypatch.setenv("RESEARCH_WEB_SEARCH_MAX_USES", "2")
     seen: dict = {}
 
-    def fake_build(**kwargs: object) -> dict:
+    def fake_select(model: str, **kwargs: object) -> object:
         seen.update(kwargs)
-        return {"type": "web_search_20250305", "name": "web_search", **kwargs}
+        max_uses = kwargs["max_uses"]
+        return WebSearchSelection(
+            kind="server",
+            tool={
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": max_uses,
+            },
+            max_uses=max_uses,  # type: ignore[arg-type]
+        )
 
-    monkeypatch.setattr(sr, "build_web_search_tool", fake_build)
+    monkeypatch.setattr(sr, "select_web_search_tool", fake_select)
     tools_seen: dict = {}
 
     async def fake_analyze_with_tools(user_content: str, **kwargs: object) -> object:
@@ -106,3 +118,45 @@ def test_specialist_research_uses_the_research_search_cap(
     asyncio.run(sr.research_one_specialist("cfo", agent, "CONTEXT"))
     assert seen == {"max_uses": 2}
     assert any(t.get("name") == "web_search" and t.get("max_uses") == 2 for t in tools_seen["tools"])
+    # Server search runs inside the provider: no client handlers to pass.
+    assert tools_seen["client_tool_handlers"] == {}
+
+
+def test_specialist_research_on_a_local_model_gets_the_client_search_loop(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The research cap sizes the client-side budget and the loop's rounds.
+
+    Selection must use the research model — the one the call is made with —
+    and the loop must know emit_research_findings is how it ends.
+    """
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    monkeypatch.setenv("ENABLE_WEB_SEARCH", "true")
+    monkeypatch.setenv("RESEARCH_WEB_SEARCH_MAX_USES", "3")
+    monkeypatch.setenv("LOCAL_MODELS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_MODELS", "qwen-local")
+    monkeypatch.setenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    ov_mod.set_override(
+        "research", model="qwen-local", model_set=True, db_path=isolated_db
+    )
+    ov_mod.invalidate_cache()
+
+    seen: dict = {}
+
+    async def fake_analyze_with_tools(user_content: str, **kwargs: object) -> object:
+        seen.update(kwargs)
+        return SimpleNamespace(content=[])
+
+    agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    assert seen["model_override"] == "qwen-local"
+    web = [t for t in seen["tools"] if t.get("name") == "web_search"]
+    assert len(web) == 1
+    assert "input_schema" in web[0], "expected the client tool, not the server one"
+    assert set(seen["client_tool_handlers"]) == {"web_search"}
+    assert seen["terminal_tool_names"] == {"emit_research_findings"}
+    # RESEARCH_WEB_SEARCH_MAX_USES=3 searches plus the emit round.
+    assert seen["max_client_tool_rounds"] == 4

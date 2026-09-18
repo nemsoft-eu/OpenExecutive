@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,18 +19,42 @@ import pytest
 
 from openexecutive.config import get_settings
 
+_SEARCH_ENV_KEYS = (
+    "ENABLE_WEB_SEARCH",
+    "WEB_SEARCH_MAX_USES",
+    "WEB_SEARCH_ALLOWED_DOMAINS",
+    "WEB_SEARCH_BLOCKED_DOMAINS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_search_env() -> Iterator[None]:
+    """Undo every os.environ write this module makes, after each test.
+
+    ``_reset_settings_cache`` writes os.environ directly and leaves
+    ENABLE_WEB_SEARCH=false behind. Without a restore, any module that runs
+    later and relies on the default (search on) silently sees it off — the
+    standing-query tests did, once this module sorted ahead of them.
+
+    A plain snapshot, not ``monkeypatch.delenv``: delenv on a key that is
+    absent records nothing, so it restores nothing — and absent is exactly
+    the state these keys start in.
+    """
+    saved = {key: os.environ.get(key) for key in _SEARCH_ENV_KEYS}
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 def _reset_settings_cache() -> None:
     # get_settings constructs a fresh Settings() each call, so just clear envs.
     # ENABLE_WEB_SEARCH defaults to True in config.py; pin it false here so
     # the "disabled" cases below have a clean baseline (tests that want it
     # enabled explicitly set ENABLE_WEB_SEARCH=true after reset).
-    for k in (
-        "ENABLE_WEB_SEARCH",
-        "WEB_SEARCH_MAX_USES",
-        "WEB_SEARCH_ALLOWED_DOMAINS",
-        "WEB_SEARCH_BLOCKED_DOMAINS",
-    ):
+    for k in _SEARCH_ENV_KEYS:
         os.environ.pop(k, None)
     os.environ["ENABLE_WEB_SEARCH"] = "false"
 
@@ -120,6 +145,47 @@ def test_persona_omits_web_search_addendum_when_disabled() -> None:
     blocks = build_system_blocks(company_profile=None, mcp_enabled=False)
     persona_text = blocks[0]["text"]
     assert "Web Search" not in persona_text
+
+
+def test_persona_omits_addendum_when_the_caller_has_no_search_tool() -> None:
+    """ENABLE_WEB_SEARCH is not the whole answer.
+
+    A local model with no SEARXNG_URL gets no search tool despite the flag.
+    Promising one produces confident claims that it searched.
+    """
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    blocks = build_system_blocks(
+        company_profile=None, mcp_enabled=False, web_search_available=False
+    )
+    assert "web_search" not in blocks[0]["text"]
+
+
+def test_persona_includes_addendum_when_the_caller_has_a_search_tool() -> None:
+    """The client-side tool counts, even though the global flag alone would too."""
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "false"
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    blocks = build_system_blocks(
+        company_profile=None, mcp_enabled=False, web_search_available=True
+    )
+    assert "web_search" in blocks[0]["text"]
+
+
+def test_addendum_gate_keeps_the_block_byte_stable() -> None:
+    """Two stable variants, not per-request text — the block is cached for 1h."""
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    from openexecutive.prompts.cache_manager import build_system_blocks
+    a = build_system_blocks(company_profile=None, mcp_enabled=False,
+                            web_search_available=True)
+    b = build_system_blocks(company_profile=None, mcp_enabled=False,
+                            web_search_available=True)
+    assert a[0]["text"] == b[0]["text"]
+    off = build_system_blocks(company_profile=None, mcp_enabled=False,
+                              web_search_available=False)
+    assert off[0]["text"] != a[0]["text"]
 
 
 # ---------------------------------------------------------------------------
