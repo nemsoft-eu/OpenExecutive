@@ -173,6 +173,41 @@ def test_empty_query_is_an_error_and_costs_nothing() -> None:
     assert budget.used == 0
 
 
+@pytest.mark.parametrize(
+    "tool_input",
+    [None, [], "just a string", 42, {"query": None}, {"query": []}, {}],
+)
+def test_malformed_input_is_an_error_not_a_raise(tool_input: Any) -> None:
+    """A raise here would cancel every sibling tool call in the turn.
+
+    The OpenAI-compatible path parses whatever JSON the model emitted for
+    ``arguments``, so a local model can hand the handler a null, a list or
+    a bare string — none of which have a .get.
+    """
+    budget = SearchBudget(max_uses=2)
+    handler = make_search_handler(budget)
+    outcome = asyncio.run(handler(tool_input))
+    assert outcome.is_error
+    assert "query" in outcome.content
+    assert budget.used == 0, "a malformed call must not spend budget"
+
+
+def test_malformed_input_does_not_abort_sibling_tool_calls() -> None:
+    """The guarantee the handler's backstop claims, at the gather boundary."""
+    handler = make_search_handler(SearchBudget(max_uses=2))
+
+    async def sibling() -> str:
+        await asyncio.sleep(0.01)
+        return "specialist result"
+
+    async def _run() -> list[Any]:
+        return await asyncio.gather(handler(None), sibling())
+
+    outcomes = asyncio.run(_run())
+    assert outcomes[0].is_error
+    assert outcomes[1] == "specialist result"
+
+
 # ---------------------------------------------------------------------------
 # Result shaping and the domain filter
 # ---------------------------------------------------------------------------

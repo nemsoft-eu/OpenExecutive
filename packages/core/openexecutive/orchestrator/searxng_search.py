@@ -128,10 +128,19 @@ def make_search_handler(
     explains when a fresh budget must — and must not — be created.
     """
 
-    async def handle_web_search(tool_input: dict[str, Any]) -> ToolOutcome:
-        query = str(tool_input.get("query") or "").strip()
+    async def handle_web_search(tool_input: Any) -> ToolOutcome:
+        # The model controls this payload's SHAPE, not just its values: the
+        # OpenAI-compatible path hands back whatever JSON the model emitted
+        # for ``arguments``, so it can be null, a list or a bare string.
+        # Calling .get on one of those would raise out of the caller's
+        # asyncio.gather and cancel every other tool call in the turn.
+        query = ""
+        if isinstance(tool_input, dict):
+            query = str(tool_input.get("query") or "").strip()
         if not query:
-            return ToolOutcome("Provide a non-empty 'query'.", is_error=True)
+            return ToolOutcome(
+                "Provide a non-empty 'query' string.", is_error=True
+            )
         if not budget.reserve():
             return ToolOutcome(
                 f"Search budget for this turn is spent ({budget.max_uses} "
