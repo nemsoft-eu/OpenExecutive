@@ -53,9 +53,12 @@ def _capture_loop_kwargs(driver: str) -> dict[str, Any]:
             asyncio.run(_drive())
         except Exception:
             # The committee path continues past the stubbed loop into review /
-            # revision, which needs a provider. The kwargs we assert on are
-            # captured before that, so a later failure is not our concern.
-            pass
+            # revision, which needs a provider, so a failure AFTER the loop ran
+            # is expected. A failure BEFORE it means the wiring under test never
+            # executed — re-raise that one rather than reporting it as a missing
+            # kwarg.
+            if not captured:
+                raise
     return captured
 
 

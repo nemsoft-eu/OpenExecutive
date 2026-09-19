@@ -313,10 +313,14 @@ routing:
   pattern: Anthropic tool use with a single `consult_specialist` tool. Multiple parallel tool_use blocks per assistant turn fan out to specialists concurrently.
   parallel_function: openexecutive.orchestrator.router.route_parallel
   conversation_context: |
-    `consult_specialist` takes only `specialist` and `query`. There is
-    deliberately NO per-call `context` field — the orchestrator supplies the
-    conversation context instead, via `route_parallel(conversation_context=...)`,
-    which reaches `BaseAgent.analyze(context=...)` as `<conversation_context>`.
+    The Executive's `consult_specialist` tool (`router.SPECIALIST_TOOLS`) takes
+    only `specialist` and `query`. There is deliberately NO per-call `context`
+    field — the orchestrator supplies the conversation context instead, via
+    `route_parallel(conversation_context=...)`, which reaches
+    `BaseAgent.analyze(context=...)` as `<conversation_context>`. This is about
+    the chat tool loop only: the MCP server exposes a separate tool of the same
+    name (`mcp_server/server.py`) that DOES take a `context` argument, because
+    an external agent has no session here for the orchestrator to render from.
 
     What it carries — `Session.render_conversation_context` renders the last
     two exchanges plus the current message, capped per-part (user 600, assistant
@@ -328,6 +332,17 @@ routing:
     the question on some channels and discard it on others. Bounding it matters
     because attachments run to 40k chars per file, up to 5 files, and the whole
     string is forwarded to every specialist in the fan-out as uncached input.
+
+    The rendered text is passed through `session._inert` (angle brackets → ‹ ›,
+    structure preserved) before it leaves. `BaseAgent.analyze` wraps it in
+    `<conversation_context>` and wraps four sibling blocks in tags of their own,
+    and this is the first path carrying raw uploaded-document text into one of
+    them — an unescaped closing tag would end the block early and have the rest
+    read as instructions, in every specialist of a fan-out at once. Same
+    convention as `alerts.review._untrusted` for the `<alert>` envelope, minus
+    its collapse-to-one-line step, which would destroy the User:/Executive:
+    structure this block exists to convey. Note the RAG path does NOT yet do
+    this — see the open issue on retrieved text reaching its envelopes raw.
 
     The 6,000 total is a guard, not a working limit — with the per-part caps and
     a 2-exchange window the joined result tops out near 5,650, so it only fires
@@ -354,7 +369,8 @@ routing:
     Re-adding a per-call `context` property would reintroduce that cost with
     no failing test, so `test_router.py` asserts the tool's input properties
     are exactly {specialist, query}. The `query` description carries the
-    matching instruction — one sentence, do not restate the background.
+    matching instruction — one or two sentences, name the subject concretely,
+    and do not repeat company background or the full conversation.
   fanout_cap: |
     The number of parallel `consult_specialist` calls dispatched in a single
     turn is bounded by `MAX_PARALLEL_SPECIALISTS` (config). Default 0 is inert

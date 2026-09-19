@@ -9,18 +9,61 @@ from openexecutive.memory.company_profile import CompanyProfile
 
 _ELISION = "\n[…]\n"
 
+# Budgets for the specialist-facing conversation tail. Named rather than inline
+# because they are one fixed policy, not per-caller knobs: the rendered text is
+# re-sent to EVERY specialist in a fan-out, uncached, so each 1k chars costs
+# ~250 tokens x N specialists of prefill. Two exchanges covers the "turn 1 named
+# the subject" case (issue #12) without paying for older turns that are rarely
+# referenced. Assistant turns get twice a user turn because the figures a
+# follow-up refers to are usually in the Executive's answer — the turn-1 reply
+# behind #12 was 5,075 chars. The current message gets the most because it may
+# carry attachment text.
+_TAIL_TURNS = 2
+_TAIL_CURRENT_MAX_CHARS = 2_000
+_TAIL_USER_MAX_CHARS = 600
+_TAIL_ASSISTANT_MAX_CHARS = 1_200
+_TAIL_TOTAL_MAX_CHARS = 6_000
+
+
+def _inert(text: str) -> str:
+    """Make *text* unable to open or close any prompt envelope.
+
+    ``BaseAgent.analyze`` wraps this block in ``<conversation_context>`` and
+    wraps four sibling blocks in tags of their own. This path is the first to
+    carry raw uploaded-document text into one of them, so a document containing
+    a closing tag would end the block early and have its remainder read as
+    instructions — in every specialist of a fan-out at once.
+
+    Follows the convention `alerts.review._untrusted` established for the
+    ``<alert>`` envelope: replace the brackets rather than one known tag, so a
+    sibling tag invented later is covered without editing this. It does NOT
+    collapse to a single line the way that helper does — the ``User:`` /
+    ``Executive:`` structure is the point of this block.
+    """
+    return text.replace("<", "‹").replace(">", "›")
+
 
 def _keep_both_ends(text: str, limit: int) -> str:
     """Truncate the middle of *text*, keeping its head and tail.
 
-    Used for the current user message, whose typed question may sit at either
-    end depending on the channel (see ``render_conversation_context``).
+    Used for any user message, whose typed question may sit at either end
+    depending on the channel (see ``render_conversation_context``). Applies to
+    replayed history turns too, not just the current one: ``add_user_message``
+    stores the attachment-augmented string verbatim, so a one-ended slice here
+    would drop next turn exactly the question this preserved last turn.
     """
     if len(text) <= limit:
         return text
     budget = limit - len(_ELISION)
+    if budget <= 0:
+        # A limit at or below the elision's own length leaves nothing to keep.
+        # Returning early also avoids `text[-0:]`, which is the WHOLE string —
+        # that would forward an entire attachment blob to every specialist,
+        # the exact cost this cap exists to prevent.
+        return text[:limit]
     head = budget // 2
-    return text[:head] + _ELISION + text[-(budget - head):]
+    tail = budget - head
+    return text[:head] + _ELISION + text[-tail:]
 
 
 @dataclass
@@ -44,19 +87,14 @@ class Session:
         self,
         current_message: str,
         *,
-        # Budgets are sized against what a fan-out costs, not round numbers:
-        # this text is re-sent to EVERY specialist, uncached, so each 1k chars
-        # is ~250 tokens x N specialists of prefill. Two exchanges covers the
-        # "turn 1 named the subject" case without paying for older turns that
-        # are rarely referenced. Assistant turns get 2x a user turn because the
-        # figures a follow-up refers to are usually in the Executive's answer
-        # (the turn-1 reply behind issue #12 was 5,075 chars); the current
-        # message gets the most because it may carry attachment text.
-        turns: int = 2,
-        current_max_chars: int = 2_000,
-        user_max_chars: int = 600,
-        assistant_max_chars: int = 1_200,
-        total_max_chars: int = 6_000,
+        # Defaults are the fixed policy above; the parameters exist so the
+        # budget and guard behaviour can be probed at their boundaries without
+        # monkeypatching module state. No production caller overrides them.
+        turns: int = _TAIL_TURNS,
+        current_max_chars: int = _TAIL_CURRENT_MAX_CHARS,
+        user_max_chars: int = _TAIL_USER_MAX_CHARS,
+        assistant_max_chars: int = _TAIL_ASSISTANT_MAX_CHARS,
+        total_max_chars: int = _TAIL_TOTAL_MAX_CHARS,
     ) -> str:
         """Render the recent conversation as plain text for a specialist.
 
@@ -85,7 +123,12 @@ class Session:
         for turn in self.get_recent_history(max_turns=turns):
             content = turn["content"]
             if not isinstance(content, str):
-                # Assistant turns can be a cache_control-wrapped block list.
+                # Defensive, not a live path: today `add_assistant_message` is
+                # only ever called with a plain str, and the cache_control block
+                # list is built inside `_build_messages` into a throwaway dict
+                # that never reaches conversation_history. Kept because the
+                # dataclass signature permits a list and stringifying one would
+                # put raw dict repr into a specialist's prompt.
                 content = "\n".join(
                     b.get("text", "")
                     for b in content
@@ -94,15 +137,22 @@ class Session:
             if not content:
                 continue
             if turn["role"] == "user":
-                parts.append(f"User: {content[:user_max_chars]}")
+                # Both-ends here too: a stored turn is the same
+                # attachment-augmented string, so a head-only slice would drop
+                # next turn the question this preserved last turn.
+                parts.append(f"User: {_keep_both_ends(content, user_max_chars)}")
             else:
                 parts.append(f"Executive: {content[:assistant_max_chars]}")
         parts.append(f"User: {_keep_both_ends(current_message, current_max_chars)}")
-        # Tail slice, so an over-budget history sheds its OLDEST turn and always
-        # keeps the current message. With the default per-part caps the joined
-        # result cannot exceed ~5.6k, so this only fires on a malformed history
-        # (more assistant turns than user turns, e.g. a corrupted restore).
-        return "\n\n".join(parts)[-total_max_chars:]
+        rendered = _inert("\n\n".join(parts))
+        # Tail slice, so an over-budget render loses its OLDEST text and always
+        # keeps the current message. It cuts at a character, not a turn
+        # boundary, so the first surviving turn can arrive as a headless
+        # fragment — acceptable here because with the default per-part caps the
+        # joined result cannot exceed ~5.6k, so this only fires on a malformed
+        # history (more assistant turns than user turns, e.g. a corrupted
+        # restore).
+        return rendered[-total_max_chars:]
 
     def get_recent_history(self, max_turns: int = 20) -> list[dict[str, Any]]:
         history = self.conversation_history[-(max_turns * 2):]

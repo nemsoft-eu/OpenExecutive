@@ -1,0 +1,25 @@
+id: cross_domain_003
+domain: cross_domain
+description: "Wide fan-out on a pricing change — exercises the rewritten consult_specialist query instruction"
+company_context:
+  stage: "Bootstrapped"
+  industry: "B2B SaaS"
+  arr: 1400000
+  headcount: 11
+query: "We're planning a one-step 30% increase to our flat per-employee subscription price next quarter. What would Finance, Strategy, Marketing, Product, Legal and People each need to change in their own plans if we go ahead?"
+expected_topics:
+  - revenue_impact
+  - churn_risk
+  - competitive_positioning
+  - contract_and_notice_obligations
+  - customer_communication
+required_routing:
+  - cfo
+  - cso
+  - cmo
+  - gc
+quality_criteria:
+  gives_recommendation: true
+  addresses_each_function: true
+  specific_to_situation: true
+  no_generic_boilerplate: true
