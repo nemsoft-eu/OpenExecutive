@@ -312,6 +312,49 @@ providers:
 routing:
   pattern: Anthropic tool use with a single `consult_specialist` tool. Multiple parallel tool_use blocks per assistant turn fan out to specialists concurrently.
   parallel_function: openexecutive.orchestrator.router.route_parallel
+  conversation_context: |
+    `consult_specialist` takes only `specialist` and `query`. There is
+    deliberately NO per-call `context` field — the orchestrator supplies the
+    conversation context instead, via `route_parallel(conversation_context=...)`,
+    which reaches `BaseAgent.analyze(context=...)` as `<conversation_context>`.
+
+    What it carries — `Session.render_conversation_context` renders the last
+    two exchanges plus the current message, capped per-part (user 600, assistant
+    1,200, current 2,000) and 6,000 chars overall. The current message keeps its
+    HEAD AND TAIL, with the middle elided, because the channels disagree about
+    where extracted attachment text goes — `api/routes/chat.py` appends it after
+    the typed question, while `integrations/telegram_bot.py` and
+    `integrations/discord_bot.py` prepend it. A one-ended slice would preserve
+    the question on some channels and discard it on others. Bounding it matters
+    because attachments run to 40k chars per file, up to 5 files, and the whole
+    string is forwarded to every specialist in the fan-out as uncached input.
+
+    The 6,000 total is a guard, not a working limit — with the per-part caps and
+    a 2-exchange window the joined result tops out near 5,650, so it only fires
+    on a malformed history (more assistant turns than user turns, e.g. a
+    corrupted restore). Its test passes the cap explicitly for that reason.
+
+    Why a tail and not just the message — a specialist receives no message
+    history and no company profile. `BaseAgent.analyze` composes exactly
+    department_memory, past_decisions, failure_cases, relevant_knowledge,
+    conversation_context, query. So `<conversation_context>` is its whole view
+    of the conversation, and `episodic_context` does not substitute — that is
+    the recorded-decision ledger, and an in-flight discussion has produced no
+    row yet (extraction is scheduled after the turn).
+
+    Why it was removed — when the model wrote the context itself it restated
+    the same background once per specialist. Measured on a six-specialist
+    fan-out (issue #12) — the routing turn emitted 1,724 output tokens and
+    spent 58.7 s generating them on the local backend (29.35 t/s) before the
+    first specialist started, and the six queries were near-verbatim
+    restatements of each other. The share of those 1,724 tokens that was
+    duplication is not separately measured. The orchestrator already holds
+    the context, so supplying it costs no output tokens.
+
+    Re-adding a per-call `context` property would reintroduce that cost with
+    no failing test, so `test_router.py` asserts the tool's input properties
+    are exactly {specialist, query}. The `query` description carries the
+    matching instruction — one sentence, do not restate the background.
   fanout_cap: |
     The number of parallel `consult_specialist` calls dispatched in a single
     turn is bounded by `MAX_PARALLEL_SPECIALISTS` (config). Default 0 is inert

@@ -14,9 +14,69 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 
 from openexecutive.orchestrator.router import (  # noqa: E402
     SPECIALIST_REGISTRY,
+    SPECIALIST_TOOLS,
     route_parallel,
     route_to_specialist,
 )
+
+
+def test_consult_specialist_tool_does_not_advertise_a_context_field() -> None:
+    """The model must not be asked to write per-call context.
+
+    Measured in issue #12: a six-specialist routing turn emitted 1,724 output
+    tokens — 58.7 s of generation on the local backend — and the six queries
+    were near-verbatim restatements of the same background. The orchestrator
+    supplies the context instead, via ``route_parallel(conversation_context=...)``,
+    which costs no output tokens. Re-adding the field would silently
+    reintroduce that cost, and no other test would fail.
+    """
+    (tool,) = [t for t in SPECIALIST_TOOLS if t["name"] == "consult_specialist"]
+    properties = tool["input_schema"]["properties"]
+    assert "context" not in properties
+    assert set(properties) == {"specialist", "query"}
+
+
+def test_route_parallel_forwards_conversation_context_to_every_specialist() -> None:
+    """One caller-supplied context reaches every specialist in the batch."""
+    cso_mock = AsyncMock(return_value="cso-out")
+    cfo_mock = AsyncMock(return_value="cfo-out")
+    with (
+        patch.object(SPECIALIST_REGISTRY["cso"], "analyze", cso_mock),
+        patch.object(SPECIALIST_REGISTRY["cfo"], "analyze", cfo_mock),
+    ):
+        asyncio.run(
+            route_parallel(
+                calls=[
+                    {"specialist": "cso", "query": "strategy q"},
+                    {"specialist": "cfo", "query": "finance q"},
+                ],
+                retrieved_knowledge_map={},
+                conversation_context="THE_TURN_CONTEXT",
+            )
+        )
+    assert cso_mock.await_args.kwargs["context"] == "THE_TURN_CONTEXT"
+    assert cfo_mock.await_args.kwargs["context"] == "THE_TURN_CONTEXT"
+
+
+def test_route_parallel_ignores_a_stray_per_call_context() -> None:
+    """A model that still emits `context` must not override the shared one.
+
+    Negative control for the test above: without it, the shared-context
+    assertion would also pass if ``route_parallel`` merely preferred the
+    per-call value whenever one happened to be absent.
+    """
+    cso_mock = AsyncMock(return_value="cso-out")
+    with patch.object(SPECIALIST_REGISTRY["cso"], "analyze", cso_mock):
+        asyncio.run(
+            route_parallel(
+                calls=[
+                    {"specialist": "cso", "query": "q", "context": "MODEL_WROTE_THIS"},
+                ],
+                retrieved_knowledge_map={},
+                conversation_context="THE_TURN_CONTEXT",
+            )
+        )
+    assert cso_mock.await_args.kwargs["context"] == "THE_TURN_CONTEXT"
 
 
 def test_route_to_specialist_passes_episodic_to_analyze() -> None:
@@ -77,8 +137,8 @@ def test_route_parallel_distributes_episodic_to_each_specialist() -> None:
         results = asyncio.run(
             route_parallel(
                 calls=[
-                    {"specialist": "cso", "query": "strategy q", "context": "c1"},
-                    {"specialist": "cfo", "query": "finance q", "context": "c2"},
+                    {"specialist": "cso", "query": "strategy q"},
+                    {"specialist": "cfo", "query": "finance q"},
                 ],
                 retrieved_knowledge_map={},
                 episodic_context="SHARED_PAST_DECISIONS",

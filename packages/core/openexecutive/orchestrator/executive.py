@@ -591,6 +591,7 @@ class Executive:
                 debug_collector=debug_collector,
                 consulted_out=consulted,
                 turn_id=turn_id,
+                conversation_context=session.render_conversation_context(user_message),
             ):
                 if isinstance(item, str) and item != self._THINKING:
                     full_response += item
@@ -824,6 +825,7 @@ class Executive:
             consulted_out=consulted,
             specialist_outputs_out=specialist_outputs,
             turn_id=turn_id,
+            conversation_context=session.render_conversation_context(user_message),
         ):
             # Swallow draft text and the THINKING sentinel — the user sees
             # only the revised stream. Pass debug-event dicts through so the
@@ -1099,6 +1101,7 @@ class Executive:
         consulted_out: list[str] | None = None,
         specialist_outputs_out: dict[str, str] | None = None,
         turn_id: str | None = None,
+        conversation_context: str = "",
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Tool-use loop that yields text deltas as they arrive.
 
@@ -1249,11 +1252,14 @@ class Executive:
             skill_tool_uses = [tu for tu in tool_uses if tu["name"] in turn_skill_handlers]
             mcp_tool_uses = [tu for tu in tool_uses if tu["name"] in MCP_TOOL_NAMES]
 
+            # No per-call "context": the tool no longer advertises one, and the
+            # orchestrator forwards a rendered conversation tail to every
+            # specialist via route_parallel(conversation_context=...). A model
+            # that still emits the field is ignored rather than paid for.
             specialist_calls = [
                 {
                     "specialist": tu["input"].get("specialist", ""),
                     "query": tu["input"].get("query", ""),
-                    "context": tu["input"].get("context", ""),
                 }
                 for tu in specialist_tool_uses
             ]
@@ -1280,7 +1286,6 @@ class Executive:
                         {
                             "specialist": c["specialist"],
                             "query": c["query"],
-                            "context": c.get("context", "")[:200],
                         }
                         for c in run_calls
                     ],
@@ -1325,6 +1330,7 @@ class Executive:
                     episodic_context=episodic_context,
                     session_id=session_id,
                     debug_collector=debug_collector,
+                    conversation_context=conversation_context,
                 )
                 spec_ms = round((time.monotonic() - spec_t0) * 1000)
                 for tu, result in zip(
@@ -1364,11 +1370,15 @@ class Executive:
                         details={
                             "iteration": iteration,
                             "duration_ms": spec_ms,
-                            "context_preview": str(call.get("context", ""))[:200],
+                            # The context is now one shared value per turn, not
+                            # per call — read it from what route_parallel was
+                            # actually given, never from the call dict, which no
+                            # longer carries a "context" key.
+                            "context_preview": conversation_context[:200],
                         },
                         full={
                             "query": call["query"],
-                            "context": call.get("context", ""),
+                            "context": conversation_context,
                             "response": spec_result,
                             "active_prompt_blocks": _system_block_names(system_blocks),
                         },
