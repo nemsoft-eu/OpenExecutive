@@ -85,7 +85,15 @@ RAG context goes in the **user turn**, not the system prompt.
 
 4. Add knowledge docs to `knowledge/your_domain/`
 
-5. Add `evals/scenarios/your_domain_001.yaml` and `your_domain_002.yaml`
+5. Add `packages/core/openexecutive/evals/_scenarios/your_domain_001.yaml` and
+   `your_domain_002.yaml` (note: `evals/` at the repo root holds only
+   `run_evals.py` and `judges/` — the scenarios live under `packages/core`).
+   The runner is single-turn (`user_message=scenario["query"]`), so a scenario
+   cannot express a follow-up that depends on a prior turn. Keys the runner
+   reads: `id`, `domain`, `description`, `company_context`, `query`,
+   `expected_topics`, `required_routing`, `quality_criteria` (free-form, passed
+   verbatim to the judge). An unrecognised key is silently ignored, so it looks
+   like a check while doing nothing.
 
 6. If the agent introduces a new pattern (new tool, new routing path, new memory contract), update `packages/core/openexecutive/architecture/architecture-facts.yaml`. Pure additions to `SPECIALIST_REGISTRY` are auto-reflected in the `agents` section without YAML edits.
 

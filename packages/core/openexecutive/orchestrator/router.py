@@ -63,11 +63,16 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "The specific question or task for the specialist. Be precise — they only see this query and the conversation context.",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Relevant context from the conversation that the specialist needs to give a good answer.",
+                    "description": (
+                        "The question for this specialist, in one or two sentences. "
+                        "Name the subject concretely — what is being decided, and the "
+                        "product and figures involved — then the angle this specialist "
+                        "should take. This text is ALSO the search query for the "
+                        "specialist's own knowledge retrieval, so it must make sense "
+                        "on its own. Do not repeat company background or the full "
+                        "conversation: the specialist receives the recent conversation "
+                        "automatically."
+                    ),
                 },
             },
             "required": ["specialist", "query"],
@@ -204,8 +209,21 @@ async def route_parallel(
     episodic_context: str = "",
     session_id: str | None = None,
     debug_collector: DebugCollector | None = None,
+    conversation_context: str = "",
 ) -> list[str]:
     """Execute multiple specialist calls concurrently.
+
+    ``conversation_context`` is the turn's rendered conversation tail, supplied by the
+    caller and forwarded verbatim to every specialist in the batch. It
+    replaces a per-call ``context`` the model used to write itself.
+
+    Measured on the six-specialist fan-out in issue #12: the routing turn
+    emitted 1,724 output tokens and took 58.7 s of generation on the local
+    backend (29.35 t/s) before any specialist started, and the six queries
+    it produced were near-verbatim restatements of the same background. The
+    orchestrator already holds that context, so supplying it here costs no
+    output tokens at all. How much of the 1,724 was the duplication is not
+    separately measured — only the total and the restatement are.
 
     Each specialist receives its own domain-filtered RAG context, fetched
     in parallel before the LLM calls fire. Callers may still supply a
@@ -263,7 +281,7 @@ async def route_parallel(
         result = await route_to_specialist(
             specialist_name=specialist,
             query=call["query"],
-            context=call.get("context", ""),
+            context=conversation_context,
             retrieved_knowledge=knowledge_per_call[idx],
             episodic_context=episodic_context,
             failure_cases=failures_per_call[idx],
