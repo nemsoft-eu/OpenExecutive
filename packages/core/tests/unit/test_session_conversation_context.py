@@ -127,6 +127,64 @@ def test_empty_session_renders_just_the_current_message() -> None:
     assert Session().render_conversation_context("first question") == "User: first question"
 
 
+class _FakeProfile:
+    def __init__(self, block: str) -> None:
+        self._block = block
+
+    def to_prompt_block(self) -> str:
+        return self._block
+
+
+def test_company_profile_reaches_the_specialist() -> None:
+    """A specialist gets no system-level company context of any kind.
+
+    The Executive reads the profile from a cached system block; `BaseAgent.
+    analyze` composes nothing equivalent, so before this a terse
+    company-relative question reached the CFO with no burn, runway or ARR.
+    """
+    session = Session()
+    session.company_profile = _FakeProfile(
+        "## Company Context\n\nARR: EUR 1.4M\nRunway: 14 months\nHeadcount: 11"
+    )
+
+    rendered = session.render_conversation_context("Can we afford ten more hires?")
+
+    assert "Runway: 14 months" in rendered
+    assert rendered.startswith("## Company Context")
+    assert "Can we afford ten more hires?" in rendered
+
+
+def test_profile_survives_an_over_budget_conversation() -> None:
+    """The profile is pinned ahead of the cap, not subject to it.
+
+    The total cap slices from the tail so the current message always survives;
+    appending the profile to the same list would make it the FIRST thing shed,
+    which is the opposite of what it is there for.
+    """
+    session = Session()
+    session.company_profile = _FakeProfile("## Company Context\n\nARR: EUR 1.4M")
+    session.add_user_message("an old question " + "u" * 5_000)
+    session.add_assistant_message("an old answer " + "a" * 9_000)
+
+    rendered = session.render_conversation_context(
+        "the current question", total_max_chars=40
+    )
+
+    assert "ARR: EUR 1.4M" in rendered
+    assert rendered.endswith("the current question")
+
+
+def test_a_broken_profile_does_not_break_the_turn() -> None:
+    class _Exploding:
+        def to_prompt_block(self) -> str:
+            raise ValueError("malformed profile")
+
+    session = Session()
+    session.company_profile = _Exploding()
+
+    assert session.render_conversation_context("q") == "User: q"
+
+
 def test_a_document_cannot_close_the_context_tag_it_is_wrapped_in() -> None:
     """Uploaded document text reaches every specialist inside this block.
 

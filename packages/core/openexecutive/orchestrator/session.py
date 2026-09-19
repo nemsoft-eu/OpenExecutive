@@ -23,6 +23,12 @@ _TAIL_CURRENT_MAX_CHARS = 2_000
 _TAIL_USER_MAX_CHARS = 600
 _TAIL_ASSISTANT_MAX_CHARS = 1_200
 _TAIL_TOTAL_MAX_CHARS = 6_000
+# The Executive gets the company profile in a cached system block; a specialist
+# gets no system-level company context at all, so without this a terse
+# company-relative question ("can we afford ten more hires?") reaches the CFO
+# with no burn, runway, ARR or headcount. The model-written per-call `context`
+# used to carry it; nothing else does.
+_TAIL_PROFILE_MAX_CHARS = 1_200
 
 
 def _inert(text: str) -> str:
@@ -95,6 +101,7 @@ class Session:
         user_max_chars: int = _TAIL_USER_MAX_CHARS,
         assistant_max_chars: int = _TAIL_ASSISTANT_MAX_CHARS,
         total_max_chars: int = _TAIL_TOTAL_MAX_CHARS,
+        profile_max_chars: int = _TAIL_PROFILE_MAX_CHARS,
     ) -> str:
         """Render the recent conversation as plain text for a specialist.
 
@@ -145,6 +152,19 @@ class Session:
                 parts.append(f"Executive: {content[:assistant_max_chars]}")
         parts.append(f"User: {_keep_both_ends(current_message, current_max_chars)}")
         rendered = _inert("\n\n".join(parts))
+        # The profile is pinned ahead of the tail slice below, not appended to
+        # `parts`: it is the only company context a specialist gets, so an
+        # over-budget turn must shed its oldest CONVERSATION, never the profile.
+        # Not passed through _inert — it is rendered from our own structured
+        # profile fields, not from anything a third party wrote.
+        profile = ""
+        if self.company_profile is not None:
+            try:
+                profile = (self.company_profile.to_prompt_block() or "")[:profile_max_chars]
+            except Exception:
+                # A malformed profile degrades to no profile rather than
+                # breaking the turn, matching _emit_memory_snapshot's handling.
+                profile = ""
         # Tail slice, so an over-budget render loses its OLDEST text and always
         # keeps the current message. It cuts at a character, not a turn
         # boundary, so the first surviving turn can arrive as a headless
@@ -152,7 +172,8 @@ class Session:
         # joined result cannot exceed ~5.6k, so this only fires on a malformed
         # history (more assistant turns than user turns, e.g. a corrupted
         # restore).
-        return rendered[-total_max_chars:]
+        conversation = rendered[-total_max_chars:]
+        return f"{profile}\n\n{conversation}" if profile else conversation
 
     def get_recent_history(self, max_turns: int = 20) -> list[dict[str, Any]]:
         history = self.conversation_history[-(max_turns * 2):]

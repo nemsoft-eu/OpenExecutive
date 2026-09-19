@@ -322,7 +322,8 @@ routing:
     name (`mcp_server/server.py`) that DOES take a `context` argument, because
     an external agent has no session here for the orchestrator to render from.
 
-    What it carries — `Session.render_conversation_context` renders the last
+    What it carries — `Session.render_conversation_context` renders a capped
+    company-profile block (1,200 chars) followed by the last
     two exchanges plus the current message, capped per-part (user 600, assistant
     1,200, current 2,000) and 6,000 chars overall. The current message keeps its
     HEAD AND TAIL, with the middle elided, because the channels disagree about
@@ -349,8 +350,14 @@ routing:
     on a malformed history (more assistant turns than user turns, e.g. a
     corrupted restore). Its test passes the cap explicitly for that reason.
 
+    The profile is pinned AHEAD of the total-cap slice, not appended with the
+    turns: the slice cuts from the tail so the current message always survives,
+    which would make an appended profile the first thing shed. It is also not
+    passed through `_inert` — it is rendered from our own structured profile
+    fields, not from third-party text.
+
     Why a tail and not just the message — a specialist receives no message
-    history and no company profile. `BaseAgent.analyze` composes exactly
+    history, and (before the profile block above) no company context at all. `BaseAgent.analyze` composes exactly
     department_memory, past_decisions, failure_cases, relevant_knowledge,
     conversation_context, query. So `<conversation_context>` is its whole view
     of the conversation, and `episodic_context` does not substitute — that is
