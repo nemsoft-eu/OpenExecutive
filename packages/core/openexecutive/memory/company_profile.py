@@ -220,5 +220,53 @@ class CompanyProfile(BaseModel):
 
         return "\n".join(lines)
 
+    def to_specialist_block(self) -> str:
+        """A compact profile for a specialist's conversation context.
+
+        Not a truncation of ``to_prompt_block``: that block runs ~3.7-4.1k chars
+        on the shipped fixtures and orders financials near the END, after target
+        customer, competitors, vendors, priorities and values — so any head
+        slice cheap enough to send to every specialist in a fan-out drops burn
+        and runway, which are the facts the block exists to supply. This selects
+        the decision-relevant fields instead, so the cost is bounded by what is
+        included rather than by where a cut happens to land.
+
+        The Executive keeps the full block; only specialists get this.
+        """
+        if not self.name:
+            return ""
+
+        head = [f"**Company**: {self.name}"]
+        if self.industry:
+            head.append(f"industry {self.industry}")
+        if self.stage:
+            head.append(f"stage {self.stage}")
+        if self.headcount:
+            head.append(f"headcount {self.headcount}")
+        if self.annual_revenue_arr:
+            head.append(f"ARR ${self.annual_revenue_arr:,.0f}")
+        lines = ["## Company Context", "", " · ".join(head)]
+
+        money: list[str] = []
+        if self.financials.burn_rate_monthly is not None:
+            money.append(f"monthly burn ${self.financials.burn_rate_monthly:,.0f}")
+        if self.financials.runway_months is not None:
+            money.append(f"runway {self.financials.runway_months:.1f} months")
+        money.extend(f"{k}: {v}" for k, v in self.financials.key_metrics.items())
+        if money:
+            lines.append("**Financial position**: " + " · ".join(money))
+
+        if self.strategic_priorities.current_year:
+            lines.append(
+                "**Priorities**: " + "; ".join(self.strategic_priorities.current_year)
+            )
+            if self.strategic_priorities.north_star_metric:
+                lines.append(
+                    f"**North star**: {self.strategic_priorities.north_star_metric}"
+                )
+        if self.org_structure.leadership_team:
+            lines.append("**Leadership**: " + ", ".join(self.org_structure.leadership_team))
+        return "\n".join(lines)
+
     def is_empty(self) -> bool:
         return not bool(self.name)

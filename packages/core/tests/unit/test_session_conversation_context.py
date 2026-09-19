@@ -131,8 +131,44 @@ class _FakeProfile:
     def __init__(self, block: str) -> None:
         self._block = block
 
-    def to_prompt_block(self) -> str:
+    def to_specialist_block(self) -> str:
         return self._block
+
+
+def test_real_profiles_reach_specialists_with_their_financials_intact() -> None:
+    """The reason this uses a digest rather than a slice of `to_prompt_block`.
+
+    That block runs 3.7-4.1k chars on the shipped fixtures and orders
+    `**Financial Position**` at char 3,041-3,386 — after target customer,
+    competitors, vendors, priorities and values. Any head slice cheap enough to
+    send to every specialist in a fan-out drops burn and runway, which are the
+    facts the block exists to supply.
+    """
+    import pathlib
+
+    import yaml
+
+    from openexecutive.memory.company_profile import CompanyProfile
+
+    fixtures = sorted(
+        pathlib.Path(__file__).parents[4].glob("fixtures/companies/*/profile.yaml")
+    )
+    assert fixtures, "shipped company fixtures not found"
+
+    for path in fixtures:
+        profile = CompanyProfile.model_validate(
+            yaml.safe_load(path.read_text())["company"]
+        )
+        session = Session()
+        session.company_profile = profile
+
+        rendered = session.render_conversation_context("Can we afford ten more hires?")
+
+        assert profile.name in rendered, path.parent.name
+        # Every fixture carries key metrics even where burn_rate_monthly is unset.
+        assert "**Financial position**" in rendered, path.parent.name
+        # The cap must not be biting on a normal profile.
+        assert "**Priorities**" in rendered, path.parent.name
 
 
 def test_company_profile_reaches_the_specialist() -> None:

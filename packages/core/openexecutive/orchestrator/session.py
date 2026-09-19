@@ -28,7 +28,14 @@ _TAIL_TOTAL_MAX_CHARS = 6_000
 # company-relative question ("can we afford ten more hires?") reaches the CFO
 # with no burn, runway, ARR or headcount. The model-written per-call `context`
 # used to carry it; nothing else does.
-_TAIL_PROFILE_MAX_CHARS = 1_200
+#
+# Sized to `CompanyProfile.to_specialist_block`, which measures 1,242-1,446
+# chars across the three shipped fixtures — the cap clears the largest with
+# headroom rather than being a round number. It is a backstop against an
+# unusually long profile, not a working limit; the digest orders header,
+# financials, then priorities, so a profile that does hit it loses leadership
+# names rather than the numbers.
+_TAIL_PROFILE_MAX_CHARS = 1_800
 
 
 def _inert(text: str) -> str:
@@ -160,7 +167,7 @@ class Session:
         profile = ""
         if self.company_profile is not None:
             try:
-                profile = (self.company_profile.to_prompt_block() or "")[:profile_max_chars]
+                profile = (self.company_profile.to_specialist_block() or "")[:profile_max_chars]
             except Exception:
                 # A malformed profile degrades to no profile rather than
                 # breaking the turn, matching _emit_memory_snapshot's handling.

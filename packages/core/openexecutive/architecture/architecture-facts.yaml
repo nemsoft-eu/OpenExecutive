@@ -322,8 +322,9 @@ routing:
     name (`mcp_server/server.py`) that DOES take a `context` argument, because
     an external agent has no session here for the orchestrator to render from.
 
-    What it carries — `Session.render_conversation_context` renders a capped
-    company-profile block (1,200 chars) followed by the last
+    What it carries — `Session.render_conversation_context` renders `CompanyProfile.to_specialist_block`
+    — a compact digest of company, financials, priorities and leadership,
+    capped at 1,800 chars — followed by the last
     two exchanges plus the current message, capped per-part (user 600, assistant
     1,200, current 2,000) and 6,000 chars overall. The current message keeps its
     HEAD AND TAIL, with the middle elided, because the channels disagree about
