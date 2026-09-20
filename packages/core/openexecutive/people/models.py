@@ -68,10 +68,20 @@ class Person(BaseModel):
     """A real human who can receive work, approve actions, and respond.
 
     `is_principal=True` marks the founding user — the fallback approver for
-    any action when no delegated Person is matched. Exactly one Person should
-    have `is_principal=True`. The API requires a valid `BACKEND_SHARED_SECRET`
-    header for all mutations (see api/main.py), so `is_principal` can only be
-    set by authenticated callers.
+    any action when no delegated Person is matched. Onboarding creates exactly
+    one, but the schema does not enforce that and the system does not assume
+    it: `idx_people_principal` is a plain (not UNIQUE) partial index, and
+    `find_principal_person` resolves a multi-row case by lowest id, so
+    co-principals are a supported state. Note that ordering is by **id**, not
+    by who was promoted first — promoting someone whose id is lower than the
+    sitting principal moves the fallback identity onto them.
+
+    Settable only at creation (onboarding, the fixture loader, `POST /people`):
+    `PersonPatch` carries no such field and `update_person` does not touch the
+    column, so changing it on an existing row is an operator action against the
+    database. That is deliberate — `BACKEND_SHARED_SECRET` is a *service*
+    credential, not a per-user one, and every rostered person with an email can
+    sign in, so a patchable flag would let any teammate self-promote.
 
     `department_slugs` is advisory — it tells the Executive which department
     contexts this person participates in. FK enforcement deferred to Phase 4.

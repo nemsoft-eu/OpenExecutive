@@ -287,13 +287,20 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
     except (KeyError, TypeError, ValueError) as exc:
         return _bad(f"bad arguments: {exc}")
 
-    # The principal flag controls fallback authority and can only be flipped
-    # via the HTTP API behind BACKEND_SHARED_SECRET (see people/models.py).
-    # The Executive must not be able to promote someone via a chat turn —
-    # social-engineering would otherwise bypass the API gate entirely.
+    # The principal flag controls fallback authority. It is settable only at
+    # creation (onboarding, fixtures, POST /people) — no update path exists on
+    # any surface, chat or HTTP (see people/models.py). The Executive must not
+    # be able to promote someone via a chat turn: social engineering would
+    # otherwise be the whole attack.
+    #
+    # This message used to say the flag could be changed "via the authenticated
+    # /people API". It could not — PersonPatch has no such field — so the
+    # refusal pointed the reader at a door that was never built.
     if bool(tool_input.get("is_principal", False)):
         return _bad(
-            "is_principal can only be set via the authenticated /people API, not via chat tools"
+            "is_principal cannot be set here. It is fixed at creation "
+            "(onboarding or POST /people); changing it afterwards is an "
+            "operator action against the database."
         )
 
     person_id = tool_input.get("person_id")
@@ -309,7 +316,9 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         # not be a stealth path to flip the flag off; we block that too.
         if existing.is_principal and not bool(tool_input.get("is_principal", existing.is_principal)):
             return _bad(
-                "is_principal can only be changed via the authenticated /people API"
+                "is_principal cannot be cleared here. Demoting the principal "
+                "is an operator action against the database — and a roster "
+                "with no principal loses proposals silently (issue #24)."
             )
 
     preferred_channel = tool_input.get("preferred_channel", "any")
