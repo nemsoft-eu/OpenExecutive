@@ -1754,20 +1754,36 @@ class Executive:
                         fanout_cap,
                         len(skipped_results),
                     )
-                specialists_consulted.extend(c["specialist"] for c in run_calls)
+                # Record only the calls that reached a real specialist. An
+                # unresolvable name still gets its tool_result above — the
+                # model needs the error to recover, and the API needs one
+                # result per tool_use — but it consulted nobody, so letting it
+                # into these lists would file a specialist_consult row for a
+                # consult that never ran (the audit graph then draws a
+                # specialist node and attributes later tool calls to it) and
+                # seed the synthesis roster, committee reviewer selection and
+                # the department sync with a token they all silently no-op on.
+                # The pre-pass drops such names outright; this is the same rule
+                # on the path that cannot drop them.
+                reached = [
+                    (call, result)
+                    for call, result in zip(run_calls, specialist_results, strict=True)
+                    if resolve_specialist_name(call["specialist"]) is not None
+                ]
+                reached_calls = [c for c, _ in reached]
+                reached_results = [r for _, r in reached]
+                specialists_consulted.extend(c["specialist"] for c in reached_calls)
                 if consulted_out is not None:
-                    consulted_out.extend(c["specialist"] for c in run_calls)
+                    consulted_out.extend(c["specialist"] for c in reached_calls)
                 if specialist_outputs_out is not None:
-                    for call, result in zip(
-                        run_calls, specialist_results, strict=True
-                    ):
+                    for call, result in reached:
                         # Last-write-wins if the same specialist is consulted
                         # in multiple iterations — committee only needs a
                         # representative excerpt per domain.
                         specialist_outputs_out[call["specialist"]] = result
                 _audit_specialist_consults(
-                    run_calls=run_calls,
-                    specialist_results=specialist_results,
+                    run_calls=reached_calls,
+                    specialist_results=reached_results,
                     session_id=session_id,
                     turn_id=turn_id,
                     iteration=iteration,

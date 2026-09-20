@@ -82,12 +82,39 @@ def test_route_parallel_survives_a_non_string_name(bad: object) -> None:
     route_to_specialist, and retrieval runs BEFORE dispatch — an unhashable
     name reached DOMAIN_ALIASES.get() and raised TypeError out of the gather,
     failing the whole turn before route_to_specialist's guard could answer."""
+    # Short query on purpose: it trips retriever._MIN_QUERY_CHARS so the real
+    # retrieve() returns without touching ChromaDB. That bypass sits AFTER the
+    # `DOMAIN_ALIASES.get(specialist_name)` lookup that raised on an unhashable
+    # name (retriever.py — lookup ~189, bypass ~207), so the raising path is
+    # still exercised. If those two are ever reordered this test would keep
+    # passing for the wrong reason; `_lookup_precedes_the_short_query_bypass`
+    # below pins the ordering so that cannot happen silently.
     with patch("openexecutive.orchestrator.router.audit_log"):
         results = asyncio.run(
             route_parallel([{"specialist": bad, "query": "q"}])  # type: ignore[list-item]
         )
     assert len(results) == 1
     assert "Unknown specialist" in results[0]
+
+
+def test_lookup_precedes_the_short_query_bypass() -> None:
+    """Pins the ordering the test above depends on.
+
+    `retrieve()` must consult DOMAIN_ALIASES before the short-query bypass
+    returns, or a short-query test stops exercising the unhashable-name path
+    and silently passes for the wrong reason.
+    """
+    import inspect
+
+    from openexecutive.knowledge import retriever
+
+    src = inspect.getsource(retriever.retrieve)
+    lookup = src.index("DOMAIN_ALIASES.get(specialist_name)")
+    bypass = src.index("_MIN_QUERY_CHARS")
+    assert lookup < bypass, (
+        "short-query bypass now precedes the DOMAIN_ALIASES lookup; "
+        "test_route_parallel_survives_a_non_string_name needs a longer query"
+    )
 
 
 def test_no_registry_key_prefixes_another() -> None:

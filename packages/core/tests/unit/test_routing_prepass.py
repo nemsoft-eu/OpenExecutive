@@ -805,6 +805,433 @@ def test_no_routing_decision_when_the_model_picked_nobody() -> None:
     assert collector._events == []
 
 
+class _RecordingCollector:
+    """Minimal DebugCollector stand-in that records every emitted event."""
+
+    def __init__(self) -> None:
+        self._events: list[dict[str, Any]] = []
+
+    def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        evt = {"kind": kind, **payload}
+        self._events.append(evt)
+        return evt
+
+    def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
+        return {"sse": evt}
+
+
+def _drive_loop_with_consults(
+    scripted: list[Any], collector: _RecordingCollector
+) -> None:
+    """Run _stream_agent_loop (pre-pass off) over a scripted provider."""
+
+    class _Stream:
+        def __init__(self, msg: Any) -> None:
+            self._msg = msg
+
+        async def __aenter__(self) -> "_Stream":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        def __aiter__(self) -> Any:
+            async def _gen() -> Any:
+                return
+                yield
+
+            return _gen()
+
+        async def get_final_message(self) -> Any:
+            return self._msg
+
+    queue = list(scripted)
+    provider = AsyncMock()
+    provider.messages_stream = lambda **kw: _Stream(queue.pop(0))
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        exec_._settings = exec_._settings.model_copy(
+            update={"routing_prepass_enabled": False}
+        )
+        async for _ in exec_._stream_agent_loop(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            search=None,
+            debug_collector=collector,
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(side_effect=lambda calls, **kw: ["analysis"] * len(calls)),
+        ),
+        patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.executive.audit_log"),
+    ):
+        asyncio.run(_drive())
+
+
+def test_synthesis_start_re_emits_when_the_roster_grows() -> None:
+    """A second consult round must update the panel, not be swallowed.
+
+    Firing only once would report the first round's roster forever and never
+    mention a specialist consulted later in the turn.
+    """
+    collector = _RecordingCollector()
+    round1 = _Response([_consult("tu_1", "cso")], stop_reason="tool_use")
+    round1.usage = None
+    round2 = _Response([_consult("tu_2", "cfo")], stop_reason="tool_use")
+    round2.usage = None
+    done = _Response([_Block("text", text="final")], stop_reason="end_turn")
+    done.usage = None
+
+    _drive_loop_with_consults([round1, round2, done], collector)
+
+    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    assert len(synth) == 2, f"expected one emit per roster growth, got {len(synth)}"
+    assert synth[0]["specialists_consulted"] == ["cso"]
+    assert synth[1]["specialists_consulted"] == ["cso", "cfo"]
+    assert synth[1]["specialist_count"] == 2
+
+
+def test_synthesis_start_fires_at_iteration_one_from_the_prepass_roster() -> None:
+    """The scenario the re-emit-on-growth logic exists for, end to end.
+
+    Every other synthesis test disables the pre-pass, and the one wiring test
+    stubs it with a spy that never touches specialists_consulted — so the
+    pre-pass-seeded path was untested despite being the default.
+    """
+    collector = _RecordingCollector()
+
+    class _Stream:
+        async def __aenter__(self) -> "_Stream":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        def __aiter__(self) -> Any:
+            async def _gen() -> Any:
+                return
+                yield
+
+            return _gen()
+
+        async def get_final_message(self) -> Any:
+            msg = _Response([_Block("text", text="final")], stop_reason="end_turn")
+            msg.usage = None
+            return msg
+
+    provider = AsyncMock()
+    provider.messages_stream = lambda **kw: _Stream()
+    # The real _routing_prepass runs; only its provider call is scripted.
+    provider.messages_create = AsyncMock(
+        return_value=_Response([_consult("tu_1", "cso")])
+    )
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        exec_._settings = exec_._settings.model_copy(
+            update={"routing_prepass_enabled": True}
+        )
+        async for _ in exec_._stream_agent_loop(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            search=None,
+            debug_collector=collector,
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(return_value=["strategy-says"]),
+        ),
+        patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.executive.audit_log"),
+    ):
+        asyncio.run(_drive())
+
+    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    assert len(synth) == 1, f"expected exactly one emit, got {len(synth)}"
+    assert synth[0]["specialists_consulted"] == ["cso"]
+
+
+def test_synthesis_start_does_not_repeat_for_an_unchanged_roster() -> None:
+    """Control for the test above: a non-specialist tool round must not
+    re-announce synthesis with the same roster."""
+    collector = _RecordingCollector()
+    consult_round = _Response([_consult("tu_1", "cso")], stop_reason="tool_use")
+    consult_round.usage = None
+    skill_round = _Response(
+        [_Block("tool_use", id="tu_2", name="list_people", input={})],
+        stop_reason="tool_use",
+    )
+    skill_round.usage = None
+    done = _Response([_Block("text", text="final")], stop_reason="end_turn")
+    done.usage = None
+
+    _drive_loop_with_consults([consult_round, skill_round, done], collector)
+
+    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    assert len(synth) == 1, f"roster did not grow; expected one emit, got {len(synth)}"
+    assert synth[0]["specialists_consulted"] == ["cso"]
+
+
+def test_main_loop_does_not_record_an_unresolvable_name_as_a_consult() -> None:
+    """The loop cannot drop the tool_use (the API needs one result per
+    tool_use, and the model needs the error to recover) — but an unresolvable
+    name reached nobody, so it must not be filed as a consult. Otherwise the
+    audit graph draws a specialist node for `zzz` and attributes later tool
+    calls to it, which is the failure this whole change exists to remove."""
+    consulted: list[str] = []
+    outputs: dict[str, str] = {}
+    audited: list[tuple[str, Any]] = []
+
+    class _Stream:
+        def __init__(self, msg: Any) -> None:
+            self._msg = msg
+
+        async def __aenter__(self) -> "_Stream":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        def __aiter__(self) -> Any:
+            async def _gen() -> Any:
+                return
+                yield
+
+            return _gen()
+
+        async def get_final_message(self) -> Any:
+            return self._msg
+
+    bad = _Response([_consult("tu_1", "zzz")], stop_reason="tool_use")
+    bad.usage = None
+    done = _Response([_Block("text", text="done")], stop_reason="end_turn")
+    done.usage = None
+    queue = [bad, done]
+    provider = AsyncMock()
+    provider.messages_stream = lambda **kw: _Stream(queue.pop(0))
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        audited.append((event_type, kw.get("actor")))
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        exec_._settings = exec_._settings.model_copy(
+            update={"routing_prepass_enabled": False}
+        )
+        async for _ in exec_._stream_agent_loop(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            search=None,
+            consulted_out=consulted,
+            specialist_outputs_out=outputs,
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+        patch("openexecutive.orchestrator.router.audit_log"),
+    ):
+        asyncio.run(_drive())
+
+    assert consulted == [], f"unresolvable name recorded as consulted: {consulted}"
+    assert outputs == {}
+    assert [a for a in audited if a[0] == "specialist_consult"] == [], (
+        f"filed a specialist_consult for a consult that never ran: {audited}"
+    )
+
+
+def test_main_loop_still_records_a_resolvable_consult() -> None:
+    """Control for the test above: the filter must not swallow real consults."""
+    consulted: list[str] = []
+    audited: list[tuple[str, Any]] = []
+
+    class _Stream:
+        def __init__(self, msg: Any) -> None:
+            self._msg = msg
+
+        async def __aenter__(self) -> "_Stream":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        def __aiter__(self) -> Any:
+            async def _gen() -> Any:
+                return
+                yield
+
+            return _gen()
+
+        async def get_final_message(self) -> Any:
+            return self._msg
+
+    good = _Response([_consult("tu_1", "cso")], stop_reason="tool_use")
+    good.usage = None
+    done = _Response([_Block("text", text="done")], stop_reason="end_turn")
+    done.usage = None
+    queue = [good, done]
+    provider = AsyncMock()
+    provider.messages_stream = lambda **kw: _Stream(queue.pop(0))
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        audited.append((event_type, kw.get("actor")))
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        exec_._settings = exec_._settings.model_copy(
+            update={"routing_prepass_enabled": False}
+        )
+        async for _ in exec_._stream_agent_loop(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            search=None,
+            consulted_out=consulted,
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(return_value=["strategy-says"]),
+        ),
+        patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+    ):
+        asyncio.run(_drive())
+
+    assert consulted == ["cso"]
+    assert ("specialist_consult", "cso") in audited
+
+
+def test_audit_row_shape_differs_only_by_phase_between_call_sites() -> None:
+    """The shared helper exists so the two call sites cannot drift; nothing
+    pinned its payload, so a schema change at one site would go unnoticed."""
+    from openexecutive.orchestrator.executive import _audit_specialist_consults
+
+    captured: list[dict[str, Any]] = []
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        captured.append({"event_type": event_type, "summary": summary, **kw})
+
+    calls = [{"specialist": "cso", "query": "the question"}]
+    with patch("openexecutive.orchestrator.executive.audit_log", _record):
+        for phase, iteration in (("prepass", 0), ("loop", 2)):
+            _audit_specialist_consults(
+                run_calls=calls,
+                specialist_results=["the answer"],
+                session_id="s-1",
+                turn_id="t-1",
+                iteration=iteration,
+                phase=phase,
+                duration_ms=42,
+                conversation_context="CTX",
+                system_blocks=[],
+            )
+
+    prepass, loop = captured
+    for row in (prepass, loop):
+        assert row["event_type"] == "specialist_consult"
+        assert row["actor"] == "cso"
+        assert row["details"]["duration_ms"] == 42
+        assert row["details"]["context_preview"] == "CTX"
+        assert row["full"]["query"] == "the question"
+        assert row["full"]["response"] == "the answer"
+    assert prepass["details"]["phase"] == "prepass"
+    assert prepass["details"]["iteration"] == 0
+    assert loop["details"]["phase"] == "loop"
+    assert loop["details"]["iteration"] == 2
+
+
+def test_prepass_audits_a_dropped_name_as_routing_anomaly() -> None:
+    """The headline "malformed names stop being invisible" claim — unasserted
+    until now, because every other test patches audit_log with a bare mock."""
+    captured: list[tuple[str, Any]] = []
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        captured.append((event_type, kw.get("details")))
+
+    provider = AsyncMock()
+    provider.messages_create = AsyncMock(
+        return_value=_Response([_consult("tu_1", "zzz")])
+    )
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        async for _ in exec_._routing_prepass(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            episodic_context="",
+            debug_collector=None,
+            consulted_out=None,
+            specialist_outputs_out=None,
+            turn_id=None,
+            conversation_context="",
+            specialists_consulted=[],
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+    ):
+        asyncio.run(_drive())
+
+    assert ("routing_anomaly", {"requested": "zzz", "resolved": None}) in captured
+    assert [c for c in captured if c[0] == "specialist_consult"] == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [({"specialist": "cso"}, {"specialist": "cso"}), (None, {}), (["cs"], {}), ("x", {})],
+)
+def test_tool_input_coerces_a_non_dict_to_empty(value: Any, expected: Any) -> None:
+    """Only Anthropic validates tool arguments; a local backend can hand back
+    null or a list, on which .get() raises."""
+    from openexecutive.orchestrator.executive import _tool_input
+
+    assert _tool_input({"input": value}) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("cso", "cso"), ("cs", "cso"), ("CSO", "cso"), ("zzz", "zzz"), (None, "None")],
+)
+def test_canonical_specialist_contract(raw: Any, expected: str) -> None:
+    """Returns the registry key, or the name unchanged so the unresolvable case
+    still reaches route_to_specialist for its error string."""
+    from openexecutive.orchestrator.executive import _canonical_specialist
+
+    assert _canonical_specialist(raw) == expected
+
+
 def test_prepass_records_a_cache_event_for_its_own_call() -> None:
     """/audit/usage aggregates cache_event only — an unrecorded call under-reports cost."""
     provider = AsyncMock()
