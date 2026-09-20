@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.audit import log_event as audit_log
 
 if TYPE_CHECKING:
     from openexecutive.orchestrator.debug_events import DebugCollector
@@ -18,6 +20,8 @@ from openexecutive.agents.product import ProductAgent
 from openexecutive.agents.strategy import StrategyAgent
 from openexecutive.agents.talent import TalentAgent
 from openexecutive.agents.triage import TriageAgent
+
+logger = logging.getLogger(__name__)
 
 SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "cso": StrategyAgent(),
@@ -83,6 +87,51 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def resolve_specialist_name(specialist_name: str) -> str | None:
+    """Map a model-emitted specialist name onto a registry key, or None.
+
+    Local models truncate and re-case the `specialist` enum value: `cso` has
+    been observed arriving as `cs` and `csO`, and `cfo`/`cmo` as `cf`/`cm`.
+    An unresolved name used to be answered with a plain "Unknown specialist"
+    string, so the turn looked like it consulted someone while consulting
+    nobody — in one measured sample every consult in the turn was malformed.
+
+    Two tolerances:
+      - case-fold, since only the casing differs;
+      - a prefix that matches exactly one registry key.
+
+    A prefix matching several keys stays unresolved: guessing between `cso`
+    and `coo` would route the question to the wrong executive, which is worse
+    than not routing it at all.
+
+    Uniqueness is a property of the CURRENT roster, not of the algorithm.
+    Today `b` resolves to `board_comms` and `g` to `gc` because nothing else
+    starts with those letters; adding a specialist would correctly turn those
+    into None, and a key that is a prefix of another key would make the longer
+    one unreachable by prefix. `test_no_registry_key_prefixes_another` pins
+    the second case so the roster cannot drift into it silently.
+    """
+    # A local OpenAI-compatible backend passes tool arguments through
+    # json.loads unvalidated, so `specialist` can arrive as null, a number, or
+    # a list. Anthropic enforces the enum; nothing else does. Reject early —
+    # before this guard, `.strip()` on a non-str raised out of route_parallel's
+    # asyncio.gather and failed the whole turn instead of returning a
+    # tool_result the model could recover from.
+    if not isinstance(specialist_name, str):
+        return None
+    if specialist_name in SPECIALIST_REGISTRY:
+        return specialist_name
+    folded = specialist_name.strip().casefold()
+    if folded in SPECIALIST_REGISTRY:
+        return folded
+    if not folded:
+        return None
+    matches = [key for key in SPECIALIST_REGISTRY if key.startswith(folded)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -101,9 +150,43 @@ async def route_to_specialist(
     consults so the two stay separable in the ``/audit/usage`` by-source
     breakdown.
     """
-    agent = SPECIALIST_REGISTRY.get(specialist_name)
-    if agent is None:
-        return f"Unknown specialist: {specialist_name}"
+    resolved = resolve_specialist_name(specialist_name)
+    # `specialist_name` may be any JSON value off a local backend, so render it
+    # for display rather than slicing it.
+    requested = str(specialist_name)[:80]
+    if resolved is None:
+        # ROUTING_ANOMALY, not specialist_consult: the audit graph turns every
+        # specialist_consult row into a specialist node AND sets
+        # last_specialist_in_turn, which later tool_invocation rows are
+        # attributed to. Filing a consult that never ran under that type would
+        # invert the very bug this fixes — a turn that looks routed and is not.
+        audit_log(
+            "routing_anomaly",
+            f"Unresolved specialist name: {requested}",
+            actor="router",
+            details={
+                "requested": requested,
+                "resolved": None,
+                "valid": sorted(SPECIALIST_REGISTRY),
+            },
+        )
+        return (
+            f"Unknown specialist: {requested}. "
+            f"Valid names: {', '.join(sorted(SPECIALIST_REGISTRY))}."
+        )
+    if resolved != specialist_name:
+        logger.info(
+            "specialist name normalised: %r -> %r", specialist_name, resolved
+        )
+        # Also routing_anomaly: the real consult is audited by the caller, so
+        # a specialist_consult row here would double-count one consult.
+        audit_log(
+            "routing_anomaly",
+            f"Normalised specialist name {requested} -> {resolved}",
+            actor="router",
+            details={"requested": requested, "resolved": resolved},
+        )
+    agent = SPECIALIST_REGISTRY[resolved]
     return await agent.analyze(
         query=query,
         context=context,
@@ -246,6 +329,30 @@ async def route_parallel(
     Returns results in the same order as ``calls`` so callers can zip
     with tool_use_ids.
     """
+    # Normalise every name HERE, before retrieval, department prefetch and the
+    # debug labels read it — not only inside route_to_specialist. Resolving
+    # late still dispatches the right agent, but a truncated `cs` would reach
+    # retrieve(specialist_name="cs"), whose DOMAIN_ALIASES lookup misses and
+    # silently degrades to UNFILTERED retrieval; skip the department prefetch
+    # (slug_for_specialist -> None); label the debug events with the raw
+    # token; and key consulted_out on "cs", which committee reviewer selection
+    # and the Honcho department sync both drop. That would make a malformed
+    # name worse than the plain error string it used to produce.
+    # An unresolvable name is left as-is so route_to_specialist returns its
+    # error string and audits the anomaly exactly once.
+    # str() on the fallback, not just the resolved value: an unresolvable name
+    # is carried through to route_to_specialist for its error string, but
+    # retrieval runs FIRST and DOMAIN_ALIASES.get() raises TypeError on an
+    # unhashable list/dict — out of the gather below, failing the whole turn
+    # before the guard in route_to_specialist is ever reached.
+    calls = [
+        {
+            **c,
+            "specialist": resolve_specialist_name(c["specialist"])
+            or str(c["specialist"]),
+        }
+        for c in calls
+    ]
     if retrieved_knowledge_map is None:
         knowledge_futures = [_retrieve_for_call(c) for c in calls]
         failures_futures = [_retrieve_failures_for_call(c) for c in calls]

@@ -312,6 +312,76 @@ providers:
 routing:
   pattern: Anthropic tool use with a single `consult_specialist` tool. Multiple parallel tool_use blocks per assistant turn fan out to specialists concurrently.
   parallel_function: openexecutive.orchestrator.router.route_parallel
+  prepass: |
+    `Executive._routing_prepass` runs one model call BEFORE the main tool-use
+    loop, offering `consult_specialist` and nothing else
+    (`ROUTING_PREPASS_ENABLED`, default true). Its picks are dispatched through
+    the same `route_parallel` fan-out and replayed into `current_messages` as a
+    matching tool_use/tool_result pair, so the main loop — otherwise untouched,
+    still holding all ~59 tools — opens with the specialist findings in hand.
+
+    Why it exists: on the full surface `consult_specialist` competes with ~58
+    client tools and a small model does not reach for it. Measured with
+    direct-provider probes against qwen3.8:27b-mtp-q4_K_M-128k on "What should
+    I be focusing on right now, and in what order?" (n=12 per arm):
+    production surface 1/12 consulting turns; persona directive alone 6/12;
+    solo tool surface alone 3/6; both together 11/12. The two levers are
+    roughly independent, so BOTH the pre-pass and the persona's
+    "Consulting Your Leadership Team" section are load-bearing — removing
+    either one roughly halves routing.
+
+    NOTE that 11/12 arm used a probe-only directive string. Re-verified twice
+    against the SHIPPED persona constant end to end: advisory 9/12 then 11/12,
+    action turn 0/12 then 1/12. Quote the range, not a single run — the spread
+    between two identical n=12 runs is about as wide as the effect some
+    single-run comparisons would claim.
+
+    The second run also produced live confirmation of the truncation defect and
+    its fix: the model emitted `cs`, which resolve_specialist_name rescued to
+    `cso`.
+
+    Safety property: a pre-pass that picks nobody appends NOTHING, so an action
+    turn ("schedule X") falls through to the loop exactly as before. Measured
+    false-positive rate on action/lookup turns with the persona's
+    "consulting is for judgement" paragraph in place: 2/6 add-person, 0/6
+    schedule, 1/6 lookup. A provider failure is caught and logged, never raised
+    — the main loop still offers `consult_specialist`, so the cost is routing
+    quality, not the answer.
+
+    Cost: the pre-pass is a different cached prefix from the main turn (tools
+    render at the prompt head), so neither warms the other. Measured with
+    generation pinned to one token: main turn warm 0.27s, pre-pass 0.82s, main
+    turn after pre-pass 0.66s — about +0.4s of prompt processing. An earlier
+    run at max_tokens=256 appeared to show ~+11s; that was an output-length
+    confound, not prefix thrash.
+  name_normalisation: |
+    `router.resolve_specialist_name` maps a model-emitted `specialist` value
+    onto a registry key: exact, then case-folded, then a prefix matching
+    exactly ONE key. An ambiguous prefix (`c` spans cso/cfo/chro/coo/cmo/cpo)
+    resolves to None rather than guessing — routing to the wrong executive is
+    worse than not routing. Non-str input (a local backend can send null, a
+    number or a list — only Anthropic enforces the enum) returns None instead
+    of raising out of route_parallel's gather and failing the turn.
+
+    APPLIED IN `route_parallel`, before the fan-out — not at dispatch. Late
+    normalisation still reaches the right agent but leaves the raw token in
+    every consumer: `retrieve(specialist_name="cs")` misses DOMAIN_ALIASES and
+    degrades to UNFILTERED retrieval, `slug_for_specialist("cs")` is None so
+    department memory is skipped, debug labels show the raw token, and
+    consulted_out keyed "cs" is dropped by both committee reviewer selection
+    and the Honcho dept sync. That would make a malformed name worse than the
+    error string it replaced. Uniqueness of a one-letter prefix (`b`, `g`) is
+    a property of the current ten-key roster, not of the algorithm;
+    `test_no_registry_key_prefixes_another` pins the invariant that no key
+    prefixes another.
+
+    Why: qwen3.8:27b truncates the enum to two characters. Observed in one
+    n=12 probe arm: `cs`, `cf`, `cm`, and `csO`. One sampled turn emitted
+    `['cs', 'cf', 'cm']` — three consults, none of which reached a specialist,
+    because the old code returned a bare "Unknown specialist: cs" string as the
+    tool_result. Nothing distinguished that from a real consult in the audit
+    log, which is why both the normalisation and the unresolved case now emit
+    a `specialist_consult` audit row.
   conversation_context: |
     The Executive's `consult_specialist` tool (`router.SPECIALIST_TOOLS`) takes
     only `specialist` and `query`. There is deliberately NO per-call `context`

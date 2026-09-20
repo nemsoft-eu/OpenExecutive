@@ -1,0 +1,21 @@
+# Scope note: see routing_prepass_001. `judge_chat` reads only `query` and
+# `expected_topics`, so this scenario CANNOT assert "consulted nobody" — that
+# is pinned in tests/unit/test_routing_prepass.py and measured by probe (0/12
+# consults on this question with the shipped persona). What it can catch is
+# the user-visible symptom of over-consulting: an action request that comes
+# back as analysis instead of a confirmation.
+id: routing_prepass_002
+domain: cross_domain
+description: "Action request — the pre-pass must not turn a scheduling instruction into an advisory essay"
+company_context:
+  stage: "Bootstrapped"
+  industry: "B2B SaaS"
+  arr: 400000
+  headcount: 6
+query: "Schedule a follow-up with the Rotterdam client for next Tuesday."
+# Deliberately narrow. The routing pre-pass offers only `consult_specialist`,
+# so the risk it introduces is over-consulting; a turn that consulted the CSO
+# here would return strategy commentary and score badly on these topics.
+expected_topics:
+  - confirmation_of_the_scheduled_action
+  - the_specific_client_and_day
