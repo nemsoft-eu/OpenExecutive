@@ -63,6 +63,7 @@ from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOLS,
 )
 from openexecutive.orchestrator.router import (
+    NAME_PREVIEW_CHARS,
     SPECIALIST_TOOLS,
     audit_name_resolution,
     partition_specialist_fanout,
@@ -1266,14 +1267,6 @@ class Executive:
         # per-reason counters would make every future `continue` responsible
         # for keeping the arithmetic true.
         requested_count = len(consult_blocks)
-        last_tool_use = next(
-            (
-                b
-                for b in reversed(decision.content)
-                if getattr(b, "type", None) == "tool_use"
-            ),
-            None,
-        )
         for block in decision.content:
             # Carry the OpenRouter reasoning array into the replayed assistant
             # turn. Every other block-by-block replay in this repo does; the
@@ -1287,26 +1280,49 @@ class Executive:
                 continue
             if block.name != "consult_specialist":
                 continue
-            # A tool_use truncated mid-arguments deserializes with a missing or
-            # empty query, which would dispatch a specialist with nothing to
-            # answer. Only the last TOOL_USE can be the truncated one — not the
-            # last content block: the translator always appends the synthetic
-            # `openrouter_reasoning` block last, so on the OpenAI-compatible
-            # path (exactly the local reasoning models this pre-pass exists
-            # for) no tool_use is ever content[-1] and a positional check would
-            # never fire. getattr: not every adapter sets stop_reason.
-            if (
-                getattr(decision, "stop_reason", None) == "max_tokens"
-                and block is last_tool_use
-            ):
-                logger.warning(
-                    "routing pre-pass hit max_tokens; dropping truncated tool_use"
-                )
-                continue
             # A tool_use's `input` is always a dict: Anthropic validates it
             # against the schema, and translator._parse_tool_arguments coerces
             # a non-object payload to {} for every OpenAI-compatible provider.
             block_input = block.input
+            # One rule, not three: a consult carrying no question is dropped,
+            # whatever produced it. Dispatching one bills a specialist call that
+            # can only answer generically and files a consult in the audit graph
+            # for a turn that reached nobody — the looks-routed-but-isn't
+            # failure this pre-pass exists to fix.
+            #
+            # Truncation is the usual source: the pre-pass runs on a 1024-token
+            # budget, and a tool_use cut mid-arguments deserializes with `query`
+            # missing or blank. But `stop_reason == "max_tokens"` is NOT
+            # evidence that a given call was the casualty — a reasoning model
+            # routinely finishes a complete consult and then spends the rest of
+            # the budget thinking — and a blank query is worth dropping even
+            # when nothing was truncated. Keying the drop on stop_reason plus
+            # "is the last tool_use" got both directions wrong at once: it
+            # discarded a complete final consult (making the pre-pass a no-op)
+            # while still dispatching a blank one that happened to be emitted
+            # first. The query is the thing actually being tested, so test it
+            # alone. stop_reason stays in the log line, where it is diagnosis
+            # rather than control flow; getattr because not every adapter sets
+            # it.
+            #
+            # The main tool loop deliberately has no equivalent drop: there the
+            # model has already been shown a tool surface, so a blank consult
+            # can be answered with a tool_result it can re-ask from. The
+            # pre-pass has no such recovery — it either dispatches or discards.
+            if not str(block_input.get("query") or "").strip():
+                # Name the block and the requested specialist: several blank
+                # consults in one decision are otherwise indistinguishable in
+                # the log, and this drop writes no audit row to correlate with.
+                # The name is model-emitted, so it gets the same preview cap
+                # the router applies before echoing one.
+                logger.warning(
+                    "routing pre-pass: dropping consult with no query "
+                    "(id=%s specialist=%r stop_reason=%s)",
+                    getattr(block, "id", None),
+                    str(block_input.get("specialist", ""))[:NAME_PREVIEW_CHARS],
+                    getattr(decision, "stop_reason", None),
+                )
+                continue
             raw_name = block_input.get("specialist", "")
             resolved = resolve_specialist_name(raw_name)
             if resolved is None:
@@ -1357,7 +1373,12 @@ class Executive:
         # the counts are what carry it. Note the Agent Activity panel renders
         # this event from `specialists` alone, so an all-dropped decision shows
         # there as an empty routing line — the detail lives in the event stream
-        # and the routing_anomaly audit rows.
+        # and, for a name that failed to resolve, the routing_anomaly audit
+        # rows. A consult dropped for a blank query writes no audit row: there
+        # is no name anomaly to record, and the drop happens before the name is
+        # read. That class is visible only here and in the log line above, so
+        # `skipped_count` exceeding the number of routing_anomaly rows for the
+        # turn is expected, not a gap.
         if debug_collector and requested_count:
             evt = debug_collector.emit("routing_decision", {
                 "iteration": 0,

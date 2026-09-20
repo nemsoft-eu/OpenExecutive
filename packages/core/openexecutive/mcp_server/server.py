@@ -37,18 +37,44 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 logger = logging.getLogger(__name__)
 
 # Sorted roster of specialist keys, kept in lockstep with
-# ``orchestrator/router.SPECIALIST_REGISTRY`` by a unit test. Declared as a
-# ``Literal`` so MCP clients see a proper enum in the tool schema.
+# ``orchestrator/router.SPECIALIST_REGISTRY`` by a unit test. This is the
+# canonical closed set, used to derive the advertised enum and by
+# ``specialist_keys()``.
+#
+# Do NOT annotate a tool parameter with it. FastMCP validates arguments against
+# the handler's type hints before the body runs, so a ``Literal`` parameter is a
+# hard schema-level rejection of anything outside the set — see ``SpecialistArg``
+# for why that is the wrong contract for a model-emitted value.
 SpecialistKey = Literal[
     "board_comms", "cfo", "chro", "cmo", "coo", "cpo", "cso", "gc", "talent", "triage"
+]
+
+# What the ``consult_specialist`` tool accepts on the wire. The roster above is
+# advertised verbatim in the generated JSON Schema — clients still see the ten
+# canonical values — but the annotation is ``str``, so *server-side* validation
+# does not reject a value outside it and `resolve_specialist_name` gets its
+# chance to recover a re-cased or truncated name like `csO` or `cs`. With a bare
+# ``Literal`` the resolver was unreachable: Pydantic raised `literal_error`
+# first, which both diverged from the chat path and lost the `routing_anomaly`
+# audit row `route_to_specialist` writes when it corrects a name.
+#
+# The tolerance is server-side only, and deliberately so. The advertised schema
+# still carries `enum`, so a client that validates outbound arguments against it
+# will refuse to send `csO` before the request leaves — correct behaviour, since
+# a client that can tell the name is wrong should say so early. What this buys
+# is the case the resolver was written for: a *model* emitting a truncated name
+# through a client that passes arguments straight through.
+SpecialistArg = Annotated[
+    str, Field(json_schema_extra={"enum": list(get_args(SpecialistKey))})
 ]
 
 _INSTRUCTIONS = (
@@ -282,7 +308,7 @@ async def talent_engagements() -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def consult_specialist(
-    specialist: SpecialistKey, query: str, context: str = ""
+    specialist: SpecialistArg, query: str, context: str = ""
 ) -> str:
     """Consult one of Open Executive's specialist executives for domain analysis.
 
@@ -301,6 +327,7 @@ async def consult_specialist(
         context: Relevant background from your own task to ground the answer.
     """
     from openexecutive.orchestrator.router import (
+        NAME_PREVIEW_CHARS,
         SPECIALIST_REGISTRY,
         resolve_specialist_name,
         route_to_specialist,
@@ -312,10 +339,17 @@ async def consult_specialist(
     # short-circuit `route_to_specialist` before it can audit the anomaly.
     # A genuinely unresolvable name still raises, because an MCP caller is a
     # program that wants an error, not a model that wants a recoverable
-    # tool_result.
+    # tool_result. The RAW name is what gets forwarded — `route_to_specialist`
+    # resolves it again and writes the `routing_anomaly` row at the point it
+    # makes the correction, so normalising here would erase the anomaly.
     if resolve_specialist_name(specialist) is None:
         valid = ", ".join(sorted(SPECIALIST_REGISTRY))
-        raise ValueError(f"Unknown specialist {specialist!r}. Valid: {valid}")
+        # Truncated for the same reason router.py truncates it in both its own
+        # messages: since the annotation widened to `str`, this value is
+        # arbitrary unbounded text from an external client, and it lands in the
+        # tool error and in FastMCP's ERROR log line.
+        shown = specialist[:NAME_PREVIEW_CHARS]
+        raise ValueError(f"Unknown specialist {shown!r}. Valid: {valid}")
     return await route_to_specialist(
         specialist, query, context=context, actor="specialist_mcp",
     )

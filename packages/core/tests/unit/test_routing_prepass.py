@@ -552,11 +552,17 @@ def _reasoning_block() -> _Block:
 
 
 def test_truncated_tool_use_is_dropped_behind_a_trailing_reasoning_block() -> None:
-    """The guard must key on the last TOOL_USE, not the last content block.
+    """A blank-query consult is dropped while its complete sibling survives.
 
-    The translator appends `openrouter_reasoning` last, so on exactly the local
-    reasoning models this pre-pass exists for, no tool_use is ever content[-1]
-    and a positional check would never fire.
+    This is the shape the OpenRouter path produces: the translator appends a
+    synthetic `openrouter_reasoning` block after the tool_use blocks whenever
+    the response carries `reasoning_details`. It is one arrangement, not the
+    only one — that field is an OpenRouter extension, so a plain local
+    OpenAI-compatible server emits no trailing block and a tool_use lands
+    last. The drop deliberately keys on neither position nor `stop_reason`
+    (see `test_blank_query_is_dropped_wherever_it_sits`); this pins the
+    behaviour in the arrangement where a naive positional check would have
+    looked correct.
     """
     resp = _Response(
         [
@@ -597,6 +603,109 @@ def test_truncated_tool_use_is_dropped_behind_a_trailing_reasoning_block() -> No
         asyncio.run(_drive())
 
     assert consulted == ["cso"]
+
+
+def test_complete_last_consult_survives_max_tokens() -> None:
+    """Hitting the budget does not mean the last call was the casualty.
+
+    A reasoning model routinely finishes a complete `consult_specialist` and
+    then spends what is left of the 1024-token budget thinking, so the response
+    carries `stop_reason="max_tokens"` with a perfectly well-formed last (and
+    here only) tool_use. Dropping on position alone discarded it and turned the
+    whole pre-pass into a no-op — the exact failure the pre-pass exists to fix.
+    """
+    resp = _Response(
+        [
+            _consult("tu_1", "cso", query="how should we sequence this?"),
+            _reasoning_block(),
+        ],
+        stop_reason="max_tokens",
+    )
+    provider = AsyncMock()
+    provider.messages_create = AsyncMock(return_value=resp)
+    route_mock = AsyncMock(return_value=["strategy-says"])
+    consulted: list[str] = []
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        async for _ in exec_._routing_prepass(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            episodic_context="",
+            debug_collector=None,
+            consulted_out=consulted,
+            specialist_outputs_out=None,
+            turn_id=None,
+            conversation_context="",
+            specialists_consulted=[],
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch("openexecutive.orchestrator.executive.route_parallel", route_mock),
+        patch("openexecutive.orchestrator.executive.audit_log"),
+    ):
+        asyncio.run(_drive())
+
+    assert consulted == ["cso"]
+
+
+def test_blank_query_is_dropped_wherever_it_sits() -> None:
+    """Position and stop_reason must not gate the drop.
+
+    The earlier guard AND-ed the blank-query test with "is the last tool_use"
+    and `stop_reason == "max_tokens"`, so a blank consult emitted FIRST, on a
+    turn that ended normally, was dispatched anyway: a billed specialist call
+    with no question, recorded in `consulted_out` as though the turn had
+    reached someone. The complete sibling must still get through.
+    """
+    resp = _Response(
+        [
+            _consult("tu_1", "cfo", query=""),
+            _consult("tu_2", "cso", query="how should we sequence this?"),
+            _reasoning_block(),
+        ],
+        stop_reason="end_turn",
+    )
+    provider = AsyncMock()
+    provider.messages_create = AsyncMock(return_value=resp)
+    route_mock = AsyncMock(return_value=["strategy-says"])
+    consulted: list[str] = []
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        async for _ in exec_._routing_prepass(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            episodic_context="",
+            debug_collector=None,
+            consulted_out=consulted,
+            specialist_outputs_out=None,
+            turn_id=None,
+            conversation_context="",
+            specialists_consulted=[],
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch("openexecutive.orchestrator.executive.route_parallel", route_mock),
+        patch("openexecutive.orchestrator.executive.audit_log"),
+    ):
+        asyncio.run(_drive())
+
+    assert consulted == ["cso"]
+    # The blank consult must not have been dispatched at all — not merely
+    # excluded from `consulted_out` after a specialist was already billed.
+    dispatched = route_mock.await_args.args[0]
+    assert [c["specialist"] for c in dispatched] == ["cso"]
 
 
 def test_main_loop_records_the_canonical_specialist_name() -> None:

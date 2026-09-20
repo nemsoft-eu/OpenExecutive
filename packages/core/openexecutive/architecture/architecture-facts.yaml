@@ -340,6 +340,28 @@ routing:
     its fix: the model emitted `cs`, which resolve_specialist_name rescued to
     `cso`.
 
+    Truncation handling: ONE test, not three — a consult whose `query` is
+    missing or blank is dropped, wherever it sits in `content` and whatever the
+    `stop_reason`. Truncation (the pre-pass runs on max_tokens=1024) is the
+    usual source, but `stop_reason == "max_tokens"` is NOT evidence that a
+    given call was the casualty: a reasoning model routinely finishes a
+    complete consult and then spends the rest of the budget thinking. An
+    earlier version AND-ed the blank-query test with `max_tokens` and
+    `block is last_tool_use`, which was wrong in BOTH directions at once — it
+    discarded a complete final consult (pre-pass becomes a no-op; raised by
+    Cursor Bugbot on PR #18) while still dispatching a blank consult emitted
+    FIRST (found by adversarial review of that fix). `stop_reason` now appears
+    only in the log line, as diagnosis rather than control flow. Position was
+    never a safe thing to test in the first place, in EITHER direction: on the
+    OpenRouter path the translator appends a synthetic `openrouter_reasoning`
+    block after the tool_use blocks, so a check keyed on the last content BLOCK
+    misses the tool_use entirely; but that block is appended only when the
+    response carries `reasoning_details`, which is an OpenRouter response
+    extension, so against a plain local OpenAI-compatible server (Ollama,
+    llama.cpp, vLLM — what the measurements above were taken on) there is no
+    trailing block and a tool_use IS `content[-1]`. Neither shape is universal,
+    which is the point: the query is the thing being tested.
+
     Safety property: a pre-pass that picks nobody appends NOTHING, so an action
     turn ("schedule X") falls through to the loop exactly as before. Measured
     false-positive rate on action/lookup turns with the persona's
@@ -3585,9 +3607,26 @@ integrations:
         LLM calls. The warm ChromaDB store is handed to handlers via
         mcp_server.set_store() from the lifespan (handlers have no Request).
       Tools: consult_specialist (flagship — orchestrator.router.route_to_specialist,
-        stateless, the specialist enum is a Literal pinned to SPECIALIST_REGISTRY
+        stateless, the specialist roster is a Literal pinned to SPECIALIST_REGISTRY
         by a unit test — includes `talent`, so the executive-search specialist's
-        ADVICE is already reachable here), search_knowledge (knowledge.retriever.retrieve),
+        ADVICE is already reachable here. The PARAMETER is deliberately not that
+        Literal: FastMCP validates arguments against the signature's Pydantic
+        model BEFORE the handler runs, so a bare Literal refused `csO`/`cs` at the
+        schema layer with a literal_error and resolve_specialist_name never ran —
+        chat parity was documented but not delivered. It is typed `str` with the
+        roster re-attached via json_schema_extra={"enum": ...}, so clients still
+        see the ten canonical values while the resolver keeps its tolerance, and
+        the RAW name reaches route_to_specialist, which is what writes the
+        routing_anomaly row. Normalising in a BeforeValidator would keep the enum
+        too but erase that anomaly. The tolerance is SERVER-SIDE ONLY: the schema
+        still advertises `enum`, so a client that validates outbound arguments
+        will still refuse to send `csO` — intended, since the case the resolver
+        exists for is a MODEL emitting a truncated name through a pass-through
+        client. Because the parameter is now unbounded caller text, the unknown-
+        specialist ValueError truncates it to NAME_PREVIEW_CHARS, matching what
+        router.py already does in its own two messages. Raised by Cursor Bugbot
+        on PR #18),
+        search_knowledge (knowledge.retriever.retrieve),
         list_workflows (workflows.list_workflows → Workflow.meta), ask_executive
         (Executive.chat fallback — non-streaming, resolves caller to principal or
         by caller_email), and a READ-ONLY executive-search suite: list_candidates
