@@ -1128,6 +1128,159 @@ def test_main_loop_still_records_a_resolvable_consult() -> None:
     assert ("specialist_consult", "cso") in audited
 
 
+def test_loop_audits_a_corrected_specialist_name() -> None:
+    """Normalising early makes route_to_specialist's own correction branch
+    unreachable from the chat path, so the correction must be audited where it
+    happens or it goes unrecorded entirely."""
+    rows: list[tuple[str, Any]] = []
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        rows.append((event_type, kw.get("details")))
+
+    class _Stream:
+        def __init__(self, msg: Any) -> None:
+            self._msg = msg
+
+        async def __aenter__(self) -> "_Stream":
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        def __aiter__(self) -> Any:
+            async def _gen() -> Any:
+                return
+                yield
+
+            return _gen()
+
+        async def get_final_message(self) -> Any:
+            return self._msg
+
+    truncated = _Response([_consult("tu_1", "cs")], stop_reason="tool_use")
+    truncated.usage = None
+    done = _Response([_Block("text", text="done")], stop_reason="end_turn")
+    done.usage = None
+    queue = [truncated, done]
+    provider = AsyncMock()
+    provider.messages_stream = lambda **kw: _Stream(queue.pop(0))
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        exec_._settings = exec_._settings.model_copy(
+            update={"routing_prepass_enabled": False}
+        )
+        async for _ in exec_._stream_agent_loop(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            search=None,
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(return_value=["strategy-says"]),
+        ),
+        patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+    ):
+        asyncio.run(_drive())
+
+    assert ("routing_anomaly", {"requested": "cs", "resolved": "cso"}) in rows
+
+
+def test_prepass_audits_a_corrected_specialist_name() -> None:
+    """Same claim, pre-pass path — it previously audited drops but not
+    corrections."""
+    rows: list[tuple[str, Any]] = []
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        rows.append((event_type, kw.get("details")))
+
+    provider = AsyncMock()
+    provider.messages_create = AsyncMock(
+        return_value=_Response([_consult("tu_1", "cf")])
+    )
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        async for _ in exec_._routing_prepass(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            episodic_context="",
+            debug_collector=None,
+            consulted_out=None,
+            specialist_outputs_out=None,
+            turn_id=None,
+            conversation_context="",
+            specialists_consulted=[],
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(return_value=["finance-says"]),
+        ),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+    ):
+        asyncio.run(_drive())
+
+    assert ("routing_anomaly", {"requested": "cf", "resolved": "cfo"}) in rows
+
+
+def test_a_well_formed_name_produces_no_anomaly_row() -> None:
+    """Control: the anomaly rows must mark real corrections, not every consult."""
+    rows: list[tuple[str, Any]] = []
+
+    def _record(event_type: str, summary: str, **kw: Any) -> None:
+        rows.append((event_type, kw.get("details")))
+
+    provider = AsyncMock()
+    provider.messages_create = AsyncMock(
+        return_value=_Response([_consult("tu_1", "cso")])
+    )
+
+    async def _drive() -> None:
+        exec_ = Executive()
+        async for _ in exec_._routing_prepass(
+            [{"type": "text", "text": "p"}],
+            [{"role": "user", "content": "q"}],
+            model="m",
+            episodic_context="",
+            debug_collector=None,
+            consulted_out=None,
+            specialist_outputs_out=None,
+            turn_id=None,
+            conversation_context="",
+            specialists_consulted=[],
+        ):
+            pass
+
+    with (
+        patch(
+            "openexecutive.orchestrator.executive.get_provider", return_value=provider
+        ),
+        patch(
+            "openexecutive.orchestrator.executive.route_parallel",
+            AsyncMock(return_value=["strategy-says"]),
+        ),
+        patch("openexecutive.orchestrator.executive.audit_log", _record),
+    ):
+        asyncio.run(_drive())
+
+    assert [r for r in rows if r[0] == "routing_anomaly"] == []
+
+
 def test_audit_row_shape_differs_only_by_phase_between_call_sites() -> None:
     """The shared helper exists so the two call sites cannot drift; nothing
     pinned its payload, so a schema change at one site would go unnoticed."""

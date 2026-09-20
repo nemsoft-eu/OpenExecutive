@@ -334,9 +334,25 @@ def _canonical_specialist(raw: Any) -> str:
 
     Returning the original on failure (rather than "" or None) keeps the
     unresolvable case flowing to ``route_to_specialist``, which answers with an
-    error string the model can act on and audits the anomaly exactly once.
+    error string the model can act on and audits the anomaly there.
+
+    The CORRECTION is audited here, because this is where it happens. Once the
+    name is canonical every later layer sees a well-formed value and has
+    nothing to report — `route_to_specialist`'s own normalisation branch is
+    unreachable from the chat path for exactly that reason, so relying on it
+    would leave every corrected name unrecorded.
     """
-    return resolve_specialist_name(raw) or str(raw)
+    resolved = resolve_specialist_name(raw)
+    if resolved is None:
+        return str(raw)
+    if resolved != raw:
+        audit_log(
+            "routing_anomaly",
+            f"Normalised specialist name {str(raw)[:40]} -> {resolved}",
+            actor="router",
+            details={"requested": str(raw)[:80], "resolved": resolved},
+        )
+    return resolved
 
 
 def _audit_specialist_consults(
@@ -1314,6 +1330,20 @@ class Executive:
                 )
                 dropped_unresolved += 1
                 continue
+            if resolved != raw_name:
+                # Audited here for the same reason as in _canonical_specialist:
+                # route_parallel and route_to_specialist both receive the
+                # already-canonical name, so neither has anything left to
+                # report and the correction would otherwise go unrecorded.
+                audit_log(
+                    "routing_anomaly",
+                    f"Routing pre-pass normalised specialist name "
+                    f"{str(raw_name)[:40]} -> {resolved}",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    actor="router",
+                    details={"requested": str(raw_name)[:80], "resolved": resolved},
+                )
             run_tool_uses.append(
                 {"id": block.id, "name": block.name, "input": block_input}
             )

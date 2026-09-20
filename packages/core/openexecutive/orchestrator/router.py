@@ -338,13 +338,16 @@ async def route_parallel(
     # token; and key consulted_out on "cs", which committee reviewer selection
     # and the Honcho department sync both drop. That would make a malformed
     # name worse than the plain error string it used to produce.
-    # An unresolvable name is left as-is so route_to_specialist returns its
-    # error string and audits the anomaly exactly once.
-    # str() on the fallback, not just the resolved value: an unresolvable name
-    # is carried through to route_to_specialist for its error string, but
-    # retrieval runs FIRST and DOMAIN_ALIASES.get() raises TypeError on an
-    # unhashable list/dict — out of the gather below, failing the whole turn
-    # before the guard in route_to_specialist is ever reached.
+    #
+    # An unresolvable name falls back to str(), not to the raw value: it is
+    # carried through so route_to_specialist can answer with its error string,
+    # but retrieval runs first and DOMAIN_ALIASES.get() raises TypeError on an
+    # unhashable list or dict — out of the gather below, failing the whole turn
+    # before that guard is ever reached.
+    #
+    # Chat turns arrive already canonical (the pre-pass and the loop both
+    # normalise, and audit the correction where they make it), so this is
+    # defence for direct callers such as workflow steps.
     calls = [
         {
             **c,
