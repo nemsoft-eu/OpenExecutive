@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from openexecutive.providers.translator import (
     StreamAccumulator,
     from_openai_response,
@@ -527,6 +529,83 @@ def test_response_synthesizes_tool_use_block_with_parsed_arguments() -> None:
     # accesses it as a dict, so we must parse here.
     assert tool_use_blocks[0].input == {"specialist": "cfo", "query": "burn"}
     assert msg.stop_reason == "tool_use"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ["null", "[1, 2]", "42", '"a bare string"', "true"],
+    ids=["null", "list", "number", "string", "bool"],
+)
+def test_response_coerces_non_object_tool_arguments_to_empty_dict(
+    arguments: str,
+) -> None:
+    """`input` must always be a dict, whatever the server sent.
+
+    Every tool's input_schema in this repo is `type: object`, and Anthropic
+    enforces that — nothing else does. `json.loads("null")` is `None`, and the
+    orchestrator's very next move is `.get()` or `**`, which raises out of an
+    asyncio.gather and kills the whole turn. This is the one door every
+    OpenAI-compatible tool call comes through, so the invariant is restored
+    here rather than once per tool.
+    """
+    msg = from_openai_response(
+        {
+            "id": "chatcmpl-3",
+            "model": "local/qwen",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_bad",
+                                "type": "function",
+                                "function": {
+                                    "name": "consult_specialist",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+    (block,) = [b for b in msg.content if b.type == "tool_use"]
+    assert block.input == {}
+    # The caller's idiom must not raise — this is the failure being prevented.
+    assert block.input.get("specialist", "") == ""
+
+
+def test_stream_accumulator_coerces_non_object_tool_arguments() -> None:
+    """Same invariant on the streaming path, which parses arguments separately."""
+    acc = StreamAccumulator()
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_bad",
+                                "function": {
+                                    "name": "consult_specialist",
+                                    "arguments": "null",
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+    )
+    msg = acc.finalize()
+    (block,) = [b for b in msg.content if b.type == "tool_use"]
+    assert block.input == {}
 
 
 def test_response_usage_reads_nested_prompt_tokens_details() -> None:

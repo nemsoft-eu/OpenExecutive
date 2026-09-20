@@ -64,6 +64,7 @@ from openexecutive.orchestrator.research_tools import (
 )
 from openexecutive.orchestrator.router import (
     SPECIALIST_TOOLS,
+    audit_name_resolution,
     partition_specialist_fanout,
     resolve_specialist_name,
     route_parallel,
@@ -318,17 +319,6 @@ def _emit_memory_snapshot(
     )
 
 
-def _tool_input(tool_use: dict[str, Any]) -> dict[str, Any]:
-    """A tool_use's ``input`` as a dict, whatever the backend deserialized.
-
-    Only Anthropic validates tool arguments against the schema; an
-    OpenAI-compatible local server hands back whatever ``json.loads`` produced,
-    including ``null`` or a list, on which ``.get()`` raises.
-    """
-    value = tool_use.get("input")
-    return value if isinstance(value, dict) else {}
-
-
 def _canonical_specialist(raw: Any) -> str:
     """Registry key for a model-emitted specialist name, or the name unchanged.
 
@@ -346,12 +336,7 @@ def _canonical_specialist(raw: Any) -> str:
     if resolved is None:
         return str(raw)
     if resolved != raw:
-        audit_log(
-            "routing_anomaly",
-            f"Normalised specialist name {str(raw)[:40]} -> {resolved}",
-            actor="router",
-            details={"requested": str(raw)[:80], "resolved": resolved},
-        )
+        audit_name_resolution(raw, resolved, source="chat_loop")
     return resolved
 
 
@@ -370,11 +355,14 @@ def _audit_specialist_consults(
     """Write one ``specialist_consult`` row per dispatched consult.
 
     Shared by the routing pre-pass and the tool-use loop so the row shape is
-    defined once. Both call sites previously restated it, and nothing would
-    have failed if they drifted apart — the audit graph and /audit/usage read
-    these rows, so a divergence shows up as a broken flow chart rather than a
-    test failure. ``phase`` distinguishes the two ("prepass" / "loop").
+    defined once: the audit graph and /audit/usage read these rows, so two
+    sites drifting apart shows up as a broken flow chart rather than a failing
+    test. ``phase`` distinguishes the two ("prepass" / "loop").
     """
+    # Per-batch, not per-call: identical for every row here, and it walks the
+    # block list to build the names.
+    prompt_blocks = _system_block_names(system_blocks)
+    context_preview = conversation_context[:200]
     for call, spec_result in zip(run_calls, specialist_results, strict=True):
         audit_log(
             "specialist_consult",
@@ -386,16 +374,15 @@ def _audit_specialist_consults(
                 "iteration": iteration,
                 "phase": phase,
                 "duration_ms": duration_ms,
-                # One shared value per turn, not per call — read it from what
-                # route_parallel was actually given, never from the call dict,
-                # which no longer carries a "context" key.
-                "context_preview": conversation_context[:200],
+                # One shared value per turn, not per call — read it from
+                # what route_parallel was given, never from the call dict.
+                "context_preview": context_preview,
             },
             full={
                 "query": call["query"],
                 "context": conversation_context,
                 "response": spec_result,
-                "active_prompt_blocks": _system_block_names(system_blocks),
+                "active_prompt_blocks": prompt_blocks,
             },
         )
 
@@ -1218,14 +1205,10 @@ class Executive:
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Decide and dispatch specialist consults before the main turn.
 
-        One model call offering `consult_specialist` and nothing else. On the
-        full surface that tool competes with ~58 client tools and a smaller
-        model simply does not reach for it: measured on qwen3.8:27b, the
-        question "What should I be focusing on right now, and in what order?"
-        consulted on 1/12 turns with the full surface, and on 9/12 and 11/12
-        across two runs with this pre-pass plus the persona's "Consulting Your
-        Leadership Team" section. An action turn ("schedule X") consulted 0/12
-        and 1/12 in the same two runs.
+        One model call offering `consult_specialist` and nothing else. On
+        the full surface that tool competes with the rest of the client
+        tool surface and a smaller model does not reach for it; the
+        measurements are recorded on ``Settings.routing_prepass_enabled``.
 
         Appends the decision and its results to ``current_messages`` as a
         well-formed tool_use/tool_result pair, so the main loop — which is
@@ -1272,8 +1255,17 @@ class Executive:
         run_tool_uses: list[dict[str, Any]] = []
         run_calls: list[dict[str, str]] = []
         reasoning_blocks: list[dict[str, Any]] = []
-        dropped_unresolved = 0
-        truncated_dropped = 0
+        consult_blocks = [
+            b
+            for b in decision.content
+            if getattr(b, "type", None) == "tool_use"
+            and b.name == "consult_specialist"
+        ]
+        # What the model asked for, counted before anything is dropped, so the
+        # debug event can report the difference. Counting survivors plus
+        # per-reason counters would make every future `continue` responsible
+        # for keeping the arithmetic true.
+        requested_count = len(consult_blocks)
         last_tool_use = next(
             (
                 b
@@ -1310,9 +1302,11 @@ class Executive:
                 logger.warning(
                     "routing pre-pass hit max_tokens; dropping truncated tool_use"
                 )
-                truncated_dropped += 1
                 continue
-            block_input = _tool_input({"input": block.input})
+            # A tool_use's `input` is always a dict: Anthropic validates it
+            # against the schema, and translator._parse_tool_arguments coerces
+            # a non-object payload to {} for every OpenAI-compatible provider.
+            block_input = block.input
             raw_name = block_input.get("specialist", "")
             resolved = resolve_specialist_name(raw_name)
             if resolved is None:
@@ -1320,29 +1314,21 @@ class Executive:
                 # only hand back an error string, and replaying the tool_use
                 # would oblige us to carry a useless tool_result into the
                 # main turn.
-                audit_log(
-                    "routing_anomaly",
-                    f"Routing pre-pass dropped unresolved specialist: {str(raw_name)[:80]}",
+                audit_name_resolution(
+                    raw_name,
+                    None,
+                    source="routing_prepass",
                     session_id=session_id,
                     turn_id=turn_id,
-                    actor="router",
-                    details={"requested": str(raw_name)[:80], "resolved": None},
                 )
-                dropped_unresolved += 1
                 continue
             if resolved != raw_name:
-                # Audited here for the same reason as in _canonical_specialist:
-                # route_parallel and route_to_specialist both receive the
-                # already-canonical name, so neither has anything left to
-                # report and the correction would otherwise go unrecorded.
-                audit_log(
-                    "routing_anomaly",
-                    f"Routing pre-pass normalised specialist name "
-                    f"{str(raw_name)[:40]} -> {resolved}",
+                audit_name_resolution(
+                    raw_name,
+                    resolved,
+                    source="routing_prepass",
                     session_id=session_id,
                     turn_id=turn_id,
-                    actor="router",
-                    details={"requested": str(raw_name)[:80], "resolved": resolved},
                 )
             run_tool_uses.append(
                 {"id": block.id, "name": block.name, "input": block_input}
@@ -1354,13 +1340,6 @@ class Executive:
                 }
             )
 
-        # Count what the model asked for BEFORE the cap truncates, so the debug
-        # event can report the drop. Reading these off the post-partition list
-        # would make requested_count == dispatched_count always and
-        # skipped_count always 0 — the drop would be structurally invisible.
-        # Includes names dropped as unresolvable and tool_uses dropped as
-        # truncated, so "requested" means what the model actually emitted.
-        requested_count = len(run_calls) + dropped_unresolved + truncated_dropped
         run_tool_uses, run_calls, _skipped_results, fanout_cap = (
             partition_specialist_fanout(
                 run_tool_uses, run_calls, self._settings.max_parallel_specialists
@@ -1372,25 +1351,14 @@ class Executive:
         # exists so the model can re-ask; here the model has not yet seen a
         # tool surface to re-ask with, and the main turn can still consult
         # whoever was left out.
-        if not run_calls:
-            # Still report it: "the model asked for specialists and every one
-            # was dropped" is the looks-routed-but-isn't case, and returning
-            # silently would leave it visible only in the audit log, never in
-            # the live panel.
-            if debug_collector and requested_count:
-                evt = debug_collector.emit("routing_decision", {
-                    "iteration": 0,
-                    "phase": "prepass",
-                    "requested_count": requested_count,
-                    "cap": fanout_cap,
-                    "dispatched_count": 0,
-                    "skipped_count": requested_count,
-                    "specialists": [],
-                })
-                yield debug_collector.to_sse_dict(evt)
-            return
-
-        if debug_collector:
+        #
+        # Emitted before the empty check so "asked for specialists, reached
+        # nobody" is still reported: it is the looks-routed-but-isn't case, and
+        # the counts are what carry it. Note the Agent Activity panel renders
+        # this event from `specialists` alone, so an all-dropped decision shows
+        # there as an empty routing line — the detail lives in the event stream
+        # and the routing_anomaly audit rows.
+        if debug_collector and requested_count:
             evt = debug_collector.emit("routing_decision", {
                 "iteration": 0,
                 "phase": "prepass",
@@ -1404,6 +1372,9 @@ class Executive:
                 ],
             })
             yield debug_collector.to_sse_dict(evt)
+
+        if not run_calls:
+            return
 
         yield self._THINKING
 
@@ -1694,9 +1665,9 @@ class Executive:
             specialist_calls = [
                 {
                     "specialist": _canonical_specialist(
-                        _tool_input(tu).get("specialist", "")
+                        tu["input"].get("specialist", "")
                     ),
-                    "query": str(_tool_input(tu).get("query", "")),
+                    "query": str(tu["input"].get("query", "")),
                 }
                 for tu in specialist_tool_uses
             ]
@@ -1715,6 +1686,10 @@ class Executive:
             if debug_collector and specialist_calls:
                 evt = debug_collector.emit("routing_decision", {
                     "iteration": iteration,
+                    # Set on both emitters or neither: a field present on some
+                    # routing_decision events and absent on others is worse
+                    # than no field at all for anything reading the stream.
+                    "phase": "loop",
                     "requested_count": len(specialist_calls),
                     "cap": fanout_cap,
                     "dispatched_count": len(run_calls),

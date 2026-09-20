@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -20,8 +19,6 @@ from openexecutive.agents.product import ProductAgent
 from openexecutive.agents.strategy import StrategyAgent
 from openexecutive.agents.talent import TalentAgent
 from openexecutive.agents.triage import TriageAgent
-
-logger = logging.getLogger(__name__)
 
 SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "cso": StrategyAgent(),
@@ -132,6 +129,40 @@ def resolve_specialist_name(specialist_name: str) -> str | None:
     return None
 
 
+def audit_name_resolution(
+    requested: Any,
+    resolved: str | None,
+    *,
+    source: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Record that a model-emitted specialist name was corrected or rejected.
+
+    ``routing_anomaly``, never ``specialist_consult``: the audit graph derives
+    a specialist node from every consult row and attributes later tool calls to
+    the most recent one, so filing a name that reached nobody under that type
+    would invert the failure this normalisation exists to remove.
+
+    One helper rather than an emit per call site — the rows feed the audit
+    graph, so two sites drifting apart shows up as a broken flow chart rather
+    than a failing test. ``source`` names the site for triage.
+    """
+    shown = str(requested)[:80]
+    if resolved is None:
+        summary = f"Unresolved specialist name: {shown}"
+    else:
+        summary = f"Normalised specialist name {shown} -> {resolved}"
+    audit_log(
+        "routing_anomaly",
+        summary,
+        session_id=session_id,
+        turn_id=turn_id,
+        actor="router",
+        details={"requested": shown, "resolved": resolved, "source": source},
+    )
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -155,36 +186,18 @@ async def route_to_specialist(
     # for display rather than slicing it.
     requested = str(specialist_name)[:80]
     if resolved is None:
-        # ROUTING_ANOMALY, not specialist_consult: the audit graph turns every
-        # specialist_consult row into a specialist node AND sets
-        # last_specialist_in_turn, which later tool_invocation rows are
-        # attributed to. Filing a consult that never ran under that type would
-        # invert the very bug this fixes — a turn that looks routed and is not.
-        audit_log(
-            "routing_anomaly",
-            f"Unresolved specialist name: {requested}",
-            actor="router",
-            details={
-                "requested": requested,
-                "resolved": None,
-                "valid": sorted(SPECIALIST_REGISTRY),
-            },
-        )
+        audit_name_resolution(specialist_name, None, source="route_to_specialist")
         return (
             f"Unknown specialist: {requested}. "
             f"Valid names: {', '.join(sorted(SPECIALIST_REGISTRY))}."
         )
     if resolved != specialist_name:
-        logger.info(
-            "specialist name normalised: %r -> %r", specialist_name, resolved
-        )
-        # Also routing_anomaly: the real consult is audited by the caller, so
-        # a specialist_consult row here would double-count one consult.
-        audit_log(
-            "routing_anomaly",
-            f"Normalised specialist name {requested} -> {resolved}",
-            actor="router",
-            details={"requested": requested, "resolved": resolved},
+        # Reachable from the MCP tool and any other direct caller, which pass
+        # the name straight through. Both chat paths normalise before they get
+        # here, so they never take this branch — they audit their own
+        # correction at the point they make it.
+        audit_name_resolution(
+            specialist_name, resolved, source="route_to_specialist"
         )
     agent = SPECIALIST_REGISTRY[resolved]
     return await agent.analyze(
@@ -345,9 +358,12 @@ async def route_parallel(
     # unhashable list or dict — out of the gather below, failing the whole turn
     # before that guard is ever reached.
     #
-    # Chat turns arrive already canonical (the pre-pass and the loop both
-    # normalise, and audit the correction where they make it), so this is
-    # defence for direct callers such as workflow steps.
+    # Both chat paths already normalise (and audit the correction where they
+    # make it), and they are the only callers today, so nothing here should
+    # normally fire. It stays because this is the single entry to the fan-out:
+    # the cost of a redundant dict lookup is nothing against a future caller
+    # reaching retrieval with a raw name, which degrades silently rather than
+    # failing.
     calls = [
         {
             **c,

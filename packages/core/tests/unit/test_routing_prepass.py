@@ -1,10 +1,9 @@
 """The routing pre-pass decides specialists before the full tool surface appears.
 
-`consult_specialist` competes with ~58 other client tools on the main turn, and
-a smaller model does not reach for it: measured on qwen3.8:27b, "What should I
-be focusing on right now, and in what order?" consulted on 1/12 turns with the
-full surface and 9-11/12 with this pre-pass plus the persona section. The pre-pass
-offers that one tool and nothing else.
+`consult_specialist` competes with the rest of the client tool surface on the
+main turn, and a smaller model does not reach for it. The pre-pass offers that
+one tool and nothing else; the measurements behind it live on
+`Settings.routing_prepass_enabled` in config.py.
 
 The invariant that keeps it safe is that it is purely additive: a pre-pass that
 picks nobody must leave the message list untouched, so an action turn behaves
@@ -22,6 +21,7 @@ import pytest
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 os.environ.setdefault("EXEC_EMAIL_ADDRESS", "exec@example.test")
 
+from openexecutive.orchestrator.debug_events import DebugCollector  # noqa: E402
 from openexecutive.orchestrator.executive import Executive  # noqa: E402
 
 
@@ -445,19 +445,7 @@ def test_prepass_drains_specialist_debug_events() -> None:
     the primary routing path.
     """
 
-    class _Collector:
-        def __init__(self) -> None:
-            self._events: list[dict[str, Any]] = []
-
-        def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-            evt = {"kind": kind, **payload}
-            self._events.append(evt)
-            return evt
-
-        def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
-            return {"sse": evt}
-
-    collector = _Collector()
+    collector = DebugCollector()
 
     async def _fake_route_parallel(calls: Any, **kw: Any) -> list[str]:
         # Mimic route_parallel: emit into the collector, yield nothing.
@@ -499,7 +487,11 @@ def test_prepass_drains_specialist_debug_events() -> None:
     ):
         asyncio.run(_drive())
 
-    kinds = [i["sse"]["kind"] for i in yielded if isinstance(i, dict) and "sse" in i]
+    kinds = [
+        i["kind"]
+        for i in yielded
+        if isinstance(i, dict) and i.get("type") == "debug_event"
+    ]
     assert "specialist_start" in kinds
     assert "specialist_done" in kinds
 
@@ -507,19 +499,7 @@ def test_prepass_drains_specialist_debug_events() -> None:
 def test_routing_decision_reports_dropped_picks() -> None:
     """requested/skipped counts must expose the drop, not hide it behind the cap."""
 
-    class _Collector:
-        def __init__(self) -> None:
-            self._events: list[dict[str, Any]] = []
-
-        def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-            evt = {"kind": kind, **payload}
-            self._events.append(evt)
-            return evt
-
-        def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
-            return {"sse": evt}
-
-    collector = _Collector()
+    collector = DebugCollector()
     provider = AsyncMock()
     # two good picks, one unresolvable -> requested 3, dispatched 2, skipped 1
     provider.messages_create = AsyncMock(
@@ -556,10 +536,10 @@ def test_routing_decision_reports_dropped_picks() -> None:
     ):
         asyncio.run(_drive())
 
-    decision = next(e for e in collector._events if e["kind"] == "routing_decision")
-    assert decision["requested_count"] == 3
-    assert decision["dispatched_count"] == 2
-    assert decision["skipped_count"] == 1
+    decision = next(e for e in collector._events if e.kind == "routing_decision")
+    assert decision.data["requested_count"] == 3
+    assert decision.data["dispatched_count"] == 2
+    assert decision.data["skipped_count"] == 1
 
 
 def _reasoning_block() -> _Block:
@@ -705,19 +685,7 @@ def test_routing_decision_is_emitted_when_every_pick_is_dropped() -> None:
     """"Asked for specialists, reached nobody" is the looks-routed-but-isn't
     case — it must not be visible only in the audit log."""
 
-    class _Collector:
-        def __init__(self) -> None:
-            self._events: list[dict[str, Any]] = []
-
-        def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-            evt = {"kind": kind, **payload}
-            self._events.append(evt)
-            return evt
-
-        def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
-            return {"sse": evt}
-
-    collector = _Collector()
+    collector = DebugCollector()
     provider = AsyncMock()
     provider.messages_create = AsyncMock(
         return_value=_Response([_consult("tu_1", "zzz"), _consult("tu_2", "nope")])
@@ -749,10 +717,10 @@ def test_routing_decision_is_emitted_when_every_pick_is_dropped() -> None:
     ):
         asyncio.run(_drive())
 
-    decision = next(e for e in collector._events if e["kind"] == "routing_decision")
-    assert decision["requested_count"] == 2
-    assert decision["dispatched_count"] == 0
-    assert decision["skipped_count"] == 2
+    decision = next(e for e in collector._events if e.kind == "routing_decision")
+    assert decision.data["requested_count"] == 2
+    assert decision.data["dispatched_count"] == 0
+    assert decision.data["skipped_count"] == 2
     assert route_mock.await_count == 0
 
 
@@ -760,19 +728,7 @@ def test_no_routing_decision_when_the_model_picked_nobody() -> None:
     """Control for the test above: an action turn must stay silent, not emit a
     zero-count routing event."""
 
-    class _Collector:
-        def __init__(self) -> None:
-            self._events: list[dict[str, Any]] = []
-
-        def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-            evt = {"kind": kind, **payload}
-            self._events.append(evt)
-            return evt
-
-        def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
-            return {"sse": evt}
-
-    collector = _Collector()
+    collector = DebugCollector()
     provider = AsyncMock()
     provider.messages_create = AsyncMock(
         return_value=_Response([_Block("text", text="I'll schedule that.")])
@@ -803,21 +759,6 @@ def test_no_routing_decision_when_the_model_picked_nobody() -> None:
         asyncio.run(_drive())
 
     assert collector._events == []
-
-
-class _RecordingCollector:
-    """Minimal DebugCollector stand-in that records every emitted event."""
-
-    def __init__(self) -> None:
-        self._events: list[dict[str, Any]] = []
-
-    def emit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        evt = {"kind": kind, **payload}
-        self._events.append(evt)
-        return evt
-
-    def to_sse_dict(self, evt: dict[str, Any]) -> dict[str, Any]:
-        return {"sse": evt}
 
 
 def _drive_loop_with_consults(
@@ -883,7 +824,7 @@ def test_synthesis_start_re_emits_when_the_roster_grows() -> None:
     Firing only once would report the first round's roster forever and never
     mention a specialist consulted later in the turn.
     """
-    collector = _RecordingCollector()
+    collector = DebugCollector()
     round1 = _Response([_consult("tu_1", "cso")], stop_reason="tool_use")
     round1.usage = None
     round2 = _Response([_consult("tu_2", "cfo")], stop_reason="tool_use")
@@ -893,11 +834,11 @@ def test_synthesis_start_re_emits_when_the_roster_grows() -> None:
 
     _drive_loop_with_consults([round1, round2, done], collector)
 
-    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    synth = [e for e in collector._events if e.kind == "synthesis_start"]
     assert len(synth) == 2, f"expected one emit per roster growth, got {len(synth)}"
-    assert synth[0]["specialists_consulted"] == ["cso"]
-    assert synth[1]["specialists_consulted"] == ["cso", "cfo"]
-    assert synth[1]["specialist_count"] == 2
+    assert synth[0].data["specialists_consulted"] == ["cso"]
+    assert synth[1].data["specialists_consulted"] == ["cso", "cfo"]
+    assert synth[1].data["specialist_count"] == 2
 
 
 def test_synthesis_start_fires_at_iteration_one_from_the_prepass_roster() -> None:
@@ -907,7 +848,7 @@ def test_synthesis_start_fires_at_iteration_one_from_the_prepass_roster() -> Non
     stubs it with a spy that never touches specialists_consulted — so the
     pre-pass-seeded path was untested despite being the default.
     """
-    collector = _RecordingCollector()
+    collector = DebugCollector()
 
     class _Stream:
         async def __aenter__(self) -> "_Stream":
@@ -962,15 +903,15 @@ def test_synthesis_start_fires_at_iteration_one_from_the_prepass_roster() -> Non
     ):
         asyncio.run(_drive())
 
-    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    synth = [e for e in collector._events if e.kind == "synthesis_start"]
     assert len(synth) == 1, f"expected exactly one emit, got {len(synth)}"
-    assert synth[0]["specialists_consulted"] == ["cso"]
+    assert synth[0].data["specialists_consulted"] == ["cso"]
 
 
 def test_synthesis_start_does_not_repeat_for_an_unchanged_roster() -> None:
     """Control for the test above: a non-specialist tool round must not
     re-announce synthesis with the same roster."""
-    collector = _RecordingCollector()
+    collector = DebugCollector()
     consult_round = _Response([_consult("tu_1", "cso")], stop_reason="tool_use")
     consult_round.usage = None
     skill_round = _Response(
@@ -983,9 +924,9 @@ def test_synthesis_start_does_not_repeat_for_an_unchanged_roster() -> None:
 
     _drive_loop_with_consults([consult_round, skill_round, done], collector)
 
-    synth = [e for e in collector._events if e["kind"] == "synthesis_start"]
+    synth = [e for e in collector._events if e.kind == "synthesis_start"]
     assert len(synth) == 1, f"roster did not grow; expected one emit, got {len(synth)}"
-    assert synth[0]["specialists_consulted"] == ["cso"]
+    assert synth[0].data["specialists_consulted"] == ["cso"]
 
 
 def test_main_loop_does_not_record_an_unresolvable_name_as_a_consult() -> None:
@@ -1049,6 +990,7 @@ def test_main_loop_does_not_record_an_unresolvable_name_as_a_consult() -> None:
             "openexecutive.orchestrator.executive.get_provider", return_value=provider
         ),
         patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
         patch("openexecutive.orchestrator.router.audit_log"),
     ):
@@ -1120,6 +1062,7 @@ def test_main_loop_still_records_a_resolvable_consult() -> None:
             AsyncMock(return_value=["strategy-says"]),
         ),
         patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
     ):
         asyncio.run(_drive())
@@ -1187,11 +1130,15 @@ def test_loop_audits_a_corrected_specialist_name() -> None:
             AsyncMock(return_value=["strategy-says"]),
         ),
         patch("openexecutive.orchestrator.executive._emit_cache_event"),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
     ):
         asyncio.run(_drive())
 
-    assert ("routing_anomaly", {"requested": "cs", "resolved": "cso"}) in rows
+    assert (
+        "routing_anomaly",
+        {"requested": "cs", "resolved": "cso", "source": "chat_loop"},
+    ) in rows
 
 
 def test_prepass_audits_a_corrected_specialist_name() -> None:
@@ -1231,11 +1178,15 @@ def test_prepass_audits_a_corrected_specialist_name() -> None:
             "openexecutive.orchestrator.executive.route_parallel",
             AsyncMock(return_value=["finance-says"]),
         ),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
     ):
         asyncio.run(_drive())
 
-    assert ("routing_anomaly", {"requested": "cf", "resolved": "cfo"}) in rows
+    assert (
+        "routing_anomaly",
+        {"requested": "cf", "resolved": "cfo", "source": "routing_prepass"},
+    ) in rows
 
 
 def test_a_well_formed_name_produces_no_anomaly_row() -> None:
@@ -1274,6 +1225,7 @@ def test_a_well_formed_name_produces_no_anomaly_row() -> None:
             "openexecutive.orchestrator.executive.route_parallel",
             AsyncMock(return_value=["strategy-says"]),
         ),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
     ):
         asyncio.run(_drive())
@@ -1353,24 +1305,16 @@ def test_prepass_audits_a_dropped_name_as_routing_anomaly() -> None:
         patch(
             "openexecutive.orchestrator.executive.get_provider", return_value=provider
         ),
+        patch("openexecutive.orchestrator.router.audit_log", _record),
         patch("openexecutive.orchestrator.executive.audit_log", _record),
     ):
         asyncio.run(_drive())
 
-    assert ("routing_anomaly", {"requested": "zzz", "resolved": None}) in captured
+    assert (
+        "routing_anomaly",
+        {"requested": "zzz", "resolved": None, "source": "routing_prepass"},
+    ) in captured
     assert [c for c in captured if c[0] == "specialist_consult"] == []
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [({"specialist": "cso"}, {"specialist": "cso"}), (None, {}), (["cs"], {}), ("x", {})],
-)
-def test_tool_input_coerces_a_non_dict_to_empty(value: Any, expected: Any) -> None:
-    """Only Anthropic validates tool arguments; a local backend can hand back
-    null or a list, on which .get() raises."""
-    from openexecutive.orchestrator.executive import _tool_input
-
-    assert _tool_input({"input": value}) == expected
 
 
 @pytest.mark.parametrize(

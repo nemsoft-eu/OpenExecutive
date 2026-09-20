@@ -144,7 +144,11 @@ def test_route_to_specialist_audits_a_normalised_name() -> None:
     ):
         asyncio.run(route_to_specialist("cs", query="q"))
     details = [c.kwargs["details"] for c in audit.call_args_list]
-    assert {"requested": "cs", "resolved": "cso"} in details
+    assert {
+        "requested": "cs",
+        "resolved": "cso",
+        "source": "route_to_specialist",
+    } in details
 
 
 def test_unresolved_name_is_audited_and_lists_valid_names() -> None:

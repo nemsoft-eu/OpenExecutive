@@ -547,22 +547,41 @@ def _remove_complete_cite_tags(text: str) -> str:
         text = stripped
 
 
-def _parse_tool_arguments(raw_args: Any, tool_name: str) -> Any:
-    """Parse a tool call's JSON arguments. OpenRouter search's ``<cite>`` markup
-    can land inside argument strings with unescaped quotes; strip it from the
-    raw text before parsing so a citation cannot turn a full payload into an
-    empty one. A payload that still fails to parse is logged (it would
-    otherwise read as "the model returned nothing")."""
-    if not isinstance(raw_args, str):
-        return raw_args
-    try:
-        return json.loads(_CITE_TAG_RE.sub("", raw_args))
-    except json.JSONDecodeError as exc:
+def _parse_tool_arguments(raw_args: Any, tool_name: str) -> dict[str, Any]:
+    """Parse a tool call's JSON arguments into a dict.
+
+    OpenRouter search's ``<cite>`` markup can land inside argument strings with
+    unescaped quotes; strip it from the raw text before parsing so a citation
+    cannot turn a full payload into an empty one. A payload that still fails to
+    parse is logged (it would otherwise read as "the model returned nothing").
+
+    Always returns a dict. Every tool's ``input_schema`` in this repo is
+    ``type: object``, so "a tool_use block's ``input`` is a dict" is a real
+    invariant — but only Anthropic's API enforces it. This function is the one
+    door every OpenAI-compatible tool call's arguments come through, so it is
+    where the invariant is restored: a local server that emits ``null``, a
+    list, or a bare number otherwise puts that value straight into
+    ``block.input``, and the first ``.get()`` or ``**`` downstream raises out
+    of an ``asyncio.gather`` and kills the whole turn. Coercing per call site
+    would mean repeating the guard once per tool.
+    """
+    parsed: Any = raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(_CITE_TAG_RE.sub("", raw_args))
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "openrouter: tool call %r carried unparseable JSON arguments (%s) — "
+                "treating as empty", tool_name, exc,
+            )
+            return {}
+    if not isinstance(parsed, dict):
         logger.warning(
-            "openrouter: tool call %r carried unparseable JSON arguments (%s) — "
-            "treating as empty", tool_name, exc,
+            "openrouter: tool call %r carried non-object arguments (%s) — "
+            "treating as empty", tool_name, type(parsed).__name__,
         )
         return {}
+    return parsed
 
 
 def _strip_cite_markup(text: str) -> str:

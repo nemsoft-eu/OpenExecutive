@@ -302,10 +302,18 @@ async def consult_specialist(
     """
     from openexecutive.orchestrator.router import (
         SPECIALIST_REGISTRY,
+        resolve_specialist_name,
         route_to_specialist,
     )
 
-    if specialist not in SPECIALIST_REGISTRY:
+    # Resolve rather than reject on an exact match. A strict membership test
+    # here would give external MCP clients a different policy from the chat
+    # path — `csO` normalised in one and refused in the other — and would
+    # short-circuit `route_to_specialist` before it can audit the anomaly.
+    # A genuinely unresolvable name still raises, because an MCP caller is a
+    # program that wants an error, not a model that wants a recoverable
+    # tool_result.
+    if resolve_specialist_name(specialist) is None:
         valid = ", ".join(sorted(SPECIALIST_REGISTRY))
         raise ValueError(f"Unknown specialist {specialist!r}. Valid: {valid}")
     return await route_to_specialist(

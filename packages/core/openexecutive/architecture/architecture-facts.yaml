@@ -381,7 +381,16 @@ routing:
     because the old code returned a bare "Unknown specialist: cs" string as the
     tool_result. Nothing distinguished that from a real consult in the audit
     log, which is why both the normalisation and the unresolved case now emit
-    a `specialist_consult` audit row.
+    a `routing_anomaly` row via `router.audit_name_resolution` — deliberately
+    NOT `specialist_consult`, which the audit graph turns into a specialist
+    node and treats as the turn's most recent specialist for causal edges.
+
+    The correction is audited where it is MADE (the pre-pass, and
+    `_canonical_specialist` on the loop path), not in `route_to_specialist`:
+    normalising before retrieval means every later layer sees a canonical name
+    and has nothing left to report, so auditing there would record nothing on
+    either chat path. `route_to_specialist` keeps its own branch for direct
+    callers — the MCP tool passes names straight through.
   conversation_context: |
     The Executive's `consult_specialist` tool (`router.SPECIALIST_TOOLS`) takes
     only `specialist` and `query`. There is deliberately NO per-call `context`
