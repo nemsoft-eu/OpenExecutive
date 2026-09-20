@@ -323,8 +323,10 @@ routing:
     an external agent has no session here for the orchestrator to render from.
 
     What it carries — `Session.render_conversation_context` renders `CompanyProfile.to_specialist_block`
-    — a compact digest of company, financials, priorities and leadership,
-    capped at 1,800 chars — followed by the last
+    — a digest of company identity, financial position, priorities and north
+    star, target customer and pain points, competitive advantages and
+    competitors, mission and leadership, IN THAT ORDER, capped at 4,300 chars
+    (the fixtures measure 3,187-3,440) — followed by the last
     two exchanges plus the current message, capped per-part (user 600, assistant
     1,200, current 2,000) and 6,000 chars overall. The current message keeps its
     HEAD AND TAIL, with the middle elided, because the channels disagree about
@@ -334,6 +336,39 @@ routing:
     the question on some channels and discard it on others. Bounding it matters
     because attachments run to 40k chars per file, up to 5 files, and the whole
     string is forwarded to every specialist in the fan-out as uncached input.
+
+    The profile cap drops whole trailing LINES (`session._fit_lines`), so the
+    digest's field ORDER — not the number — is what decides a cut's cost: an
+    over-long profile sheds its leadership roster and mission statement first.
+    Line-wise rather than character-wise because a character slice cut through
+    values: an unvalidated free-text `industry` long enough to crowd the budget
+    rendered `**Financial position**: monthly burn $25` for a $250,000 burn, a
+    wrong number carrying no elision marker. The guarantee is "whole fields are
+    lost, never a cut value, and trailing fields go first" — NOT "a number
+    always survives": a single field longer than the whole budget is skipped,
+    and if that is the identity header its headcount and ARR go with it. Every
+    list field is therefore one entry per line, which also avoids inventing
+    entries, since ", " occurs inside every leadership entry and "; " inside 3
+    of 8 tandem competitors. Re-derive these claims whenever the order changes;
+    a stale version of one is how the earlier 1,200-char head slice of
+    `to_prompt_block` came to drop burn and runway while reading as deliberate.
+
+    The digest IS escaped through `session._inert`, contrary to an earlier note
+    here calling it first-party. `POST /clients/generate` feeds uploaded
+    PDF/Word/Excel/CSV text to the engagement-intake agent, which is instructed
+    to copy facts verbatim, and `clients/slots.py` writes the resulting
+    profile.yaml over the live profile — so a competitor gloss or mission can
+    carry text a prospective client wrote, including a closing tag.
+
+    Extracted document TEXT reaches specialists this way; an attached IMAGE does
+    not. `integrations/attachments.build_attachment_output` returns no text for
+    an image (only a vision block), and `conversation_context` is a plain
+    string, so an image is visible to the Executive alone.
+    `Executive._build_messages` therefore appends an `<attachment_notice>` on
+    attachment turns, instructing the model to restate any figures, readings or
+    labels it took from an image inside that consult's `query`. Forwarding the
+    vision blocks themselves needs per-specialist-model vision gating and is
+    tracked in issue #19.
 
     The rendered text is passed through `session._inert` (angle brackets → ‹ ›,
     structure preserved) before it leaves. `BaseAgent.analyze` wraps it in

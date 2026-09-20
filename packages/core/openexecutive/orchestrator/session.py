@@ -29,13 +29,21 @@ _TAIL_TOTAL_MAX_CHARS = 6_000
 # with no burn, runway, ARR or headcount. The model-written per-call `context`
 # used to carry it; nothing else does.
 #
-# Sized to `CompanyProfile.to_specialist_block`, which measures 1,242-1,446
-# chars across the three shipped fixtures — the cap clears the largest with
-# headroom rather than being a round number. It is a backstop against an
-# unusually long profile, not a working limit; the digest orders header,
-# financials, then priorities, so a profile that does hit it loses leadership
-# names rather than the numbers.
-_TAIL_PROFILE_MAX_CHARS = 1_800
+# Sized to `CompanyProfile.to_specialist_block`, which measures 3,187-3,440
+# chars across the three shipped fixtures — the cap clears the largest by ~25%,
+# matching the margin the pre-market-context cap (1_800) had over its own 1,446.
+# It is a backstop against an unusually long profile, not a working limit: none
+# of the shipped fixtures reaches it.
+#
+# Enforced by `_fit_lines`, which drops whole LINES, not characters. The
+# guarantee that buys is "whole fields are lost, never a cut value, and trailing
+# fields go first" — deliberately weaker than the "never a number" this comment
+# once claimed, which measurement falsified: an unvalidated free-text `industry`
+# could crowd the budget and render `monthly burn $25` for a $250,000 burn.
+# Re-derive this whenever `to_specialist_block`'s field order changes; a stale
+# claim here is how the earlier 1,200-char head slice of `to_prompt_block` came
+# to drop burn and runway while reading as deliberate (PR #18, Bugbot + Codex).
+_TAIL_PROFILE_MAX_CHARS = 4_300
 
 
 def _inert(text: str) -> str:
@@ -54,6 +62,45 @@ def _inert(text: str) -> str:
     ``Executive:`` structure is the point of this block.
     """
     return text.replace("<", "‹").replace(">", "›")
+
+
+def _fit_lines(text: str, limit: int) -> str:
+    """Trim *text* to *limit* by dropping whole trailing LINES, not characters.
+
+    A raw ``text[:limit]`` cuts mid-character, and on the profile digest that
+    produced a corrupted figure rather than a missing one: a profile whose
+    free-text ``industry`` crowded the budget rendered
+    ``**Financial position**: monthly burn $25`` for a company burning $250,000
+    a month, with no elision marker to signal the cut. A specialist reads that
+    as fact. Dropping whole lines makes the unit of loss a whole field, so the
+    digest's field order is what decides the cost — which is what its docstring
+    claims.
+
+    A line that does not fit is SKIPPED rather than ending the scan, so one
+    pathological field cannot take every field after it. ``industry`` and the
+    other identity strings have no length validation, and stopping at the first
+    over-long line meant a 4,300-char ``industry`` discarded the financial line
+    behind it — losing the numbers for the opposite reason. Skipping keeps them.
+
+    What this guarantees is therefore: whole fields are lost, never a cut value,
+    and trailing fields go before leading ones. It is NOT "a number always
+    survives" — a single field longer than the entire budget is dropped, and if
+    that field is the identity header its headcount and ARR go with it. Dropping
+    a figure is recoverable; showing a specialist ``$25`` for a $250,000 burn is
+    not, which is the trade this makes.
+    """
+    if len(text) <= limit:
+        return text
+    kept: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        # +1 for the newline that rejoins this line to the previous one.
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > limit:
+            continue
+        kept.append(line)
+        used += cost
+    return "\n".join(kept)
 
 
 def _keep_both_ends(text: str, limit: int) -> str:
@@ -162,12 +209,24 @@ class Session:
         # The profile is pinned ahead of the tail slice below, not appended to
         # `parts`: it is the only company context a specialist gets, so an
         # over-budget turn must shed its oldest CONVERSATION, never the profile.
-        # Not passed through _inert — it is rendered from our own structured
-        # profile fields, not from anything a third party wrote.
+        #
+        # It IS passed through _inert. An earlier version of this comment called
+        # the profile first-party and skipped the escape; that was false.
+        # `POST /clients/generate` feeds uploaded PDF/Word/Excel/CSV text to the
+        # engagement-intake agent, which is instructed to copy facts verbatim,
+        # and `clients/slots.py` then writes that profile.yaml over the live
+        # profile. So a competitor gloss or mission statement can carry text a
+        # prospective client wrote. Without the escape, a `</conversation_context>`
+        # inside one of those fields closes the envelope early and the remainder
+        # is read as instructions — by every specialist in every fan-out, for
+        # the life of the engagement.
         profile = ""
         if self.company_profile is not None:
             try:
-                profile = (self.company_profile.to_specialist_block() or "")[:profile_max_chars]
+                profile = _fit_lines(
+                    _inert(self.company_profile.to_specialist_block() or ""),
+                    profile_max_chars,
+                )
             except Exception:
                 # A malformed profile degrades to no profile rather than
                 # breaking the turn, matching _emit_memory_snapshot's handling.

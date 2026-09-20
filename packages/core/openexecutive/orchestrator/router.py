@@ -70,8 +70,10 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
                         "should take. This text is ALSO the search query for the "
                         "specialist's own knowledge retrieval, so it must make sense "
                         "on its own. Do not repeat company background or the full "
-                        "conversation: the specialist receives the recent conversation "
-                        "automatically."
+                        "conversation: the specialist automatically receives a company "
+                        "profile digest and the recent conversation as TEXT. It does "
+                        "NOT receive attachments — restate anything you read from an "
+                        "attached image here."
                     ),
                 },
             },

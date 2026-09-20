@@ -439,6 +439,37 @@ class Executive:
         # by the caller — no separate block needed for those.
         if attachment_blocks:
             user_content_parts.extend(attachment_blocks)
+            # Images reach the Executive ONLY. `build_attachment_output` returns
+            # no text for an image, so nothing about it lands in `user_message`
+            # — and a specialist's whole view is the rendered conversation tail
+            # built from that string (`Session.render_conversation_context` ->
+            # `route_parallel(conversation_context=...)`), which carries text,
+            # never content blocks. Without this instruction a consult on an
+            # image turn sends the specialist neither the image nor any
+            # description of it, and it answers from priors while the Executive
+            # synthesizes the result as authoritative (PR #18, Codex P1).
+            # Forwarding the blocks themselves needs vision gating per
+            # specialist model and is tracked in issue #19; relaying the
+            # findings through `query` is what restores the evidence path here.
+            # Inert on the committee revision pass, which is sent no tools and
+            # so has no consult to relay into — harmless, and cheaper than
+            # threading a flag through `_build_messages` for one extra turn.
+            user_content_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "<attachment_notice>\n"
+                        "The attached image(s) are visible to you alone. Any "
+                        "specialist you consult receives only text, so it "
+                        "cannot see them. If you consult a specialist about "
+                        "anything shown in an attachment, restate the relevant "
+                        "figures, readings, labels or wording inside that "
+                        "call's `query` — the specialist has no other way to "
+                        "reach them.\n"
+                        "</attachment_notice>"
+                    ),
+                }
+            )
 
         user_content_parts.append({"type": "text", "text": user_message})
         messages.append({"role": "user", "content": user_content_parts})
