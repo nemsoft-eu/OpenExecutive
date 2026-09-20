@@ -7,7 +7,7 @@ description: >
   per finding.
 tools: Read, Grep, Glob, Bash
 model: fable
-effort: xhigh
+effort: medium
 maxTurns: 30
 color: red
 ---

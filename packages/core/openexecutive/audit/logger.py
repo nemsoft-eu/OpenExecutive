@@ -59,6 +59,11 @@ EVENT_TYPES: tuple[str, ...] = (
     "memory_snapshot",      # episodic context + company profile at turn entry
     "committee_review",     # committee-reviewed draft + critiques (pre-existing emit, now declared)
     "peer_memory",          # Honcho per-person memory — prefetch + sync_turn outcomes
+    # Deliberately NOT specialist_consult: a corrected or rejected specialist
+    # name is a routing event, not a consult. The audit graph derives specialist
+    # nodes and tool→specialist causal edges from specialist_consult rows, so
+    # filing these there would credit a specialist that never answered.
+    "routing_anomaly",      # specialist name normalised, or rejected as unresolvable
 )
 
 

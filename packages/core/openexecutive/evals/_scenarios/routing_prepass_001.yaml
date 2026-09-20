@@ -1,0 +1,25 @@
+# Scope note, so this file is not mistaken for a routing assertion:
+# `judge_chat` (evals/judges.py) reads ONLY `query` and `expected_topics`, and
+# the chat runner calls `executive.chat()`, which surfaces no consulted-
+# specialist list. `required_routing` is read by no code in this repo at all.
+# So this scenario measures whether the ANSWER improves once specialists are
+# consulted — it cannot, and does not, assert that they were. The routing
+# behaviour itself is pinned in tests/unit/test_routing_prepass.py.
+id: routing_prepass_001
+domain: cross_domain
+description: "Open-ended sequencing question — the answer should reflect several functional views, not a company-profile restatement"
+company_context:
+  stage: "Bootstrapped"
+  industry: "B2B SaaS"
+  arr: 400000
+  headcount: 6
+query: "What should I be focusing on right now, and in what order?"
+# Chosen to be answerable well only with finance, strategy and marketing input.
+# Measured on qwen3.8:27b, this exact question consulted no one on 11 of 12
+# turns before the routing pre-pass and answered from the profile alone — the
+# answer read plausibly, which is why topic coverage is the signal here.
+expected_topics:
+  - prioritization_with_explicit_ordering
+  - cash_and_runway_constraints
+  - go_to_market_tradeoffs
+  - what_to_defer_and_why

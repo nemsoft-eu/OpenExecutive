@@ -49,7 +49,7 @@ def _tu(i: int) -> dict:
 
 
 def _call(name: str) -> dict:
-    return {"specialist": name, "query": "q", "context": ""}
+    return {"specialist": name, "query": "q"}
 
 
 def test_partition_under_cap_is_inert() -> None:

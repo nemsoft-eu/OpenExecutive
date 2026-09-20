@@ -5,6 +5,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.audit import log_event as audit_log
 
 if TYPE_CHECKING:
     from openexecutive.orchestrator.debug_events import DebugCollector
@@ -63,17 +64,109 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "The specific question or task for the specialist. Be precise — they only see this query and the conversation context.",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Relevant context from the conversation that the specialist needs to give a good answer.",
+                    "description": (
+                        "The question for this specialist, in one or two sentences. "
+                        "Name the subject concretely — what is being decided, and the "
+                        "product and figures involved — then the angle this specialist "
+                        "should take. This text is ALSO the search query for the "
+                        "specialist's own knowledge retrieval, so it must make sense "
+                        "on its own. Do not repeat company background or the full "
+                        "conversation: the specialist automatically receives a company "
+                        "profile digest and the recent conversation as TEXT. It does "
+                        "NOT receive attachments — restate anything you read from an "
+                        "attached image here."
+                    ),
                 },
             },
             "required": ["specialist", "query"],
         },
     }
 ]
+
+
+# Truncation for a model-emitted name echoed into an error string or an audit
+# row. Long enough for any real key plus obvious garbage, short enough that a
+# pathological payload cannot bloat the row.
+NAME_PREVIEW_CHARS = 80
+
+
+def resolve_specialist_name(specialist_name: Any) -> str | None:
+    """Map a model-emitted specialist name onto a registry key, or None.
+
+    Local models truncate and re-case the `specialist` enum value: `cso` has
+    been observed arriving as `cs` and `csO`, and `cfo`/`cmo` as `cf`/`cm`.
+    An unresolved name used to be answered with a plain "Unknown specialist"
+    string, so the turn looked like it consulted someone while consulting
+    nobody — in one measured sample every consult in the turn was malformed.
+
+    Two tolerances:
+      - case-fold, since only the casing differs;
+      - a prefix that matches exactly one registry key.
+
+    A prefix matching several keys stays unresolved: guessing between `cso`
+    and `coo` would route the question to the wrong executive, which is worse
+    than not routing it at all.
+
+    Uniqueness is a property of the CURRENT roster, not of the algorithm.
+    Today `b` resolves to `board_comms` and `g` to `gc` because nothing else
+    starts with those letters; adding a specialist would correctly turn those
+    into None, and a key that is a prefix of another key would make the longer
+    one unreachable by prefix. `test_no_registry_key_prefixes_another` pins
+    the second case so the roster cannot drift into it silently.
+    """
+    # A local OpenAI-compatible backend passes tool arguments through
+    # json.loads unvalidated, so `specialist` can arrive as null, a number, or
+    # a list. Anthropic enforces the enum; nothing else does. Reject early —
+    # before this guard, `.strip()` on a non-str raised out of route_parallel's
+    # asyncio.gather and failed the whole turn instead of returning a
+    # tool_result the model could recover from.
+    if not isinstance(specialist_name, str):
+        return None
+    if specialist_name in SPECIALIST_REGISTRY:
+        return specialist_name
+    folded = specialist_name.strip().casefold()
+    if folded in SPECIALIST_REGISTRY:
+        return folded
+    if not folded:
+        return None
+    matches = [key for key in SPECIALIST_REGISTRY if key.startswith(folded)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def audit_name_resolution(
+    requested: Any,
+    resolved: str | None,
+    *,
+    source: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Record that a model-emitted specialist name was corrected or rejected.
+
+    ``routing_anomaly``, never ``specialist_consult``: the audit graph derives
+    a specialist node from every consult row and attributes later tool calls to
+    the most recent one, so filing a name that reached nobody under that type
+    would invert the failure this normalisation exists to remove.
+
+    One helper rather than an emit per call site — the rows feed the audit
+    graph, so two sites drifting apart shows up as a broken flow chart rather
+    than a failing test. ``source`` names the site for triage.
+    """
+    shown = str(requested)[:NAME_PREVIEW_CHARS]
+    if resolved is None:
+        summary = f"Unresolved specialist name: {shown}"
+    else:
+        summary = f"Normalised specialist name {shown} -> {resolved}"
+    audit_log(
+        "routing_anomaly",
+        summary,
+        session_id=session_id,
+        turn_id=turn_id,
+        actor="router",
+        details={"requested": shown, "resolved": resolved, "source": source},
+    )
 
 
 async def route_to_specialist(
@@ -94,9 +187,25 @@ async def route_to_specialist(
     consults so the two stay separable in the ``/audit/usage`` by-source
     breakdown.
     """
-    agent = SPECIALIST_REGISTRY.get(specialist_name)
-    if agent is None:
-        return f"Unknown specialist: {specialist_name}"
+    resolved = resolve_specialist_name(specialist_name)
+    # `specialist_name` may be any JSON value off a local backend, so render it
+    # for display rather than slicing it.
+    requested = str(specialist_name)[:NAME_PREVIEW_CHARS]
+    if resolved is None:
+        audit_name_resolution(specialist_name, None, source="route_to_specialist")
+        return (
+            f"Unknown specialist: {requested}. "
+            f"Valid names: {', '.join(sorted(SPECIALIST_REGISTRY))}."
+        )
+    if resolved != specialist_name:
+        # Reachable from the MCP tool and any other direct caller, which pass
+        # the name straight through. Both chat paths normalise before they get
+        # here, so they never take this branch — they audit their own
+        # correction at the point they make it.
+        audit_name_resolution(
+            specialist_name, resolved, source="route_to_specialist"
+        )
+    agent = SPECIALIST_REGISTRY[resolved]
     return await agent.analyze(
         query=query,
         context=context,
@@ -204,8 +313,21 @@ async def route_parallel(
     episodic_context: str = "",
     session_id: str | None = None,
     debug_collector: DebugCollector | None = None,
+    conversation_context: str = "",
 ) -> list[str]:
     """Execute multiple specialist calls concurrently.
+
+    ``conversation_context`` is the turn's rendered conversation tail, supplied by the
+    caller and forwarded verbatim to every specialist in the batch. It
+    replaces a per-call ``context`` the model used to write itself.
+
+    Measured on the six-specialist fan-out in issue #12: the routing turn
+    emitted 1,724 output tokens and took 58.7 s of generation on the local
+    backend (29.35 t/s) before any specialist started, and the six queries
+    it produced were near-verbatim restatements of the same background. The
+    orchestrator already holds that context, so supplying it here costs no
+    output tokens at all. How much of the 1,724 was the duplication is not
+    separately measured — only the total and the restatement are.
 
     Each specialist receives its own domain-filtered RAG context, fetched
     in parallel before the LLM calls fire. Callers may still supply a
@@ -226,6 +348,36 @@ async def route_parallel(
     Returns results in the same order as ``calls`` so callers can zip
     with tool_use_ids.
     """
+    # Normalise every name HERE, before retrieval, department prefetch and the
+    # debug labels read it — not only inside route_to_specialist. Resolving
+    # late still dispatches the right agent, but a truncated `cs` would reach
+    # retrieve(specialist_name="cs"), whose DOMAIN_ALIASES lookup misses and
+    # silently degrades to UNFILTERED retrieval; skip the department prefetch
+    # (slug_for_specialist -> None); label the debug events with the raw
+    # token; and key consulted_out on "cs", which committee reviewer selection
+    # and the Honcho department sync both drop. That would make a malformed
+    # name worse than the plain error string it used to produce.
+    #
+    # An unresolvable name falls back to str(), not to the raw value: it is
+    # carried through so route_to_specialist can answer with its error string,
+    # but retrieval runs first and DOMAIN_ALIASES.get() raises TypeError on an
+    # unhashable list or dict — out of the gather below, failing the whole turn
+    # before that guard is ever reached.
+    #
+    # Both chat paths already normalise (and audit the correction where they
+    # make it), and they are the only callers today, so nothing here should
+    # normally fire. It stays because this is the single entry to the fan-out:
+    # the cost of a redundant dict lookup is nothing against a future caller
+    # reaching retrieval with a raw name, which degrades silently rather than
+    # failing.
+    calls = [
+        {
+            **c,
+            "specialist": resolve_specialist_name(c["specialist"])
+            or str(c["specialist"]),
+        }
+        for c in calls
+    ]
     if retrieved_knowledge_map is None:
         knowledge_futures = [_retrieve_for_call(c) for c in calls]
         failures_futures = [_retrieve_failures_for_call(c) for c in calls]
@@ -263,7 +415,7 @@ async def route_parallel(
         result = await route_to_specialist(
             specialist_name=specialist,
             query=call["query"],
-            context=call.get("context", ""),
+            context=conversation_context,
             retrieved_knowledge=knowledge_per_call[idx],
             episodic_context=episodic_context,
             failure_cases=failures_per_call[idx],

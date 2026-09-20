@@ -153,7 +153,67 @@ async def test_consult_specialist_routes_to_specialist() -> None:
 @pytest.mark.asyncio
 async def test_consult_specialist_rejects_unknown() -> None:
     with pytest.raises(ValueError, match="Unknown specialist"):
-        await mcp_server.consult_specialist("bogus", "q")  # type: ignore[arg-type]
+        await mcp_server.consult_specialist("bogus", "q")
+
+
+@pytest.mark.asyncio
+async def test_wire_path_accepts_a_truncated_name_and_forwards_it_raw() -> None:
+    """Exercise `call_tool`, not the handler — the schema layer is the defect.
+
+    FastMCP builds a Pydantic model from the handler's type hints and validates
+    arguments against it *before* the handler runs. While `specialist` was
+    annotated as the bare `SpecialistKey` Literal, `csO` was rejected there with
+    a `literal_error` and `resolve_specialist_name` never ran, so the documented
+    parity with the chat path did not hold on the wire at all. Calling the
+    handler directly cannot catch that regression, because a direct call skips
+    Pydantic entirely.
+
+    The raw name must also survive to `route_to_specialist`: that is where the
+    `routing_anomaly` audit row is written, so normalising it earlier would
+    erase the anomaly instead of recording it.
+    """
+    mock = AsyncMock(return_value="CSO analysis")
+    with patch("openexecutive.orchestrator.router.route_to_specialist", new=mock):
+        await mcp_server.mcp.call_tool(
+            "consult_specialist", {"specialist": "csO", "query": "sequence this"}
+        )
+    mock.assert_awaited_once_with(
+        "csO", "sequence this", context="", actor="specialist_mcp",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_specialist_error_truncates_caller_input() -> None:
+    """The parameter is now unbounded caller text, so it cannot be echoed whole.
+
+    `router.py` truncates a model-emitted name to 80 chars in both of its own
+    messages for this reason; widening the annotation to `str` brought the same
+    exposure to the tool error and to FastMCP's ERROR log line.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        await mcp_server.consult_specialist("z" * 5000, "q")
+    assert "z" * 80 in str(excinfo.value)
+    assert "z" * 81 not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_wire_schema_still_advertises_the_exact_roster() -> None:
+    """Pin the advertised enum against a future edit that drops it.
+
+    Note what this does NOT prove: a bare `Literal[...]` of strings emits the
+    same `{"type": "string", "enum": [...]}` schema, so this assertion passes
+    on the strict annotation too and cannot detect the `literal_error`
+    regression. `test_wire_path_accepts_a_truncated_name_and_forwards_it_raw`
+    is the test that carries that. This one guards the other direction — that
+    someone widening the parameter to a plain `str` does not silently stop
+    telling clients what the valid values are.
+    """
+    from openexecutive.orchestrator.router import SPECIALIST_REGISTRY
+
+    tools = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    schema = tools["consult_specialist"].inputSchema["properties"]["specialist"]
+    assert set(schema["enum"]) == set(SPECIALIST_REGISTRY)
+    assert schema["type"] == "string"
 
 
 @pytest.mark.asyncio

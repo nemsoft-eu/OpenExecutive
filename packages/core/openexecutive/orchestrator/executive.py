@@ -63,8 +63,11 @@ from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOLS,
 )
 from openexecutive.orchestrator.router import (
+    NAME_PREVIEW_CHARS,
     SPECIALIST_TOOLS,
+    audit_name_resolution,
     partition_specialist_fanout,
+    resolve_specialist_name,
     route_parallel,
 )
 from openexecutive.orchestrator.schedule_tools import (
@@ -317,6 +320,74 @@ def _emit_memory_snapshot(
     )
 
 
+def _canonical_specialist(raw: Any) -> str:
+    """Registry key for a model-emitted specialist name, or the name unchanged.
+
+    Returning the original on failure (rather than "" or None) keeps the
+    unresolvable case flowing to ``route_to_specialist``, which answers with an
+    error string the model can act on and audits the anomaly there.
+
+    The CORRECTION is audited here, because this is where it happens. Once the
+    name is canonical every later layer sees a well-formed value and has
+    nothing to report — `route_to_specialist`'s own normalisation branch is
+    unreachable from the chat path for exactly that reason, so relying on it
+    would leave every corrected name unrecorded.
+    """
+    resolved = resolve_specialist_name(raw)
+    if resolved is None:
+        return str(raw)
+    if resolved != raw:
+        audit_name_resolution(raw, resolved, source="chat_loop")
+    return resolved
+
+
+def _audit_specialist_consults(
+    *,
+    run_calls: list[dict[str, str]],
+    specialist_results: list[str],
+    session_id: str | None,
+    turn_id: str | None,
+    iteration: int,
+    phase: str,
+    duration_ms: int,
+    conversation_context: str,
+    system_blocks: list[dict[str, Any]],
+) -> None:
+    """Write one ``specialist_consult`` row per dispatched consult.
+
+    Shared by the routing pre-pass and the tool-use loop so the row shape is
+    defined once: the audit graph and /audit/usage read these rows, so two
+    sites drifting apart shows up as a broken flow chart rather than a failing
+    test. ``phase`` distinguishes the two ("prepass" / "loop").
+    """
+    # Per-batch, not per-call: identical for every row here, and it walks the
+    # block list to build the names.
+    prompt_blocks = _system_block_names(system_blocks)
+    context_preview = conversation_context[:200]
+    for call, spec_result in zip(run_calls, specialist_results, strict=True):
+        audit_log(
+            "specialist_consult",
+            f"Consulted {call['specialist']}: {str(call['query'])[:160]}",
+            session_id=session_id,
+            turn_id=turn_id,
+            actor=call["specialist"],
+            details={
+                "iteration": iteration,
+                "phase": phase,
+                "duration_ms": duration_ms,
+                # One shared value per turn, not per call — read it from
+                # what route_parallel was given, never from the call dict.
+                "context_preview": context_preview,
+            },
+            full={
+                "query": call["query"],
+                "context": conversation_context,
+                "response": spec_result,
+                "active_prompt_blocks": prompt_blocks,
+            },
+        )
+
+
 def _emit_cache_event(
     *,
     session_id: str | None,
@@ -439,6 +510,37 @@ class Executive:
         # by the caller — no separate block needed for those.
         if attachment_blocks:
             user_content_parts.extend(attachment_blocks)
+            # Images reach the Executive ONLY. `build_attachment_output` returns
+            # no text for an image, so nothing about it lands in `user_message`
+            # — and a specialist's whole view is the rendered conversation tail
+            # built from that string (`Session.render_conversation_context` ->
+            # `route_parallel(conversation_context=...)`), which carries text,
+            # never content blocks. Without this instruction a consult on an
+            # image turn sends the specialist neither the image nor any
+            # description of it, and it answers from priors while the Executive
+            # synthesizes the result as authoritative (PR #18, Codex P1).
+            # Forwarding the blocks themselves needs vision gating per
+            # specialist model and is tracked in issue #19; relaying the
+            # findings through `query` is what restores the evidence path here.
+            # Inert on the committee revision pass, which is sent no tools and
+            # so has no consult to relay into — harmless, and cheaper than
+            # threading a flag through `_build_messages` for one extra turn.
+            user_content_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "<attachment_notice>\n"
+                        "The attached image(s) are visible to you alone. Any "
+                        "specialist you consult receives only text, so it "
+                        "cannot see them. If you consult a specialist about "
+                        "anything shown in an attachment, restate the relevant "
+                        "figures, readings, labels or wording inside that "
+                        "call's `query` — the specialist has no other way to "
+                        "reach them.\n"
+                        "</attachment_notice>"
+                    ),
+                }
+            )
 
         user_content_parts.append({"type": "text", "text": user_message})
         messages.append({"role": "user", "content": user_content_parts})
@@ -591,6 +693,7 @@ class Executive:
                 debug_collector=debug_collector,
                 consulted_out=consulted,
                 turn_id=turn_id,
+                conversation_context=session.render_conversation_context(user_message),
             ):
                 if isinstance(item, str) and item != self._THINKING:
                     full_response += item
@@ -824,6 +927,7 @@ class Executive:
             consulted_out=consulted,
             specialist_outputs_out=specialist_outputs,
             turn_id=turn_id,
+            conversation_context=session.render_conversation_context(user_message),
         ):
             # Swallow draft text and the THINKING sentinel — the user sees
             # only the revised stream. Pass debug-event dicts through so the
@@ -1086,6 +1190,292 @@ class Executive:
         # tasks and don't share the ContextVar value.
         clear_turn()
 
+    async def _routing_prepass(
+        self,
+        system_blocks: list[dict[str, Any]],
+        current_messages: list[dict[str, Any]],
+        *,
+        model: str,
+        episodic_context: str,
+        debug_collector: DebugCollector | None,
+        consulted_out: list[str] | None,
+        specialist_outputs_out: dict[str, str] | None,
+        turn_id: str | None,
+        conversation_context: str,
+        specialists_consulted: list[str],
+    ) -> AsyncIterator[str | dict[str, Any]]:
+        """Decide and dispatch specialist consults before the main turn.
+
+        One model call offering `consult_specialist` and nothing else. On
+        the full surface that tool competes with the rest of the client
+        tool surface and a smaller model does not reach for it; the
+        measurements are recorded on ``Settings.routing_prepass_enabled``.
+
+        Appends the decision and its results to ``current_messages`` as a
+        well-formed tool_use/tool_result pair, so the main loop — which is
+        otherwise untouched and still sees every tool — opens with the
+        specialist findings already in hand. A pre-pass that picks nobody
+        appends nothing, which is why an action turn ("schedule X") cannot
+        regress: it simply falls through to the loop as before.
+        """
+        prepass_tools = [
+            {
+                **SPECIALIST_TOOLS[0],
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        ]
+        try:
+            decision = await get_provider(model).messages_create(
+                model=model,
+                max_tokens=1024,
+                system=system_blocks,
+                tools=prepass_tools,
+                messages=current_messages,
+            )
+        except Exception:
+            # Never fail the turn on the pre-pass: the main loop still offers
+            # consult_specialist, so a failure here costs routing quality, not
+            # the answer.
+            logger.exception("routing pre-pass failed; continuing without it")
+            return
+
+        session_id = getattr(current_session.get(), "session_id", None)
+        # The pre-pass is a real billed call against the full system prefix.
+        # Without this row /audit/usage and the per-session CostSummary — both
+        # of which aggregate cache_event only — would under-report every turn
+        # by one call. iteration=0 marks it as pre-loop.
+        _emit_cache_event(
+            session_id=session_id,
+            turn_id=turn_id or "",
+            iteration=0,
+            final_msg=decision,
+            model=model,
+            actor="routing_prepass",
+        )
+
+        run_tool_uses: list[dict[str, Any]] = []
+        run_calls: list[dict[str, str]] = []
+        reasoning_blocks: list[dict[str, Any]] = []
+        consult_blocks = [
+            b
+            for b in decision.content
+            if getattr(b, "type", None) == "tool_use"
+            and b.name == "consult_specialist"
+        ]
+        # What the model asked for, counted before anything is dropped, so the
+        # debug event can report the difference. Counting survivors plus
+        # per-reason counters would make every future `continue` responsible
+        # for keeping the arithmetic true.
+        requested_count = len(consult_blocks)
+        for block in decision.content:
+            # Carry the OpenRouter reasoning array into the replayed assistant
+            # turn. Every other block-by-block replay in this repo does; the
+            # translator's contract is that a tool_use turn whose reasoning was
+            # dropped can be 400'd by a thinking-enabled model, and OpenRouter
+            # loses continuity without it.
+            if (replay := reasoning_replay_block(block)) is not None:
+                reasoning_blocks.append(replay)
+                continue
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            if block.name != "consult_specialist":
+                continue
+            # A tool_use's `input` is always a dict: Anthropic validates it
+            # against the schema, and translator._parse_tool_arguments coerces
+            # a non-object payload to {} for every OpenAI-compatible provider.
+            block_input = block.input
+            # One rule, not three: a consult carrying no question is dropped,
+            # whatever produced it. Dispatching one bills a specialist call that
+            # can only answer generically and files a consult in the audit graph
+            # for a turn that reached nobody — the looks-routed-but-isn't
+            # failure this pre-pass exists to fix.
+            #
+            # Truncation is the usual source: the pre-pass runs on a 1024-token
+            # budget, and a tool_use cut mid-arguments deserializes with `query`
+            # missing or blank. But `stop_reason == "max_tokens"` is NOT
+            # evidence that a given call was the casualty — a reasoning model
+            # routinely finishes a complete consult and then spends the rest of
+            # the budget thinking — and a blank query is worth dropping even
+            # when nothing was truncated. Keying the drop on stop_reason plus
+            # "is the last tool_use" got both directions wrong at once: it
+            # discarded a complete final consult (making the pre-pass a no-op)
+            # while still dispatching a blank one that happened to be emitted
+            # first. The query is the thing actually being tested, so test it
+            # alone. stop_reason stays in the log line, where it is diagnosis
+            # rather than control flow; getattr because not every adapter sets
+            # it.
+            #
+            # The main tool loop deliberately has no equivalent drop: there the
+            # model has already been shown a tool surface, so a blank consult
+            # can be answered with a tool_result it can re-ask from. The
+            # pre-pass has no such recovery — it either dispatches or discards.
+            if not str(block_input.get("query") or "").strip():
+                # Name the block and the requested specialist: several blank
+                # consults in one decision are otherwise indistinguishable in
+                # the log, and this drop writes no audit row to correlate with.
+                # The name is model-emitted, so it gets the same preview cap
+                # the router applies before echoing one.
+                logger.warning(
+                    "routing pre-pass: dropping consult with no query "
+                    "(id=%s specialist=%r stop_reason=%s)",
+                    getattr(block, "id", None),
+                    str(block_input.get("specialist", ""))[:NAME_PREVIEW_CHARS],
+                    getattr(decision, "stop_reason", None),
+                )
+                continue
+            raw_name = block_input.get("specialist", "")
+            resolved = resolve_specialist_name(raw_name)
+            if resolved is None:
+                # Dropped rather than dispatched: route_to_specialist would
+                # only hand back an error string, and replaying the tool_use
+                # would oblige us to carry a useless tool_result into the
+                # main turn.
+                audit_name_resolution(
+                    raw_name,
+                    None,
+                    source="routing_prepass",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+                continue
+            if resolved != raw_name:
+                audit_name_resolution(
+                    raw_name,
+                    resolved,
+                    source="routing_prepass",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+            run_tool_uses.append(
+                {"id": block.id, "name": block.name, "input": block_input}
+            )
+            run_calls.append(
+                {
+                    "specialist": resolved,
+                    "query": str(block_input.get("query", "")),
+                }
+            )
+
+        run_tool_uses, run_calls, _skipped_results, fanout_cap = (
+            partition_specialist_fanout(
+                run_tool_uses, run_calls, self._settings.max_parallel_specialists
+            )
+        )
+        # Over-cap picks are dropped outright rather than carried as skip
+        # results (hence discarding `_skipped_results`, which the loop uses to
+        # give each over-cap tool_use a tool_result). The loop's skip message
+        # exists so the model can re-ask; here the model has not yet seen a
+        # tool surface to re-ask with, and the main turn can still consult
+        # whoever was left out.
+        #
+        # Emitted before the empty check so "asked for specialists, reached
+        # nobody" is still reported: it is the looks-routed-but-isn't case, and
+        # the counts are what carry it. Note the Agent Activity panel renders
+        # this event from `specialists` alone, so an all-dropped decision shows
+        # there as an empty routing line — the detail lives in the event stream
+        # and, for a name that failed to resolve, the routing_anomaly audit
+        # rows. A consult dropped for a blank query writes no audit row: there
+        # is no name anomaly to record, and the drop happens before the name is
+        # read. That class is visible only here and in the log line above, so
+        # `skipped_count` exceeding the number of routing_anomaly rows for the
+        # turn is expected, not a gap.
+        if debug_collector and requested_count:
+            evt = debug_collector.emit("routing_decision", {
+                "iteration": 0,
+                "phase": "prepass",
+                "requested_count": requested_count,
+                "cap": fanout_cap,
+                "dispatched_count": len(run_calls),
+                "skipped_count": requested_count - len(run_calls),
+                "specialists": [
+                    {"specialist": c["specialist"], "query": c["query"]}
+                    for c in run_calls
+                ],
+            })
+            yield debug_collector.to_sse_dict(evt)
+
+        if not run_calls:
+            return
+
+        yield self._THINKING
+
+        # route_parallel appends specialist_start/specialist_done to the
+        # collector but does not yield them; the caller drains them. The loop
+        # does that from its own cursor — and takes that cursor AFTER the
+        # pre-pass runs, so anything emitted here would never be yielded by
+        # either. Without this drain the live Agent Activity panel shows
+        # "Routing to CSO, CFO" and then nothing until synthesis, on what is
+        # now the primary routing path. /debug/last-turn snapshots _events
+        # wholesale afterwards, so a post-hoc check would not catch it.
+        event_cursor = len(debug_collector._events) if debug_collector else 0
+        spec_t0 = time.monotonic()
+        specialist_results = await route_parallel(
+            run_calls,
+            episodic_context=episodic_context,
+            session_id=session_id,
+            debug_collector=debug_collector,
+            conversation_context=conversation_context,
+        )
+        spec_ms = round((time.monotonic() - spec_t0) * 1000)
+        if debug_collector:
+            for evt in debug_collector._events[event_cursor:]:
+                yield debug_collector.to_sse_dict(evt)
+
+        specialists_consulted.extend(c["specialist"] for c in run_calls)
+        if consulted_out is not None:
+            consulted_out.extend(c["specialist"] for c in run_calls)
+        if specialist_outputs_out is not None:
+            for call, result in zip(run_calls, specialist_results, strict=True):
+                specialist_outputs_out[call["specialist"]] = result
+
+        _audit_specialist_consults(
+            run_calls=run_calls,
+            specialist_results=specialist_results,
+            session_id=session_id,
+            turn_id=turn_id,
+            iteration=0,
+            phase="prepass",
+            duration_ms=spec_ms,
+            conversation_context=conversation_context,
+            system_blocks=system_blocks,
+        )
+
+        # Replay only the dispatched tool_uses, so every tool_use in the
+        # assistant message has exactly the one tool_result the API requires.
+        # Reasoning blocks lead, matching the loop's block-by-block replay.
+        current_messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    *reasoning_blocks,
+                    *(
+                        {
+                            "type": "tool_use",
+                            "id": tu["id"],
+                            "name": tu["name"],
+                            "input": tu["input"],
+                        }
+                        for tu in run_tool_uses
+                    ),
+                ],
+            }
+        )
+        current_messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": result,
+                    }
+                    for tu, result in zip(
+                        run_tool_uses, specialist_results, strict=True
+                    )
+                ],
+            }
+        )
+
     async def _stream_agent_loop(
         self,
         system_blocks: list[dict[str, Any]],
@@ -1099,6 +1489,7 @@ class Executive:
         consulted_out: list[str] | None = None,
         specialist_outputs_out: dict[str, str] | None = None,
         turn_id: str | None = None,
+        conversation_context: str = "",
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Tool-use loop that yields text deltas as they arrive.
 
@@ -1109,6 +1500,7 @@ class Executive:
         current_messages = list(messages)
         last_full_text = ""
         specialists_consulted: list[str] = []
+        synthesis_roster_size = 0
 
         stream_model = model or self._settings.default_model
         # Built before the loop: see client_search_handlers on why the budget
@@ -1117,6 +1509,21 @@ class Executive:
             **_ALL_SKILL_HANDLERS,
             **client_search_handlers(search),
         }
+
+        if self._settings.routing_prepass_enabled:
+            async for item in self._routing_prepass(
+                system_blocks,
+                current_messages,
+                model=stream_model,
+                episodic_context=episodic_context,
+                debug_collector=debug_collector,
+                consulted_out=consulted_out,
+                specialist_outputs_out=specialist_outputs_out,
+                turn_id=turn_id,
+                conversation_context=conversation_context,
+                specialists_consulted=specialists_consulted,
+            ):
+                yield item
 
         for iteration in range(1, max_iterations + 1):
             logger.info(
@@ -1129,11 +1536,25 @@ class Executive:
 
             # If specialists were already consulted, this is the synthesis pass.
             # Emit synthesis_start before text chunks begin streaming.
-            if debug_collector and specialists_consulted:
+            #
+            # Re-emitted whenever the consulted roster GROWS, rather than once.
+            # This event could always fire on several iterations of one turn
+            # (consult at iteration 1, use a tool at iteration 2, and it fired
+            # at the top of both 2 and 3) — the pre-pass only makes iteration 1
+            # eligible too. Firing once would be the regression: the panel
+            # would report the pre-pass's roster and never mention a specialist
+            # the loop went on to consult.
+            # Names are de-duplicated because the same specialist can be
+            # consulted by both the pre-pass and the loop; the count is a
+            # roster for the UI ("Synthesizing N specialist responses"), not a
+            # call tally.
+            unique_consulted = list(dict.fromkeys(specialists_consulted))
+            if debug_collector and len(unique_consulted) > synthesis_roster_size:
                 evt = debug_collector.emit("synthesis_start", {
-                    "specialist_count": len(specialists_consulted),
-                    "specialists_consulted": specialists_consulted,
+                    "specialist_count": len(unique_consulted),
+                    "specialists_consulted": unique_consulted,
                 })
+                synthesis_roster_size = len(unique_consulted)
                 yield debug_collector.to_sse_dict(evt)
 
             # Client-side tools are sorted by name for cache stability; the
@@ -1249,11 +1670,25 @@ class Executive:
             skill_tool_uses = [tu for tu in tool_uses if tu["name"] in turn_skill_handlers]
             mcp_tool_uses = [tu for tu in tool_uses if tu["name"] in MCP_TOOL_NAMES]
 
+            # No per-call "context": the tool no longer advertises one, and the
+            # orchestrator forwards a rendered conversation tail to every
+            # specialist via route_parallel(conversation_context=...). A model
+            # that still emits the field is ignored rather than paid for.
+            # Normalise the name HERE as well as inside route_parallel. The
+            # router rebinds its own local `calls`, so without this the loop
+            # would dispatch to the canonical specialist while recording the
+            # raw token in specialists_consulted / consulted_out and as the
+            # audit actor — committee reviewer selection and the department
+            # sync both drop an unrecognised key, so a truncated `cs` would
+            # consult the CSO and then be invisible to everything downstream.
+            # An unresolvable name is left as-is so route_to_specialist returns
+            # its error string and audits the anomaly exactly once.
             specialist_calls = [
                 {
-                    "specialist": tu["input"].get("specialist", ""),
-                    "query": tu["input"].get("query", ""),
-                    "context": tu["input"].get("context", ""),
+                    "specialist": _canonical_specialist(
+                        tu["input"].get("specialist", "")
+                    ),
+                    "query": str(tu["input"].get("query", "")),
                 }
                 for tu in specialist_tool_uses
             ]
@@ -1272,6 +1707,10 @@ class Executive:
             if debug_collector and specialist_calls:
                 evt = debug_collector.emit("routing_decision", {
                     "iteration": iteration,
+                    # Set on both emitters or neither: a field present on some
+                    # routing_decision events and absent on others is worse
+                    # than no field at all for anything reading the stream.
+                    "phase": "loop",
                     "requested_count": len(specialist_calls),
                     "cap": fanout_cap,
                     "dispatched_count": len(run_calls),
@@ -1280,7 +1719,6 @@ class Executive:
                         {
                             "specialist": c["specialist"],
                             "query": c["query"],
-                            "context": c.get("context", "")[:200],
                         }
                         for c in run_calls
                     ],
@@ -1325,6 +1763,7 @@ class Executive:
                     episodic_context=episodic_context,
                     session_id=session_id,
                     debug_collector=debug_collector,
+                    conversation_context=conversation_context,
                 )
                 spec_ms = round((time.monotonic() - spec_t0) * 1000)
                 for tu, result in zip(
@@ -1341,38 +1780,44 @@ class Executive:
                         fanout_cap,
                         len(skipped_results),
                     )
-                specialists_consulted.extend(c["specialist"] for c in run_calls)
+                # Record only the calls that reached a real specialist. An
+                # unresolvable name still gets its tool_result above — the
+                # model needs the error to recover, and the API needs one
+                # result per tool_use — but it consulted nobody, so letting it
+                # into these lists would file a specialist_consult row for a
+                # consult that never ran (the audit graph then draws a
+                # specialist node and attributes later tool calls to it) and
+                # seed the synthesis roster, committee reviewer selection and
+                # the department sync with a token they all silently no-op on.
+                # The pre-pass drops such names outright; this is the same rule
+                # on the path that cannot drop them.
+                reached = [
+                    (call, result)
+                    for call, result in zip(run_calls, specialist_results, strict=True)
+                    if resolve_specialist_name(call["specialist"]) is not None
+                ]
+                reached_calls = [c for c, _ in reached]
+                reached_results = [r for _, r in reached]
+                specialists_consulted.extend(c["specialist"] for c in reached_calls)
                 if consulted_out is not None:
-                    consulted_out.extend(c["specialist"] for c in run_calls)
+                    consulted_out.extend(c["specialist"] for c in reached_calls)
                 if specialist_outputs_out is not None:
-                    for call, result in zip(
-                        run_calls, specialist_results, strict=True
-                    ):
+                    for call, result in reached:
                         # Last-write-wins if the same specialist is consulted
                         # in multiple iterations — committee only needs a
                         # representative excerpt per domain.
                         specialist_outputs_out[call["specialist"]] = result
-                for call, spec_result in zip(
-                    run_calls, specialist_results, strict=True
-                ):
-                    audit_log(
-                        "specialist_consult",
-                        f"Consulted {call['specialist']}: {str(call['query'])[:160]}",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        actor=call["specialist"],
-                        details={
-                            "iteration": iteration,
-                            "duration_ms": spec_ms,
-                            "context_preview": str(call.get("context", ""))[:200],
-                        },
-                        full={
-                            "query": call["query"],
-                            "context": call.get("context", ""),
-                            "response": spec_result,
-                            "active_prompt_blocks": _system_block_names(system_blocks),
-                        },
-                    )
+                _audit_specialist_consults(
+                    run_calls=reached_calls,
+                    specialist_results=reached_results,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    iteration=iteration,
+                    phase="loop",
+                    duration_ms=spec_ms,
+                    conversation_context=conversation_context,
+                    system_blocks=system_blocks,
+                )
 
             if skill_tool_uses:
                 for tu in skill_tool_uses:

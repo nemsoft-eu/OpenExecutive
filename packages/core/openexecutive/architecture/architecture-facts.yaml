@@ -312,6 +312,209 @@ providers:
 routing:
   pattern: Anthropic tool use with a single `consult_specialist` tool. Multiple parallel tool_use blocks per assistant turn fan out to specialists concurrently.
   parallel_function: openexecutive.orchestrator.router.route_parallel
+  prepass: |
+    `Executive._routing_prepass` runs one model call BEFORE the main tool-use
+    loop, offering `consult_specialist` and nothing else
+    (`ROUTING_PREPASS_ENABLED`, default true). Its picks are dispatched through
+    the same `route_parallel` fan-out and replayed into `current_messages` as a
+    matching tool_use/tool_result pair, so the main loop — otherwise untouched,
+    still holding all ~59 tools — opens with the specialist findings in hand.
+
+    Why it exists: on the full surface `consult_specialist` competes with ~58
+    client tools and a small model does not reach for it. Measured with
+    direct-provider probes against qwen3.8:27b-mtp-q4_K_M-128k on "What should
+    I be focusing on right now, and in what order?" (n=12 per arm):
+    production surface 1/12 consulting turns; persona directive alone 6/12;
+    solo tool surface alone 3/6; both together 11/12. The two levers are
+    roughly independent, so BOTH the pre-pass and the persona's
+    "Consulting Your Leadership Team" section are load-bearing — removing
+    either one roughly halves routing.
+
+    NOTE that 11/12 arm used a probe-only directive string. Re-verified twice
+    against the SHIPPED persona constant end to end: advisory 9/12 then 11/12,
+    action turn 0/12 then 1/12. Quote the range, not a single run — the spread
+    between two identical n=12 runs is about as wide as the effect some
+    single-run comparisons would claim.
+
+    The second run also produced live confirmation of the truncation defect and
+    its fix: the model emitted `cs`, which resolve_specialist_name rescued to
+    `cso`.
+
+    Truncation handling: ONE test, not three — a consult whose `query` is
+    missing or blank is dropped, wherever it sits in `content` and whatever the
+    `stop_reason`. Truncation (the pre-pass runs on max_tokens=1024) is the
+    usual source, but `stop_reason == "max_tokens"` is NOT evidence that a
+    given call was the casualty: a reasoning model routinely finishes a
+    complete consult and then spends the rest of the budget thinking. An
+    earlier version AND-ed the blank-query test with `max_tokens` and
+    `block is last_tool_use`, which was wrong in BOTH directions at once — it
+    discarded a complete final consult (pre-pass becomes a no-op; raised by
+    Cursor Bugbot on PR #18) while still dispatching a blank consult emitted
+    FIRST (found by adversarial review of that fix). `stop_reason` now appears
+    only in the log line, as diagnosis rather than control flow. Position was
+    never a safe thing to test in the first place, in EITHER direction: on the
+    OpenRouter path the translator appends a synthetic `openrouter_reasoning`
+    block after the tool_use blocks, so a check keyed on the last content BLOCK
+    misses the tool_use entirely; but that block is appended only when the
+    response carries `reasoning_details`, which is an OpenRouter response
+    extension, so against a plain local OpenAI-compatible server (Ollama,
+    llama.cpp, vLLM — what the measurements above were taken on) there is no
+    trailing block and a tool_use IS `content[-1]`. Neither shape is universal,
+    which is the point: the query is the thing being tested.
+
+    Safety property: a pre-pass that picks nobody appends NOTHING, so an action
+    turn ("schedule X") falls through to the loop exactly as before. Measured
+    false-positive rate on action/lookup turns with the persona's
+    "consulting is for judgement" paragraph in place: 2/6 add-person, 0/6
+    schedule, 1/6 lookup. A provider failure is caught and logged, never raised
+    — the main loop still offers `consult_specialist`, so the cost is routing
+    quality, not the answer.
+
+    Cost: the pre-pass is a different cached prefix from the main turn (tools
+    render at the prompt head), so neither warms the other. Measured with
+    generation pinned to one token: main turn warm 0.27s, pre-pass 0.82s, main
+    turn after pre-pass 0.66s — about +0.4s of prompt processing. An earlier
+    run at max_tokens=256 appeared to show ~+11s; that was an output-length
+    confound, not prefix thrash.
+  name_normalisation: |
+    `router.resolve_specialist_name` maps a model-emitted `specialist` value
+    onto a registry key: exact, then case-folded, then a prefix matching
+    exactly ONE key. An ambiguous prefix (`c` spans cso/cfo/chro/coo/cmo/cpo)
+    resolves to None rather than guessing — routing to the wrong executive is
+    worse than not routing. Non-str input (a local backend can send null, a
+    number or a list — only Anthropic enforces the enum) returns None instead
+    of raising out of route_parallel's gather and failing the turn.
+
+    APPLIED IN `route_parallel`, before the fan-out — not at dispatch. Late
+    normalisation still reaches the right agent but leaves the raw token in
+    every consumer: `retrieve(specialist_name="cs")` misses DOMAIN_ALIASES and
+    degrades to UNFILTERED retrieval, `slug_for_specialist("cs")` is None so
+    department memory is skipped, debug labels show the raw token, and
+    consulted_out keyed "cs" is dropped by both committee reviewer selection
+    and the Honcho dept sync. That would make a malformed name worse than the
+    error string it replaced. Uniqueness of a one-letter prefix (`b`, `g`) is
+    a property of the current ten-key roster, not of the algorithm;
+    `test_no_registry_key_prefixes_another` pins the invariant that no key
+    prefixes another.
+
+    Why: qwen3.8:27b truncates the enum to two characters. Observed in one
+    n=12 probe arm: `cs`, `cf`, `cm`, and `csO`. One sampled turn emitted
+    `['cs', 'cf', 'cm']` — three consults, none of which reached a specialist,
+    because the old code returned a bare "Unknown specialist: cs" string as the
+    tool_result. Nothing distinguished that from a real consult in the audit
+    log, which is why both the normalisation and the unresolved case now emit
+    a `routing_anomaly` row via `router.audit_name_resolution` — deliberately
+    NOT `specialist_consult`, which the audit graph turns into a specialist
+    node and treats as the turn's most recent specialist for causal edges.
+
+    The correction is audited where it is MADE (the pre-pass, and
+    `_canonical_specialist` on the loop path), not in `route_to_specialist`:
+    normalising before retrieval means every later layer sees a canonical name
+    and has nothing left to report, so auditing there would record nothing on
+    either chat path. `route_to_specialist` keeps its own branch for direct
+    callers — the MCP tool passes names straight through.
+  conversation_context: |
+    The Executive's `consult_specialist` tool (`router.SPECIALIST_TOOLS`) takes
+    only `specialist` and `query`. There is deliberately NO per-call `context`
+    field — the orchestrator supplies the conversation context instead, via
+    `route_parallel(conversation_context=...)`, which reaches
+    `BaseAgent.analyze(context=...)` as `<conversation_context>`. This is about
+    the chat tool loop only: the MCP server exposes a separate tool of the same
+    name (`mcp_server/server.py`) that DOES take a `context` argument, because
+    an external agent has no session here for the orchestrator to render from.
+
+    What it carries — `Session.render_conversation_context` renders `CompanyProfile.to_specialist_block`
+    — a digest of company identity, financial position, priorities and north
+    star, target customer and pain points, competitive advantages and
+    competitors, mission and leadership, IN THAT ORDER, capped at 4,300 chars
+    (the fixtures measure 3,187-3,440) — followed by the last
+    two exchanges plus the current message, capped per-part (user 600, assistant
+    1,200, current 2,000) and 6,000 chars overall. The current message keeps its
+    HEAD AND TAIL, with the middle elided, because the channels disagree about
+    where extracted attachment text goes — `api/routes/chat.py` appends it after
+    the typed question, while `integrations/telegram_bot.py` and
+    `integrations/discord_bot.py` prepend it. A one-ended slice would preserve
+    the question on some channels and discard it on others. Bounding it matters
+    because attachments run to 40k chars per file, up to 5 files, and the whole
+    string is forwarded to every specialist in the fan-out as uncached input.
+
+    The profile cap drops whole trailing LINES (`session._fit_lines`), so the
+    digest's field ORDER — not the number — is what decides a cut's cost: an
+    over-long profile sheds its leadership roster and mission statement first.
+    Line-wise rather than character-wise because a character slice cut through
+    values: an unvalidated free-text `industry` long enough to crowd the budget
+    rendered `**Financial position**: monthly burn $25` for a $250,000 burn, a
+    wrong number carrying no elision marker. The guarantee is "whole fields are
+    lost, never a cut value, and trailing fields go first" — NOT "a number
+    always survives": a single field longer than the whole budget is skipped,
+    and if that is the identity header its headcount and ARR go with it. Every
+    list field is therefore one entry per line, which also avoids inventing
+    entries, since ", " occurs inside every leadership entry and "; " inside 3
+    of 8 tandem competitors. Re-derive these claims whenever the order changes;
+    a stale version of one is how the earlier 1,200-char head slice of
+    `to_prompt_block` came to drop burn and runway while reading as deliberate.
+
+    The digest IS escaped through `session._inert`, contrary to an earlier note
+    here calling it first-party. `POST /clients/generate` feeds uploaded
+    PDF/Word/Excel/CSV text to the engagement-intake agent, which is instructed
+    to copy facts verbatim, and `clients/slots.py` writes the resulting
+    profile.yaml over the live profile — so a competitor gloss or mission can
+    carry text a prospective client wrote, including a closing tag.
+
+    Extracted document TEXT reaches specialists this way; an attached IMAGE does
+    not. `integrations/attachments.build_attachment_output` returns no text for
+    an image (only a vision block), and `conversation_context` is a plain
+    string, so an image is visible to the Executive alone.
+    `Executive._build_messages` therefore appends an `<attachment_notice>` on
+    attachment turns, instructing the model to restate any figures, readings or
+    labels it took from an image inside that consult's `query`. Forwarding the
+    vision blocks themselves needs per-specialist-model vision gating and is
+    tracked in issue #19.
+
+    The rendered text is passed through `session._inert` (angle brackets → ‹ ›,
+    structure preserved) before it leaves. `BaseAgent.analyze` wraps it in
+    `<conversation_context>` and wraps four sibling blocks in tags of their own,
+    and this is the first path carrying raw uploaded-document text into one of
+    them — an unescaped closing tag would end the block early and have the rest
+    read as instructions, in every specialist of a fan-out at once. Same
+    convention as `alerts.review._untrusted` for the `<alert>` envelope, minus
+    its collapse-to-one-line step, which would destroy the User:/Executive:
+    structure this block exists to convey. Note the RAG path does NOT yet do
+    this — see the open issue on retrieved text reaching its envelopes raw.
+
+    The 6,000 total is a guard, not a working limit — with the per-part caps and
+    a 2-exchange window the joined result tops out near 5,650, so it only fires
+    on a malformed history (more assistant turns than user turns, e.g. a
+    corrupted restore). Its test passes the cap explicitly for that reason.
+
+    The profile is pinned AHEAD of the total-cap slice, not appended with the
+    turns: the slice cuts from the tail so the current message always survives,
+    which would make an appended profile the first thing shed. It is also not
+    passed through `_inert` — it is rendered from our own structured profile
+    fields, not from third-party text.
+
+    Why a tail and not just the message — a specialist receives no message
+    history, and (before the profile block above) no company context at all. `BaseAgent.analyze` composes exactly
+    department_memory, past_decisions, failure_cases, relevant_knowledge,
+    conversation_context, query. So `<conversation_context>` is its whole view
+    of the conversation, and `episodic_context` does not substitute — that is
+    the recorded-decision ledger, and an in-flight discussion has produced no
+    row yet (extraction is scheduled after the turn).
+
+    Why it was removed — when the model wrote the context itself it restated
+    the same background once per specialist. Measured on a six-specialist
+    fan-out (issue #12) — the routing turn emitted 1,724 output tokens and
+    spent 58.7 s generating them on the local backend (29.35 t/s) before the
+    first specialist started, and the six queries were near-verbatim
+    restatements of each other. The share of those 1,724 tokens that was
+    duplication is not separately measured. The orchestrator already holds
+    the context, so supplying it costs no output tokens.
+
+    Re-adding a per-call `context` property would reintroduce that cost with
+    no failing test, so `test_router.py` asserts the tool's input properties
+    are exactly {specialist, query}. The `query` description carries the
+    matching instruction — one or two sentences, name the subject concretely,
+    and do not repeat company background or the full conversation.
   fanout_cap: |
     The number of parallel `consult_specialist` calls dispatched in a single
     turn is bounded by `MAX_PARALLEL_SPECIALISTS` (config). Default 0 is inert
@@ -3404,9 +3607,26 @@ integrations:
         LLM calls. The warm ChromaDB store is handed to handlers via
         mcp_server.set_store() from the lifespan (handlers have no Request).
       Tools: consult_specialist (flagship — orchestrator.router.route_to_specialist,
-        stateless, the specialist enum is a Literal pinned to SPECIALIST_REGISTRY
+        stateless, the specialist roster is a Literal pinned to SPECIALIST_REGISTRY
         by a unit test — includes `talent`, so the executive-search specialist's
-        ADVICE is already reachable here), search_knowledge (knowledge.retriever.retrieve),
+        ADVICE is already reachable here. The PARAMETER is deliberately not that
+        Literal: FastMCP validates arguments against the signature's Pydantic
+        model BEFORE the handler runs, so a bare Literal refused `csO`/`cs` at the
+        schema layer with a literal_error and resolve_specialist_name never ran —
+        chat parity was documented but not delivered. It is typed `str` with the
+        roster re-attached via json_schema_extra={"enum": ...}, so clients still
+        see the ten canonical values while the resolver keeps its tolerance, and
+        the RAW name reaches route_to_specialist, which is what writes the
+        routing_anomaly row. Normalising in a BeforeValidator would keep the enum
+        too but erase that anomaly. The tolerance is SERVER-SIDE ONLY: the schema
+        still advertises `enum`, so a client that validates outbound arguments
+        will still refuse to send `csO` — intended, since the case the resolver
+        exists for is a MODEL emitting a truncated name through a pass-through
+        client. Because the parameter is now unbounded caller text, the unknown-
+        specialist ValueError truncates it to NAME_PREVIEW_CHARS, matching what
+        router.py already does in its own two messages. Raised by Cursor Bugbot
+        on PR #18),
+        search_knowledge (knowledge.retriever.retrieve),
         list_workflows (workflows.list_workflows → Workflow.meta), ask_executive
         (Executive.chat fallback — non-streaming, resolves caller to principal or
         by caller_email), and a READ-ONLY executive-search suite: list_candidates

@@ -128,6 +128,20 @@ class Settings(BaseSettings):
     # prefetch, so unbounded fan-out is the main per-turn cost driver).
     max_parallel_specialists: int = Field(0, alias="MAX_PARALLEL_SPECIALISTS")
 
+    # Run a routing pre-pass before the main chat turn: one call offering only
+    # `consult_specialist`, whose picks are dispatched before the full tool
+    # surface is ever shown. `consult_specialist` otherwise competes with ~58
+    # client tools, and a smaller model loses it in the crowd — measured on
+    # qwen3.8:27b, a strategic sequencing question consulted on 1/12 turns with
+    # the full surface, and on 9/12 and 11/12 across two runs with the pre-pass
+    # plus the persona's "Consulting Your Leadership Team" section. An action
+    # turn ("schedule X") consulted 0/12 and 1/12 in the same two runs, so the
+    # over-consulting risk is real but small.
+    # Costs one extra model call per turn (~0.4 s of added prompt processing
+    # locally; the pre-pass prompt is a different prefix, so it does not reuse
+    # the main turn's cache).
+    routing_prepass_enabled: bool = Field(True, alias="ROUTING_PREPASS_ENABLED")
+
     # ---- OpenRouter routing --------------------------------------------
     # Toggle that routes Claude calls through OpenRouter (so usage is
     # billed to your OpenRouter account) and unlocks the curated set of

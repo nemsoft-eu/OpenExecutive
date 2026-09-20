@@ -1,0 +1,22 @@
+id: cross_domain_004
+domain: cross_domain
+description: "Subject named once, needed by every specialist — guards against queries too terse to ground or retrieve on"
+company_context:
+  stage: "Series A"
+  industry: "Industrial IoT"
+  arr: 4200000
+  headcount: 34
+query: "We want to move our hardware attachment-sensor line from outright sale to a three-year lease. How should we think about it?"
+expected_topics:
+  - revenue_recognition
+  - cash_flow_timing
+  - contract_structure
+  - customer_appetite
+required_routing:
+  - cfo
+  - gc
+quality_criteria:
+  names_the_subject: true
+  gives_recommendation: true
+  explains_rationale: true
+  not_generic_leasing_advice: true
