@@ -67,7 +67,7 @@ def test_non_string_names_are_rejected_not_raised(bad: object) -> None:
     unvalidated, so `specialist` can arrive as null, a number or a list. Before
     the isinstance guard this raised out of route_parallel's asyncio.gather and
     failed the whole turn instead of returning a recoverable tool_result."""
-    assert resolve_specialist_name(bad) is None  # type: ignore[arg-type]
+    assert resolve_specialist_name(bad) is None
 
 
 def test_non_string_name_returns_an_error_string_not_an_exception() -> None:

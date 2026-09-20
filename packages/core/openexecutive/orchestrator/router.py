@@ -84,7 +84,13 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def resolve_specialist_name(specialist_name: str) -> str | None:
+# Truncation for a model-emitted name echoed into an error string or an audit
+# row. Long enough for any real key plus obvious garbage, short enough that a
+# pathological payload cannot bloat the row.
+_NAME_PREVIEW_CHARS = 80
+
+
+def resolve_specialist_name(specialist_name: Any) -> str | None:
     """Map a model-emitted specialist name onto a registry key, or None.
 
     Local models truncate and re-case the `specialist` enum value: `cso` has
@@ -148,7 +154,7 @@ def audit_name_resolution(
     graph, so two sites drifting apart shows up as a broken flow chart rather
     than a failing test. ``source`` names the site for triage.
     """
-    shown = str(requested)[:80]
+    shown = str(requested)[:_NAME_PREVIEW_CHARS]
     if resolved is None:
         summary = f"Unresolved specialist name: {shown}"
     else:
@@ -184,7 +190,7 @@ async def route_to_specialist(
     resolved = resolve_specialist_name(specialist_name)
     # `specialist_name` may be any JSON value off a local backend, so render it
     # for display rather than slicing it.
-    requested = str(specialist_name)[:80]
+    requested = str(specialist_name)[:_NAME_PREVIEW_CHARS]
     if resolved is None:
         audit_name_resolution(specialist_name, None, source="route_to_specialist")
         return (
