@@ -276,3 +276,44 @@ def test_usage_endpoint_empty_db_is_all_zero(tmp_path: Path) -> None:
     assert data["totals"]["cost_usd"] == 0.0
     assert data["by_day"] == []
     assert data["by_model"] == []
+
+
+def test_routing_anomaly_attaches_to_its_turn_in_the_session_graph() -> None:
+    """A `routing_anomaly` node must hang off the turn anchor, not float free.
+
+    The row exists to make a corrected or rejected specialist name visible; an
+    orphaned node in the flow chart is the failure it was added to fix. The
+    edge set is a hardcoded list, so a new event type is silently excluded.
+    """
+    from types import SimpleNamespace
+
+    from openexecutive.api.routes.audit import _build_session_graph
+
+    def _evt(eid: int, event_type: str, actor: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=eid,
+            event_type=event_type,
+            summary=f"{event_type} row",
+            actor=actor,
+            ts="2026-09-20T12:00:00Z",
+            session_id="s1",
+            turn_id="t1",
+            details={},
+            department=None,
+        )
+
+    graph, _ = _build_session_graph(
+        [
+            _evt(1, "chat_turn", "user"),
+            _evt(2, "routing_anomaly", "router"),
+            _evt(3, "specialist_consult", "cso"),
+        ]
+    )
+
+    anomaly = next(n for n in graph.nodes if n.event_id == 2)
+    attached = {e.target for e in graph.edges}
+    assert anomaly.id in attached, (
+        f"routing_anomaly node {anomaly.id} is orphaned; edges={graph.edges}"
+    )
+    # And it is labelled as routing, not mistaken for a specialist.
+    assert anomaly.kind == "routing"

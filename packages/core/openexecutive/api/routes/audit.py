@@ -245,6 +245,7 @@ _KIND_BY_EVENT_TYPE: dict[str, str] = {
     "committee_review": "committee",
     "scheduled_action": "scheduled",
     "alert": "alert",
+    "routing_anomaly": "routing",
 }
 
 
@@ -361,6 +362,11 @@ def _build_session_graph(events: list[Any]) -> tuple[AuditGraph, str | None]:
             "tool_invocation",
             "cache_event",
             "committee_review",
+            # Anomalies carry session and turn ids, so leaving them out of this
+            # set produced a node floating unattached in the flow chart — the
+            # row exists to make a corrected or rejected specialist name
+            # visible, and an orphaned node is the failure it was added to fix.
+            "routing_anomaly",
         } and tid:
             anchor = turn_anchor.get(tid)
             if anchor is not None:

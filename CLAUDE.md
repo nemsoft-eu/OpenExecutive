@@ -89,11 +89,21 @@ RAG context goes in the **user turn**, not the system prompt.
    `your_domain_002.yaml` (note: `evals/` at the repo root holds only
    `run_evals.py` and `judges/` — the scenarios live under `packages/core`).
    The runner is single-turn (`user_message=scenario["query"]`), so a scenario
-   cannot express a follow-up that depends on a prior turn. Keys the runner
-   reads: `id`, `domain`, `description`, `company_context`, `query`,
-   `expected_topics`, `required_routing`, `quality_criteria` (free-form, passed
-   verbatim to the judge). An unrecognised key is silently ignored, so it looks
-   like a check while doing nothing.
+   cannot express a follow-up that depends on a prior turn. An unrecognised key
+   is silently ignored, so it looks like a check while doing nothing — which
+   makes the exact key list load-bearing:
+
+   - **A chat scenario is judged on `query` and `expected_topics` only.**
+     `judge_chat` (`evals/judges.py`) interpolates nothing else. `id`, `domain`,
+     `description` and `company_context` are used by the runner for selection
+     and setup.
+   - **`required_routing` is read by no code in this repo.** The chat runner
+     calls `executive.chat()`, which surfaces no consulted-specialist list, so
+     routing is not observable there at all. Do not add it expecting an
+     assertion; pin routing behaviour in a unit test instead (see
+     `tests/unit/test_routing_prepass.py`).
+   - **`quality_criteria` reaches `judge_workflow` only**, for artifact
+     scenarios. On a chat scenario it is inert.
 
 6. If the agent introduces a new pattern (new tool, new routing path, new memory contract), update `packages/core/openexecutive/architecture/architecture-facts.yaml`. Pure additions to `SPECIALIST_REGISTRY` are auto-reflected in the `agents` section without YAML edits.
 
