@@ -166,7 +166,12 @@ def test_propose_only_without_approver_fails_visibly() -> None:
         asyncio.run(_execute_action(action, gateway=None))
 
     mock_chat.assert_not_called()
-    assert alert_store.list_alerts() == []
+    # The proposal is filed unrouted so /today still shows it — the failed
+    # scheduled_actions row itself is not a surface the UI reads.
+    alerts = alert_store.list_alerts()
+    assert len(alerts) == 1
+    assert alerts[0].routed_to_person_id is None
+    assert "department:finance" in alerts[0].topic_tags
     updated = episodic.get_scheduled_action(action.id)
     assert updated is not None
     # Terminal on the first attempt: failed, not done and not re-queued.

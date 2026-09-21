@@ -166,7 +166,7 @@ def _route_proposal(
 
 def propose_via_alert(
     department_slug: str,
-    person_id: int,
+    person_id: int | None,
     summary: str,
     body: str,
     suggested_action: str = "",
@@ -177,6 +177,12 @@ def propose_via_alert(
     """Persist a proposal as an alert routed to a specific Person.
 
     Returns the alert id, or None if a duplicate was suppressed.
+
+    ``person_id=None`` files the proposal unrouted, for the case where the
+    gate found nobody to approve it. /today's "principal owns unrouted" rule
+    still surfaces it, which is the only way such a proposal is visible at
+    all — the scheduled_actions row itself is failed, and every UI listing of
+    that table asks for status=pending.
 
     topic_tags carries both department and person identifiers so the UI
     and future resolvers can filter/match without parsing the body;
@@ -194,11 +200,14 @@ def propose_via_alert(
     """
     from openexecutive.alerts.store import coalesce_alert, insert_alert
 
-    topic_tags = [f"department:{department_slug}", f"person:{person_id}"]
+    topic_tags = [f"department:{department_slug}"]
+    if person_id is not None:
+        topic_tags.append(f"person:{person_id}")
     for tag in extra_tags or []:
         if tag not in topic_tags:
             topic_tags.append(tag)
-    dedup_key = f"proposal:{department_slug}:{person_id}:{summary[:60]}"
+    routing_key = person_id if person_id is not None else "unrouted"
+    dedup_key = f"proposal:{department_slug}:{routing_key}:{summary[:60]}"
     external_id = f"{dedup_key}:{external_id_suffix}" if external_id_suffix else dedup_key
 
     try:
@@ -219,7 +228,7 @@ def propose_via_alert(
         )
     except Exception:
         logger.exception(
-            "authority_gate: propose_via_alert failed for dept=%r person=%d",
+            "authority_gate: propose_via_alert failed for dept=%r person=%s",
             department_slug, person_id,
         )
         return None

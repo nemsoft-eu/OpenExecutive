@@ -1584,8 +1584,10 @@ departments:
     `propose_only` departments route scheduled actions to an approver as a
     briefing alert (`propose_via_alert`) instead of executing immediately;
     the scheduled_actions row is then marked done and the pending-ness lives
-    on the alert. With no approver to route to, the row is failed instead
-    (terminal, no retry) so the request is never silently lost. This is NOT the `wait_for_human` workflow gate — that is a
+    on the alert. With no approver to route to, the alert is filed unrouted
+    (/today's principal-owns-unrouted rule still shows it) and the row is
+    failed instead (terminal, no retry) so the request is never silently
+    lost. This is NOT the `wait_for_human` workflow gate — that is a
     separate primitive with its own table (`workflow_runs.status`), delivery
     path and resolver; an earlier version of this note conflated the two.
     Autonomous departments fire actions directly. The approver is
@@ -4103,9 +4105,12 @@ company_onboarding:
     A zero-principal roster is NOT a safe state, and an earlier revision of
     this note wrongly said it was. The lookups return None cleanly; several
     consumers then degrade rather than refusing. A propose_only action with no
-    approver is failed terminally via mark_action_failed (no retry; last_error
-    "propose_only action has no approver to route to") rather than marked done, so the request stays visible instead of vanishing
-    (issue #24 — it used to be marked done with no alert). On the escalate
+    approver files its proposal as an UNROUTED alert and is then failed
+    terminally via mark_action_failed (no retry; last_error "propose_only
+    action has no approver to route to") rather than marked done. The alert
+    is what makes it visible: every UI listing of scheduled_actions asks for
+    status=pending, so the failed row alone is read by nobody (issue #24 — it
+    used to be marked done with no alert at all). On the escalate
     path the alert is skipped while dispatch continues. _deliver_to_principal
     drops the outbound permanently; artifact_tools leaves routed_to_person_id
     null.

@@ -264,9 +264,18 @@ async def _execute_action(
         if decision.action == "propose":
             # Surface to approver; do NOT dispatch the outbound message.
             if decision.assignee_person_id is None:
-                # Nobody can approve it (e.g. a zero-principal roster). Marking
-                # it done would lose the request silently; fail it terminally
-                # (no retry) so it stays visible as failed.
+                # Nobody can approve it (e.g. a zero-principal roster). File
+                # the proposal unrouted so /today still shows it — every UI
+                # listing of scheduled_actions asks for status=pending, so the
+                # failed row below is not a surface anyone reads — then fail
+                # the action terminally (no retry) rather than marking it done.
+                propose_via_alert(
+                    department_slug=action.department,
+                    person_id=None,
+                    summary=action.intent_text[:160],
+                    body=action.intent_text,
+                    suggested_action=_proposed_action_phrase(urgent=False),
+                )
                 mark_action_failed(
                     action.id, "propose_only action has no approver to route to"
                 )
