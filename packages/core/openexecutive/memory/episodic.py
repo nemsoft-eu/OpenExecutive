@@ -1264,6 +1264,16 @@ def mark_action_done(action_id: int, db_path: Path | None = None) -> bool:
         return cursor.rowcount > 0
 
 
+def mark_action_failed(action_id: int, error: str, db_path: Path | None = None) -> bool:
+    """Fail an action terminally, with no retry."""
+    with _get_conn(_resolve_db_path(db_path)) as conn:
+        cursor = conn.execute(
+            "UPDATE scheduled_actions SET status = 'failed', last_error = ? WHERE id = ?",
+            (error[:500], action_id),
+        )
+        return cursor.rowcount > 0
+
+
 def mark_action_failed_or_retry(
     action_id: int,
     error: str,

@@ -292,10 +292,6 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
     # path changes it (see people/models.py). The Executive must not be able
     # to promote someone via a chat turn: social engineering would otherwise
     # be the whole attack.
-    #
-    # This message used to say the flag could be changed "via the authenticated
-    # /people API". It could not — PersonPatch has no such field — so the
-    # refusal pointed the reader at a door that was never built.
     if bool(tool_input.get("is_principal", False)):
         return _bad(
             "is_principal cannot be set here. It is set at creation "

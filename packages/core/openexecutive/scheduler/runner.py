@@ -16,6 +16,7 @@ from openexecutive.memory.episodic import (
     ScheduledAction,
     claim_due_actions,
     mark_action_done,
+    mark_action_failed,
     mark_action_failed_or_retry,
     requeue_orphaned_running,
     reschedule_action,
@@ -265,11 +266,9 @@ async def _execute_action(
             if decision.assignee_person_id is None:
                 # Nobody can approve it (e.g. a zero-principal roster). Marking
                 # it done would lose the request silently; fail it terminally
-                # (max_attempts=0, no retry) so it stays visible as failed.
-                mark_action_failed_or_retry(
-                    action.id,
-                    "propose_only action has no approver to route to",
-                    max_attempts=0,
+                # (no retry) so it stays visible as failed.
+                mark_action_failed(
+                    action.id, "propose_only action has no approver to route to"
                 )
                 logger.warning(
                     "scheduler: action %d (dept=%r) failed — propose_only with no approver",

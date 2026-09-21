@@ -336,7 +336,7 @@ def find_person_by_slack_id(slack_user_id: str, db_path: Path | None = None) -> 
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE slack_user_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE slack_user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (slack_user_id,),
         ).fetchone()
         if row is None:
@@ -350,7 +350,7 @@ def find_person_by_telegram_chat_id(telegram_chat_id: str, db_path: Path | None 
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE telegram_chat_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE telegram_chat_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (telegram_chat_id,),
         ).fetchone()
         if row is None:
@@ -375,8 +375,8 @@ def find_person_by_email(email: str, db_path: Path | None = None) -> Person | No
         if not _table_exists(conn, "people"):
             return None
         row = conn.execute(
-            # email is not UNIQUE, so ORDER BY id pins which row a duplicate
-            # address resolves to instead of leaving it to SQLite's scan order.
+            # None of the channel ids is UNIQUE, so every finder here orders
+            # by id: a duplicate resolves to the oldest row, not scan order.
             "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0 "
             "ORDER BY id LIMIT 1",
             (email,),
@@ -392,7 +392,7 @@ def find_person_by_discord_id(discord_user_id: str, db_path: Path | None = None)
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE discord_user_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE discord_user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (discord_user_id,),
         ).fetchone()
         if row is None:

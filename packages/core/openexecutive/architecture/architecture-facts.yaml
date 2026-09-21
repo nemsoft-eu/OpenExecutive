@@ -4103,9 +4103,8 @@ company_onboarding:
     A zero-principal roster is NOT a safe state, and an earlier revision of
     this note wrongly said it was. The lookups return None cleanly; several
     consumers then degrade rather than refusing. A propose_only action with no
-    approver is failed terminally (max_attempts=0, last_error "propose_only
-    action has no approver to route to")
-    rather than marked done, so the request stays visible instead of vanishing
+    approver is failed terminally via mark_action_failed (no retry; last_error
+    "propose_only action has no approver to route to") rather than marked done, so the request stays visible instead of vanishing
     (issue #24 — it used to be marked done with no alert). On the escalate
     path the alert is skipped while dispatch continues. _deliver_to_principal
     drops the outbound permanently; artifact_tools leaves routed_to_person_id
