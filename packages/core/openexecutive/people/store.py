@@ -480,8 +480,9 @@ def archive_person(person_id: int, db_path: Path | None = None) -> bool:
     Raises LastPrincipalError instead of archiving the last active principal:
     a zero-principal roster loses the fallback approver, and the principal's
     UI access with it. A co-principal can still be archived while another
-    remains. The guard lives in the UPDATE itself, so two concurrent archives
-    of the last two principals cannot both pass a count read beforehand.
+    remains. The guard lives in the UPDATE itself rather than in a count read
+    beforehand, so two concurrent archives of the last two principals cannot
+    both succeed.
     """
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
