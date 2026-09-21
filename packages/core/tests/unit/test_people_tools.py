@@ -43,6 +43,18 @@ def shared_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db_path
 
 
+@pytest.fixture(autouse=True)
+def audit_events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
+    """Capture tool audit rows instead of writing them to the default DB."""
+    events: list[tuple[str, dict]] = []
+
+    def _capture(event_type: str, summary: str, **kwargs) -> None:
+        events.append((summary, kwargs.get("details") or {}))
+
+    monkeypatch.setattr("openexecutive.audit.log_event", _capture)
+    return events
+
+
 def _call(coro_fn, payload: dict) -> dict:
     return json.loads(asyncio.run(coro_fn(payload)))
 
@@ -155,12 +167,15 @@ def test_archive_existing_person() -> None:
     assert pid not in active_ids
 
 
-def test_archive_last_principal_refused() -> None:
+def test_archive_last_principal_refused(audit_events: list[tuple[str, dict]]) -> None:
     pid = people_store.upsert_person(full_name="Principal Pat", is_principal=True)
     result = _call(handle_archive_person, {"person_id": pid})
     assert "last active principal" in result["error"]
     principal = people_store.find_principal_person()
     assert principal is not None and principal.id == pid
+    summary, details = audit_events[-1]
+    assert "REFUSED" in summary
+    assert details["ok"] is False and details["archived"] is False
 
 
 def test_archive_co_principal_allowed() -> None:

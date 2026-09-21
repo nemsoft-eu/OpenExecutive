@@ -96,6 +96,16 @@ def test_archive_last_principal_409(client: TestClient) -> None:
     assert client.get(f"/people/{pid}").json()["archived"] is False
 
 
+def test_archive_co_principal_204(client: TestClient) -> None:
+    first = client.post(
+        "/people", json={"full_name": "Founder A", "is_principal": True}
+    ).json()["id"]
+    client.post("/people", json={"full_name": "Founder B", "is_principal": True})
+    resp = client.post(f"/people/{first}/archive")
+    assert resp.status_code == 204
+    assert client.get(f"/people/{first}").json()["archived"] is True
+
+
 def test_archive_unknown_person_404(client: TestClient) -> None:
     assert client.post("/people/9999/archive").status_code == 404
 
