@@ -179,10 +179,11 @@ def propose_via_alert(
     Returns the alert id, or None if a duplicate was suppressed.
 
     ``person_id=None`` files the proposal unrouted, for the case where the
-    gate found nobody to approve it. /today's "principal owns unrouted" rule
-    still surfaces it, which is the only way such a proposal is visible at
-    all — the scheduled_actions row itself is failed, and every UI listing of
-    that table asks for status=pending.
+    gate found nobody to approve it. /today returns it among the proposals,
+    but the UI's "principal owns unrouted" rule cannot claim it — that state
+    only arises when there is no principal — so it sits in the team queue.
+    Pass an ``external_id_suffix`` for anything that can recur: an unrouted
+    proposal nobody acts on would otherwise suppress its own repeats.
 
     topic_tags carries both department and person identifiers so the UI
     and future resolvers can filter/match without parsing the body;

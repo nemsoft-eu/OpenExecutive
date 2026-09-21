@@ -253,6 +253,60 @@ def test_propose_via_alert_dedup() -> None:
     assert second is None  # duplicate suppressed
 
 
+def test_propose_via_alert_unrouted_keeps_its_own_dedup_key() -> None:
+    """An unrouted proposal must not collide with a routed one for the same
+    department and summary — the routing key separates them."""
+    from openexecutive.alerts import store as alert_store
+
+    _set_dept_level("finance", AuthorityLevel.PROPOSE_ONLY)
+    cfo_id = people_store.upsert_person(full_name="Sarah")
+
+    unrouted = propose_via_alert("finance", None, "Same summary", "body")
+    routed = propose_via_alert("finance", cfo_id, "Same summary", "body")
+    assert unrouted is not None and routed is not None and unrouted != routed
+
+    alert = alert_store.get_alert(unrouted)
+    assert alert is not None
+    assert alert.routed_to_person_id is None
+    assert "department:finance" in alert.topic_tags
+    # No person to tag — the tag is omitted rather than carrying a None.
+    assert not any(t.startswith("person:") for t in alert.topic_tags)
+
+
+def test_propose_via_alert_unrouted_repeats_need_a_suffix() -> None:
+    """The scheduler passes the action id as the suffix, which is what keeps a
+    recurring unrouted proposal re-minable once the open card is handled.
+    Without a suffix the card is one-shot for the life of the row."""
+    from openexecutive.alerts import store as alert_store
+
+    _set_dept_level("finance", AuthorityLevel.PROPOSE_ONLY)
+
+    # No suffix: the repeat is swallowed outright, even after the card is acted
+    # on, because INSERT OR IGNORE keys on the row's existence.
+    one_shot = propose_via_alert("finance", None, "One-shot intent", "body")
+    assert one_shot is not None
+    alert_store.set_status(one_shot, "acknowledged")
+    assert propose_via_alert("finance", None, "One-shot intent", "body") is None
+
+    # With a per-occurrence suffix: while the card is open a repeat refreshes
+    # it in place, and once it has been handled the next action id mints a
+    # fresh one instead of vanishing.
+    first = propose_via_alert(
+        "finance", None, "Recurring intent", "body one", external_id_suffix="41"
+    )
+    assert first is not None
+    assert propose_via_alert(
+        "finance", None, "Recurring intent", "body two", external_id_suffix="52"
+    ) is None
+    refreshed = alert_store.get_alert(first)
+    assert refreshed is not None and refreshed.body == "body two"
+    alert_store.set_status(first, "acknowledged")
+    nxt = propose_via_alert(
+        "finance", None, "Recurring intent", "body three", external_id_suffix="63"
+    )
+    assert nxt is not None and nxt != first
+
+
 def test_propose_via_alert_suffix_coalesces_then_reissues() -> None:
     """With an external_id_suffix the card is recurring: an open one is
     refreshed in place, an acknowledged one is left alone until the suffix
