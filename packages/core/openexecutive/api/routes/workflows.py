@@ -14,7 +14,6 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -36,6 +35,7 @@ from openexecutive.workflows.dynamic_store import (
     set_active,
     upsert_definition,
 )
+from openexecutive.workflows.gate import checkpoint_gate
 from openexecutive.workflows.persistence import (
     complete_run,
     create_run,
@@ -44,7 +44,6 @@ from openexecutive.workflows.persistence import (
     get_run,
     initialize_runs_db,
     list_runs,
-    save_checkpoint,
 )
 from openexecutive.workflows.wait_for_human import WaitForHumanEvent
 
@@ -67,10 +66,18 @@ async def list_workflow_runs(workflow: str | None = None, limit: int = 100) -> d
 
 @router.get("/workflows/runs/{run_id}")
 async def get_workflow_run(run_id: str) -> dict[str, Any]:
-    """Full record of one run, including the artifact if complete."""
+    """Full record of one run, including the artifact if complete.
+
+    `resume_state_json` is replaced by a small `resume_progress` summary. The
+    payload holds the full text of every step completed before the gate, and
+    the run-detail page POLLS this endpoint while a run is unfinished — so
+    returning it would re-send the whole run body every few seconds to render
+    a progress list that only needs the step ids.
+    """
     run = get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    run["resume_progress"] = _resume_progress(run.pop("resume_state_json", None))
     return run
 
 
@@ -242,20 +249,32 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
                 # paused, and stop. The resumer applies the timeout policy;
                 # the inbound resolver records the human's reply.
                 if isinstance(event, WaitForHumanEvent):
-                    until = datetime.now(UTC) + timedelta(hours=event.timeout_hours)
-                    save_checkpoint(
+                    # Delivery + checkpoint live in `workflows.gate` so this
+                    # route, the chat tool and the resumer cannot drift apart.
+                    pause = await checkpoint_gate(
                         run_id=run_id,
-                        state_json=event.model_dump_json(),
-                        awaiting_person_id=event.person_id,
-                        awaiting_until=until,
+                        event=event,
+                        workflow_title=workflow.title,
                     )
                     paused = True
                     yield _sse({
                         "type": "awaiting_human",
                         "run_id": run_id,
-                        "person_id": event.person_id,
-                        "question": event.question,
-                        "awaiting_until": until.isoformat(),
+                        "person_id": pause.person_id,
+                        "question": pause.question,
+                        "awaiting_until": pause.awaiting_until.isoformat(),
+                        # "sent" / "self" / "suppressed" / "alerted" / "failed" —
+                        # the client must not say "waiting on them" when the
+                        # question never reached them.
+                        "delivery": pause.delivery,
+                        # True when the run will continue by itself once the
+                        # answer lands; False for a pause-only gate.
+                        "resumable": pause.resumable,
+                        # No `done` or `error` follows a pause — this IS the
+                        # last frame. Without it a client waiting for a
+                        # terminal event just sees the connection close and
+                        # spins on the gate step forever.
+                        "terminal": True,
                     })
                     break
 
@@ -265,7 +284,9 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
                 yield _sse(event_dict)
 
             if paused:
-                pass  # run left in 'awaiting_human'; no done/error emitted
+                # Run left in 'awaiting_human'; the awaiting_human frame above
+                # was terminal, so nothing more is emitted.
+                pass
             elif artifact:
                 complete_run(run_id=run_id, artifact=artifact)
                 yield _sse({"type": "done", "run_id": run_id})
@@ -278,7 +299,13 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
                 })
         except Exception as exc:  # noqa: BLE001 — must report any failure to the client
             logger.exception("workflow.run_failed run_id=%s workflow=%s", run_id, workflow.name)
-            fail_run(run_id=run_id, error=str(exc))
+            # NOT after a successful checkpoint. `fail_run` has no status
+            # guard, so failing here would overwrite 'awaiting_human' with
+            # 'error' and destroy the resume payload — for something as
+            # ordinary as the client disconnecting while we yield the frame.
+            # The run is safely parked; only the stream broke.
+            if not paused:
+                fail_run(run_id=run_id, error=str(exc))
             yield _sse({"type": "error", "run_id": run_id, "message": str(exc)})
         finally:
             logger.info(
@@ -301,6 +328,27 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+
+def _resume_progress(resume_state_json: str | None) -> dict[str, Any] | None:
+    """The client-safe digest of a paused run's resume payload.
+
+    Enough for the UI to mark which steps are already done and which one is
+    waiting; none of the step text itself.
+    """
+    if not resume_state_json:
+        return None
+    try:
+        state = json.loads(resume_state_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    outputs = state.get("outputs")
+    return {
+        "gate_step_id": str(state.get("gate_step_id") or ""),
+        "completed_step_ids": list(outputs) if isinstance(outputs, dict) else [],
+    }
 
 
 def _sse(payload: dict[str, Any]) -> str:

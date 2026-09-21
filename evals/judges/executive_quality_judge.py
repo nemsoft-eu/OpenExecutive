@@ -1,8 +1,6 @@
 """LLM-as-judge for executive response quality."""
 from __future__ import annotations
 
-import anthropic
-
 JUDGE_SYSTEM_PROMPT = """You are a critical evaluator of AI executive advisory systems. Your job is to assess whether responses meet the standard of a senior business executive with 25+ years of experience.
 
 You are harsh but fair. You penalize:
@@ -27,7 +25,9 @@ async def judge(
     expected_topics: list[str] | None = None,
     api_key: str | None = None,
 ) -> dict:
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    from openexecutive.providers.anthropic_provider import configured_async_client
+
+    client = configured_async_client(api_key=api_key)
 
     context_str = ""
     if company_context:

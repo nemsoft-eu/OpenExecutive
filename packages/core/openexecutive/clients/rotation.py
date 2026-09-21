@@ -48,6 +48,7 @@ from openexecutive.clients.slots import (
     get_active_client,
     list_client_slots,
 )
+from openexecutive.workflows.gate import ensure_workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,7 @@ async def _run_quiet_work_for_live_client(settings: Any, slug: str) -> None:
     artifact = ""
     try:
         async for event in workflow.run(inputs, store):
+            event = ensure_workflow_event(event, site='clients.rotation.quiet_work')
             if event.type == "artifact" and event.content:
                 artifact = event.content
             elif event.type == "error":
@@ -288,8 +290,6 @@ def _compose_digest(
             bits.append(f"{c.awaiting_replies} awaiting reply")
         if c.unread_alerts:
             bits.append(f"{c.unread_alerts} alerts")
-        if c.onboarding_due_soon:
-            bits.append(f"{c.onboarding_due_soon} onboarding due")
         if isinstance(c.days_to_renewal, int) and c.days_to_renewal <= 30:
             bits.append(
                 "renewal due"

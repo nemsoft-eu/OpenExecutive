@@ -5,7 +5,33 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { WorkflowRunDetail, getWorkflowRun } from "@/lib/api";
+import {
+  GateState,
+  TERMINAL_RUN_STATUSES,
+  WorkflowRunDetail,
+  getWorkflowRun,
+} from "@/lib/api";
+import { runStatusLabel, runStatusTextColor } from "@/lib/runStatus";
+
+// A paused run is resumed by a background worker, so this page has to notice
+// a change it did not cause. Poll quickly at first — an approval that just
+// landed finishes in seconds — then back off, because a run can legitimately
+// sit awaiting a person for days and polling that every 3s for 48h is waste.
+const POLL_FAST_MS = 3000;
+const POLL_SLOW_MS = 10000;
+const POLL_BACKOFF_AFTER_MS = 2 * 60 * 1000;
+
+function parseGateState(raw: string | null | undefined): GateState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as GateState)
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -20,9 +46,46 @@ export default function RunDetailPage() {
 
   useEffect(() => {
     if (!runId) return;
-    getWorkflowRun(runId)
-      .then(setRun)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Scoped to THIS run, not to the component: the App Router can keep the
+    // same instance across a navigation between two run ids, and a mount-time
+    // ref would hand the next run the previous one's elapsed clock — starting
+    // a seconds-old run straight onto the slow cadence.
+    const startedAt = Date.now();
+
+    function schedule() {
+      const elapsed = Date.now() - startedAt;
+      timer = setTimeout(
+        poll,
+        elapsed > POLL_BACKOFF_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS
+      );
+    }
+
+    async function poll() {
+      try {
+        const next = await getWorkflowRun(runId!);
+        if (cancelled) return;
+        setRun(next);
+        setError(null); // a previous blip is over
+        if (TERMINAL_RUN_STATUSES.has(next.status)) return; // nothing more to see
+        schedule();
+      } catch (e) {
+        if (cancelled) return;
+        // Keep any run already on screen — a transient fetch failure should not
+        // replace a rendered artifact with an error page — and KEEP POLLING.
+        // Returning here instead would stop the page updating for good after a
+        // single blip, on a run that is still moving.
+        setError(e instanceof Error ? e.message : String(e));
+        schedule();
+      }
+    }
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [runId]);
 
   const handleCopy = useCallback(async () => {
@@ -49,7 +112,11 @@ export default function RunDetailPage() {
     URL.revokeObjectURL(url);
   }, [run]);
 
-  if (error) {
+  // Only take over the whole page when there is nothing to show. Once a run has
+  // loaded, a failed poll is a transient blip: keep the artifact on screen and
+  // report the problem inline (below), or the page would flip to an error view
+  // and lose everything the reader was looking at.
+  if (error && !run) {
     return (
       <div className="flex flex-col h-full bg-surface text-fg items-center justify-center">
         <div className="text-sm text-red-400 mb-4">Error: {error}</div>
@@ -102,9 +169,36 @@ export default function RunDetailPage() {
             )}
           </div>
 
+          {error && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-3 text-xs text-red-300">
+              Couldn&apos;t refresh just now ({error}). Still retrying.
+            </div>
+          )}
+
           {run.status === "running" && (
             <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-300">
-              This run is still in progress. Refresh in a moment.
+              This run is still in progress — this page updates itself.
+            </div>
+          )}
+
+          {run.status === "awaiting_human" && (
+            <AwaitingPanel run={run} />
+          )}
+
+          {run.status === "resolved" && (
+            <div className="rounded-md border border-indigo-500/30 bg-indigo-500/5 px-4 py-3 text-sm text-indigo-300">
+              Answered — picking the workflow back up now. The remaining steps
+              are running.
+            </div>
+          )}
+
+          {run.status === "timed_out" && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-3 text-sm text-red-300">
+              <div className="font-medium mb-1">No reply before the deadline</div>
+              <div className="text-xs">
+                The step&apos;s timeout policy was applied, so this run stopped
+                without finishing.
+              </div>
             </div>
           )}
 
@@ -156,11 +250,63 @@ export default function RunDetailPage() {
 }
 
 function StatusPill({ status }: { status: string }) {
-  const color =
-    status === "done"
-      ? "text-emerald-400"
-      : status === "error"
-      ? "text-red-400"
-      : "text-amber-400";
-  return <span className={`${color} font-medium`}>{status}</span>;
+  return (
+    <span className={`${runStatusTextColor(status)} font-medium`}>
+      {runStatusLabel(status)}
+    </span>
+  );
+}
+
+// What the question's delivery state means for the reader. The distinction
+// matters: a suppressed or failed send means nobody has actually been asked,
+// and saying "waiting on them" would be untrue.
+const DELIVERY_NOTES: Record<string, string> = {
+  sent: "The question was sent to them.",
+  self: "The question was put to them directly in the conversation.",
+  suppressed:
+    "The message was held back (duplicate, rate cap, or quiet hours), so they have not been asked yet.",
+  alerted:
+    "They could not be reached on any messaging channel — the request is on their briefing board instead.",
+  failed: "The question could not be delivered, so nobody has been asked yet.",
+};
+
+function AwaitingPanel({ run }: { run: WorkflowRunDetail }) {
+  const gate = parseGateState(run.state_json);
+  const delivery = gate?.delivery;
+  const undelivered = delivery !== undefined && delivery !== "sent" && delivery !== "self";
+  const deadline = run.awaiting_until
+    ? new Date(run.awaiting_until).toLocaleString()
+    : null;
+  const done = run.resume_progress?.completed_step_ids.length ?? 0;
+
+  return (
+    <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-300 space-y-2">
+      <div className="font-medium">
+        Waiting for sign-off
+        {run.awaiting_person_id ? ` from person ${run.awaiting_person_id}` : ""}
+      </div>
+      {gate?.question && (
+        <div className="text-fg text-sm">&ldquo;{gate.question}&rdquo;</div>
+      )}
+      <div className="text-xs space-y-1">
+        {deadline && <div>Deadline {deadline}.</div>}
+        {delivery && (
+          <div className={undelivered ? "text-red-300" : undefined}>
+            {DELIVERY_NOTES[delivery] ?? `Delivery: ${delivery}.`}
+          </div>
+        )}
+        {run.resume_progress ? (
+          <div>
+            {done} step{done === 1 ? "" : "s"} already finished — they run on
+            automatically once this is answered.
+          </div>
+        ) : (
+          <div>
+            This run stops at the sign-off; the decision is recorded but no
+            further steps will run.
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }

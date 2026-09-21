@@ -82,6 +82,7 @@ class OpenAICompatibleProvider:
         spec_lookup: dict[str, FeatureSpec] | None = None,
         model_resolver: Callable[[str], tuple[str, FeatureSpec] | None] | None = None,
         reasoning_effort: str | None = None,
+        include_usage_accounting: bool = False,
     ) -> None:
         self._api_key = api_key
         # only the local backend sets this; OpenRouter uses the translator's nested `reasoning`
@@ -102,6 +103,12 @@ class OpenAICompatibleProvider:
         # without enumerating them, so a catalog refresh after construction
         # needs no provider rebuild. Returning None defers to the lookups.
         self._model_resolver = model_resolver
+        # OpenRouter-only request extension (see to_openai_request). Off by
+        # default: a generic self-hosted/gateway backend may forward the
+        # request nearly verbatim to a stricter upstream (e.g. real Anthropic
+        # behind a LiteLLM gateway), which rejects an unrecognized top-level
+        # `usage` field outright rather than ignoring it.
+        self._include_usage_accounting = include_usage_accounting
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -131,7 +138,9 @@ class OpenAICompatibleProvider:
         model = kwargs.pop("model", "")
         slug, spec = self._resolve(model)
         gated = apply_feature_gates(spec, kwargs)
-        body = to_openai_request(slug, gated)
+        body = to_openai_request(
+            slug, gated, include_usage=self._include_usage_accounting
+        )
         if self._reasoning_effort is not None:
             body["reasoning_effort"] = self._reasoning_effort
         _announce_reasoning(slug, body)

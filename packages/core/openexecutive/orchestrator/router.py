@@ -17,7 +17,6 @@ from openexecutive.agents.marketing import MarketingAgent
 from openexecutive.agents.operations import OperationsAgent
 from openexecutive.agents.product import ProductAgent
 from openexecutive.agents.strategy import StrategyAgent
-from openexecutive.agents.talent import TalentAgent
 from openexecutive.agents.triage import TriageAgent
 
 SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
@@ -29,7 +28,6 @@ SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "cmo": MarketingAgent(),
     "cpo": ProductAgent(),
     "board_comms": BoardCommsAgent(),
-    "talent": TalentAgent(),
     "triage": TriageAgent(),
 }
 
@@ -42,7 +40,6 @@ SPECIALIST_DESCRIPTIONS = {
     "cmo": "Chief Marketing Officer — GTM strategy, brand, messaging, PR, crisis communications",
     "cpo": "Chief Product Officer — product roadmap, prioritization frameworks, product strategy",
     "board_comms": "Board Communications Director — board decks, investor relations, governance",
-    "talent": "Head of Talent & Executive Search — candidate screening & fit scoring, executive sourcing, energy-sector talent-market mapping",
     "triage": "Chief of Staff — evaluates inbound events (email/Slack/docs) for significance and decides alerting",
 }
 

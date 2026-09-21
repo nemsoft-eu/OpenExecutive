@@ -89,10 +89,25 @@ class SpecialistStepSpec(BaseModel):
 class ApprovalGateStepSpec(BaseModel):
     """Pause the run for a human decision (the wait_for_human primitive).
 
-    NOTE: full generator-resume after the human replies is a deferred upstream
-    capability. A gate followed by further steps will pause at
-    ``awaiting_human`` and not auto-continue; place gates immediately before
-    the synthesis step (or use ``on_timeout='auto_proceed'``).
+    The question is delivered to ``person_id`` on their preferred channel and
+    the run parks at ``awaiting_human``. When they answer, the run CONTINUES
+    from the next step — a gate may sit anywhere in the sequence, and a
+    definition may have more than one.
+
+    What the answer does:
+    - ``approve`` (and the ``auto_proceed`` a timeout synthesises) → the
+      remaining steps run, and the decision is recorded as this step's own
+      output, so it appears as a section in the artifact.
+    - ``reject`` / ``defer`` → the run ends at ``error`` with the person's
+      note. Everything after a sign-off exists to act on a yes.
+
+    ``on_timeout`` applies when nobody answers within ``timeout_hours``:
+    ``escalate`` files a briefing alert and ends the run at ``timed_out``,
+    ``auto_proceed`` continues as though approved, ``fail`` ends it at
+    ``error``.
+
+    Not allowed in a cadence-enabled workflow: a scheduled fire has no
+    interactive human to ask (``validate_definition`` rejects it).
     """
 
     kind: Literal["approval_gate"] = "approval_gate"

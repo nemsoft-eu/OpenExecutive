@@ -13,6 +13,7 @@ from openexecutive.agents.tool_outcome import unwrap_tool_outcome
 from openexecutive.audit import bind_turn, clear_turn, set_turn
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.redaction import (
+    ERROR_DETAIL_LEN,
     audit_tool_input,
     audit_tool_input_full,
     audit_tool_result,
@@ -50,10 +51,6 @@ from openexecutive.orchestrator.form_tools import (
     build_form_patch_event,
 )
 from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES, MCP_TOOLS, MCPGateway
-from openexecutive.orchestrator.onboarding_tools import (
-    ONBOARDING_TOOL_HANDLERS,
-    ONBOARDING_TOOLS,
-)
 from openexecutive.orchestrator.people_tools import (
     PEOPLE_TOOL_HANDLERS,
     PEOPLE_TOOLS,
@@ -77,10 +74,6 @@ from openexecutive.orchestrator.schedule_tools import (
 )
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
-from openexecutive.orchestrator.talent_tools import (
-    TALENT_TOOL_HANDLERS,
-    TALENT_TOOLS,
-)
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
@@ -117,6 +110,168 @@ def _trunc(value: Any, limit: int = 200) -> str:
     if len(s) <= limit:
         return s
     return f"{s[:limit]}…[truncated {len(s) - limit} chars]"
+
+
+# Smallest cap for which the never-exceeds-limit guarantee holds; mirrored
+# by the ge= bound on TOOL_RESULT_MAX_CHARS in config.py.
+_MIN_USEFUL_CAP = 1_000
+
+# Longest tool name echoed into a truncation marker. Real names are well
+# under this (the longest in the MCP surface is ~40 chars); the bound exists
+# so a model-supplied name cannot inflate the marker past its own budget.
+_TOOL_NAME_MARKER_MAX = 80
+
+
+def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
+    """Bound one tool result before it enters the prompt.
+
+    A circuit breaker, not a routine clipper: the default budget is set so
+    it never fires on ordinary tool output. It exists because a single
+    unbounded result (a large document fetch) otherwise lands in the
+    context and is then re-sent on every remaining iteration of the tool
+    loop, which is the dominant token cost of a long turn.
+
+    The marker is load-bearing. Truncating silently is worse than not
+    truncating: the model reads the cut text as the whole answer and
+    confabulates the rest. Naming the tool and steering toward a
+    *narrower* re-request (rather than a retry, which would re-trigger
+    the cut and burn another iteration) is what makes the cut recoverable.
+
+    Non-``str`` results pass through untouched — every producer returns a
+    string today, and guessing at the size of some other type is not this
+    function's job.
+
+    ``limit`` is passed in rather than read here: ``get_settings()`` builds
+    a fresh ``Settings`` on every call, and this runs once per tool result.
+
+    Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
+    "never exceeds ``limit``" guarantee holds by reserving the marker
+    inside the budget, and the marker itself is ~284-383 chars — below
+    that floor there is no room for it and the guarantee breaks. The
+    config field enforces this with ``ge=1_000``.
+    """
+    if not isinstance(text, str):
+        return text
+    if len(text) <= limit:
+        return text
+
+    # ``tool_name`` comes from the model's tool_use block, so it is
+    # attacker-influenceable via prompt injection. Two consequences:
+    #   * it is never passed through ``str.format`` — a name containing
+    #     braces would otherwise be interpreted as a field reference,
+    #     substituting our locals or raising and killing the turn;
+    #   * it is length-bounded, so the marker cannot outgrow the budget
+    #     it is supposed to fit inside.
+    safe_name = tool_name[:_TOOL_NAME_MARKER_MAX] if isinstance(tool_name, str) else "?"
+
+    def marker(shown: int, pct: int) -> str:
+        return (
+            f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
+            f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
+            "This is NOT the full result. To see more, call the tool again "
+            "with a narrower request — a page range, a section name, a query "
+            "or filter — rather than re-requesting the whole document.]"
+        )
+
+    # Reserve the marker inside the budget so the capped result never
+    # exceeds ``limit``. Reserve against the widest form: ``shown`` can
+    # never exceed ``limit``, and ``pct`` can round up to 100 (three
+    # digits), so no real marker is longer than this one. With safe_name
+    # bounded, the reserve stays well under the config's 1_000 minimum.
+    shown = max(0, limit - len(marker(limit, 100)))
+    pct = round((len(text) - shown) * 100 / len(text))
+    logger.warning(
+        "tool_result truncated tool=%s original_chars=%d shown_chars=%d limit=%d",
+        safe_name, len(text), shown, limit,
+    )
+    return text[:shown] + marker(shown, pct)
+
+
+def _apply_loop_cache_marker(
+    messages: list[dict[str, Any]], start: int = 0
+) -> None:
+    """Move the agent loop's intra-turn cache breakpoint to the newest
+    tool result, in place.
+
+    Without this the loop caches only the static tools+system prefix, so
+    every iteration re-sends the whole accumulated transcript at full
+    input price and ``cache_read_input_tokens`` stays pinned flat while
+    the prompt grows. Marking the newest tool result makes each iteration
+    read the previous iteration's write and extend it, so hits accrue.
+
+    The marker MOVES rather than accumulates: a per-iteration marker left
+    in place would reach ``max_iterations`` breakpoints and blow the
+    4-breakpoint API limit. Sweeping first also makes this idempotent and
+    self-healing — there is no bookkeeping index to drift out of sync.
+
+    Placement is the newest non-empty ``tool_result`` in a user message.
+    That is normally the last block of the last user message; when the
+    newest results are empty it falls back to the newest non-empty one
+    before them, so an all-empty iteration still gets a breakpoint. Only
+    the empty blocks then sit outside the cached prefix, which costs
+    nothing.
+
+    The marker must stay at the ``tool_result`` block's own top level:
+    ``providers.feature_gate._strip_cache_control`` removes markers one
+    level deep only, so a marker nested inside ``tool_result["content"]``
+    would survive the gate and reach a provider that rejects the field.
+
+    ``start`` bounds the sweep to messages this loop appended. The loop's
+    ``current_messages`` is a SHALLOW copy, so the caller still owns the
+    dicts before that index; without the bound a caller-supplied
+    ``tool_result`` would be mutated in place. Today no caller builds one,
+    but making that structural beats guarding it with a comment.
+    """
+    # Sweep every marker, and remember every markable block in order. The
+    # newest one wins, but keeping the whole list means an iteration whose
+    # last results are all empty falls back to the newest earlier result
+    # rather than shipping with no breakpoint at all — losing the marker
+    # costs the entire accumulated transcript at full price for that step.
+    markable: list[dict[str, Any]] = []
+    for msg in messages[start:]:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        is_user = msg.get("role") == "user"
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            block.pop("cache_control", None)
+            # An empty result carries nothing worth caching and risks an
+            # upstream 400 on the translated typed block. Non-str content
+            # (a typed/image result) is markable — it is real bytes in the
+            # prefix — but is left to the translator to render.
+            body = block.get("content")
+            if is_user and body:
+                markable.append(block)
+    if markable:
+        markable[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+def _tool_error_result(tool_name: str, exc: BaseException) -> str:
+    """Render a crashed tool handler as a JSON tool_result the model can read.
+
+    Tool handlers are *supposed* to return a JSON error string rather than
+    raise (see the `_err` helpers in the orchestrator tool modules), but a bug
+    in one of them — or in a library it calls — used to abort the entire turn,
+    because `asyncio.gather` propagates the first exception. The adapter then
+    showed the user a generic apology with no way to tell which tool failed.
+    Converting the exception into a normal error tool_result keeps the turn
+    alive and lets the model recover on the next iteration.
+
+    Only the exception's TYPE goes to the model. Its message can carry
+    filesystem paths, a validation error echoing the input, or a third-party
+    HTTP body — and anything in model context can end up quoted back to the
+    user. The full repr stays in the server log and the audit row.
+    """
+    return json.dumps(
+        {
+            "error": (
+                f"{tool_name} failed with {type(exc).__name__}. The failure is "
+                "recorded; do not retry the same call unchanged."
+            )
+        }
+    )
 
 
 def _build_current_speaker_block(person_id: int | None) -> str | None:
@@ -169,8 +324,6 @@ _ALL_SKILL_TOOLS = [
     *RESEARCH_TOOLS,
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
-    *TALENT_TOOLS,
-    *ONBOARDING_TOOLS,
     *FORM_TOOLS,
 ]
 _ALL_SKILL_HANDLERS = {
@@ -186,8 +339,6 @@ _ALL_SKILL_HANDLERS = {
     **RESEARCH_TOOL_HANDLERS,
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
-    **TALENT_TOOL_HANDLERS,
-    **ONBOARDING_TOOL_HANDLERS,
     **FORM_TOOL_HANDLERS,
 }
 
@@ -434,28 +585,23 @@ class Executive:
         peer_memory_context: str = "",
         person_id: int | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         history = session.get_recent_history()
 
-        for i, turn in enumerate(history):
-            msg: dict[str, Any] = {"role": turn["role"], "content": turn["content"]}
-            # Cache the penultimate assistant turn to build a rolling cache
-            if (
-                turn["role"] == "assistant"
-                and i == len(history) - 2
-                and self._settings.enable_caching
-                and isinstance(turn["content"], str)
-            ):
-                msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": turn["content"],
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-            messages.append(msg)
+        for turn in history:
+            # No cache_control on history turns. The breakpoint budget is 4
+            # per request and the other three are always spoken for: two
+            # system blocks (cache_manager.build_system_blocks) plus the tool
+            # block, leaving exactly one for the agent loop's intra-turn
+            # marker (_apply_loop_cache_marker). A rolling marker here used
+            # to claim a latent fifth, which Anthropic rejects outright on
+            # the direct path; it never earned its slot anyway, since history
+            # turns are flat strings and the system + tool blocks already
+            # cover the expensive stable prefix.
+            messages.append({"role": turn["role"], "content": turn["content"]})
 
         user_content_parts: list[dict[str, Any]] = []
 
@@ -479,6 +625,18 @@ class Executive:
         if briefing_context:
             user_content_parts.append(
                 {"type": "text", "text": f"<briefing>\n{briefing_context}\n</briefing>"}
+            )
+        # Which surface the principal is talking to us on, and what can and
+        # cannot be completed there. Chat adapters (Slack, Discord, Telegram)
+        # set this; the web app leaves it empty because the model is already
+        # in the app. User turn, never a cached system block — it varies per
+        # request and would otherwise invalidate the prompt cache.
+        if channel_context_block:
+            user_content_parts.append(
+                {
+                    "type": "text",
+                    "text": f"<channel>\n{channel_context_block}\n</channel>",
+                }
             )
         # Per-person memory from Honcho (when HONCHO_ENABLED + person_id
         # available). Goes in the user turn alongside episodic / retrieved
@@ -564,7 +722,9 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel = "minimal",
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
+        turn_id: str | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream a response from the Executive, routing to specialists as needed.
 
@@ -637,7 +797,12 @@ class Executive:
         # Bound BEFORE prefetch so the Honcho audit row inherits the
         # turn link (otherwise it lands with session_id=NULL and is
         # invisible in the session-grouped audit view).
-        turn_id = f"t-{uuid.uuid4().hex[:12]}"
+        # A caller-supplied id wins: the SSE route binds the turn at route
+        # level and must agree with us, or one turn splits across two ids.
+        # Every other entry point passes nothing and keeps its own id.
+        # `is None`, not `or`: an explicitly-passed empty string would
+        # otherwise silently mint a second id and split one turn in two.
+        turn_id = f"t-{uuid.uuid4().hex[:12]}" if turn_id is None else turn_id
 
         t0 = time.monotonic()
         full_response = ""
@@ -667,6 +832,7 @@ class Executive:
                 peer_memory_context=peer_memory_context,
                 person_id=person_id,
                 briefing_context=briefing_context,
+                channel_context_block=channel_context_block,
                 page_context_block=page_context_block,
             )
 
@@ -737,24 +903,34 @@ class Executive:
             )
 
         from openexecutive.memory.episodic import (
-            MIN_TURN_CHARS_FOR_EXTRACTION,
             schedule_extraction,
+            should_extract,
         )
-        if len(full_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
-            schedule_extraction(user_message, full_response, session_id=session.session_id)
 
-        # Mirror the completed exchange into Honcho so its server-side
-        # extraction can update the peer card. Fire-and-forget; the
-        # wrapper no-ops when person_id is None or Honcho is disabled.
-        #
         # Re-bind the audit ContextVars for the duration of these calls so
         # the fire-and-forget tasks they schedule can snapshot the right
         # session_id/turn_id (the main `with set_turn(...)` block above
         # exited at the end of the `async for` so the ContextVars are back
-        # to None by now). Without this wrapper, every sync_turn /
-        # sync_department_turn audit row would land with session_id=NULL
-        # and be invisible in the per-session audit view.
+        # to None by now). Without this wrapper, every extraction /
+        # sync_turn / sync_department_turn audit row would land with
+        # session_id=NULL and be invisible in the per-session audit view.
         with set_turn(session_id=session.session_id, turn_id=turn_id):
+            # Inside the wrapper: schedule_extraction snapshots the vars at
+            # call time, so scheduling it out here would snapshot (None,
+            # None) and the memory_extractor's model call would record
+            # unattributed however correct the snapshot itself was.
+            if should_extract(
+                user_message,
+                origin_channel=session.origin_channel,
+                person_id=person_id,
+            ):
+                schedule_extraction(
+                    user_message, full_response, session_id=session.session_id
+                )
+
+            # Mirror the completed exchange into Honcho so its server-side
+            # extraction can update the peer card. Fire-and-forget; the
+            # wrapper no-ops when person_id is None or Honcho is disabled.
             from openexecutive.memory.honcho_client import sync_turn as _honcho_sync
             _honcho_sync(
                 user_message,
@@ -789,7 +965,9 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel = "medium",
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
+        turn_id: str | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Committee-reviewed variant of stream_chat.
 
@@ -850,7 +1028,12 @@ class Executive:
         # Generated and bound BEFORE the Honcho prefetch so the peer_memory
         # audit row inherits the turn link (else it lands with
         # session_id=NULL and is invisible in the session-grouped view).
-        turn_id = f"t-{uuid.uuid4().hex[:12]}"
+        # A caller-supplied id wins: the SSE route binds the turn at route
+        # level and must agree with us, or one turn splits across two ids.
+        # Every other entry point passes nothing and keeps its own id.
+        # `is None`, not `or`: an explicitly-passed empty string would
+        # otherwise silently mint a second id and split one turn in two.
+        turn_id = f"t-{uuid.uuid4().hex[:12]}" if turn_id is None else turn_id
         # Stash on the function frame so the closing audit_log("committee_review")
         # at the end of this function can carry the same turn_id.
         _committee_turn_id = turn_id
@@ -889,6 +1072,7 @@ class Executive:
             peer_memory_context=peer_memory_context,
             person_id=person_id,
             briefing_context=briefing_context,
+            channel_context_block=channel_context_block,
             page_context_block=page_context_block,
         )
 
@@ -1159,11 +1343,17 @@ class Executive:
         )
 
         from openexecutive.memory.episodic import (
-            MIN_TURN_CHARS_FOR_EXTRACTION,
             schedule_extraction,
+            should_extract,
         )
-        if len(final_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
-            schedule_extraction(user_message, final_response, session_id=session.session_id)
+        if should_extract(
+            user_message,
+            origin_channel=session.origin_channel,
+            person_id=person_id,
+        ):
+            schedule_extraction(
+                user_message, final_response, session_id=session.session_id
+            )
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale). Fire-and-forget; no-ops when person_id is None.
@@ -1482,7 +1672,12 @@ class Executive:
         messages: list[dict[str, Any]],
         model: str = "",
         *,
-        search: WebSearchSelection | None,
+        # Defaults to None — "no web search this turn" — which every use site
+        # below already guards for. Production callers always pass an explicit
+        # selection from `select_web_search_tool`; leaving the default here
+        # keeps the loop callable without one, which is how tests that exercise
+        # unrelated parts of it (cache markers, tool-error isolation) drive it.
+        search: WebSearchSelection | None = None,
         max_iterations: int = 15,
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
@@ -1498,6 +1693,8 @@ class Executive:
         Also yields debug event dicts when a debug_collector is provided.
         """
         current_messages = list(messages)
+        # Shallow copy — the caller owns every dict up to this index.
+        caller_message_count = len(current_messages)
         last_full_text = ""
         specialists_consulted: list[str] = []
         synthesis_roster_size = 0
@@ -1822,10 +2019,55 @@ class Executive:
             if skill_tool_uses:
                 for tu in skill_tool_uses:
                     logger.info("→ skill:%s  input=%s", tu["name"], _trunc(tu["input"]))
+                # return_exceptions=True: one crashing handler must not abort
+                # the whole turn. See `_tool_error_result`.
                 raw_skill_results = await asyncio.gather(
-                    *(turn_skill_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses)
+                    *(turn_skill_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses),
+                    return_exceptions=True,
                 )
                 for tu, raw in zip(skill_tool_uses, raw_skill_results, strict=True):
+                    if isinstance(raw, BaseException):
+                        # Cancellation is not a tool failure — `gather` captures
+                        # it like any other exception, so re-raise it or the
+                        # turn-timeout / client-disconnect paths in
+                        # api/routes/chat.py silently stop working.
+                        if isinstance(raw, asyncio.CancelledError):
+                            raise raw
+                        # Computed, not hardcoded: turn_skill_handlers also
+                        # carries the client-side web_search overlay, which
+                        # audits as client_tool on the success path below. A
+                        # crash must not reclassify it as a skill.
+                        tool_kind = (
+                            "skill" if tu["name"] in _ALL_SKILL_HANDLERS else "client_tool"
+                        )
+                        logger.exception(
+                            "%s:%s raised — session=%s turn=%s iteration=%d",
+                            tool_kind, tu["name"], session_id, turn_id, iteration,
+                            exc_info=raw,
+                        )
+                        audit_log(
+                            "tool_invocation",
+                            f"{tool_kind}:{tu['name']} FAILED: {type(raw).__name__}",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tu["name"],
+                                "kind": tool_kind,
+                                "iteration": iteration,
+                                "ok": False,
+                                "error": repr(raw)[:ERROR_DETAIL_LEN],
+                            },
+                        )
+                        # Hand the model an error tool_result and move on. No
+                        # chip: summarize_action must never see an exception.
+                        results_by_id[tu["id"]] = _tool_error_result(tu["name"], raw)
+                        # Same flag a handler-reported ToolOutcome failure gets
+                        # below: a crash is an error too, and without this the
+                        # API sees a successful tool_result carrying an error
+                        # payload.
+                        error_tool_use_ids.add(tu["id"])
+                        continue
                     # Any handler may return a ToolOutcome to report failure;
                     # everything downstream of this line sees a plain string.
                     result, is_error = unwrap_tool_outcome(raw)
@@ -1906,11 +2148,43 @@ class Executive:
                         )
                     else:
                         logger.info("→ %s  input=%s", tu["name"], _trunc(tu["input"]))
+                # Same isolation as the skill gather above: a gateway crash on
+                # one tool must not take the turn down with it.
                 mcp_results = await asyncio.gather(
-                    *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses)
+                    *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses),
+                    return_exceptions=True,
                 )
-                for tu, result in zip(mcp_tool_uses, mcp_results, strict=True):
+                for tu, raw in zip(mcp_tool_uses, mcp_results, strict=True):
                     tool_label = tu["input"].get("name", tu["name"]) if tu["name"] == "call_tool" else tu["name"]
+                    if isinstance(raw, BaseException):
+                        if isinstance(raw, asyncio.CancelledError):
+                            raise raw
+                        logger.exception(
+                            "mcp:%s raised — session=%s turn=%s iteration=%d",
+                            tool_label, session_id, turn_id, iteration,
+                            exc_info=raw,
+                        )
+                        audit_log(
+                            "tool_invocation",
+                            f"mcp:{tool_label} FAILED: {type(raw).__name__}",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tool_label,
+                                "kind": "mcp",
+                                "iteration": iteration,
+                                "ok": False,
+                                "error": repr(raw)[:ERROR_DETAIL_LEN],
+                            },
+                        )
+                        results_by_id[tu["id"]] = _tool_error_result(tool_label, raw)
+                        # Same flag the skill crash path sets: without it the
+                        # API sees a successful tool_result whose payload
+                        # happens to be an error string.
+                        error_tool_use_ids.add(tu["id"])
+                        continue
+                    result = raw
                     logger.info("← %s  result=%s", tool_label, _trunc(result))
                     results_by_id[tu["id"]] = result
                     # MCP chip emission. search_tools is read-only (gets
@@ -1948,19 +2222,35 @@ class Executive:
                     yield debug_collector.to_sse_dict(evt)
 
             current_messages.append({"role": "assistant", "content": response_content})
+            # Cap here, at the single point every result reaches the model,
+            # rather than at each producer: this also covers specialist
+            # output, tool errors and the unknown-tool fallback, and it
+            # leaves non-model consumers (the propose_form_values JSON
+            # parse above, the audit trail) reading the full text.
+            #
+            # Written as a loop rather than a comprehension because `is_error`
+            # is set conditionally — only the tool_uses whose handler reported
+            # or raised a failure carry the key.
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
-                    "content": results_by_id.get(
-                        tu["id"], f"Unknown tool: {tu['name']}"
+                    "content": _cap_tool_result(
+                        results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
+                        tool_name=tu["name"],
+                        limit=self._settings.tool_result_max_chars,
                     ),
                 }
                 if tu["id"] in error_tool_use_ids:
                     result_block["is_error"] = True
                 tool_results.append(result_block)
             current_messages.append({"role": "user", "content": tool_results})
+            # Bounded to the messages this loop appended: current_messages
+            # is a shallow copy, so anything at a lower index is still owned
+            # by the caller and must not be mutated.
+            if self._settings.enable_caching:
+                _apply_loop_cache_marker(current_messages, caller_message_count)
 
         logger.warning("max_iterations=%d reached — returning partial result", max_iterations)
         yield last_full_text or "I was unable to complete the analysis. Please try again."
@@ -1980,14 +2270,15 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel | None = None,
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
     ) -> str:
         """Non-streaming chat — collects and returns the full response.
 
         When ``committee_review=True`` the call routes through
         ``stream_chat_with_committee`` so the answer is the revised
-        response, not the raw draft. Used by non-HTTP callers (e.g.
-        the email poller) that want committee output without holding
-        an SSE stream open.
+        response, not the raw draft. Lets non-HTTP callers get
+        committee output without holding an SSE stream open; the
+        channel adapters (Slack, Discord, email) all use the default.
 
         ``attachment_blocks`` is a list of Anthropic content blocks (image
         type) assembled by the caller from inbound file attachments.  Text
@@ -1997,8 +2288,8 @@ class Executive:
         ``person_id`` / ``co_present_person_ids`` / ``peer_memory_reasoning_level``
         thread through to the Honcho memory layer — see ``stream_chat``
         for details. ``peer_memory_reasoning_level=None`` (default)
-        keeps each underlying entry point's own default (``"low"`` for
-        the streaming path, ``"medium"`` for the committee path).
+        keeps each underlying entry point's own default (``"minimal"``
+        for the streaming path, ``"medium"`` for the committee path).
         """
         # Build the kwargs dict so we can conditionally include the
         # reasoning_level only when caller specified one — otherwise
@@ -2014,6 +2305,7 @@ class Executive:
             "person_id": person_id,
             "co_present_person_ids": co_present_person_ids,
             "briefing_context": briefing_context,
+            "channel_context_block": channel_context_block,
         }
         if peer_memory_reasoning_level is not None:
             common_kwargs["peer_memory_reasoning_level"] = peer_memory_reasoning_level

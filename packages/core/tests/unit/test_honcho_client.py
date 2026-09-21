@@ -859,3 +859,101 @@ def test_delete_workspace_cascade_list_failure_records_and_continues(
     details = [r for r in captured if r["event_type"] == "peer_memory"][0]["details"]
     assert details["sessions_deleted"] == 0
     assert "workspace 404" in details["sessions_list_error"]
+
+
+# --- prompt scaffolding never becomes the person's words --------------------
+
+_WRAPPED = (
+    "<outbound_reply_context>\n"
+    'You (oe) recently sent this person a DM: "Hey Alex — heard the deck slipped."\n'
+    "This incoming message MAY be their reply to it. No further backstory is available.\n"
+    "</outbound_reply_context>\n\n"
+    "oh that, sorry"
+)
+
+
+def test_sync_turn_strips_outbound_reply_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Left in, Honcho's deriver attributes the Executive's own DM to the
+    person who replied to it."""
+    _enable(monkeypatch)
+    last: dict[str, Any] = {}
+    fake = _FakeClient(last)
+
+    async def runner() -> None:
+        with _patched_client(fake):
+            honcho_client.sync_turn(_WRAPPED, "No problem.", person_id=11, session_id="discord:dm:alex")
+            pending = list(honcho_client._pending_sync_tasks)
+            if pending:
+                await asyncio.gather(*pending)
+
+    asyncio.run(runner())
+    msgs = last.get("add_messages") or []
+    assert [m["content"] for m in msgs] == ["oh that, sorry", "No problem."]
+
+
+def test_sync_turn_posts_only_the_reply_when_the_user_text_is_all_scaffolding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    last: dict[str, Any] = {}
+    fake = _FakeClient(last)
+    only_block = _WRAPPED[: _WRAPPED.index("oh that")]
+
+    async def runner() -> None:
+        with _patched_client(fake):
+            honcho_client.sync_turn(only_block, "No problem.", person_id=11, session_id="discord:dm:alex")
+            pending = list(honcho_client._pending_sync_tasks)
+            if pending:
+                await asyncio.gather(*pending)
+
+    asyncio.run(runner())
+    msgs = last.get("add_messages") or []
+    assert [m["content"] for m in msgs] == ["No problem."]
+
+
+def test_prefetch_query_strips_outbound_reply_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dialectic is asked about what the person said, not about the
+    Executive's own DM."""
+    _enable(monkeypatch)
+    last: dict[str, Any] = {}
+    fake = _FakeClient(last, answer="Alex is easygoing.")
+    with _patched_client(fake):
+        result = asyncio.run(honcho_client.prefetch(_WRAPPED, person_id=7))
+    assert result == "Alex is easygoing."
+    assert last["chat"]["query"] == "oh that, sorry"
+
+
+def test_sync_department_turn_strips_outbound_reply_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The originating person authors the user message in the department
+    session too, under the same peer id as sync_turn — so the same rule."""
+    _enable(monkeypatch)
+    last: dict[str, Any] = {}
+    fake = _FakeClient(last)
+
+    async def runner() -> None:
+        with _patched_client(fake):
+            honcho_client.sync_department_turn(
+                _WRAPPED, "No problem.", department_slug="finance",
+                session_id="discord:dm:alex", originating_person_id=11,
+            )
+            pending = list(honcho_client._pending_sync_tasks)
+            if pending:
+                await asyncio.gather(*pending)
+
+    asyncio.run(runner())
+    msgs = last.get("add_messages") or []
+    contents = [m["content"] for m in msgs]
+    assert "oh that, sorry" in contents
+    assert not any(c.startswith("<outbound_reply_context>") for c in contents)
+
+
+def test_prefetch_with_only_scaffolding_asks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An attachment-only DM on a hydrated turn leaves no words to ask about."""
+    _enable(monkeypatch)
+    last: dict[str, Any] = {}
+    fake = _FakeClient(last, answer="should not be used")
+    only_block = _WRAPPED[: _WRAPPED.index("oh that")]
+    with _patched_client(fake):
+        result = asyncio.run(honcho_client.prefetch(only_block, person_id=7))
+    assert result == ""
+    assert "chat" not in last

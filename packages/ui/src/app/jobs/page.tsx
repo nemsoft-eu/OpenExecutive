@@ -19,6 +19,12 @@ import {
   listWorkflowRuns,
   listWorkflows,
 } from "@/lib/api";
+import {
+  RunBucket,
+  runStatusBadgeColor,
+  runStatusBucket,
+  runStatusLabel,
+} from "@/lib/runStatus";
 
 const SECTION_ORDER: WorkflowSection[] = [
   "Board",
@@ -45,13 +51,15 @@ const SECTION_BLURB: Record<WorkflowSection, string> = {
 };
 
 type Tab = "catalog" | "runs";
-type RunStatus = "active" | "done" | "error";
+type RunStatus = RunBucket;
 
 function isTab(v: string | null): v is Tab {
   return v === "catalog" || v === "runs";
 }
 function isStatus(v: string | null): v is RunStatus {
-  return v === "active" || v === "done" || v === "error";
+  return (
+    v === "active" || v === "awaiting" || v === "done" || v === "error"
+  );
 }
 
 function formatRelativeTime(iso: string): string {
@@ -65,17 +73,11 @@ function formatRelativeTime(iso: string): string {
 }
 
 function statusBadge(status: string) {
-  const color =
-    status === "done"
-      ? "bg-emerald-500/10 text-emerald-400 ring-emerald-500/30"
-      : status === "error"
-      ? "bg-red-500/10 text-red-400 ring-red-500/30"
-      : "bg-amber-500/10 text-amber-400 ring-amber-500/30";
   return (
     <span
-      className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ring-1 ${color}`}
+      className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ring-1 ${runStatusBadgeColor(status)}`}
     >
-      {status}
+      {runStatusLabel(status)}
     </span>
   );
 }
@@ -98,13 +100,6 @@ function groupBy<T, K extends string>(
     else out.set(k, [item]);
   }
   return out;
-}
-
-function runStatusBucket(s: WorkflowRunSummary["status"]): RunStatus {
-  if (s === "running") return "active";
-  if (s === "done" || s === "error") return s;
-  // Defensive: unknown future statuses surface under Active so they're not lost.
-  return "active";
 }
 
 function JobsPageInner() {
@@ -157,7 +152,7 @@ function JobsPageInner() {
   );
 
   const runCounts = useMemo(() => {
-    const c = { active: 0, done: 0, error: 0 };
+    const c = { active: 0, awaiting: 0, done: 0, error: 0 };
     for (const r of runs) c[runStatusBucket(r.status)]++;
     return c;
   }, [runs]);
@@ -172,9 +167,12 @@ function JobsPageInner() {
     if (status !== null) return;
     if (defaultedStatusRef.current) return;
     defaultedStatusRef.current = true;
-    const next: RunStatus = runCounts.active > 0 ? "active" : "done";
+    // Awaiting first: a run blocked on the viewer outranks one that is simply
+    // still working.
+    const next: RunStatus =
+      runCounts.awaiting > 0 ? "awaiting" : runCounts.active > 0 ? "active" : "done";
     setParam({ status: next });
-  }, [tab, loading, status, runCounts.active, setParam]);
+  }, [tab, loading, status, runCounts.active, runCounts.awaiting, setParam]);
 
   const workflowTitleMap = useMemo(
     () => new Map(workflows.map((w) => [w.name, w.title] as const)),
@@ -475,6 +473,8 @@ function RunsView({
   const emptyMsg =
     status === "active"
       ? "No active runs."
+      : status === "awaiting"
+      ? "Nothing waiting on a sign-off."
       : status === "done"
       ? "No completed runs yet."
       : "No errors.";
@@ -487,6 +487,13 @@ function RunsView({
           onClick={() => onStatusChange("active")}
           label="Active"
           count={counts.active}
+          tone="amber"
+        />
+        <StatusSegment
+          active={status === "awaiting"}
+          onClick={() => onStatusChange("awaiting")}
+          label="Awaiting sign-off"
+          count={counts.awaiting}
           tone="amber"
         />
         <StatusSegment
