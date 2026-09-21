@@ -439,9 +439,9 @@ def find_principal_person(db_path: Path | None = None) -> Person | None:
     if onboarding ran twice (or someone toggled the flag) multiple rows
     may match. ``ORDER BY id`` makes the oldest principal win
     deterministically — a stale row would route web traffic to the
-    wrong peer card. If you re-run onboarding, archive the old
-    principal once the new one exists — archive_person refuses the last
-    active principal.
+    wrong peer card. Re-running onboarding demotes principals left off
+    the new roster; to remove a principal by hand, archive them once
+    another exists — archive_person refuses the last active principal.
     """
     if not _resolve_db_path(db_path).exists():
         return None

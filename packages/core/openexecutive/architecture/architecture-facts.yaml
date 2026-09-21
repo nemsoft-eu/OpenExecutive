@@ -4054,18 +4054,23 @@ company_onboarding:
     Onboarding marks exactly one person is_principal (the user) and gives them
     AuthorityScope.WILDCARD; nobody else gets a scope. That is what onboarding
     PRODUCES, not an invariant the system enforces afterwards — see
-    principal_flag_is_set_at_create_only. PersonDraft uses extra="ignore" so an email or
+    principal_flag_is_not_patchable. PersonDraft uses extra="ignore" so an email or
     chat handle the model emits despite the system prompt is dropped at the
     model boundary — OE never auto-imports contacts, matching the fixture and
     engagement-intake invariants. Channels, availability and scopes stay a
     deliberate action on /people.
-  principal_flag_is_set_at_create_only: |
-    is_principal is settable ONLY at creation — onboarding, the fixture loader,
-    or POST /people. There is deliberately no update path: PersonPatch carries
-    no is_principal field, update_person does not touch the column, and the
-    upsert_person chat tool refuses the flag outright (people_tools.py) so a
-    promotion cannot be socially engineered through the Executive. Changing it
-    on an existing row is an operator action against the database.
+  principal_flag_is_not_patchable: |
+    is_principal is set at creation — the fixture loader or POST /people — and
+    by an onboarding commit. There is deliberately no PATCH or chat update
+    path: PersonPatch carries no is_principal field, update_person does not
+    touch the column, and the upsert_person chat tool refuses the flag outright
+    (people_tools.py) so a promotion cannot be socially engineered through the
+    Executive. The onboarding commit (POST /onboard/interview/commit) IS an
+    update path on existing rows: save_onboarding_people rewrites the flag on
+    a name-matched person and _demote_stale_principals clears it on anyone left
+    off the new roster. That route sits behind the same service credential as
+    everything else, so the self-promotion exposure described below applies to
+    it today.
 
     A PersonPatch.is_principal field was implemented and then deliberately NOT
     landed (2026-09-20). Adding it would have created a privilege escalation:

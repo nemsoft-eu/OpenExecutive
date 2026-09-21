@@ -76,12 +76,15 @@ class Person(BaseModel):
     by who was promoted first — promoting someone whose id is lower than the
     sitting principal moves the fallback identity onto them.
 
-    Settable only at creation (onboarding, the fixture loader, `POST /people`):
-    `PersonPatch` carries no such field and `update_person` does not touch the
-    column, so changing it on an existing row is an operator action against the
-    database. That is deliberate — `BACKEND_SHARED_SECRET` is a *service*
-    credential, not a per-user one, and every rostered person with an email can
-    sign in, so a patchable flag would let any teammate self-promote.
+    Not patchable: `PersonPatch` carries no such field and `update_person` does
+    not touch the column. It is set at creation (the fixture loader,
+    `POST /people`) and by an onboarding commit, which is the one path that
+    changes it on an EXISTING row — `save_onboarding_people` rewrites the flag
+    on a name-matched person and `_demote_stale_principals` clears it on anyone
+    left off the new roster. `BACKEND_SHARED_SECRET` is a *service* credential,
+    not a per-user one, and every rostered person with an email can sign in, so
+    that commit route is reachable by any teammate; a patchable flag would widen
+    the same exposure.
 
     `department_slugs` is advisory — it tells the Executive which department
     contexts this person participates in. FK enforcement deferred to Phase 4.
