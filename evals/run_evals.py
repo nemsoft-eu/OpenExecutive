@@ -246,9 +246,12 @@ async def main() -> None:
     initialize_overrides_db()
     ReviewStore.initialize_db()
 
-    import anthropic
+    # Built through the app's factory so an organisation-scoped key gets its
+    # `anthropic-workspace-id` header here too — a bare AsyncAnthropic() 400s
+    # on every judge call for those keys (#128).
+    from openexecutive.providers.anthropic_provider import configured_async_client
 
-    client = anthropic.AsyncAnthropic()
+    client = configured_async_client()
 
     scenario_dir = Path(args.scenarios)
     output_dir = Path(args.output)

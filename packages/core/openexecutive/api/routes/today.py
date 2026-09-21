@@ -28,11 +28,6 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from openexecutive.briefing.onboarding_digest import (
-    OnboardingBriefItem,
-    build_onboarding_brief_items,
-)
-from openexecutive.briefing.talent_digest import TalentBriefItem, build_talent_brief_items
 from openexecutive.clients.cockpit import ClientCockpitCard, format_practice_for_today
 
 if TYPE_CHECKING:
@@ -394,13 +389,6 @@ class TodayResponse(BaseModel):
     # and people we're awaiting a reply from. Both additive, default empty.
     in_flight: list[InFlightItem] = []
     awaiting: list[AwaitingItem] = []
-    # Active executive-search engagements rolled up by pipeline stage, so the
-    # briefing surfaces talent the same way it surfaces departments and
-    # proposals. Additive, default empty (no talent data ⇒ no section).
-    talent: list[TalentBriefItem] = []
-    # New hires currently onboarding, rolled up by progress. Additive, default
-    # empty (no onboarding plans ⇒ no section).
-    onboarding: list[OnboardingBriefItem] = []
     # Multi-client practice mode only (2+ client slots): rollup cards for the
     # PARKED clients — overdue follow-ups, awaiting replies, renewals — so the
     # operator sees the whole practice from the active client's brief.
@@ -696,13 +684,14 @@ def _build_today(
     # Attention-worthy people first; stable name order within a priority band.
     person_items.sort(key=lambda p: (-p.priority, p.full_name))
 
+    from openexecutive.alerts import lifecycle as lifecycle_module
     from openexecutive.alerts.lifecycle import list_live_alerts
     from openexecutive.alerts.store import count_superseded_by
     from openexecutive.briefing.ranking import score_and_categorize
 
     # Live = unread AND inside its TTL AND not snoozed — the read-side twin of
     # the scheduler's expiry sweep, so the page is right before the sweep runs.
-    raw_alerts = list_live_alerts(limit=100, now=now)
+    raw_alerts = list_live_alerts(limit=lifecycle_module.BOARD_LIMIT, now=now)
     superseded_counts = count_superseded_by()
     trust_by_slug = _watch_trust_by_slug(raw_alerts)
     proposal_items = []
@@ -815,14 +804,6 @@ def _build_today(
     response.in_flight = in_flight_items
     response.awaiting = awaiting_items
 
-    # Active executive-search engagements, rolled up by pipeline stage. The
-    # helper swallows its own errors (returns []), so a talent-store hiccup or a
-    # fresh install with no talent tables never breaks the brief.
-    response.talent = build_talent_brief_items()
-
-    # New hires currently onboarding. Same swallow-errors contract as talent.
-    response.onboarding = build_onboarding_brief_items()
-
     # Parked clients in multi-client practice mode. The helper returns [] for
     # single-company installs (0–1 slots) and swallows its own errors.
     from openexecutive.config import get_settings as _get_settings
@@ -930,12 +911,27 @@ def _payload_headline(payload_json: str | None) -> str | None:
     return None
 
 
-def _build_activity(limit: int, since: datetime | None = None) -> ActivityResponse:
+def _build_activity(
+    limit: int,
+    since: datetime | None = None,
+    *,
+    include_alert_raised: bool = True,
+) -> ActivityResponse:
     """Aggregate recent self-initiated Executive activity across sources.
 
     ``since`` bounds the feed to items at/after that instant (the briefs pass
     the previous delivery time so "what changed" is a real delta); the pool
     is widened so a busy history cannot starve the window.
+
+    ``include_alert_raised=False`` omits the ``alert_raised`` source entirely.
+    The rail wants it — a raise really happened, even if the card is gone — but
+    the briefing narrative wants neither half of it. A *closed* alert read as
+    live work the principal had already settled. A *live* one is worse than
+    redundant: ``lifecycle.is_live`` is the very predicate behind
+    ``list_live_alerts``, so every live raise is already a proposal card, and
+    the header prompt forbids re-listing the cards. Dropping the source is also
+    why this is not a post-pull filter: ``recent_alerts`` would otherwise burn
+    the whole pool on closed rows and starve the live ones out of the feed.
 
     Sources, all pulled from the shared SQLite database:
       • scheduled_actions with status='done' — fired follow-ups, nudges,
@@ -1077,17 +1073,19 @@ def _build_activity(limit: int, since: datetime | None = None) -> ActivityRespon
             at=instance.resolved_at or instance.created_at,
         ))
 
-    # Operational alerts the Executive raised. All statuses are included on
-    # purpose: this is a historical "what happened" feed (like decisions /
-    # advice, which have no status), so an alert later read or dismissed still
-    # represents a real raise event at its `created_at`. Decision-scheduling
-    # alerts are excluded in SQL (not after the pull, so they can't starve real
-    # alerts out of the pool) — they are the companion alert for a gated
-    # booking, already represented by the `decision_resolved` rows above (and as
-    # a live proposal while pending), so surfacing them here would double-count.
-    for alert in alerts_store.recent_alerts(
+    # Operational alerts the Executive raised. For the rail, all statuses are
+    # included on purpose: this is a historical "what happened" feed (like
+    # decisions / advice, which have no status), so an alert later read or
+    # dismissed still represents a real raise event at its `created_at`. The
+    # narrative opts the whole source out — see the docstring.
+    # Decision-scheduling alerts are excluded in SQL (not after the pull, so
+    # they can't starve real alerts out of the pool) — they are the companion
+    # alert for a gated booking, already represented by the `decision_resolved`
+    # rows above (and as a live proposal while pending), so surfacing them here
+    # would double-count.
+    for alert in (alerts_store.recent_alerts(
         limit=pool, exclude_source=decision_ledger.DECISION_ALERT_SOURCE,
-    ):
+    ) if include_alert_raised else []):
         items.append(ActivityItem(
             kind="alert_raised",
             summary=alert.headline,
@@ -1229,6 +1227,87 @@ def _narrative_inputs(
     )
 
 
+def _narrative_activity(
+    viewer: PersonBriefItem | None, viewer_desc: dict[str, str] | None
+) -> list[dict[str, Any]]:
+    """The activity list the narrative reasons over.
+
+    Background task only — deliberately NOT part of the cache hash. Hashing it
+    looked like the fix for a frozen header, but it has no floor: the 20-row
+    window moves on almost every DM, decision, advice row and completed
+    workflow, so every viewer's narrative would regenerate (a real model call
+    each) on nearly any Executive action. `_nothing_needs_attention` is what
+    actually keeps a frozen header from recurring, and the hash now tracks the
+    proposal fields that genuinely change what the narrative would say.
+
+    ``alert_raised`` is excluded (see `_build_activity`): live raises are the
+    proposal cards, which the header must not re-list, and closed ones are
+    settled work.
+
+    ``viewer_desc`` is `_narrative_inputs`' third element: non-None only for a
+    non-principal teammate, whose feed is narrowed to their own departments.
+    Taken as-is rather than as a bool so the call site passes what it already
+    holds instead of re-deriving the same condition.
+    """
+    activity = [
+        item.model_dump()
+        for item in _build_activity(20, include_alert_raised=False).items
+    ]
+    if viewer_desc is not None and viewer is not None:
+        # Teammate view: keep only activity in their departments.
+        vdepts = set(viewer.department_slugs)
+        activity = [a for a in activity if a.get("department") in vdepts]
+    return activity
+
+
+def _nothing_needs_attention(today_data: dict[str, Any]) -> bool:
+    """True when the viewer's slice holds nothing that wants a decision.
+
+    The header's job is to synthesize what needs attention. With no action
+    proposals, no at-risk/off-track department and nobody awaiting, there is
+    nothing to synthesize — and handing the model only the history rail makes
+    it manufacture urgency out of settled items. Callers emit a fixed quiet
+    line instead of spending a model call.
+    """
+    if today_data.get("proposals"):
+        return False
+    if any(
+        d.get("at_risk_count", 0) or d.get("off_track_count", 0)
+        for d in today_data.get("departments", [])
+    ):
+        return False
+    return not any(p.get("awaiting_count", 0) for p in today_data.get("people", []))
+
+
+def _narrative_context(
+    today_data: dict[str, Any],
+    viewer: PersonBriefItem | None,
+    viewer_desc: dict[str, str] | None,
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """``(context, activity)`` — the exact user turn the model would receive.
+
+    The single source both the cache key and the model call come from, so the
+    key can never be computed over something the model did not see.
+
+    On a quiet board it returns `narrative_cache.QUIET_CONTEXT` and no
+    activity: the narrative is a fixed line there, so the key must not depend
+    on the rail, and building the rail would be wasted work (it is a
+    seven-source SQL union) on a request whose answer is a constant.
+    """
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.briefing.narrative import render_briefing_context
+
+    if _nothing_needs_attention(today_data):
+        return narrative_cache.QUIET_CONTEXT, None
+    activity = _narrative_activity(viewer, viewer_desc)
+    context = render_briefing_context(
+        period_label=datetime.now(UTC).strftime("%Y-%m-%d"),
+        today_data=today_data,
+        activity=activity,
+    )
+    return context, activity
+
+
 def _attach_narrative(
     response: TodayResponse,
     *,
@@ -1240,9 +1319,10 @@ def _attach_narrative(
     (the deprecated alias) serves cache-only without scheduling regen."""
     from openexecutive.briefing import narrative_cache
 
-    scope, today_data, _desc, _viewer = _narrative_inputs(response, caller_person_id)
+    scope, today_data, desc, viewer = _narrative_inputs(response, caller_person_id)
     try:
-        nhash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+        context, _activity = _narrative_context(today_data, viewer, desc)
+        nhash = narrative_cache.build_narrative_input_hash(context, scope=scope)
         cached = narrative_cache.get(scope)
         if cached is not None:
             response.narrative = cached.narrative_text
@@ -1270,7 +1350,11 @@ async def _regen_briefing_narrative(
     different scope's cache entry.
     """
     from openexecutive.briefing import narrative_cache
-    from openexecutive.briefing.narrative import synthesize_briefing_narrative
+    from openexecutive.briefing.narrative import (
+        QUIET_PRINCIPAL,
+        QUIET_VIEWER,
+        synthesize_briefing_narrative,
+    )
 
     try:
         snapshot = _build_today()
@@ -1283,26 +1367,30 @@ async def _regen_briefing_narrative(
                 "regen; skipping write", expected_scope, scope,
             )
             return
-        activity = [item.model_dump() for item in _build_activity(20).items]
-        if viewer_desc is not None and viewer is not None:
-            # Teammate view: keep only activity in their departments.
-            vdepts = set(viewer.department_slugs)
-            activity = [a for a in activity if a.get("department") in vdepts]
-        period_label = datetime.now(UTC).strftime("%Y-%m-%d")
-        text = await asyncio.wait_for(
-            synthesize_briefing_narrative(
-                today_data=today_data, activity=activity,
-                period_label=period_label, viewer=viewer_desc,
-            ),
-            timeout=25.0,
-        )
+        context, activity = _narrative_context(today_data, viewer, viewer_desc)
+        if context == narrative_cache.QUIET_CONTEXT:
+            # Nothing awaits a decision — skip the model call entirely and
+            # write the fixed quiet line. Still cached (below) so the hot path
+            # sees a fresh hash instead of re-scheduling this task forever.
+            text = QUIET_VIEWER if viewer_desc is not None else QUIET_PRINCIPAL
+        else:
+            text = await asyncio.wait_for(
+                synthesize_briefing_narrative(
+                    today_data=today_data, activity=activity or [],
+                    period_label=datetime.now(UTC).strftime("%Y-%m-%d"),
+                    viewer=viewer_desc,
+                    # Hand the model the very string that was hashed.
+                    rendered_context=context,
+                ),
+                timeout=25.0,
+            )
     except Exception:
         logger.exception("today: briefing narrative regen failed")
         return
 
     if not text:
         return
-    input_hash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+    input_hash = narrative_cache.build_narrative_input_hash(context, scope=scope)
     narrative_cache.put(narrative_cache.BriefingNarrative(
         scope=scope,
         input_hash=input_hash,

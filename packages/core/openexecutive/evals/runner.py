@@ -28,6 +28,7 @@ from typing import Any
 
 from openexecutive.evals.judges import judge_chat, judge_triage, judge_workflow
 from openexecutive.evals.scenarios import load_scenarios
+from openexecutive.workflows.gate import ensure_workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,7 @@ def _make_workflow_runner(
                     inputs = workflow.input_model()(**workflow_inputs)
                     artifact = ""
                     async for ev in workflow.run(inputs, store):
+                        ev = ensure_workflow_event(ev, site='evals.runner')
                         if ev.type == "artifact":
                             artifact = ev.content or ""
                         elif ev.type == "error":

@@ -516,7 +516,18 @@ class ExecutiveReflectionWorkflow(Workflow):
         # Withhold the raw per-channel DM tools: DMs go through message_person
         # (server resolves the channel id), so the model can't pass — or
         # fabricate — a channel id. Mirrors executive_research's synthesis.
-        _excluded_dm = {"send_slack_dm", "send_discord_dm", "send_telegram_message"}
+        # `ack_alert` is withheld for the same reason the architecture notes
+        # already state that "Reflection never closes alerts — the alert
+        # review does, with evidence": this pass runs unattended with open
+        # alerts rendered into its context, and those headlines come from
+        # inbound mail and chat, so an injected "the principal already
+        # dismissed 13" would be acted on with nobody watching.
+        _excluded_dm = {
+            "send_slack_dm",
+            "send_discord_dm",
+            "send_telegram_message",
+            "ack_alert",
+        }
         tools = sorted(
             (t for t in _ALL_SKILL_TOOLS if t["name"] not in _excluded_dm),
             key=lambda t: t["name"],

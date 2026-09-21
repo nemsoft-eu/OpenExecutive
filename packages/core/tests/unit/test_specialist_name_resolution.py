@@ -43,15 +43,24 @@ def test_every_registry_key_resolves_to_itself(name: str) -> None:
         ("  cso  ", "cso"),
         ("bo", "board_comms"),
         ("tr", "triage"),
+        # `t` was ambiguous while `talent` was in the registry. With the talent
+        # specialist gone, `triage` is the only `t*` key, so a one-character
+        # truncation now resolves rather than refusing.
+        ("t", "triage"),
     ],
 )
 def test_malformed_names_resolve(emitted: str, expected: str) -> None:
     assert resolve_specialist_name(emitted) == expected
 
 
-@pytest.mark.parametrize("ambiguous", ["c", "t"])
+@pytest.mark.parametrize("ambiguous", ["c"])
 def test_ambiguous_prefixes_refuse_to_guess(ambiguous: str) -> None:
-    """`c` spans cso/cfo/chro/coo/cmo/cpo — routing to any one is worse than not routing."""
+    """`c` spans cso/cfo/chro/coo/cmo/cpo — routing to any one is worse than not routing.
+
+    The assert below is a guard on the parameter, not on the resolver: it fails
+    loudly if a registry change makes the prefix unambiguous, which is how `t`
+    (once talent + triage) left this list.
+    """
     assert len({k for k in SPECIALIST_REGISTRY if k.startswith(ambiguous)}) > 1
     assert resolve_specialist_name(ambiguous) is None
 

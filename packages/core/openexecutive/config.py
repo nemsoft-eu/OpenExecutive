@@ -1,7 +1,8 @@
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Walk up from this file to find the repo root .env. If no .env exists
@@ -20,6 +21,14 @@ while _ROOT.parent != _ROOT:
 if not _FOUND_ENV:
     _ROOT = Path.cwd()
 _ENV_FILE = _ROOT / ".env"
+
+
+# An Anthropic workspace id is an opaque token. Pinning it to a token charset
+# is not about their format but about ours: a stray quote, space, control
+# character or non-ASCII byte from a .env line becomes an illegal header value,
+# which httpx/h11 reject as a *connection* error at the first Claude call —
+# two silent retries later, and nowhere near the setting that caused it.
+_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _blank_or_comment(v: Any) -> bool:
@@ -88,6 +97,11 @@ class Settings(BaseSettings):
     # registry raises an actionable error if a Claude model is requested
     # while this is unset.
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
+    # Required only for a key issued at the ORGANISATION level rather than
+    # inside a workspace: Anthropic rejects those calls with HTTP 400 unless
+    # the request carries an `anthropic-workspace-id` header (#128). A
+    # workspace-scoped key needs no value here.
+    anthropic_workspace_id: str | None = Field(None, alias="ANTHROPIC_WORKSPACE_ID")
 
     default_model: str = Field("claude-sonnet-5", alias="DEFAULT_MODEL")
     deep_reasoning_model: str = Field("claude-opus-5", alias="DEEP_REASONING_MODEL")
@@ -183,6 +197,29 @@ class Settings(BaseSettings):
         _DEFAULT_OPENROUTER_CATALOG_REFRESH_S, alias="OPENROUTER_CATALOG_REFRESH_S"
     )
 
+    @field_validator("anthropic_workspace_id", mode="before")
+    @classmethod
+    def _parse_anthropic_workspace_id(cls, v: Any) -> Any:
+        """Reject at boot what would otherwise 400 on the first Claude call.
+
+        `ANTHROPIC_WORKSPACE_ID=` with a trailing `# comment` parses the
+        comment as the VALUE (dotenv, verified), and that string is a legal
+        header — so an install that needs no workspace at all would start
+        sending one and fail every call with the very error this setting
+        exists to fix.
+        """
+        if _blank_or_comment(v):
+            return None
+        if isinstance(v, str):
+            v = v.strip()
+            if not _WORKSPACE_ID_RE.match(v):
+                raise ValueError(
+                    "ANTHROPIC_WORKSPACE_ID must be a bare workspace id "
+                    "(letters, digits, '.', '_', '-') with no quotes, spaces "
+                    f"or trailing comment; got {v!r}"
+                )
+        return v
+
     @field_validator("openrouter_catalog_providers", mode="before")
     @classmethod
     def _parse_openrouter_catalog_providers(cls, v: Any) -> list[str]:
@@ -242,6 +279,17 @@ class Settings(BaseSettings):
     # Anthropic thinking, so this is the only reasoning control there.
     local_reasoning_effort: Literal["none", "low", "medium", "high"] | None = Field(
         None, alias="LOCAL_REASONING_EFFORT"
+    )
+    # Off by default: the `usage: {include: true}` request field is an
+    # OpenRouter-only accounting extension, not part of the OpenAI or
+    # Anthropic request schema. A plain self-hosted server (Ollama, vLLM) or
+    # a strict gateway that forwards nearly verbatim to real Anthropic will
+    # reject an unrecognized top-level field outright instead of ignoring
+    # it. Only turn this on if you've confirmed your LOCAL_BASE_URL backend
+    # actually understands OpenRouter's request format (some hosted, billed
+    # gateways do) — otherwise every local-model call 400s.
+    local_include_usage_accounting: bool = Field(
+        False, alias="LOCAL_INCLUDE_USAGE_ACCOUNTING"
     )
 
     @field_validator("local_models", mode="before")
@@ -433,10 +481,26 @@ class Settings(BaseSettings):
     )
     google_chat_project_number: str | None = Field(None, alias="GOOGLE_CHAT_PROJECT_NUMBER")
 
+    # ---- Tool results ----
+    # Upper bound on a single tool result's characters before it enters the
+    # prompt. A circuit breaker against an unbounded result (a large document
+    # fetch) dominating a turn and then being re-sent on every remaining
+    # iteration of the tool loop — deliberately set high enough that ordinary
+    # tool output never reaches it. Applies to every tool, not just MCP.
+    tool_result_max_chars: int = Field(
+        50_000, alias="TOOL_RESULT_MAX_CHARS", ge=1_000
+    )
+
     mcp_servers_config_path: Path = Field(
         _ROOT / "company" / "mcp_servers.json", alias="MCP_SERVERS_CONFIG_PATH"
     )
+    # Left unset, this is inferred from the presence of mcp_servers_config_path
+    # (see _resolve_mcp). Set explicitly, the explicit value always wins.
     mcp_enabled: bool = Field(False, alias="MCP_ENABLED")
+    # Whether mcp_enabled above came from the environment rather than from
+    # _resolve_mcp's inference. A private attr, not a field: it is derived on
+    # every load, so an env var for it would only ever be discarded.
+    _mcp_enabled_explicit: bool = PrivateAttr(default=False)
 
     # ---- Calendar booking (first-climb autonomy, Build 1) ------------------
     # When true, the `create_calendar_event` / `cancel_calendar_event` tools
@@ -821,9 +885,52 @@ class Settings(BaseSettings):
     def _resolve_mcp(self) -> "Settings":
         if not self.mcp_servers_config_path.is_absolute():
             self.mcp_servers_config_path = Path.cwd() / self.mcp_servers_config_path
-        if not self.mcp_enabled and self.mcp_servers_config_path.exists():
+        # Convenience for people who never touch the var: dropping an
+        # mcp_servers.json next to profile.yaml turns MCP on. An EXPLICIT
+        # setting wins in both directions — `model_fields_set` holds the fields
+        # the env/init actually supplied, which is what separates "never set"
+        # from "set to false" (the `not self.mcp_enabled` this used to test
+        # could not, so the file silently overrode MCP_ENABLED=false — #122).
+        # Read it BEFORE assigning mcp_enabled below: pydantic adds a field to
+        # that set on assignment too. See architecture-facts.yaml →
+        # integrations → mcp_gateway for the full note.
+        self._mcp_enabled_explicit = "mcp_enabled" in self.model_fields_set
+        if not self._mcp_enabled_explicit and mcp_config_file_present(
+            self.mcp_servers_config_path
+        ):
             self.mcp_enabled = True
         return self
+
+    @property
+    def mcp_auto_enabled(self) -> bool:
+        """True when MCP is on ONLY because the config file exists.
+
+        The API lifespan reports this when MCP then fails to come up: an
+        operator who never set MCP_ENABLED has to be told that the file is what
+        turned MCP on, which is the diagnosis #122 cost 15 container restarts
+        and a read of this module.
+        """
+        return self.mcp_enabled and not self._mcp_enabled_explicit
+
+
+def mcp_config_file_present(config_path: Path) -> bool:
+    """Whether `config_path` is a regular file, without ever raising.
+
+    `Path.is_file` / `Path.exists` re-raise any OSError outside (ENOENT,
+    ENOTDIR, EBADF, ELOOP), so an EACCES on a parent directory whose ownership
+    does not match the container user propagates rather than answering False.
+    Raised from inside `_resolve_mcp` that means out of `Settings()` itself,
+    and `api/main.py` builds the app at module level — so it is an IMPORT-time
+    crash: #122's restart loop again, with even less to read. A path we cannot
+    stat is treated as absent.
+
+    `is_file` rather than `exists` so a directory at the config path counts as
+    absent too. It is not a config, and it used to be enough to auto-enable MCP.
+    """
+    try:
+        return config_path.is_file()
+    except (OSError, ValueError):
+        return False
 
 
 def get_settings() -> Settings:

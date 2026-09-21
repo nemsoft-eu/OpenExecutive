@@ -63,7 +63,9 @@ async def judge_triage(
     decision: dict[str, Any],
     client: anthropic.AsyncAnthropic | None = None,
 ) -> dict[str, Any]:
-    cli = client or anthropic.AsyncAnthropic()
+    from openexecutive.providers.anthropic_provider import configured_async_client
+
+    cli = client or configured_async_client()
 
     judge_prompt = f"""You are an evaluator for a Triage agent that decides whether incoming
 events (emails, Slack messages, documents) should fire proactive alerts to a

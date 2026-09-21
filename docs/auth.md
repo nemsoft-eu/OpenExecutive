@@ -10,8 +10,31 @@ Two independent layers. Either one alone would be insufficient; together they fa
 
 | Layer | What it does | Where |
 |---|---|---|
-| **UI: Auth.js v5 + Google OAuth** | Anyone hitting the public UI is redirected to `/signin`. Only Google accounts in `ALLOWED_EMAILS` can complete sign-in. | [packages/ui/src/auth.ts](../packages/ui/src/auth.ts), [packages/ui/src/middleware.ts](../packages/ui/src/middleware.ts), [packages/ui/src/app/signin/page.tsx](../packages/ui/src/app/signin/page.tsx) |
+| **UI: Auth.js v5 + Google OAuth** | Anyone hitting the public UI is redirected to `/signin`. Only Google accounts on the allow-list can complete sign-in — the **union** of `ALLOWED_EMAILS` and the People roster (see below). | [packages/ui/src/auth.ts](../packages/ui/src/auth.ts), [packages/ui/src/middleware.ts](../packages/ui/src/middleware.ts), [packages/ui/src/app/signin/page.tsx](../packages/ui/src/app/signin/page.tsx) |
 | **API: shared-secret header** | The FastAPI backend is reachable over the network. It rejects every request whose `x-api-key` header doesn't match `BACKEND_SHARED_SECRET`. The UI proxy stamps this header on every upstream call. | [packages/core/openexecutive/api/main.py](../packages/core/openexecutive/api/main.py), [packages/ui/src/app/api/backend/[...path]/route.ts](../packages/ui/src/app/api/backend/%5B...path%5D/route.ts) |
+
+### Who is on the allow-list
+
+Two **additive** sources. An email is admitted if it appears in *either*:
+
+1. **`ALLOWED_EMAILS`** — the comma-separated env var on the UI, read once at startup.
+   Checked first, and a hit short-circuits: a configured operator signs in even when the
+   API is completely down, and pays no roster-fetch latency.
+2. **The People roster** — every non-archived Person with an email, served by
+   `GET /auth/allowed-emails` and cached for 5 minutes per UI instance.
+
+Neither one overrides the other. Adding people to the roster cannot revoke an
+`ALLOWED_EMAILS` entry, and leaving `ALLOWED_EMAILS` blank is fine once the roster is
+populated.
+
+Membership is re-checked on every request the middleware gates, not just at sign-in, so a
+roster removal takes effect within the cache window rather than waiting out the 24h JWT.
+
+If the roster fetch fails, `ALLOWED_EMAILS` users are unaffected (their check never
+consults the roster). Roster-only users with an existing session keep working — the UI
+fails open rather than signing everyone out over a brief backend hiccup, since the strict
+sign-in gate already vetted them — but a *new* roster-only sign-in is denied until the
+backend answers.
 
 ### Request flow
 
@@ -136,15 +159,28 @@ OE_PUBLIC_DEPLOYMENT=1
 
 ### Add or remove a user
 
-Update `ALLOWED_EMAILS` on the UI and restart it:
+Access comes from two additive sources, so there are two ways in — and removal means
+taking the person out of **both**.
+
+**Add via the roster (no restart).** Create a Person with that email in People. It goes
+live within the 5-minute roster cache window. This is the normal path for teammates.
+
+**Add via `ALLOWED_EMAILS` (restart).** Append the email and restart the UI:
 
 ```
 ALLOWED_EMAILS=alice@x.com,bob@y.com,carol@z.com
 ```
 
 The list is read once at startup, so the new entry goes live when the restart finishes.
+Recommended for your own operator/break-glass account: nothing that writes the roster —
+a fixture load, an onboarding run, someone editing People — can take it away.
 
 Rules: comma-separated, case-insensitive, whitespace around entries is stripped, trailing commas are harmless.
+
+**Remove a user.** Archive or delete their Person **and** drop them from
+`ALLOWED_EMAILS`. Removing only one leaves the other still granting access. The roster
+half lands on their next gated request once the cache expires; the env half needs a UI
+restart.
 
 ### Rotate the shared secret
 
@@ -177,7 +213,8 @@ If `AUTH_GOOGLE_SECRET` is leaked, regenerate in Google Cloud Console (Clients �
 | `OAuth client was not found` / `invalid_client` | `AUTH_GOOGLE_ID` typo, swapped with `AUTH_GOOGLE_SECRET`, or the client lives in a different GCP project |
 | `redirect_uri_mismatch` | The Authorized redirect URI in Google Console doesn't exactly match `<origin>/api/auth/callback/google`. Wait 5 min for Google to propagate after edits |
 | Browser tries to load `0.0.0.0` after sign-in | `AUTH_URL` not set on the UI |
-| `AccessDenied` page after Google login | Email not in `ALLOWED_EMAILS`, or Google returned `email_verified !== true` |
+| `AccessDenied` page after Google login | Email is in neither `ALLOWED_EMAILS` nor the People roster (the two are unioned), or Google returned `email_verified !== true`. Check the `auth_login` audit row's `source`: `no_match` = checked against both lists and genuinely not on either; `env_only_roster_unavailable` = the roster fetch failed and the email isn't in the env list |
+| A removed teammate can still sign in | Their email is still in `ALLOWED_EMAILS`. The roster is additive, so archiving the Person alone doesn't revoke access |
 | API returns `401` for every request | UI and API have different `BACKEND_SHARED_SECRET` values (very common after rotating in two separate terminal sessions) |
 | API refuses to start with `RuntimeError: BACKEND_SHARED_SECRET is required` | `OE_PUBLIC_DEPLOYMENT` is set and the secret is missing. Set it; the next restart will boot |
 | Sign-in works but the chat stays empty | Backend is auth'd but `ANTHROPIC_API_KEY` is missing on the API. Its logs will show the error |

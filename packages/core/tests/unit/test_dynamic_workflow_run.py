@@ -116,6 +116,18 @@ async def test_run_pauses_at_approval_gate(monkeypatch: pytest.MonkeyPatch) -> N
     # Run stops at the gate — no artifact emitted.
     assert not any(getattr(e, "type", None) == "artifact" for e in events)
 
+    # The gate carries everything needed to pick the run back up: which step
+    # it stopped at, where to continue, and what the earlier steps produced.
+    state = gates[0].resume_state
+    assert state is not None
+    assert state.workflow_name == "weekly_watch"
+    assert state.gate_step_id == "gate"
+    assert state.gate_step_index == 1
+    assert state.outputs == {"research": ("Research", "section")}
+    # Pins the whole step list, not just the gate: a definition edited during
+    # the pause must not be able to swap the steps the approval lands on.
+    assert state.steps_fingerprint
+
 
 @pytest.mark.asyncio
 async def test_run_synthesis_with_instructions_calls_specialist(
@@ -173,3 +185,106 @@ async def test_run_reports_placeholder_error(monkeypatch: pytest.MonkeyPatch) ->
     events = await _collect(wf, bad_inputs)
     errors = [e for e in events if getattr(e, "type", None) == "error"]
     assert errors and "placeholder error" in errors[0].message
+
+
+def _never_route(called: list[str]) -> Any:
+    async def fake_route(**kwargs: Any) -> str:  # pragma: no cover - must not run
+        called.append(kwargs["specialist_name"])
+        return "Unknown specialist: talent"
+    return fake_route
+
+
+@pytest.mark.asyncio
+async def test_run_fails_loudly_when_stored_specialist_no_longer_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Definitions are validated on create/update, not on load, so a stored
+    definition can name a specialist that has since been removed (the `talent`
+    key). The run must emit an error event before doing anything — not feed
+    "Unknown specialist" into the synthesis step as if it were analysis."""
+    called: list[str] = []
+    monkeypatch.setattr(dyn, "route_to_specialist", _never_route(called))
+    d = _def(
+        steps=[
+            {"kind": "specialist", "id": "screen", "title": "Screen",
+             "specialist": "talent", "goal": "Assess {topic}."},
+            {"kind": "synthesis", "id": "assemble", "title": "Assemble"},
+        ],
+    )
+    wf = DynamicWorkflow(d)
+    inputs = wf.input_model()(topic="a candidate")
+    events = await _collect(wf, inputs)
+    types = [getattr(e, "type", None) for e in events]
+    # Pre-flight: the error is the ONLY event — not even the context step ran.
+    assert types == ["error"]
+    assert "'talent'" in events[0].message and "'screen'" in events[0].message
+    assert "artifact" not in types
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_run_fails_when_synthesis_step_names_missing_specialist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthesis step with `instructions` consults its own `specialist` and
+    returns that consult as the WHOLE artifact — the same hole, one field over."""
+    called: list[str] = []
+    monkeypatch.setattr(dyn, "route_to_specialist", _never_route(called))
+    d = _def(
+        steps=[
+            {"kind": "synthesis", "id": "assemble", "title": "Assemble",
+             "instructions": "Polish this.", "specialist": "talent"},
+        ],
+    )
+    wf = DynamicWorkflow(d)
+    events = await _collect(wf, wf.input_model()(topic="x"))
+    assert [getattr(e, "type", None) for e in events] == ["error"]
+    assert "'assemble'" in events[0].message
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_without_instructions_ignores_its_specialist_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without `instructions` the synthesis step never consults anyone, so a
+    stale default there must not fail an otherwise-valid workflow."""
+    async def fake_route(**kwargs: Any) -> str:
+        return "analysis"
+    monkeypatch.setattr(dyn, "route_to_specialist", fake_route)
+    d = _def(
+        steps=[
+            {"kind": "specialist", "id": "research", "title": "Research",
+             "specialist": "cso", "goal": "Analyze {topic}."},
+            {"kind": "synthesis", "id": "assemble", "title": "Assemble",
+             "specialist": "talent"},
+        ],
+    )
+    wf = DynamicWorkflow(d)
+    events = await _collect(wf, wf.input_model()(topic="x"))
+    types = [getattr(e, "type", None) for e in events]
+    assert "error" not in types and "artifact" in types
+
+
+@pytest.mark.asyncio
+async def test_stale_specialist_fails_before_an_earlier_approval_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check is pre-flight: a gate BEFORE the stale step must not pause the
+    run and DM a human for sign-off on a workflow that cannot complete."""
+    called: list[str] = []
+    monkeypatch.setattr(dyn, "route_to_specialist", _never_route(called))
+    d = _def(
+        steps=[
+            {"kind": "approval_gate", "id": "gate", "title": "Gate",
+             "person_id": 7, "question": "Proceed with {topic}?"},
+            {"kind": "specialist", "id": "screen", "title": "Screen",
+             "specialist": "talent", "goal": "Assess {topic}."},
+            {"kind": "synthesis", "id": "assemble", "title": "Assemble"},
+        ],
+    )
+    wf = DynamicWorkflow(d)
+    events = await _collect(wf, wf.input_model()(topic="x"))
+    assert not any(isinstance(e, WaitForHumanEvent) for e in events)
+    assert [getattr(e, "type", None) for e in events] == ["error"]
+    assert called == []
