@@ -247,9 +247,55 @@ def test_find_principal_returns_none_when_absent(db: Path) -> None:
 
 
 def test_find_principal_skips_archived(db: Path) -> None:
-    pid = people_store.upsert_person(full_name="Ex Boss", is_principal=True)
-    people_store.archive_person(pid)
-    assert people_store.find_principal_person() is None
+    # The older principal wins the id tie-break until archived; a co-principal
+    # has to exist for the archive to be allowed at all.
+    old = people_store.upsert_person(full_name="Ex Boss", is_principal=True)
+    new = people_store.upsert_person(full_name="New Boss", is_principal=True)
+    people_store.archive_person(old)
+    principal = people_store.find_principal_person()
+    assert principal is not None and principal.id == new
+
+
+def test_archive_last_principal_refused(db: Path) -> None:
+    pid = people_store.upsert_person(full_name="The Boss", is_principal=True)
+    people_store.upsert_person(full_name="Staff")
+    with pytest.raises(people_store.LastPrincipalError):
+        people_store.archive_person(pid)
+    principal = people_store.find_principal_person()
+    assert principal is not None and principal.id == pid
+
+
+def test_archive_co_principal_allowed_until_one_remains(db: Path) -> None:
+    first = people_store.upsert_person(full_name="Founder A", is_principal=True)
+    second = people_store.upsert_person(full_name="Founder B", is_principal=True)
+    assert people_store.archive_person(first) is True
+    with pytest.raises(people_store.LastPrincipalError):
+        people_store.archive_person(second)
+
+
+def test_archive_non_principal_unaffected_by_guard(db: Path) -> None:
+    people_store.upsert_person(full_name="The Boss", is_principal=True)
+    staff = people_store.upsert_person(full_name="Staff")
+    assert people_store.archive_person(staff) is True
+
+
+def test_archive_already_archived_principal_returns_false(db: Path) -> None:
+    first = people_store.upsert_person(full_name="Founder A", is_principal=True)
+    people_store.upsert_person(full_name="Founder B", is_principal=True)
+    people_store.archive_person(first)
+    # Now the only *active* principal is B, but A is already archived, so
+    # this is a plain miss, not a last-principal refusal.
+    assert people_store.archive_person(first) is False
+
+
+def test_find_person_by_email_duplicate_resolves_to_lowest_id(db: Path) -> None:
+    # A plain table scan also yields rowid order today, so this pins the
+    # contract rather than discriminating the ORDER BY: it breaks if an index
+    # or a query change ever lets SQLite pick a different duplicate.
+    first = people_store.upsert_person(full_name="Dana One", email="dana@acme.example")
+    people_store.upsert_person(full_name="Dana Two", email="DANA@acme.example")
+    found = people_store.find_person_by_email("dana@acme.example")
+    assert found is not None and found.id == first
 
 
 def test_find_principal_no_db_file_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

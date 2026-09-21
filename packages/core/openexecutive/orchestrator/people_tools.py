@@ -287,13 +287,15 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
     except (KeyError, TypeError, ValueError) as exc:
         return _bad(f"bad arguments: {exc}")
 
-    # The principal flag controls fallback authority and can only be flipped
-    # via the HTTP API behind BACKEND_SHARED_SECRET (see people/models.py).
-    # The Executive must not be able to promote someone via a chat turn —
-    # social-engineering would otherwise bypass the API gate entirely.
+    # The principal flag controls fallback authority. It is set at creation
+    # (fixtures, POST /people) and by an onboarding commit — no PATCH or chat
+    # path changes it (see people/models.py). The Executive must not be able
+    # to promote someone via a chat turn: social engineering would otherwise
+    # be the whole attack.
     if bool(tool_input.get("is_principal", False)):
         return _bad(
-            "is_principal can only be set via the authenticated /people API, not via chat tools"
+            "is_principal cannot be set here. It is set at creation "
+            "(POST /people) or by re-running onboarding, not by chat tools."
         )
 
     person_id = tool_input.get("person_id")
@@ -309,7 +311,9 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         # not be a stealth path to flip the flag off; we block that too.
         if existing.is_principal and not bool(tool_input.get("is_principal", existing.is_principal)):
             return _bad(
-                "is_principal can only be changed via the authenticated /people API"
+                "is_principal cannot be cleared here. Demoting the principal "
+                "happens by re-running onboarding, not by chat tools — and a roster with no "
+                "principal has no fallback approver."
             )
 
     preferred_channel = tool_input.get("preferred_channel", "any")
@@ -415,6 +419,16 @@ async def handle_archive_person(tool_input: dict[str, Any]) -> str:
         archived = people_store.archive_person(person_id)
         if archived:
             people_registry.invalidate()
+    except people_store.LastPrincipalError as exc:
+        # The same refusal as upsert_person's on is_principal: a chat turn
+        # (possibly steered by inbound content) must not be able to remove
+        # the operator's fallback authority and UI access.
+        _audit(
+            "archive_person", "write", False,
+            f"archive_person REFUSED id={person_id}: last active principal",
+            {"person_id": person_id, "archived": False},
+        )
+        return json.dumps({"error": str(exc)})
     except Exception as exc:
         logger.exception("archive_person: failed")
         _audit("archive_person", "write", False, f"archive_person FAILED id={person_id}: {exc}", {"error": str(exc)[:300]})

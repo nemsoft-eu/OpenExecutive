@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(os.environ.get("EPISODIC_DB_PATH", "./episodic_memory.db"))
 
 
+class LastPrincipalError(ValueError):
+    """Archiving this person would leave the roster with no active principal."""
+
+
 def _resolve_db_path(db_path: Path | None) -> Path:
     """Return caller-supplied path or the current module-level DB_PATH.
 
@@ -332,7 +336,7 @@ def find_person_by_slack_id(slack_user_id: str, db_path: Path | None = None) -> 
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE slack_user_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE slack_user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (slack_user_id,),
         ).fetchone()
         if row is None:
@@ -346,7 +350,7 @@ def find_person_by_telegram_chat_id(telegram_chat_id: str, db_path: Path | None 
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE telegram_chat_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE telegram_chat_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (telegram_chat_id,),
         ).fetchone()
         if row is None:
@@ -371,7 +375,10 @@ def find_person_by_email(email: str, db_path: Path | None = None) -> Person | No
         if not _table_exists(conn, "people"):
             return None
         row = conn.execute(
-            "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0 LIMIT 1",
+            # None of the channel ids is UNIQUE, so every finder here orders
+            # by id: a duplicate resolves to the oldest row, not scan order.
+            "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0 "
+            "ORDER BY id LIMIT 1",
             (email,),
         ).fetchone()
         if row is None:
@@ -385,7 +392,7 @@ def find_person_by_discord_id(discord_user_id: str, db_path: Path | None = None)
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM people WHERE discord_user_id = ? AND archived = 0 LIMIT 1",
+            "SELECT * FROM people WHERE discord_user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
             (discord_user_id,),
         ).fetchone()
         if row is None:
@@ -432,8 +439,9 @@ def find_principal_person(db_path: Path | None = None) -> Person | None:
     if onboarding ran twice (or someone toggled the flag) multiple rows
     may match. ``ORDER BY id`` makes the oldest principal win
     deterministically — a stale row would route web traffic to the
-    wrong peer card. If you re-run onboarding, archive the old
-    principal first.
+    wrong peer card. Re-running onboarding demotes principals left off
+    the new roster; to remove a principal by hand, archive them once
+    another exists — archive_person refuses the last active principal.
     """
     if not _resolve_db_path(db_path).exists():
         return None
@@ -467,13 +475,36 @@ def list_people(
 
 
 def archive_person(person_id: int, db_path: Path | None = None) -> bool:
-    """Soft-delete a person. Returns True if a row was found and archived."""
+    """Soft-delete a person. Returns True if a row was found and archived.
+
+    Raises LastPrincipalError instead of archiving the last active principal:
+    a zero-principal roster loses the fallback approver, and the principal's
+    UI access with it. A co-principal can still be archived while another
+    remains. The guard lives in the UPDATE itself rather than in a count read
+    beforehand, so two concurrent archives of the last two principals cannot
+    both succeed.
+    """
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE people SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0",
+            "UPDATE people SET archived = 1, updated_at = ? "
+            "WHERE id = ? AND archived = 0 AND (is_principal = 0 OR ("
+            "SELECT COUNT(*) FROM people WHERE is_principal = 1 AND archived = 0"
+            ") > 1)",
             (_now(), person_id),
         )
-        return cursor.rowcount > 0
+        if cursor.rowcount > 0:
+            return True
+        # rowcount 0 is either "no active row" or the guard refusing; tell
+        # them apart so callers do not report a refusal as not-found.
+        row = conn.execute(
+            "SELECT is_principal FROM people WHERE id = ? AND archived = 0",
+            (person_id,),
+        ).fetchone()
+        if row is not None and row["is_principal"]:
+            raise LastPrincipalError(
+                f"cannot archive person {person_id}: they are the last active principal"
+            )
+        return False
 
 
 def find_approvers(

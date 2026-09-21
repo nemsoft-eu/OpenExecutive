@@ -165,6 +165,12 @@ def patch_person(person_id: int, body: PersonPatch) -> Person:
 def archive_person(person_id: int) -> Response:
     if people_store.get_person(person_id) is None:
         raise HTTPException(status_code=404, detail="Person not found")
-    people_store.archive_person(person_id)
+    try:
+        people_store.archive_person(person_id)
+    except people_store.LastPrincipalError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot archive the last active principal",
+        ) from exc
     people_registry.invalidate()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

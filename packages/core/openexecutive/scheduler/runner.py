@@ -16,6 +16,7 @@ from openexecutive.memory.episodic import (
     ScheduledAction,
     claim_due_actions,
     mark_action_done,
+    mark_action_failed,
     mark_action_failed_or_retry,
     requeue_orphaned_running,
     reschedule_action,
@@ -262,22 +263,52 @@ async def _execute_action(
 
         if decision.action == "propose":
             # Surface to approver; do NOT dispatch the outbound message.
-            if decision.assignee_person_id is not None:
-                if decision.deliver_at is not None and decision.deliver_at > now:
-                    # Approver is outside their window — defer to next slot.
-                    reschedule_action(action.id, decision.deliver_at)
-                    logger.info(
-                        "scheduler: action %d deferred to %s (approver outside window)",
-                        action.id, decision.deliver_at.isoformat(),
-                    )
-                    return
-                propose_via_alert(
+            if decision.assignee_person_id is None:
+                # Nobody can approve it (e.g. a zero-principal roster). File
+                # the proposal unrouted, then fail the action terminally (no
+                # retry) rather than marking it done. The alert is the only
+                # durable surface: every UI listing of scheduled_actions asks
+                # for status=pending, so the failed row below is read by
+                # nobody. With no principal the card belongs to no one, so it
+                # shows up in /today's team queue rather than anyone's
+                # "Needs you" bucket.
+                #
+                # The action id as suffix keeps repeats re-minable: without a
+                # suffix the dedup key is one-shot for the life of the row, so
+                # every later occurrence of the same intent would be swallowed
+                # by INSERT OR IGNORE and silently lost again.
+                alert_id = propose_via_alert(
                     department_slug=action.department,
-                    person_id=decision.assignee_person_id,
+                    person_id=None,
                     summary=action.intent_text[:160],
                     body=action.intent_text,
                     suggested_action=_proposed_action_phrase(urgent=False),
+                    external_id_suffix=str(action.id),
                 )
+                mark_action_failed(
+                    action.id, "propose_only action has no approver to route to"
+                )
+                logger.warning(
+                    "scheduler: action %d (dept=%r) failed — propose_only with "
+                    "no approver (unrouted alert=%s)",
+                    action.id, action.department, alert_id,
+                )
+                return
+            if decision.deliver_at is not None and decision.deliver_at > now:
+                # Approver is outside their window — defer to next slot.
+                reschedule_action(action.id, decision.deliver_at)
+                logger.info(
+                    "scheduler: action %d deferred to %s (approver outside window)",
+                    action.id, decision.deliver_at.isoformat(),
+                )
+                return
+            propose_via_alert(
+                department_slug=action.department,
+                person_id=decision.assignee_person_id,
+                summary=action.intent_text[:160],
+                body=action.intent_text,
+                suggested_action=_proposed_action_phrase(urgent=False),
+            )
             mark_action_done(action.id)
             logger.info(
                 "scheduler: action %d proposed to person %s — not dispatched",

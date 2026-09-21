@@ -1584,7 +1584,10 @@ departments:
     `propose_only` departments route scheduled actions to an approver as a
     briefing alert (`propose_via_alert`) instead of executing immediately;
     the scheduled_actions row is then marked done and the pending-ness lives
-    on the alert. This is NOT the `wait_for_human` workflow gate — that is a
+    on the alert. With no approver to route to, the alert is filed unrouted
+    (keyed by action id so repeats are not swallowed by the dedup) and the
+    row is failed instead (terminal, no retry) so the request is never
+    silently lost. This is NOT the `wait_for_human` workflow gate — that is a
     separate primitive with its own table (`workflow_runs.status`), delivery
     path and resolver; an earlier version of this note conflated the two.
     Autonomous departments fire actions directly. The approver is
@@ -4050,12 +4053,82 @@ company_onboarding:
     empty drafted mission or head leaves the existing value alone rather than
     clearing it.
   people_and_contacts: |
-    Exactly one person is is_principal (the user) and gets AuthorityScope.WILDCARD;
-    nobody else gets a scope. PersonDraft uses extra="ignore" so an email or
+    Onboarding marks exactly one person is_principal (the user) and gives them
+    AuthorityScope.WILDCARD; nobody else gets a scope. That is what onboarding
+    PRODUCES, not an invariant the system enforces afterwards — see
+    principal_flag_is_not_patchable. PersonDraft uses extra="ignore" so an email or
     chat handle the model emits despite the system prompt is dropped at the
     model boundary — OE never auto-imports contacts, matching the fixture and
     engagement-intake invariants. Channels, availability and scopes stay a
     deliberate action on /people.
+  principal_flag_is_not_patchable: |
+    is_principal is set at creation — the fixture loader or POST /people — and
+    by an onboarding commit. There is deliberately no PATCH or chat update
+    path: PersonPatch carries no is_principal field, update_person does not
+    touch the column, and the upsert_person chat tool refuses the flag outright
+    (people_tools.py) so a promotion cannot be socially engineered through the
+    Executive. The onboarding commit (POST /onboard/interview/commit) IS an
+    update path on existing rows: save_onboarding_people rewrites the flag on
+    a name-matched person and _demote_stale_principals clears it on anyone left
+    off the new roster. That route sits behind the same service credential as
+    everything else, so the self-promotion exposure described below applies to
+    it today.
+
+    A PersonPatch.is_principal field was implemented and then deliberately NOT
+    landed (2026-09-20). Adding it would have created a privilege escalation:
+    /auth/allowed-emails admits every rostered person with an email, the UI
+    proxy stamps BACKEND_SHARED_SECRET on every authenticated request with no
+    route allowlist, and the route does no per-user authorization — so any
+    teammate could have self-promoted. A "caller must be principal" guard does
+    not fix it, because _resolve_caller_person_id falls back to the principal
+    when x-caller-email is absent, which is exactly the bare-secret case. The
+    real gap is that this API has a service credential and no user credential;
+    until a distinct admin credential exists, treat everyone on the roster with
+    an email as an administrator of the instance.
+
+    The flag is NOT single-occupancy. idx_people_principal is a plain (not
+    UNIQUE) partial index, and find_principal_person's own docstring says the
+    schema does not enforce a single row: it filters to is_principal = 1 and
+    then ORDER BY id LIMIT 1, so the OLDEST principal wins the fallback. (The
+    is_principal DESC sort is list_people's, a different function — do not
+    conflate them.) Co-principals are therefore a supported state. Because the
+    tie-break is id order and NOT creation-as-principal order, a roster whose
+    sitting principal has the higher id resolves the fallback identity onto the
+    lower-id principal: every header-less /chat turn, _deliver_to_principal
+    and new artifact alerts follow that row.
+
+    find_approvers orders is_principal ASC (non-principals first), and only
+    returns people who hold a scope row at all, since it JOINs
+    person_authority_scope. So principal status changes approver ORDER, never
+    approver membership.
+
+    A zero-principal roster is NOT a safe state, and an earlier revision of
+    this note wrongly said it was. The lookups return None cleanly; several
+    consumers then degrade rather than refusing. A propose_only action with no
+    approver files its proposal as an UNROUTED alert (external_id_suffix =
+    the action id, so a recurring intent re-mints a card instead of being
+    swallowed by the one-shot dedup) and is then failed terminally via
+    mark_action_failed (no retry; last_error "propose_only action has no
+    approver to route to") rather than marked done. The alert is what makes
+    it visible: every UI listing of scheduled_actions asks for
+    status=pending, so the failed row alone is read by nobody (issue #24 — it
+    used to be marked done with no alert at all). The card lands in /today's
+    team queue, NOT in a "Needs you" bucket: the UI's principal-owns-unrouted
+    rule needs a caller who is a principal, and this state is reached only
+    when there is none. It expires on the ordinary action TTL (14 days,
+    source authority_gate is not TTL-exempt), after which only
+    POST /alerts/{id}/reopen brings it back. On the escalate
+    path the alert is skipped while dispatch continues. _deliver_to_principal
+    drops the outbound permanently; artifact_tools leaves routed_to_person_id
+    null.
+
+    people_store.archive_person refuses the LAST active principal with
+    LastPrincipalError (the route answers 409, the archive_person chat tool
+    returns an error), so archiving cannot reach the zero-principal state; a
+    co-principal can still be archived while another remains. The guard sits
+    in the UPDATE's WHERE clause, not in a count read beforehand, so two
+    concurrent archives cannot both pass it. A zero-principal roster is now
+    reachable only by a direct database edit or a roster that never had one.
   org_structure_is_derived: |
     profile.org_structure.departments and .leadership_team are computed from
     the reviewed people and department tables at commit time
