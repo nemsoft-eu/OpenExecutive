@@ -51,7 +51,7 @@ One volume, mounted at `/data`:
 - `/data/chroma_db/` — ChromaDB vector index (built-in knowledge + uploaded company docs)
 - `/data/episodic_memory.db` — SQLite: episodic memory, people, alerts, scheduled actions, audit log
 - `/data/company/profile.yaml` + `/data/company/docs/` — onboarding output + uploaded docs
-- `/data/company/mcp_servers.json` — MCP gateway config
+- `/data/company/mcp_servers.json` — MCP gateway config. Placing this file is what **enables** MCP when `MCP_ENABLED` is unset; set `MCP_ENABLED=false` to keep MCP off with the file in place. A config defining no servers under `mcpServers`, or a gateway that fails to start, is logged and skipped — the API boots without MCP tools (and without the email poller) rather than failing to boot.
 - `/data/google_credentials/` — Google Workspace OAuth token, if that integration is enabled
 
 Nothing hardcodes those paths. Each is an env var, and the defaults are

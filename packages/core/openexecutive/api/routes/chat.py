@@ -39,11 +39,40 @@ _last_turn_meta: dict[str, Any] = {}
 _TITLE_MAX_LEN = 60
 
 
+# Session ids are client-supplied (a JSON field on /chat, a form field on
+# /chat/upload) and are now bound as the audit session for the WHOLE turn, so
+# they reach every audit and usage row the turn produces — and the route's own
+# log lines. An unconstrained value is therefore a log-injection vector (a
+# newline forges a log record) and makes mis-attribution trivially easy.
+# Same charset as api.routes.audit._SESSION_ID_RE, which already had to
+# defend the read side against integration-derived ids; it is wide enough for
+# every real form ("slack:thread:C1:1700000000.001", "email:x@host", uuid4).
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_:@\-\.\+/=]{1,256}$")
+
+
+def _clean_session_id(session_id: str | None) -> str | None:
+    """Drop a client-supplied session id that isn't a plausible id.
+
+    Dropped rather than rejected: a malformed id is indistinguishable from a
+    stale client, and minting a fresh session keeps the turn working while
+    denying the attacker a chosen audit key.
+    """
+    if session_id is None:
+        return None
+    if not _SESSION_ID_RE.match(session_id):
+        logger.warning(
+            "chat.session_id_rejected len=%d", len(session_id),
+        )
+        return None
+    return session_id
+
+
 def _get_or_create_session(session_id: str | None, request: Request) -> Any:
     from openexecutive.memory.session_store import load_messages
     from openexecutive.onboarding.profile_builder import load_or_create_profile
     from openexecutive.orchestrator.session import Session
 
+    session_id = _clean_session_id(session_id)
     if session_id and session_id in _sessions:
         return _sessions[session_id]
 
@@ -172,7 +201,9 @@ async def _run_chat_turn(
     from openexecutive.orchestrator.executive import Executive
 
     t0 = time.monotonic()
-    turn_id = uuid.uuid4().hex
+    # Same shape every other entry point mints (Executive.stream_chat), so
+    # an audit query filtering on the `t-` prefix sees SSE turns too.
+    turn_id = f"t-{uuid.uuid4().hex[:12]}"
     collector = DebugCollector(t0=t0, turn_id=turn_id)
 
     session = _get_or_create_session(session_id, request)
@@ -239,22 +270,22 @@ async def _run_chat_turn(
             return ""
 
     async def _do_briefing() -> str:
-        # Current open-alert digest + open-search digest so the Executive can
-        # discuss a briefing item the principal clicked or named (the items
-        # behind the /today "What's going on" narrative) AND the live executive
-        # searches. Sync SQLite reads off the event loop; both formatters
-        # swallow their own errors, so this is belt-and-suspenders.
-        from openexecutive.briefing.context import format_open_alerts_for_prompt
-        from openexecutive.briefing.onboarding_digest import format_onboarding_for_prompt
-        from openexecutive.briefing.talent_digest import format_talent_for_prompt
+        # Current open-alert digest so the Executive can discuss a briefing item
+        # the principal clicked or named (the items behind the /today "What's
+        # going on" narrative). Sync SQLite read off the event loop; the
+        # formatter swallows its own errors, so this is belt-and-suspenders.
+        from openexecutive.briefing.context import render_and_trust
 
-        # return_exceptions=True so one digest raising never discards the others —
+        # `render_and_trust` also records on the session exactly which alert
+        # ids this block named. `ack_alert` accepts nothing else, so a web turn
+        # that skipped this step could not clear a card at all — and, before
+        # the trusted set was recorded here, could clear ANY id, including one
+        # an inbound email wrote into an alert body.
+        # return_exceptions=True so a digest raising never discards the others —
         # each formatter already swallows its own errors, this just guards the
         # to_thread wrappers themselves.
         results = await asyncio.gather(
-            asyncio.to_thread(format_open_alerts_for_prompt),
-            asyncio.to_thread(format_talent_for_prompt),
-            asyncio.to_thread(format_onboarding_for_prompt),
+            asyncio.to_thread(render_and_trust, session),
             return_exceptions=True,
         )
         digests: list[str] = []
@@ -287,6 +318,15 @@ async def _run_chat_turn(
                 # the helper raises, don't sink the whole gather() with it.
                 logger.exception("chat.honcho_prefetch_failed turn_id=%s", turn_id)
                 return ""
+
+    # Clear the trusted alert ids BEFORE the gather, unconditionally. Web
+    # sessions are long-lived (`_sessions`), so if `render_and_trust` never
+    # runs this turn — the to_thread wrapper fails to schedule, the gather is
+    # cancelled, a future code path skips the digest — the previous turn's set
+    # would otherwise still be sitting there and `ack_alert` would accept it.
+    # Clearing here makes "shown nothing, can ack nothing" hold on every path
+    # instead of only the ones that reach the recorder.
+    session.trusted_alert_ids = set()
 
     retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
         asyncio.to_thread(
@@ -321,6 +361,29 @@ async def _run_chat_turn(
         timeout_s += settings.committee_extra_timeout_s
 
     async def event_generator():
+        # Bind the turn for the whole SSE body, not just its first step.
+        # `_sse_body` drives the executive with `asyncio.wait_for`, which
+        # wraps every `__anext__()` in a fresh Task that copies the context
+        # at that moment — so a binding made *inside* the executive's own
+        # generator lands in a throwaway per-step context and is gone by the
+        # next resume. Everything after step one (the whole tool-call loop
+        # and the specialist fan-out) then records with no session or turn.
+        # Bound out here, in the generator Starlette itself drives, every
+        # step inherits it. `set_turn` saves and restores rather than using
+        # Token.reset precisely so it survives that task-hopping.
+        # aclosing is load-bearing, not decoration: `async for` does NOT
+        # close its sub-iterator when the enclosing generator is closed. This
+        # body used to BE event_generator, so a client disconnect ran its
+        # `finally` directly (the /debug/last-turn snapshot, and the
+        # Executive's upstream stream aclose). Wrapping it in a plain
+        # `async for` would leave `_sse_body` suspended at its yield until a
+        # later GC hop — or never, if the loop closes first.
+        with set_turn(session_id=session.session_id, turn_id=turn_id):
+            async with contextlib.aclosing(_sse_body()) as body:
+                async for evt in body:
+                    yield evt
+
+    async def _sse_body():
         from openexecutive.memory.session_store import (
             save_message,
             update_session_timestamp,
@@ -351,6 +414,7 @@ async def _run_chat_turn(
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
+                    turn_id=turn_id,
                 ).__aiter__()
             else:
                 stream = executive.stream_chat(
@@ -364,6 +428,7 @@ async def _run_chat_turn(
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
+                    turn_id=turn_id,
                 ).__aiter__()
 
             # Whole-turn deadline, not per-chunk: a stream that drips bytes

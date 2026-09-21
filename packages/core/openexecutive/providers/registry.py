@@ -287,7 +287,10 @@ def _anthropic() -> AnthropicProvider:
                     "at a configured local model."
                 ),
             )
-        _anthropic_provider = AnthropicProvider(api_key=api_key)
+        _anthropic_provider = AnthropicProvider(
+            api_key=api_key,
+            workspace_id=getattr(settings, "anthropic_workspace_id", None),
+        )
     return _anthropic_provider
 
 
@@ -316,6 +319,9 @@ def _local() -> OpenAICompatibleProvider:
             timeout_s=getattr(settings, "local_timeout_s", 300.0),
             spec_lookup=spec_lookup,
             reasoning_effort=getattr(settings, "local_reasoning_effort", None),
+            include_usage_accounting=getattr(
+                settings, "local_include_usage_accounting", False
+            ),
         )
     return _local_provider
 

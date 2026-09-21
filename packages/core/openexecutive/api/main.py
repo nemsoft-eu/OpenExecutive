@@ -40,8 +40,6 @@ from openexecutive.api.routes import (
     scheduled,
     sessions,
     skills,
-    staff_onboarding,
-    talent,
     today,
     watchlist,
     workflows,
@@ -53,10 +51,11 @@ from openexecutive.integrations.google_chat import router as google_chat_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
 
 if TYPE_CHECKING:
-    from openexecutive.integrations.slack_bot import EmbeddedSlackBot
+    from openexecutive.config import Settings
 
-# Upper bound on each embedded chat bot's shutdown (Discord, Slack): a close
-# handshake that stalls during a reconnect must not hold the lifespan open.
+# Upper bound on the embedded Discord bot's shutdown: a close handshake that
+# stalls during a reconnect must not hold the lifespan open. Slack has its own
+# bound (SLACK_SHUTDOWN_TIMEOUT_S) alongside its handler below.
 _BOT_SHUTDOWN_TIMEOUT_S = 10.0
 
 
@@ -169,6 +168,136 @@ _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
 )
 
 
+# How long the MCP gateway gets to come up. The child is
+# `uvx --from git+https://…/extensible-mcp`, which resolves and may clone that
+# repo on a cold start, so this is generous; what it must not be is unbounded.
+# `MCPGateway.start` builds `ClientSession` with no `read_timeout_seconds`, so
+# `initialize()` waits forever on a child that is alive but silent — and a
+# lifespan that never yields is a healthcheck that never passes, which is
+# #122's symptom with none of its traceback. A dead child is already fine
+# (the session's receive loop fails every pending request on close); it is the
+# silent one that needs a clock.
+_MCP_START_TIMEOUT_S = 120.0
+# Tearing down a gateway that just failed walks the same stdio machinery that
+# failed, so it gets a clock too.
+_MCP_CLOSE_TIMEOUT_S = 10.0
+
+
+async def _close_mcp_gateway_quietly(gateway: Any, log: logging.Logger) -> None:
+    """Reap a gateway that failed to start. Never raises, never hangs.
+
+    `MCPGateway.close` suppresses `Exception` around each step, which is not
+    enough here: anyio raises `BaseExceptionGroup` as soon as one sub-exception
+    is a `BaseException` such as `CancelledError`, and that is not an
+    `Exception`. Since this runs from inside an `except` block, anything it
+    raises replaces the actionable log we just wrote with the crash that log
+    exists to prevent.
+    """
+    try:
+        await asyncio.wait_for(gateway.close(), timeout=_MCP_CLOSE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        log.warning(
+            "MCP gateway teardown after a failed start did not finish cleanly; "
+            "continuing shutdown of the failed gateway anyway",
+            exc_info=True,
+        )
+
+
+async def _start_mcp_gateway(
+    app: FastAPI, settings: Settings
+) -> asyncio.Task[None] | None:
+    """Bring the MCP gateway up, or leave MCP off and say why.
+
+    Sets ``app.state.mcp_gateway`` — the gateway on success, ``None`` otherwise
+    — and returns the email-poller task that rides on it, or ``None``.
+
+    Never raises and never blocks indefinitely. The gateway spawns
+    extensible-mcp as a subprocess, and a failure there used to propagate out
+    of the lifespan and kill the container; under ``restart: unless-stopped``
+    that is a crash loop whose only outward symptom is a healthcheck that never
+    passes (#122). Booting without MCP costs the Gmail/Calendar/Drive tool
+    surface and the email poller; refusing to boot costs everything, so degrade
+    and log loudly enough to alert on.
+
+    ``except BaseException`` rather than ``except Exception``, with real
+    cancellation re-raised first: the failure in #122 surfaced from anyio, and
+    anyio wraps a task group's failures in ``BaseExceptionGroup`` as soon as one
+    of them is a ``BaseException`` such as ``CancelledError``. That group is not
+    an ``Exception``, so ``except Exception`` would let through the single
+    exception shape this function exists to contain.
+    """
+    app.state.mcp_gateway = None
+    if not settings.mcp_enabled:
+        return None
+
+    from openexecutive.config import mcp_config_file_present
+    from openexecutive.orchestrator.mcp_gateway import (
+        MCPGateway,
+        configured_server_names,
+        set_active_gateway,
+    )
+
+    log = logging.getLogger("openexecutive")
+    config_path = settings.mcp_servers_config_path
+    servers = configured_server_names(config_path)
+    # With MCP_ENABLED unset it is the config file's presence that turned MCP
+    # on (config._resolve_mcp), so an operator can arrive here without having
+    # asked for MCP. Naming which it was is the fact the original traceback
+    # never carried — and the remedy has to track it, or we tell someone who
+    # set MCP_ENABLED=true to unset the file that enabled MCP.
+    auto = settings.mcp_auto_enabled
+    why = (
+        "auto-enabled by the presence of the config file"
+        if auto
+        else "MCP_ENABLED was set explicitly"
+    )
+
+    if not servers:
+        log.warning(
+            "MCP is on (%s) but %s %s; starting without MCP tools. %s.",
+            why,
+            config_path,
+            "defines no servers under 'mcpServers'"
+            if mcp_config_file_present(config_path)
+            else "is not a readable file",
+            "Add a server to that file, or set MCP_ENABLED=false so its "
+            "presence stops enabling MCP"
+            if auto
+            else "Point MCP_SERVERS_CONFIG_PATH at a config that defines a "
+            "server, or set MCP_ENABLED=false",
+        )
+        return None
+
+    gateway = MCPGateway()
+    try:
+        await asyncio.wait_for(
+            gateway.start(config_path), timeout=_MCP_START_TIMEOUT_S
+        )
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        log.exception(
+            "MCP gateway failed to start within %.0fs; continuing WITHOUT MCP "
+            "tools and without the email poller. config=%s servers=[%s] (%s)",
+            _MCP_START_TIMEOUT_S, config_path, ", ".join(servers), why,
+        )
+        await _close_mcp_gateway_quietly(gateway, log)
+        return None
+
+    app.state.mcp_gateway = gateway
+    set_active_gateway(gateway)
+
+    from openexecutive.integrations.email_poller import run_email_poller
+    return asyncio.create_task(run_email_poller(gateway))
+
+
+# How long the lifespan waits for the Slack socket to cancel its pending
+# connect and close cleanly before abandoning it. Named so tests can shrink it.
+SLACK_SHUTDOWN_TIMEOUT_S = 10.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from openexecutive.alerts.store import initialize_db as initialize_alerts_db
@@ -276,21 +405,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from openexecutive.people.store import initialize_db as initialize_people_db
     initialize_people_db()
 
-    # Talent / executive-search core (clients, engagements, candidates).
-    # Self-contained tables in the same DB; no FK ordering constraint with
-    # the other subsystems.
-    from openexecutive.talent.store import initialize_db as initialize_talent_db
-    initialize_talent_db()
-
-    # Staff-onboarding framework (templates, plans, tasks). Self-contained tables
-    # in the same DB; no FK ordering constraint with the other subsystems.
-    from openexecutive.staff_onboarding.store import (
-        initialize_db as initialize_staff_onboarding_db,
-    )
-    initialize_staff_onboarding_db()
-    # Seed default onboarding templates (idempotent — operator edits are kept).
-    from openexecutive.staff_onboarding.seed import seed_default_templates
-    seed_default_templates()
+    # One-shot cleanup of reminders the removed talent / staff-onboarding
+    # workflows left pending on the principal's DM channel (see the function's
+    # docstring for the removal schedule). Runs after `initialize_db()` so the
+    # `app_migrations` table exists.
+    from openexecutive.memory.episodic import cancel_orphaned_talent_reminders
+    try:
+        _swept = cancel_orphaned_talent_reminders()
+    except Exception:
+        # Best-effort data cleanup — a locked DB must not block boot.
+        logging.getLogger("openexecutive").exception("orphaned-reminder sweep failed")
+    else:
+        if _swept:
+            logging.getLogger("openexecutive").info(
+                "cancelled %d orphaned talent/onboarding reminder(s) on startup", _swept
+            )
 
     # Departments: persistent state layer over the 8 specialist agents. Init
     # AFTER episodic_db so the additive ALTERs (department column on decisions,
@@ -417,19 +546,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         catalog_refresh_task = asyncio.create_task(run_catalog_refresher(settings))
     discord_bot: Any = None
     discord_bot_task: asyncio.Task[None] | None = None
+    slack_handler: Any = None
+    slack_connect_task: asyncio.Task[None] | None = None
 
-    if settings.mcp_enabled:
-        from openexecutive.orchestrator.mcp_gateway import MCPGateway, set_active_gateway
-
-        gateway = MCPGateway()
-        await gateway.start(settings.mcp_servers_config_path)
-        app.state.mcp_gateway = gateway
-        set_active_gateway(gateway)
-
-        from openexecutive.integrations.email_poller import run_email_poller
-        email_poller_task = asyncio.create_task(run_email_poller(gateway))
-    else:
-        app.state.mcp_gateway = None
+    email_poller_task = await _start_mcp_gateway(app, settings)
 
     if settings.scheduler_enabled:
         from openexecutive.scheduler import run_scheduler
@@ -473,14 +593,59 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 discord_bot = None
                 discord_bot_task = None
 
-    # Slack Socket Mode bot (see EmbeddedSlackBot). Needs both tokens: the bot
-    # token for the Web API, the app token for the Socket Mode connection.
-    slack_bot: EmbeddedSlackBot | None = None
+    # Slack Socket Mode listener. Embedded for the same reason as Discord
+    # above: the bot reads the same SQLite + ChromaDB under /data, and that
+    # volume attaches to a single instance. Before this, `make dev` started
+    # only uvicorn + the UI, so Slack silently never listened unless someone
+    # ran `python -m openexecutive.integrations.slack_bot` by hand (#131).
+    #
+    # Requires BOTH tokens: the bot token authenticates the Web API calls,
+    # the app-level token opens the Socket Mode connection.
     if settings.slack_bot_token and settings.slack_app_token:
-        from openexecutive.integrations.slack_bot import EmbeddedSlackBot
+        _slack_log = logging.getLogger("openexecutive")
+        try:
+            # Imported inside the try, not above it: slack_bolt is itself
+            # imported lazily inside create_slack_app, so a missing dependency
+            # surfaces from the await rather than from this line — but keeping
+            # the import here means a future third-party import added to
+            # slack_bot.py degrades to "continue without Slack" instead of
+            # failing the whole boot.
+            from openexecutive.integrations.slack_bot import create_slack_app
 
-        slack_bot = EmbeddedSlackBot()
-        slack_bot.start().add_done_callback(_log_bot_crash("Slack"))
+            _, slack_handler = await create_slack_app()
+
+            # connect_async() does NOT fail fast: on a bad app token or an
+            # unreachable Slack it retries internally and never returns, so
+            # awaiting it here would hang boot forever. Run it as a
+            # background task, like the Discord bot above. Unlike Discord's
+            # callback this one also logs on success: "listener connected"
+            # is the operator's confirmation that `make dev` really did
+            # bring Slack up, which is the whole point of #131.
+            slack_connect_task = asyncio.create_task(
+                slack_handler.connect_async()
+            )
+
+            def _on_slack_connect_done(task: asyncio.Task[None]) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    _slack_log.error(
+                        "Slack socket mode connect failed", exc_info=exc
+                    )
+                else:
+                    _slack_log.info("Slack socket mode listener connected")
+
+            slack_connect_task.add_done_callback(_on_slack_connect_done)
+        except Exception:
+            # Covers a missing slack_bolt, a malformed token, and any
+            # failure building the app. Nothing to release here: the
+            # handler is only bound by the tuple unpack above, so it is
+            # still None on this path. A connect_async() that fails later
+            # lands in the task and is released by the shutdown block.
+            _slack_log.exception(
+                "Failed to start Slack bot; continuing without it"
+            )
 
     # Run the MCP Streamable-HTTP session manager for the life of the app.
     # Mounting the sub-app does NOT run its lifespan, so without this every
@@ -519,18 +684,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ):
                     await discord_bot_task
 
-    # Slack next, for the same reason, within the same bound. stop() also
-    # cancels a start still in progress, whose cleanup closes a half-built
-    # Socket Mode handler that can stall like any other close.
-    if slack_bot is not None:
+    # Close the Slack socket before tearing down the gateway/poller/scheduler
+    # that its handlers call into. Cancelling the pending connect and closing
+    # the client are bounded together under ONE deadline — the same shape as
+    # the Discord shutdown above — so neither step can hang the lifespan.
+    if slack_handler is not None or slack_connect_task is not None:
+        async def _shutdown_slack() -> None:
+            if slack_connect_task is not None and not slack_connect_task.done():
+                slack_connect_task.cancel()
+                # asyncio.wait(), not `suppress(CancelledError): await task`.
+                # wait_for enforces its deadline BY cancelling us, so
+                # suppressing CancelledError here would swallow that signal
+                # and the 10s bound would never fire. wait() reports the
+                # task's outcome without re-raising it, and still propagates
+                # a cancellation aimed at this coroutine.
+                await asyncio.wait([slack_connect_task])
+            if slack_handler is not None:
+                # close_async() disconnects and shuts down the client's
+                # monitor, message processor and worker pool. CancelledError
+                # is not an Exception subclass, so this suppress() does not
+                # swallow the deadline either.
+                with contextlib.suppress(Exception):
+                    await slack_handler.close_async()
+
         try:
-            await asyncio.wait_for(slack_bot.stop(), timeout=_BOT_SHUTDOWN_TIMEOUT_S)
-        except Exception:
-            logging.getLogger("openexecutive").warning(
-                "Slack shutdown failed or exceeded %.0fs; continuing",
-                _BOT_SHUTDOWN_TIMEOUT_S,
-                exc_info=True,
+            await asyncio.wait_for(
+                _shutdown_slack(), timeout=SLACK_SHUTDOWN_TIMEOUT_S
             )
+        except TimeoutError:
+            logging.getLogger("openexecutive").warning(
+                "Slack shutdown exceeded %.0fs; abandoning the socket",
+                SLACK_SHUTDOWN_TIMEOUT_S,
+            )
+            if slack_connect_task is not None and not slack_connect_task.done():
+                slack_connect_task.cancel()
 
     if email_poller_task is not None:
         email_poller_task.cancel()
@@ -649,8 +836,6 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, tags=["audit"])
     app.include_router(departments.router, tags=["departments"])
     app.include_router(people.router, tags=["people"])
-    app.include_router(talent.router, tags=["talent"])
-    app.include_router(staff_onboarding.router, tags=["staff-onboarding"])
     app.include_router(today.router, tags=["today"])
     app.include_router(scheduled.router, tags=["scheduled"])
     app.include_router(watchlist.router, tags=["watchlist"])

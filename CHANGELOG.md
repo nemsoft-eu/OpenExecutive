@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The sign-in allow-list is now the union of `ALLOWED_EMAILS` and the People
+  roster, not the roster alone** (#132). The UI previously treated the roster
+  as authoritative as soon as it held one email, so any Person row with an
+  address silently disabled `ALLOWED_EMAILS` — a fixture load, which wipes
+  `people` and inserts its own addresses, could lock the configured operator
+  out of their own instance. **This widens access on upgrade:** every address
+  still sitting in `ALLOWED_EMAILS` regains sign-in even if that person is not
+  on the roster, so audit the env var before deploying. Removing someone now
+  means removing them from *both* the roster and `ALLOWED_EMAILS`. The
+  `authorized` callback's fail-open also narrows: it used to admit any valid
+  session whenever the roster fetch failed, and now admits only a session that
+  is not in `ALLOWED_EMAILS` and whose roster membership is unreadable.
+- `packages/ui`: force `lodash-es` to 4.18.1 via an npm `overrides` entry
+  (GHSA-r5fr-rjxr-66jc code injection in `_.template`, GHSA-f23m-r3pf-42rh
+  prototype pollution in `_.unset`/`_.omit`). The vulnerable 4.17.23 was pinned
+  exactly by `chevrotain@11.1.2` underneath `mermaid@12.0.0`, and no mermaid
+  release moves off it.
+
+### Removed
+- **Talent / executive search.** The whole vertical is gone: the `talent`
+  specialist, `openexecutive/talent/` (engagements, candidates, offers, the
+  ChromaDB matching graph), its 21 REST routes, 12 chat tools, 4 MCP tools and
+  the `/talent` UI, plus the five recruiting workflows (`candidate_screen`,
+  `candidate_outreach`, `interview_coordination`, `reference_check`,
+  `offer_approval`). The `chro` specialist and its `comp_refresh` /
+  `org_design` / `performance_review` / `exec_search_brief` workflows are
+  unchanged — `exec_search_brief` is an advisory hiring brief, not pipeline.
+- **Staff onboarding.** `openexecutive/staff_onboarding/` (templates, per-hire
+  plans, tasks), its REST routes and 8 chat tools, the `new_hire_onboarding` and
+  `role_onboarding` workflows, the `/staff-onboarding` UI, and the
+  `onboarding_ramp` / `onboarding_kickoff` / `onboarding_checkin` scheduler
+  kinds. **The company-setup wizard (`/onboard`) is untouched** — it is a
+  different subsystem that happens to share the word.
+- `GET /today` no longer returns the `talent` or `onboarding` fields, and the
+  per-turn chat briefing no longer includes their digests.
+
+  Existing SQLite tables (`engagements`, `candidates`, `offers`,
+  `onboarding_templates`, `onboarding_plans`, `onboarding_tasks`) are **not
+  dropped** — nothing reads them, and a blank client slot still wipes them so
+  candidate data cannot cross slots. Pending talent reminders the removed
+  workflows had scheduled on the principal's DM channel are cancelled by a
+  one-time startup sweep (`cancel_orphaned_talent_reminders`, recorded in the
+  new `app_migrations` table); the sweep can be deleted in the release after
+  next.
+
 ### Added
 - **Slack runs inside the API.** Nothing used to start the Slack bot. It now
   starts in the FastAPI lifespan whenever both `SLACK_BOT_TOKEN` and

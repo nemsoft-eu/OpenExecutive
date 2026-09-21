@@ -10,7 +10,7 @@ from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
-from openexecutive.config import get_settings
+from openexecutive.config import get_settings, mcp_config_file_present
 
 logger = logging.getLogger(__name__)
 
@@ -578,6 +578,72 @@ def _record_email_outbound_context(arguments: dict[str, Any]) -> None:
         logger.exception(
             "record_email_outbound_context: persist failed (non-fatal)"
         )
+
+
+# Ceiling on the MCP config we will read into memory. The real file is a
+# handful of server entries; anything past this is a mistake or a symlink to
+# something that is not a config, and reading it during startup is how you get
+# the boot hang this function exists to prevent.
+_MAX_CONFIG_BYTES = 1 << 20  # 1 MiB
+
+
+def configured_server_names(config_path: Path) -> list[str]:
+    """Names the MCP config at `config_path` defines under `mcpServers`.
+
+    Empty when the file is absent, unreadable, oversized, not a JSON object, or
+    defines no servers. Callers use this to decide whether starting the gateway
+    can accomplish anything: extensible-mcp's own config loader ends with
+    `ValueError("Config must define at least one server in 'mcpServers'")` and
+    exits, and because the child is already gone by then the only thing that
+    reaches us is anyio's "Attempted to exit cancel scope in a different task"
+    from `stdio_client` unwinding — a traceback that names nothing about
+    configuration (#122). Checking first is what makes the failure legible.
+
+    That an empty `mcpServers` is fatal to the child rather than merely idle is
+    confirmed in #122 by the maintainer reading extensible-mcp's own
+    `load_config`, so skipping the gateway here removes no working
+    configuration: a "servers are added at runtime via load_mcp_server" config
+    never brought the gateway up either. It only makes the failure legible.
+
+    NEVER RAISES, and the breadth of the `except` is deliberate: this reads an
+    operator-owned path during startup, where an exception is the crash loop
+    #122 was filed for rather than a bug report. Nothing here is subtle enough
+    to be worth a narrower catch — `json.loads` answers deeply-nested input
+    with `RecursionError`, which is not a `ValueError`, and a read can fail in
+    as many ways as the filesystem has moods. `mcp_config_file_present` keeps a
+    directory or a symlink to a FIFO from ever being opened.
+
+    Every key under `mcpServers` counts as a server, `_comment` included. That
+    is deliberate: a stray key there is a misconfiguration worth surfacing as a
+    server name in the log, not one worth hiding.
+    """
+    if not mcp_config_file_present(config_path):
+        return []
+    try:
+        # Bounded read rather than stat-then-read: a stat cannot bind what a
+        # later read returns (a file that grows in between, or a /proc-style
+        # file reporting size 0), and one byte past the ceiling is all it takes
+        # to know we are over it.
+        with config_path.open("rb") as fh:
+            blob = fh.read(_MAX_CONFIG_BYTES + 1)
+        if len(blob) > _MAX_CONFIG_BYTES:
+            logger.warning(
+                "MCP config %s is larger than the %d-byte ceiling; treating it "
+                "as defining no servers",
+                config_path, _MAX_CONFIG_BYTES,
+            )
+            return []
+        raw = json.loads(blob)
+    except Exception:
+        logger.warning(
+            "MCP config %s could not be read as JSON; treating it as defining "
+            "no servers", config_path, exc_info=True,
+        )
+        return []
+    servers = raw.get("mcpServers") if isinstance(raw, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    return sorted(str(name) for name in servers)
 
 
 class MCPGateway:

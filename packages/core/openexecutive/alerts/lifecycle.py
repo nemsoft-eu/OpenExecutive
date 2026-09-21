@@ -138,6 +138,14 @@ def is_live(alert: Alert, now: datetime | None = None) -> bool:
     return alert.status == "unread" and not is_expired(alert, now) and not _is_snoozed(alert, now)
 
 
+# How many live alerts every board-shaped surface takes. `/today` renders this
+# many cards, and `briefing.context` trusts this many ids for `ack_alert` —
+# those two MUST agree, or a card the principal can see and discuss is one the
+# Executive is refused permission to clear. Shared here, with `list_live_alerts`,
+# rather than duplicated as a literal at each call site.
+BOARD_LIMIT = 100
+
+
 def list_live_alerts(
     limit: int = 100,
     db_path: Path | None = None,

@@ -130,17 +130,35 @@ Open http://localhost:3000 to start chatting with your executive. The API runs o
 > downloads a small embedding model (~90 MB) to build the local vector index — so the
 > first `make dev` takes a few minutes before the app is ready. Subsequent starts are fast.
 
+> **On Windows:** run `make` from Git Bash or WSL, not PowerShell or `cmd`.
+> The recipes are POSIX shell (`if [ -f .env ]; …`), and GNU Make falls back to
+> `cmd.exe` when no `sh` is on PATH — which fails with
+> `-f was unexpected at this time`. If Make still picks the wrong shell, point
+> it at one: `make dev SHELL="C:/Program Files/Git/bin/sh.exe"`. Note that
+> `make stop` uses `lsof` and has no Windows equivalent; stop the two dev
+> servers from their own terminals instead.
+
 **For contributors not using `make`:**
 
 ```bash
 cd packages/core
 uv sync
-source .venv/bin/activate
-uvicorn openexecutive.api.main:app --reload --port 8000
+uv run uvicorn openexecutive.api.main:app --reload --port 8000
 
 # In a second terminal
-cd packages/ui && npm install && npm run dev
+cd packages/ui
+npm install
+npm run dev
 ```
+
+`uv run` executes inside the project's virtualenv without activating it, so
+these commands are the same on macOS, Linux and Windows. (Activating manually
+works too, but the path differs per platform: `.venv/bin/activate` on
+macOS/Linux, `.venv\Scripts\Activate.ps1` on Windows.) The `packages/ui`
+commands are listed one per line rather than chained with `&&` so that they
+run in every shell too: Windows PowerShell 5.1, the version that ships with
+Windows, has no `&&` operator and rejects the chained form with `The token
+'&&' is not a valid statement separator in this version.`
 
 ## Run the Discord Bot
 
@@ -199,6 +217,60 @@ The built-in knowledge base is **trusted by default** — the Executive can use 
 | **Google Chat** | Mention the app in a space |
 | **Discord** | DM the bot, `@mention` it in a channel, or use `/ask` / `/today` slash commands |
 | **CLI** | `openexecutive chat` |
+| **MCP** | Point any MCP client at `http://localhost:8000/mcp` (see [Connect as an MCP Server](#connect-as-an-mcp-server)) |
+
+## Connect as an MCP Server
+
+Open Executive exposes its company context and specialist council to external
+MCP clients (Claude Code, Claude Desktop, Cursor, or any other agent), so they
+can ground themselves in your company without being re-briefed. There is no
+separate server process to start: the server is mounted into the FastAPI app at
+`/mcp` over Streamable HTTP, so running the API is running the MCP server.
+
+The endpoint is `http://localhost:8000/mcp`, or `https://<your-host>/mcp` once
+deployed. Authentication is the same shared-secret gate as every other route,
+so clients send `x-api-key: $BACKEND_SHARED_SECRET`. With that variable unset
+locally the gate is off and the header can be omitted.
+
+On any internet-reachable instance set both `BACKEND_SHARED_SECRET` and
+`OE_PUBLIC_DEPLOYMENT=1`, which makes the API refuse to start without a
+secret rather than serving `/mcp` unauthenticated. See
+[Deployment](#deployment).
+
+```json
+{
+  "mcpServers": {
+    "open-executive": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "x-api-key": "YOUR_BACKEND_SHARED_SECRET"
+      }
+    }
+  }
+}
+```
+
+Claude Code can write that entry for you:
+
+```bash
+claude mcp add --transport http open-executive http://localhost:8000/mcp \
+  --header "x-api-key: YOUR_BACKEND_SHARED_SECRET"
+```
+
+Connected clients get eight read-only resources (company profile, today's
+briefing and activity, people roster, department state, and episodic memory for
+decisions, initiatives and advice) and four tools, of which `consult_specialist`
+is the primary one: domain analysis from any of the nine specialists, each
+grounded in your company's knowledge base. The full inventory is on the **MCP
+Server** section of the `/architecture` page.
+
+This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
+under [Configuration](#configuration), which configure the MCP *gateway*: Open
+Executive consuming other servers' tools. The server side needs no configuration
+beyond `BACKEND_SHARED_SECRET`. If a client errors on connect, try `/mcp/` with
+the trailing slash, since the endpoint 307-redirects and not every client
+follows the redirect.
 
 ## Document Upload
 
@@ -244,6 +316,7 @@ the app refuses to start.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes¹ | — | Anthropic API key |
+| `ANTHROPIC_WORKSPACE_ID` | No | — | Required only for an organisation-scoped Anthropic key; sent as the `anthropic-workspace-id` header. Workspace-scoped keys need no value |
 | `DEFAULT_MODEL` | No | `claude-sonnet-5` | Executive + most specialists |
 | `DEEP_REASONING_MODEL` | No | `claude-opus-5` | CSO, CFO, GC, Board |
 | `VECTOR_STORE_PATH` | No | `./chroma_db` | ChromaDB directory |

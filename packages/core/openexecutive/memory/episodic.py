@@ -9,7 +9,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel
 
@@ -373,6 +373,15 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_outbound_ctx_lookup
                 ON outbound_context(channel, channel_ref, status, created_at DESC);
+
+            -- One-shot data migrations. Schema changes above are idempotent
+            -- DDL and need no bookkeeping; this table is for sweeps that must
+            -- run exactly once per DB (e.g. cancelling rows a removed feature
+            -- left behind). A migration inserts its name when it has applied.
+            CREATE TABLE IF NOT EXISTS app_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
         """)
 
 
@@ -1305,6 +1314,75 @@ def cancel_scheduled_action(action_id: int, db_path: Path | None = None) -> str:
         return "cancelled"
 
 
+# Intent-text shapes of the ad-hoc reminders the removed talent /
+# staff-onboarding workflows scheduled on the principal's real DM channel.
+# Nothing creates these any more, but rows pending from before the removal
+# would keep firing (for weeks, in the outreach case) about candidates whose
+# records are unreachable. They were `kind="ad_hoc"` with `department=''` on
+# a live channel, so the scheduler's `__internal__` drain never sees them.
+# Each pattern is the full generated template up to its first free-text
+# field — deliberately NOT a bare prefix like "Outreach reminder %", which
+# would also catch a reminder the Executive phrased that way for the
+# principal's own work. (`talent.reminders`, `workflows.candidate_outreach`,
+# `interview_coordination`, `reference_check`, `new_hire_onboarding`,
+# `talent.offers` at the pre-removal commit.)
+_ORPHANED_TALENT_REMINDER_PATTERNS: tuple[str, ...] = (
+    "Outreach reminder %/% (%) for the % search (%). Send the principal %",
+    "Interview coordination for % on the % search (%). Send the principal %",
+    "Reference checks (%) for % on the % search (%). Send the principal %",
+    "Onboarding check-in (day %) for %, % at %. DM the principal %",
+    "Offer expiry reminder: the offer to % for the % role (offer %) %. DM the principal %",
+)
+_TALENT_REMINDER_SWEEP = "2026-09-cancel-talent-reminders"
+
+
+def cancel_orphaned_talent_reminders(db_path: Path | None = None) -> int:
+    """One-shot sweep: cancel reminders left by the removed talent and
+    staff-onboarding features. Returns the number of rows cancelled.
+
+    Bounded by ``app_migrations``: the marker row is claimed FIRST with
+    ``INSERT OR IGNORE`` inside the same transaction as the sweep, so of two
+    processes booting against one DB exactly one does the work and the other
+    is a clean no-op (no ``IntegrityError``). Every later call is a no-op even
+    if a matching row appears afterwards. ``running`` rows are included: the
+    scheduler's ``requeue_orphaned_running`` runs AFTER this sweep at boot and
+    would otherwise resurrect a crash-orphaned row as ``pending``. Delete this
+    function (and its callers) in the release after next, once every install
+    has booted on it once.
+    """
+    with _get_conn(_resolve_db_path(db_path)) as conn:
+        claimed = conn.execute(
+            "INSERT OR IGNORE INTO app_migrations (name, applied_at) VALUES (?, ?)",
+            (_TALENT_REMINDER_SWEEP, datetime.now(UTC).isoformat()),
+        )
+        if claimed.rowcount == 0:
+            return 0
+        shape = " OR ".join(
+            "intent_text LIKE ?" for _ in _ORPHANED_TALENT_REMINDER_PATTERNS
+        )
+        cur = conn.execute(
+            "UPDATE scheduled_actions "
+            "SET status = 'cancelled', "
+            "    awaiting_response_since = NULL, "
+            "    last_error = 'cancelled: talent/staff-onboarding feature removed' "
+            "WHERE status IN ('pending', 'running') "
+            "  AND kind = 'ad_hoc' AND department = '' "
+            f"  AND ({shape})",
+            _ORPHANED_TALENT_REMINDER_PATTERNS,
+        )
+        # Delivered talent reminders still marked as awaiting a reply would
+        # keep feeding the nudge engine ("chase the open commitment …") about
+        # a dead candidate. Clear the flag; leave the rows as history.
+        conn.execute(
+            "UPDATE scheduled_actions SET awaiting_response_since = NULL "
+            "WHERE awaiting_response_since IS NOT NULL AND status = 'done' "
+            "  AND kind = 'ad_hoc' AND department = '' "
+            f"  AND ({shape})",
+            _ORPHANED_TALENT_REMINDER_PATTERNS,
+        )
+        return int(cur.rowcount)
+
+
 def get_scheduled_action(
     action_id: int, db_path: Path | None = None
 ) -> ScheduledAction | None:
@@ -1755,12 +1833,247 @@ def _is_valid_user_commitment(quote: str, user_message: str) -> bool:
 
 _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 
-# Minimum combined chars (user + assistant) required to schedule extraction.
-# Below this floor, the turn is a clarifying question or small-talk exchange
-# and the LLM gate's cost isn't justified. Both stream_chat and the committee
-# path use this constant — keeping them symmetric prevents the committee path
-# from firing 2.5x more often than streaming, which it used to.
-MIN_TURN_CHARS_FOR_EXTRACTION = 1500
+# How many individual drop records ride along in the audit row's `details`.
+# `dropped_count` is always exact; this caps only the itemised list, because a
+# model that returns fifty malformed items would otherwise put fifty records
+# in one audit row. Ten is enough to see the pattern — and the pattern is what
+# an operator reads this field for, since the counts above it already say how
+# bad it is.
+_MAX_DROPPED_IN_AUDIT = 10
+
+def should_extract(
+    user_message: str,
+    *,
+    origin_channel: str = "",
+    person_id: int | None = None,
+) -> bool:
+    """True when this turn is worth an extraction pass.
+
+    **No length floor.** There used to be one on the combined user+assistant
+    length, which discarded short instructions answered at length — on a live
+    tenant it blocked every commitment the principal made while admitting only
+    the long analytical exchanges that had none, and the extractor ran 13
+    times storing nothing.
+
+    Moving that floor to the user's side does not fix it, it relocates it: the
+    canonical executive decision is a long analysis answered with "Approve
+    option B." (17 chars) or "Do B." (5), and any floor high enough to skip
+    "Done" (4) also skips those. Length cannot separate a decision from an
+    acknowledgement — "Do B." and "Done" differ by one character and mean
+    opposite things. A pass over an acknowledgement costs one utility-fast
+    call and stores nothing, which is the right trade against losing
+    approvals. If per-turn cost ever becomes the binding constraint, the lever
+    is a semantic prefilter or a per-session cap — not a length proxy for a
+    property it cannot measure.
+
+    **Only the principal's own words.** `_is_valid_user_commitment` is the
+    gate that tests for a commitment, and it does so by requiring a verbatim
+    quote from `user_message`. That is only meaningful when `user_message`
+    actually holds the principal's words. On a chat channel it does not: a
+    teammate's Slack line would be stored in `decisions` with no speaker
+    attached, indistinguishable from the principal's own; an inbound email
+    body is text the sender chose, and a self-quote is free.
+
+    Removing the length floor is what makes this matter — short channel
+    traffic used to fall under it incidentally — so the speaker check lands
+    with it. A turn with no `origin_channel` came from the web app, the CLI or
+    the API, all of which are the principal's own authenticated surfaces, and
+    `person_id` is legitimately None there in a single-user install. A turn
+    that names a channel must resolve to a person marked `is_principal`.
+
+    The single decision point for both call sites in `orchestrator.executive`,
+    so the rule is testable directly and the two paths cannot drift apart.
+    """
+    if not user_message.strip():
+        return False
+    if not origin_channel:
+        return True
+    if person_id is None:
+        return False
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        # Fail closed: an unresolvable speaker is not the principal.
+        logger.warning(
+            "extraction_speaker_lookup_failed person_id=%s channel=%s",
+            person_id,
+            origin_channel,
+            exc_info=True,
+        )
+        return False
+    return bool(person is not None and person.is_principal)
+
+
+# Drop reasons for a payload SHAPE the model got wrong, as opposed to an item
+# it proposed and that was then rejected. Kept apart in the audit row so the
+# `proposed == stored + item drops` arithmetic stays true.
+_SHAPE_REASONS = frozenset({"not_a_list", "item_not_a_dict", "payload_not_a_dict"})
+
+
+class _ItemSpec(NamedTuple):
+    """How one kind of extracted item is read out of the model's payload.
+
+    The three kinds differ only in their field names, so this is the one place
+    those names live. Spelling them once keeps a drop recorded by
+    `_iter_items` and a drop recorded by `_accept` under the same `kind`,
+    which is what makes "bad-quote drops on decisions this week" a single
+    query rather than a union over spellings that have drifted apart.
+    """
+
+    key: str
+    """The payload key the model writes, e.g. `decisions`."""
+
+    kind: str
+    """Singular name every drop record for this kind is filed under."""
+
+    required: tuple[str, ...]
+    """Fields that must be non-empty for the item to be worth storing."""
+
+    label: str
+    """The field echoed (truncated) into a drop so a human can identify it."""
+
+
+_DECISIONS = _ItemSpec("decisions", "decision", ("summary",), "summary")
+_INITIATIVES = _ItemSpec("initiatives", "initiative", ("title", "summary"), "title")
+_ADVICE = _ItemSpec(
+    "advice", "advice", ("query_summary", "advice_summary"), "query_summary"
+)
+
+
+def _iter_items(
+    payload: dict[str, Any], spec: _ItemSpec, dropped: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """The dict-shaped items for ``spec``, skipping anything malformed.
+
+    The model's tool payload is not schema-checked, so `{"decisions": "..."}`
+    or `{"decisions": ["text"]}` used to raise out of the whole pass — taking
+    the other two kinds with it AND suppressing the audit row, which left the
+    log looking exactly like "extraction never ran". Malformed shapes are now
+    counted as drops and the pass continues.
+
+    A missing key or an explicit `null` is not a drop: the model omitting a
+    kind it found nothing for is the normal case.
+    """
+    raw = payload.get(spec.key)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        dropped.append({"kind": spec.kind, "reason": "not_a_list"})
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append(item)
+        else:
+            dropped.append({"kind": spec.kind, "reason": "item_not_a_dict"})
+    return out
+
+
+def _accept(
+    item: dict[str, Any],
+    spec: _ItemSpec,
+    user_message: str,
+    dropped: list[dict[str, str]],
+) -> bool:
+    """True when ``item`` is complete and genuinely the user's own commitment.
+
+    Shared by all three kinds so a drop is recorded on every rejecting path.
+    Counting an item as proposed and then returning without a drop record is
+    the bug this centralises away: it broke `proposed == stored + dropped`,
+    which is the arithmetic an operator uses to tell "the model found nothing"
+    from "the model found things and every one was rejected".
+
+    The quote check is the hard gate. The model has repeatedly proven willing
+    to log the Executive's *recommendations* as if the user had committed to
+    them — the May 27 incident turned the question "Should we scope as fixed
+    POC or hourly?" into the decision "First $30K deal will be structured as
+    fixed POC". Requiring a verbatim quote from the user's own message is what
+    catches that; the prompt is only the soft instruction layer.
+    """
+    missing = [field for field in spec.required if not item.get(field)]
+    if missing:
+        dropped.append(
+            {"kind": spec.kind, "reason": "missing_field", "field": missing[0]}
+        )
+        return False
+
+    quote = str(item.get("user_commitment_quote", ""))
+    label = str(item.get(spec.label, ""))
+    if not _is_valid_user_commitment(quote, user_message):
+        dropped.append(
+            {"kind": spec.kind, "reason": "bad_quote", "label": label[:60]}
+        )
+        logger.debug(
+            "Dropping %s — invalid user_commitment_quote %r (%s=%r)",
+            spec.kind,
+            quote[:120],
+            spec.label,
+            label[:80],
+        )
+        return False
+    return True
+
+
+def _audit_extraction(
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[dict[str, str]],
+    *,
+    session_id: str,
+    failure: str = "",
+) -> None:
+    """One `memory_extraction` audit row per extraction pass.
+
+    The point is that "the model proposed nothing" and "the model proposed
+    things and every one was rejected" are different failures with different
+    fixes, and until this row existed they were indistinguishable outside a
+    SQLite session on the tenant. A pass that proposes and stores nothing is
+    normal on most turns, so this is deliberately not a warning — the signal
+    is the RATIO over time, which a `proposed>0, stored=0` streak makes
+    obvious.
+
+    `proposed` counts items the model actually emitted as objects, so every
+    proposed item is either stored or dropped and
+    `proposed == stored + (dropped - malformed)` holds. A malformed SHAPE was
+    never a usable item, so it is counted separately rather than folded into
+    `proposed` — otherwise `dropped > proposed` on a payload that was nothing
+    but garbage. `malformed` is broken out for the same reason the rest of
+    this row exists: without it a pass where the model returned only garbage
+    reads `proposed=0 stored=0`, which is what "the model found nothing"
+    looks like.
+
+    Never raises: auditing an extraction must not be able to break the turn
+    that produced it.
+    """
+    total_proposed = sum(proposed.values())
+    total_stored = sum(stored.values())
+    malformed = sum(1 for d in dropped if d["reason"] in _SHAPE_REASONS)
+    prefix = f"FAILED({failure}) " if failure else ""
+    try:
+        from openexecutive.audit import log_event
+
+        log_event(
+            "memory_extraction",
+            f"{prefix}proposed={total_proposed} stored={total_stored} "
+            f"dropped={len(dropped)} malformed={malformed}",
+            session_id=session_id or None,
+            actor="memory_extractor",
+            details={
+                "proposed": proposed,
+                "stored": stored,
+                "dropped_count": len(dropped),
+                "malformed_count": malformed,
+                "failure": failure,
+                # Structured like `proposed`/`stored` so "how many bad-quote
+                # drops on decisions this week" is a query, not a string split
+                # over a field that can itself contain colons.
+                "dropped": dropped[:_MAX_DROPPED_IN_AUDIT],
+            },
+        )
+    except Exception:
+        logger.debug("memory extraction audit failed", exc_info=True)
 
 
 async def extract_and_store(
@@ -1768,13 +2081,55 @@ async def extract_and_store(
     assistant_response: str,
     db_path: Path = DB_PATH,
     session_id: str = "",
+    audit_session_id: str | None = None,
+    audit_turn_id: str | None = None,
 ) -> None:
     """Extract memorable items from a conversation turn and persist them.
 
     `session_id` is forwarded to store_decision/store_advice so the stored
     rows can later be scoped back to this conversation via format_for_prompt.
     Runs as a background task — never blocks the response stream.
+
+    `audit_session_id` / `audit_turn_id` are the caller's audit ContextVars,
+    snapshotted by schedule_extraction before this task was spawned and
+    re-bound here. A background task starts from a context in which the
+    caller's `with set_turn(...)` has already exited, so without them this
+    function's model call records unattributed.
     """
+    from openexecutive.audit.context import get_active_ids, set_turn
+
+    # Fall back per field, not as a pair. Binding a half-empty snapshot
+    # would erase the ambient counterpart — a row under a session with no
+    # turn, or a turn that joins to nothing — which is worse than either
+    # binding both or leaving the ambient values alone. With nothing to
+    # restore at all this is a plain no-op, so a caller that awaits this
+    # directly from inside its own `with set_turn(...)` keeps its binding.
+    ambient_session, ambient_turn = get_active_ids()
+    effective_session = audit_session_id if audit_session_id is not None else ambient_session
+    effective_turn = audit_turn_id if audit_turn_id is not None else ambient_turn
+
+    if (effective_session, effective_turn) == (ambient_session, ambient_turn):
+        await _extract_and_store(
+            user_message, assistant_response, db_path, session_id
+        )
+        return
+
+    with set_turn(session_id=effective_session, turn_id=effective_turn):
+        await _extract_and_store(
+            user_message, assistant_response, db_path, session_id
+        )
+
+
+async def _extract_and_store(
+    user_message: str,
+    assistant_response: str,
+    db_path: Path,
+    session_id: str,
+) -> None:
+    proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
+    stored = {"decisions": 0, "initiatives": 0, "advice": 0}
+    dropped: list[dict[str, str]] = []
+    failure = ""
     try:
         from openexecutive.audit.usage import log_model_usage
         from openexecutive.config import get_settings
@@ -1820,78 +2175,83 @@ async def extract_and_store(
 
         log_model_usage(response, model=routing_model, actor="memory_extractor")
 
+        # Extraction outcome, per turn. Without this a working extractor and a
+        # broken one look identical from the outside: drops were `logger.debug`
+        # and a successful store wrote no row either, so the only symptom of a
+        # total failure was an empty `decisions` table nobody was watching. It
+        # took reading a tenant's SQLite to find that the turn gate had been
+        # discarding every commitment for the whole life of the install.
+
         for block in response.content:
             if block.type != "tool_use" or block.name != "store_memories":
                 continue
 
             inp = block.input
-            # Validate every item against the user's actual text. The LLM has
-            # repeatedly proven willing to log the executive's recommendations
-            # as if the user had committed to them — see the May 27 incident
-            # where "Should we scope as fixed POC or hourly?" produced a
-            # decision "First $30K deal will be structured as fixed POC".
-            # The user_commitment_quote field + this validator are the
-            # hard gate that catches that pattern; the prompt is now just
-            # the soft instruction layer.
-            for d in inp.get("decisions", []):
-                domain = d.get("domain", "general")
-                summary = d.get("summary", "")
-                quote = d.get("user_commitment_quote", "")
-                if not summary:
-                    continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
-                        quote[:120],
-                        summary[:80],
-                    )
+            if not isinstance(inp, dict):
+                dropped.append({"kind": "pass", "reason": "payload_not_a_dict"})
+                continue
+            # Each loop is read → count → validate → store. The counting and
+            # validation are identical across the three kinds and live in
+            # `_accept`; only the store call differs, because the three store
+            # functions take different fields.
+            for d in _iter_items(inp, _DECISIONS, dropped):
+                proposed["decisions"] += 1
+                if not _accept(d, _DECISIONS, user_message, dropped):
                     continue
                 store_decision(
-                    domain=domain,
-                    summary=summary,
+                    domain=d.get("domain", "general"),
+                    summary=d["summary"],
                     rationale=d.get("rationale", ""),
                     session_id=session_id,
                     db_path=db_path,
                 )
-            for i in inp.get("initiatives", []):
-                title = i.get("title", "")
-                status = i.get("status", "active")
-                summary = i.get("summary", "")
-                quote = i.get("user_commitment_quote", "")
-                if not (title and summary):
+                stored["decisions"] += 1
+            for i in _iter_items(inp, _INITIATIVES, dropped):
+                proposed["initiatives"] += 1
+                if not _accept(i, _INITIATIVES, user_message, dropped):
                     continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
-                        quote[:120],
-                        title[:80],
-                    )
-                    continue
-                store_initiative(title=title, status=status, summary=summary, db_path=db_path)
-            for a in inp.get("advice", []):
-                domain = a.get("domain", "general")
-                query_summary = a.get("query_summary", "")
-                advice_summary = a.get("advice_summary", "")
-                quote = a.get("user_commitment_quote", "")
-                if not (query_summary and advice_summary):
-                    continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping advice — invalid user_commitment_quote %r (query=%r)",
-                        quote[:120],
-                        query_summary[:80],
-                    )
+                store_initiative(
+                    title=i["title"],
+                    status=i.get("status", "active"),
+                    summary=i["summary"],
+                    db_path=db_path,
+                )
+                stored["initiatives"] += 1
+            for a in _iter_items(inp, _ADVICE, dropped):
+                proposed["advice"] += 1
+                if not _accept(a, _ADVICE, user_message, dropped):
                     continue
                 store_advice(
-                    domain=domain,
-                    query_summary=query_summary,
-                    advice_summary=advice_summary,
+                    domain=a.get("domain", "general"),
+                    query_summary=a["query_summary"],
+                    advice_summary=a["advice_summary"],
                     session_id=session_id,
                     db_path=db_path,
                 )
+                stored["advice"] += 1
 
-    except Exception:
+    except Exception as exc:
+        # Recorded so the audit row can say the pass FAILED. Without it a
+        # provider outage writes no rows at all, which reads identically to
+        # "extraction was never scheduled" — the indistinguishable-failure
+        # state this row exists to eliminate.
+        failure = type(exc).__name__
         logger.exception("Episodic memory extraction failed — skipping silently")
+    except BaseException as exc:
+        # `CancelledError` is a BaseException, so the clause above misses it
+        # while the `finally` still writes a row. A pass cancelled at shutdown
+        # would then be logged as `proposed=0 stored=0 failure=''` — byte for
+        # byte what "the model proposed nothing" looks like, which is the one
+        # ambiguity this row exists to remove. Labelled and re-raised, never
+        # swallowed: cancellation still has to propagate.
+        failure = type(exc).__name__
+        raise
+    finally:
+        # In `finally`, not the happy path: a pass that crashed is exactly the
+        # one an operator needs to see.
+        _audit_extraction(
+            proposed, stored, dropped, session_id=session_id, failure=failure
+        )
 
 
 def schedule_extraction(
@@ -1904,10 +2264,27 @@ def schedule_extraction(
     Pass `session_id` to tag extracted decisions and advice with the
     originating conversation so format_for_prompt can scope them later.
     """
+    from openexecutive.audit.context import get_active_ids
+
+    # Snapshot the audit ContextVars at scheduling time. By the time the
+    # background task runs, the caller's ``with set_turn(...)`` block has
+    # exited and the vars are back to None — so without this snapshot the
+    # memory_extractor's own model call records with ``session_id=NULL``
+    # and is invisible in the per-session view. Same pattern as
+    # memory.honcho_client's background syncs. The thread branch needs it
+    # even more: a new thread starts from an empty context, so nothing is
+    # inherited there at all.
+    audit_sid, audit_tid = get_active_ids()
     try:
         loop = asyncio.get_running_loop()
         task = loop.create_task(
-            extract_and_store(user_message, assistant_response, session_id=session_id)
+            extract_and_store(
+                user_message,
+                assistant_response,
+                session_id=session_id,
+                audit_session_id=audit_sid,
+                audit_turn_id=audit_tid,
+            )
         )
         # Hold a strong reference so GC cannot cancel the task mid-flight.
         _background_tasks.add(task)
@@ -1916,7 +2293,13 @@ def schedule_extraction(
         # No running event loop (CLI context) — run in a daemon thread.
         threading.Thread(
             target=lambda: asyncio.run(
-                extract_and_store(user_message, assistant_response, session_id=session_id)
+                extract_and_store(
+                    user_message,
+                    assistant_response,
+                    session_id=session_id,
+                    audit_session_id=audit_sid,
+                    audit_turn_id=audit_tid,
+                )
             ),
             daemon=True,
         ).start()

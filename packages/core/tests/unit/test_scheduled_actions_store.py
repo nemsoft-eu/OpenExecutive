@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from openexecutive.memory.episodic import (
+    cancel_orphaned_talent_reminders,
     cancel_scheduled_action,
     claim_due_actions,
     count_pending_for_channel_ref,
@@ -444,3 +445,147 @@ def test_list_pending_scheduled_actions_excludes_done(db: Path) -> None:
     )
     mark_action_done(aid, db_path=db)
     assert list_pending_scheduled_actions(db_path=db) == []
+
+
+# --------------------------------------------------------------------------- #
+# One-shot sweep for reminders the removed talent / staff-onboarding
+# workflows left on the principal's DM channel.
+# --------------------------------------------------------------------------- #
+
+# Literal intent texts as the deleted generators produced them (pre-removal
+# commit d160d3d: workflows/candidate_outreach.py, interview_coordination.py,
+# reference_check.py, new_hire_onboarding.py, talent/offers.py). The sweep
+# must match THESE, not strings derived from its own patterns.
+_ORPHAN_INTENTS = [
+    "Outreach reminder 1/3 (Day 0) for the VP Operations search (Acme). Send the "
+    "principal this ready-to-send draft for Jane Doe so they can review and send it "
+    "themselves. Do NOT contact the candidate directly.\n\nHi Jane…",
+    "Interview coordination for Jane Doe on the VP Operations search (Acme). Send the "
+    "principal the proposed interview loop below and the ready-to-send availability "
+    "request so they can line up the panel and send the request to the candidate.",
+    "Reference checks (3) for Jane Doe on the VP Operations search (Acme). Send the "
+    "principal the rubric below and the ready-to-send reference-outreach so they can "
+    "line up and run the references themselves.",
+    "Onboarding check-in (day 30) for Jane Doe, VP Operations at Acme. DM the "
+    "principal the day-30 milestone questions from the onboarding plan so they can "
+    "run the check-in themselves.",
+    "Offer expiry reminder: the offer to Jane Doe for the VP Operations role "
+    "(offer 12) expires in 3 days. DM the principal so they can check in with the "
+    "candidate and either record a decision (accepted / declined / expired) or "
+    "re-extend.",
+]
+
+# Principal-authored follow-ups that share the opening words — must survive.
+_NEAR_MISS_INTENTS = [
+    "Outreach reminder: chase the Series A investor list before Friday",
+    "Interview coordination for the podcast guest — confirm the studio slot",
+    "Reference checks (informal) on the new agency before we sign",
+    "Onboarding check-in (day 1) with the new fractional CFO about access",
+    "Offer expiry reminder: the vendor's discounted quote lapses Monday",
+]
+
+
+def _insert_reminder(
+    db: Path, text: str, *, status: str = "pending", kind: str = "ad_hoc",
+    department: str = "", awaiting: bool = False,
+) -> int:
+    aid = insert_scheduled_action(
+        run_at=_future(3600), channel="telegram", channel_ref="123",
+        intent_text=text, kind=kind, department=department, db_path=db,
+    )
+    if status == "running":
+        # Simulate a crash mid-dispatch: claimed (running) but never finished.
+        import sqlite3
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE scheduled_actions SET status='running' WHERE id=?", (aid,))
+    elif status == "done":
+        mark_action_done(aid, db_path=db)
+    if awaiting:
+        import sqlite3
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "UPDATE scheduled_actions SET awaiting_response_since=? WHERE id=?",
+                (_past(3600), aid),
+            )
+    return aid
+
+
+def _status(db: Path, aid: int) -> str:
+    row = get_scheduled_action(aid, db)
+    assert row is not None
+    return row.status
+
+
+def test_orphan_sweep_cancels_the_five_generated_shapes_and_nothing_else(db: Path) -> None:
+    orphans = [_insert_reminder(db, t) for t in _ORPHAN_INTENTS]
+    near_misses = [_insert_reminder(db, t) for t in _NEAR_MISS_INTENTS]
+    unrelated = _insert_reminder(db, "Follow up with the board candidate on the Q3 deck")
+    delivered = _insert_reminder(db, _ORPHAN_INTENTS[0], status="done")
+    # Same text, but a department-scoped or non-ad-hoc row is not a talent
+    # reminder (those never set a department and were always ad_hoc).
+    dept_scoped = _insert_reminder(db, _ORPHAN_INTENTS[0], department="hr")
+    other_kind = _insert_reminder(db, _ORPHAN_INTENTS[0], kind="proactive_nudge")
+
+    assert cancel_orphaned_talent_reminders(db) == len(_ORPHAN_INTENTS)
+
+    for aid in orphans:
+        row = get_scheduled_action(aid, db)
+        assert row is not None and row.status == "cancelled"
+        assert "feature removed" in row.last_error
+    for aid in near_misses + [unrelated, dept_scoped, other_kind]:
+        assert _status(db, aid) == "pending"
+    assert _status(db, delivered) == "done"
+
+
+def test_orphan_sweep_includes_running_rows(db: Path) -> None:
+    """A row left `running` by a crash mid-dispatch is reclaimed to `pending`
+    by the scheduler AFTER this sweep runs at boot — so the sweep must take it
+    too, or it comes back from the dead."""
+    stuck = _insert_reminder(db, _ORPHAN_INTENTS[1], status="running")
+    assert cancel_orphaned_talent_reminders(db) == 1
+    assert _status(db, stuck) == "cancelled"
+
+
+def test_orphan_sweep_clears_awaiting_flag_on_delivered_reminders(db: Path) -> None:
+    """Delivered talent reminders still flagged as awaiting a reply would keep
+    feeding the nudge engine; the flag goes, the history row stays."""
+    delivered = _insert_reminder(db, _ORPHAN_INTENTS[2], status="done", awaiting=True)
+    keep = _insert_reminder(db, _NEAR_MISS_INTENTS[2], status="done", awaiting=True)
+    assert cancel_orphaned_talent_reminders(db) == 0  # nothing pending to cancel
+    swept = get_scheduled_action(delivered, db)
+    assert swept is not None and swept.status == "done"
+    assert swept.awaiting_response_since is None
+    kept = get_scheduled_action(keep, db)
+    assert kept is not None and kept.awaiting_response_since is not None
+
+
+def test_orphan_sweep_runs_once_per_db(db: Path) -> None:
+    """The marker row bounds the sweep: a matching row inserted AFTER the first
+    run is left alone, proving later boots do no work."""
+    first = _insert_reminder(db, _ORPHAN_INTENTS[0])
+    assert cancel_orphaned_talent_reminders(db) == 1
+
+    late = _insert_reminder(db, _ORPHAN_INTENTS[0])
+    assert cancel_orphaned_talent_reminders(db) == 0
+    assert _status(db, late) == "pending"
+    assert _status(db, first) == "cancelled"
+
+
+def test_orphan_sweep_marker_is_claimed_atomically(db: Path) -> None:
+    """Two boots against one DB: the marker is claimed with INSERT OR IGNORE in
+    the sweep's own transaction, so a pre-existing marker means a clean no-op —
+    never an IntegrityError."""
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO app_migrations (name, applied_at) VALUES (?, ?)",
+            ("2026-09-cancel-talent-reminders", "2026-09-17T00:00:00+00:00"),
+        )
+    orphan = _insert_reminder(db, _ORPHAN_INTENTS[0])
+    assert cancel_orphaned_talent_reminders(db) == 0
+    assert _status(db, orphan) == "pending"
+
+
+def test_orphan_sweep_is_a_noop_on_a_clean_db(db: Path) -> None:
+    assert cancel_orphaned_talent_reminders(db) == 0
+    assert cancel_orphaned_talent_reminders(db) == 0
