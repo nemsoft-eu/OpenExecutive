@@ -155,6 +155,21 @@ def test_archive_existing_person() -> None:
     assert pid not in active_ids
 
 
+def test_archive_last_principal_refused() -> None:
+    pid = people_store.upsert_person(full_name="Principal Pat", is_principal=True)
+    result = _call(handle_archive_person, {"person_id": pid})
+    assert "last active principal" in result["error"]
+    principal = people_store.find_principal_person()
+    assert principal is not None and principal.id == pid
+
+
+def test_archive_co_principal_allowed() -> None:
+    first = people_store.upsert_person(full_name="Founder A", is_principal=True)
+    people_store.upsert_person(full_name="Founder B", is_principal=True)
+    result = _call(handle_archive_person, {"person_id": first})
+    assert result["status"] == "archived"
+
+
 def test_archive_missing_person_returns_not_found() -> None:
     result = _call(handle_archive_person, {"person_id": 9999})
     assert result["status"] == "not_found"

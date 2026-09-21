@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(os.environ.get("EPISODIC_DB_PATH", "./episodic_memory.db"))
 
 
+class LastPrincipalError(ValueError):
+    """Archiving this person would leave the roster with no active principal."""
+
+
 def _resolve_db_path(db_path: Path | None) -> Path:
     """Return caller-supplied path or the current module-level DB_PATH.
 
@@ -371,7 +375,10 @@ def find_person_by_email(email: str, db_path: Path | None = None) -> Person | No
         if not _table_exists(conn, "people"):
             return None
         row = conn.execute(
-            "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0 LIMIT 1",
+            # email is not UNIQUE, so ORDER BY id pins which row a duplicate
+            # address resolves to instead of leaving it to SQLite's scan order.
+            "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0 "
+            "ORDER BY id LIMIT 1",
             (email,),
         ).fetchone()
         if row is None:
@@ -433,7 +440,8 @@ def find_principal_person(db_path: Path | None = None) -> Person | None:
     may match. ``ORDER BY id`` makes the oldest principal win
     deterministically — a stale row would route web traffic to the
     wrong peer card. If you re-run onboarding, archive the old
-    principal first.
+    principal once the new one exists — archive_person refuses the last
+    active principal.
     """
     if not _resolve_db_path(db_path).exists():
         return None
@@ -467,13 +475,35 @@ def list_people(
 
 
 def archive_person(person_id: int, db_path: Path | None = None) -> bool:
-    """Soft-delete a person. Returns True if a row was found and archived."""
+    """Soft-delete a person. Returns True if a row was found and archived.
+
+    Raises LastPrincipalError instead of archiving the last active principal:
+    a zero-principal roster loses the fallback approver, and the principal's
+    UI access with it. A co-principal can still be archived while another
+    remains. The guard lives in the UPDATE itself, so two concurrent archives
+    of the last two principals cannot both pass a count read beforehand.
+    """
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE people SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0",
+            "UPDATE people SET archived = 1, updated_at = ? "
+            "WHERE id = ? AND archived = 0 AND (is_principal = 0 OR ("
+            "SELECT COUNT(*) FROM people WHERE is_principal = 1 AND archived = 0"
+            ") > 1)",
             (_now(), person_id),
         )
-        return cursor.rowcount > 0
+        if cursor.rowcount > 0:
+            return True
+        # rowcount 0 is either "no active row" or the guard refusing; tell
+        # them apart so callers do not report a refusal as not-found.
+        row = conn.execute(
+            "SELECT is_principal FROM people WHERE id = ? AND archived = 0",
+            (person_id,),
+        ).fetchone()
+        if row is not None and row["is_principal"]:
+            raise LastPrincipalError(
+                f"cannot archive person {person_id}: they are the last active principal"
+            )
+        return False
 
 
 def find_approvers(

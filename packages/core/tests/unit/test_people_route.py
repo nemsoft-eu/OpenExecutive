@@ -87,6 +87,19 @@ def test_list_include_archived(client: TestClient) -> None:
     assert "Archived" in names
 
 
+def test_archive_last_principal_409(client: TestClient) -> None:
+    pid = client.post(
+        "/people", json={"full_name": "Founder", "is_principal": True}
+    ).json()["id"]
+    resp = client.post(f"/people/{pid}/archive")
+    assert resp.status_code == 409
+    assert client.get(f"/people/{pid}").json()["archived"] is False
+
+
+def test_archive_unknown_person_404(client: TestClient) -> None:
+    assert client.post("/people/9999/archive").status_code == 404
+
+
 # --------------------------------------------------------------------------- #
 # Patch
 # --------------------------------------------------------------------------- #

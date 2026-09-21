@@ -1584,7 +1584,8 @@ departments:
     `propose_only` departments route scheduled actions to an approver as a
     briefing alert (`propose_via_alert`) instead of executing immediately;
     the scheduled_actions row is then marked done and the pending-ness lives
-    on the alert. This is NOT the `wait_for_human` workflow gate — that is a
+    on the alert. With no approver to route to, the row is failed instead
+    (terminal, no retry) so the request is never silently lost. This is NOT the `wait_for_human` workflow gate — that is a
     separate primitive with its own table (`workflow_runs.status`), delivery
     path and resolver; an earlier version of this note conflated the two.
     Autonomous departments fire actions directly. The approver is
@@ -4096,14 +4097,22 @@ company_onboarding:
 
     A zero-principal roster is NOT a safe state, and an earlier revision of
     this note wrongly said it was. The lookups return None cleanly; several
-    consumers then degrade badly rather than refusing. scheduler/runner.py
-    calls mark_action_done OUTSIDE the assignee-is-not-None branch, so a
-    propose_only action with no approver is marked done with no alert and no
-    retry — the approval request is lost (issue #24). On the escalate path the
-    alert is skipped while dispatch continues. _deliver_to_principal drops the
-    outbound permanently; artifact_tools leaves routed_to_person_id null. Note archive_person has no
-    principal guard on either the route or the chat tool, so archiving the
-    principal reaches this state in one call.
+    consumers then degrade rather than refusing. A propose_only action with no
+    approver is failed terminally (max_attempts=0, last_error "propose_only
+    action has no approver to route to")
+    rather than marked done, so the request stays visible instead of vanishing
+    (issue #24 — it used to be marked done with no alert). On the escalate
+    path the alert is skipped while dispatch continues. _deliver_to_principal
+    drops the outbound permanently; artifact_tools leaves routed_to_person_id
+    null.
+
+    people_store.archive_person refuses the LAST active principal with
+    LastPrincipalError (the route answers 409, the archive_person chat tool
+    returns an error), so archiving cannot reach the zero-principal state; a
+    co-principal can still be archived while another remains. The guard sits
+    in the UPDATE's WHERE clause, not in a count read beforehand, so two
+    concurrent archives cannot both pass it. A zero-principal roster is now
+    reachable only by a direct database edit or a roster that never had one.
   org_structure_is_derived: |
     profile.org_structure.departments and .leadership_team are computed from
     the reviewed people and department tables at commit time

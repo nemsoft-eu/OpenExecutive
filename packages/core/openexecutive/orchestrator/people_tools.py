@@ -318,7 +318,7 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
             return _bad(
                 "is_principal cannot be cleared here. Demoting the principal "
                 "is an operator action against the database — and a roster "
-                "with no principal loses proposals silently (issue #24)."
+                "with no principal has no fallback approver."
             )
 
     preferred_channel = tool_input.get("preferred_channel", "any")
@@ -424,6 +424,16 @@ async def handle_archive_person(tool_input: dict[str, Any]) -> str:
         archived = people_store.archive_person(person_id)
         if archived:
             people_registry.invalidate()
+    except people_store.LastPrincipalError as exc:
+        # The same refusal as upsert_person's on is_principal: a chat turn
+        # (possibly steered by inbound content) must not be able to remove
+        # the operator's fallback authority and UI access.
+        _audit(
+            "archive_person", "write", False,
+            f"archive_person REFUSED id={person_id}: last active principal",
+            {"person_id": person_id, "archived": False},
+        )
+        return json.dumps({"error": str(exc)})
     except Exception as exc:
         logger.exception("archive_person: failed")
         _audit("archive_person", "write", False, f"archive_person FAILED id={person_id}: {exc}", {"error": str(exc)[:300]})

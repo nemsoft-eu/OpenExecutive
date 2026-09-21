@@ -262,22 +262,35 @@ async def _execute_action(
 
         if decision.action == "propose":
             # Surface to approver; do NOT dispatch the outbound message.
-            if decision.assignee_person_id is not None:
-                if decision.deliver_at is not None and decision.deliver_at > now:
-                    # Approver is outside their window — defer to next slot.
-                    reschedule_action(action.id, decision.deliver_at)
-                    logger.info(
-                        "scheduler: action %d deferred to %s (approver outside window)",
-                        action.id, decision.deliver_at.isoformat(),
-                    )
-                    return
-                propose_via_alert(
-                    department_slug=action.department,
-                    person_id=decision.assignee_person_id,
-                    summary=action.intent_text[:160],
-                    body=action.intent_text,
-                    suggested_action=_proposed_action_phrase(urgent=False),
+            if decision.assignee_person_id is None:
+                # Nobody can approve it (e.g. a zero-principal roster). Marking
+                # it done would lose the request silently; fail it terminally
+                # (max_attempts=0, no retry) so it stays visible as failed.
+                mark_action_failed_or_retry(
+                    action.id,
+                    "propose_only action has no approver to route to",
+                    max_attempts=0,
                 )
+                logger.warning(
+                    "scheduler: action %d (dept=%r) failed — propose_only with no approver",
+                    action.id, action.department,
+                )
+                return
+            if decision.deliver_at is not None and decision.deliver_at > now:
+                # Approver is outside their window — defer to next slot.
+                reschedule_action(action.id, decision.deliver_at)
+                logger.info(
+                    "scheduler: action %d deferred to %s (approver outside window)",
+                    action.id, decision.deliver_at.isoformat(),
+                )
+                return
+            propose_via_alert(
+                department_slug=action.department,
+                person_id=decision.assignee_person_id,
+                summary=action.intent_text[:160],
+                body=action.intent_text,
+                suggested_action=_proposed_action_phrase(urgent=False),
+            )
             mark_action_done(action.id)
             logger.info(
                 "scheduler: action %d proposed to person %s — not dispatched",

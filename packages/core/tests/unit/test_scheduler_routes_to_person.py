@@ -145,6 +145,36 @@ def test_propose_only_outside_window_reschedules() -> None:
 
 
 # ---------------------------------------------------------------------------
+# propose_only, no approver and no principal → failed, never marked done
+# ---------------------------------------------------------------------------
+
+def test_propose_only_without_approver_fails_visibly() -> None:
+    dept_store.seed_default_departments()
+    dept_store.update_department("finance", authority_level=AuthorityLevel.PROPOSE_ONLY)
+    # A roster with nobody holding a scope and no principal: the gate returns
+    # propose with assignee_person_id=None.
+    people_store.upsert_person(full_name="Staff")
+    dept_registry.invalidate()
+    people_registry.invalidate()
+
+    action = _make_action(department="finance")
+
+    with patch(
+        "openexecutive.orchestrator.executive.Executive.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        asyncio.run(_execute_action(action, gateway=None))
+
+    mock_chat.assert_not_called()
+    assert alert_store.list_alerts() == []
+    updated = episodic.get_scheduled_action(action.id)
+    assert updated is not None
+    # Terminal on the first attempt: failed, not done and not re-queued.
+    assert updated.status == "failed"
+    assert "no approver" in updated.last_error
+
+
+# ---------------------------------------------------------------------------
 # __internal__ channel → no dispatch, action done
 # ---------------------------------------------------------------------------
 
