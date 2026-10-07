@@ -488,3 +488,53 @@ async def test_eod_digest_keeps_a_repair_that_grounds_it(monkeypatch: pytest.Mon
     [row] = rows
     assert row["details"]["repaired"] is True  # type: ignore[index]
     assert row["details"]["held_back"] == []  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_solo_sections_are_left_out_of_a_shared_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`principal_due_soon` and `build_top_three` both resolve the lowest-id
+    principal and take no recipient, so on a solo workspace with
+    co-principals — where the brief is generated SHARED and fanned out to all
+    of them — they would put one founder's own commitments and their calendar
+    event titles in the other's DM. Gated on `_private_ok`, like the
+    calendar read directly below them."""
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+
+    due_calls: list[object] = []
+    top_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        top_calls.append(_due)
+        return [], None
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    # Shared run (no PRINCIPAL_DELIVERY): neither principal-keyed read fires.
+    [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert (due_calls, top_calls) == ([], [])
+
+    # The sole-principal run still gets them — that is the whole solo brief.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+    assert len(due_calls) == 1 and len(top_calls) == 1

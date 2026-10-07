@@ -282,3 +282,18 @@ def test_reasoning_effort_logged_once_per_slug(
     _run_create(provider)
     assert fake_logger.info.call_count == 1
     assert fake_logger.info.call_args.args[1:] == ("low", "llama3.3")
+
+
+def test_the_sampling_opt_out_is_per_field() -> None:
+    """`LOCAL_TEMPERATURE=off` alone still sends top_p, and a backend that
+    rejects sampling rejects whichever field is left — so .env.example tells
+    operators to set both. Pinned as a contract rather than coupled: making
+    one key suppress the other would render a deliberately set LOCAL_TOP_P
+    silently inert."""
+    captured = _run_create(_local_provider(temperature=None, top_p=0.8))
+    assert "temperature" not in captured["json"]
+    assert captured["json"]["top_p"] == 0.8
+
+    both_off = _run_create(_local_provider(temperature=None, top_p=None))
+    assert "temperature" not in both_off["json"]
+    assert "top_p" not in both_off["json"]

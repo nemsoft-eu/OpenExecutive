@@ -637,3 +637,39 @@ def test_the_daily_chain_is_unchanged_by_the_weekly_dedupe() -> None:
     first = runner._enqueue_next_principal_brief("principal_brief_morning", after)
     second = runner._enqueue_next_principal_brief("principal_brief_morning", after)
     assert first is not None and second is not None and first != second
+
+
+def test_co_principals_do_not_see_each_others_commitments(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`principal_due_soon` is keyed to `find_principal_person()` — the
+    lowest-id row — and the scheduler fans the solo weekly review out to every
+    active principal, so including it would hand one founder the other's own
+    commitments and the asks their contacts made of them."""
+    from openexecutive.people import store as people_store
+
+    _solo()
+    _stub_models(monkeypatch)
+    called = False
+
+    def _should_not_be_read(**_kw: object) -> list[dict[str, object]]:
+        nonlocal called
+        called = True
+        return [
+            {"loop_id": 4, "description": "Send Ada's revised invoice", "due_at": "",
+             "due_date": "2026-09-23", "state": "overdue"},
+        ]
+
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon", _should_not_be_read
+    )
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+    assert len(people_store.active_principals()) == 2
+
+    artifact = _artifact(_run())
+
+    assert called is False  # not even read, so it cannot leak
+    assert "Send Ada's revised invoice" not in artifact
+    # The section keeps its shape rather than vanishing.
+    assert "_Nothing overdue or due in the next week._" in artifact

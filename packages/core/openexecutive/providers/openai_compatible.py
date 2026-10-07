@@ -210,7 +210,11 @@ class OpenAICompatibleProvider:
         ``reasoning_effort`` as xhigh, but it also substitutes
         temperature/top_p 1.0 over the Modelfile when they are missing, and
         that substitution is the regression these defaults exist to stop. An
-        operator who wants neither sets ``LOCAL_TEMPERATURE=off``.
+        operator who wants neither sets BOTH ``LOCAL_TEMPERATURE=off`` and
+        ``LOCAL_TOP_P=off``: they are independent switches, so turning off
+        only one still sends the other, and a backend that rejects sampling
+        rejects whichever is left. Coupling them would mean a set
+        ``LOCAL_TOP_P`` being silently ignored because of an unrelated key.
 
         Only the CONFIGURED values are withheld; a value the caller passed is
         left alone. ``response_gate`` sends ``temperature=0`` because the

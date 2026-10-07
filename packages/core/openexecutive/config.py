@@ -327,7 +327,10 @@ class Settings(BaseSettings):
     # Bounded here rather than at the server: an out-of-range value comes
     # back as an opaque 400 mid-turn, long after the typo.
     #
-    # `off` (or `none`) is the opt-out, and it needs a WORD rather than a
+    # `off` (or `none`) is the opt-out, PER FIELD — suppressing sampling
+    # altogether means setting both, and `.env.example` says so. Coupling
+    # them would make a deliberately set LOCAL_TOP_P silently inert because
+    # of an unrelated key. It needs a WORD rather than a
     # blank: `env_ignore_empty=True` above drops `LOCAL_TEMPERATURE=` before
     # validation, so a blank falls back to this default and the `| None` in
     # the annotation would be unreachable from a `.env` — which is the shape

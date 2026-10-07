@@ -198,7 +198,13 @@ class MorningBriefWorkflow(Workflow):
             logger.exception("morning_brief: /today aggregation failed")
             today_data = {"departments": [], "people": [], "proposals": []}
         top_three_calendar = False
-        if mode == "solo":
+        # `private_ok`, not just `mode`: both reads below are keyed to
+        # `find_principal_person()` — the lowest-id row — and neither takes a
+        # recipient. On a solo workspace with co-principals the brief is
+        # generated SHARED and fanned out to all of them, so including these
+        # would put one founder's own commitments, the asks their contacts
+        # made of them, and their calendar event titles in the other's DM.
+        if mode == "solo" and private_ok:
             # What the principal owns that is due this week or overdue — their
             # dated commitments. It lands here even when no channel reaches
             # them for a nudge. Never raises (reads as empty on failure).

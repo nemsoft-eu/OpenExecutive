@@ -951,7 +951,21 @@ def test_solo_morning_brief_carries_the_due_items(
     async def _drain(mode: str) -> None:
         captured.clear()
         ws.restore_workspace_settings(ws.WorkspaceSettings(mode=mode))  # type: ignore[arg-type]
-        [e async for e in MorningBriefWorkflow().run(MorningBriefInput(force_full=True), MagicMock())]
+        # As the scheduler runs it for a sole principal. `due_soon` is keyed
+        # to `find_principal_person()`, so it is only read when the brief is
+        # being generated for that one person — see `morning_brief._private_ok`.
+        from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+        token = PRINCIPAL_DELIVERY.set(True)
+        try:
+            [
+                e
+                async for e in MorningBriefWorkflow().run(
+                    MorningBriefInput(force_full=True), MagicMock()
+                )
+            ]
+        finally:
+            PRINCIPAL_DELIVERY.reset(token)
 
     asyncio.run(_drain("solo"))
     assert [d["description"] for d in captured["today_data"]["due_soon"]] == [

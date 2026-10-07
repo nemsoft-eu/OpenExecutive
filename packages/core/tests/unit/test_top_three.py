@@ -393,6 +393,26 @@ def _brief() -> list[Any]:
     return asyncio.run(_go())
 
 
+def _solo_brief() -> list[Any]:
+    """As the scheduler runs it for a SOLE principal, which is the only way the
+    top three ships: both it and `due_soon` resolve `find_principal_person()`
+    and take no recipient, so `morning_brief._private_ok` holds them back when
+    the brief is being generated for more than one founder.
+
+    Separate from `_brief` on purpose — setting the flag also unlocks the
+    private calendar read, which the team test above asserts is absent."""
+    from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+    async def _go() -> list[Any]:
+        token = PRINCIPAL_DELIVERY.set(True)
+        try:
+            return [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+        finally:
+            PRINCIPAL_DELIVERY.reset(token)
+
+    return asyncio.run(_go())
+
+
 def test_solo_brief_with_a_calendar_gets_slots_and_the_days_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,7 +423,7 @@ def test_solo_brief_with_a_calendar_gets_slots_and_the_days_events(
     monkeypatch.setattr(
         "openexecutive.orchestrator.calendar_tools.is_business_day", lambda _d: True
     )
-    _brief()
+    _solo_brief()
     (call,) = calls
     context = call["messages"][0]["content"]
     assert call["system"] == STANDALONE_BRIEF_SOLO_SYSTEM
@@ -419,7 +439,7 @@ def test_solo_brief_without_a_calendar_has_no_slots(monkeypatch: pytest.MonkeyPa
     _seed_solo_state()
     calls = _stub_brief(monkeypatch)
     _connect(monkeypatch, None)
-    _brief()
+    _solo_brief()
     context = calls[0]["messages"][0]["content"]
     assert "TOP THREE TODAY" in context
     assert "suggested slot" not in context and "no free block" not in context
