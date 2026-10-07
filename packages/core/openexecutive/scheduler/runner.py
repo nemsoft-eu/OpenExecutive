@@ -1926,9 +1926,20 @@ async def deliver_to_each_principal(
     same list it gated on: the principal brief decides
     ``PRINCIPAL_DELIVERY`` from the roster and then spends minutes
     generating, so re-reading here would hand a founder added inside that
-    window a brief built as private to someone else. The audience is pinned
-    in both directions — a principal archived mid-run still gets this one,
-    and a roster change takes effect from the next brief.
+    window a brief built as private to someone else.
+
+    It is an upper bound, not a licence. The list is intersected with the
+    roster as it stands NOW, by person id, and the live row's channel fields
+    are the ones used. So the audience can only ever shrink between gating
+    and sending: nobody is added (the content was gated on the pinned list),
+    and anyone archived or demoted inside the window drops out. Pinning in
+    both directions was the wrong call — a brief generated as private to a
+    sole principal carries their mail, calendar, notes and drafts, and
+    ``handle_send_slack_dm`` has no unconditional roster gate (unlike the
+    Discord and Telegram handlers, which refuse a non-rostered id outright),
+    so an offboarded founder would still have received it on Slack. Re-reading
+    the row also means a ``slack_user_id`` changed mid-run is not used to DM
+    whoever now holds the old id.
 
     Returns one result PER RECIPIENT rather than a single verdict, on
     purpose. ``brief_state.record_delivery_outcome`` stores one
@@ -1944,10 +1955,17 @@ async def deliver_to_each_principal(
     point retrying the same misconfiguration on the next tick — and audits
     the failure instead.
     """
-    if recipients is None:
-        from openexecutive.people import store as people_store
+    from openexecutive.people import store as people_store
 
-        recipients = people_store.active_principals()
+    live = people_store.active_principals()
+    if recipients is None:
+        recipients = live
+    else:
+        # Intersect on id and take the LIVE row: see the docstring. A pinned
+        # row with no id cannot be revalidated, and cannot have come from
+        # `active_principals()` either, so it is dropped rather than trusted.
+        by_id = {p.id: p for p in live if p.id is not None}
+        recipients = [by_id[p.id] for p in recipients if p.id is not None and p.id in by_id]
     return [(p, await deliver_to_person(p, text, label=label)) for p in recipients]
 
 
@@ -2225,7 +2243,9 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         else:
             sending = True
             # `recipients`, not a fresh lookup: the audience that gated the
-            # content has to be the audience that receives it.
+            # content caps the audience that receives it. The fan-out still
+            # re-reads each row, so a founder offboarded while this was
+            # generating drops out instead of being sent a private brief.
             sends = await deliver_to_each_principal(
                 artifact, label=workflow.title, recipients=recipients
             )

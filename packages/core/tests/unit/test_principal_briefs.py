@@ -915,3 +915,83 @@ def test_no_principal_at_all_is_recorded_as_no_owner(
     assert brief_state.last_delivered("principal_brief_morning") is None
     outcome = brief_state.last_delivery_outcome()
     assert outcome is not None and (outcome.reason, outcome.channel) == ("no_owner", None)
+
+
+def test_a_founder_offboarded_while_the_brief_runs_does_not_get_the_private_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror of the test above, and the direction that leaks. Pinning the
+    audience in BOTH directions meant a sole principal archived mid-run still
+    received a brief built as private to them — their mail, calendar, notes and
+    drafts — and `handle_send_slack_dm` has no unconditional roster gate to
+    catch it downstream (Discord and Telegram do). The pinned list is an upper
+    bound, so the audience may shrink but never grow."""
+    from openexecutive.briefing import brief_state
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import (
+        PRINCIPAL_DELIVERY,
+        MorningBriefInput,
+        MorningBriefWorkflow,
+    )
+
+    class _OffboardsTheFounderMidRun(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            assert PRINCIPAL_DELIVERY.get() is True  # one principal: private
+            only = people_store.active_principals()[0]
+            assert only.id is not None
+            people_store.archive_person(only.id)
+            yield WorkflowEvent(type="result", data={
+                "brief_fingerprint": "fp-123", "private_to_principal": True,
+            })
+            yield WorkflowEvent(type="artifact", content="PRIVATE BRIEF")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    sends = _run_brief(
+        tmp_path, monkeypatch, workflow=_OffboardsTheFounderMidRun(), principals=1
+    )
+
+    assert sends == []  # nothing goes to the offboarded founder
+    assert people_store.active_principals() == []
+    # An empty audience is the no-owner case, which is what the Setup page reads.
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and (outcome.reason, outcome.channel) == ("no_owner", None)
+
+
+def test_a_channel_changed_while_the_brief_runs_uses_the_new_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned row's channel fields are stale too. Sending to the Slack id
+    captured before the run would DM whoever holds the old id now."""
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import MorningBriefInput, MorningBriefWorkflow
+
+    class _MovesTheFoundersSlackMidRun(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            only = people_store.active_principals()[0]
+            assert only.id is not None and only.slack_user_id == "U0"
+            people_store.update_person(only.id, slack_user_id="U-MOVED")
+            yield WorkflowEvent(type="result", data={"brief_fingerprint": "fp-123"})
+            yield WorkflowEvent(type="artifact", content="BRIEF")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    captured: list[str | None] = []
+
+    async def _see_the_person(person, text: str, **_kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        captured.append(person.slack_user_id)
+        return runner.PrincipalDelivery(True, "slack_dm → sent", "delivered", "slack_dm")
+
+    _run_brief(
+        tmp_path,
+        monkeypatch,
+        workflow=_MovesTheFoundersSlackMidRun(),
+        deliver_person=_see_the_person,
+        principals=1,
+    )
+
+    assert captured == ["U-MOVED"]
