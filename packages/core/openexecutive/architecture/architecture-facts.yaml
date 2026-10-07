@@ -7398,15 +7398,24 @@ integrations:
     name; _fetch never logs a URL (Telegram's carries the token), and the
     Telegram token must match \d+:[A-Za-z0-9_-]{30,} before it is put in
     one. Daily brief (check_brief, id "brief", after the scheduler): off
-    with the scheduler; amber with no owner (link /people) or nowhere to
-    send it (runner.delivery_order empty — link /people/<owner id>); red
-    when the latest brief's send failed or it couldn't be written
-    (brief_state.current_problem); amber, naming them, when any OTHER
-    active principal has no channel (runner.unreachable_principals over
-    the snapshot's own roster — "Not reaching everyone: nothing is set up
-    to send it to Grace", link /people/<their id>), ranked below the red
-    states because a brief that reached one founder was still sent; amber
-    when the last brief got through
+    with the scheduler; amber with no owner (link /people); amber "Kept in
+    the app only" when NO active principal can be reached (the owner's
+    runner.delivery_order empty AND runner.unreachable_principals covers
+    the whole roster — link /people/<owner id>), the one state where
+    DELIVERY_PROBLEMS' "send it to you" is true for whoever is reading;
+    red when the latest brief's send failed or it couldn't be written
+    (brief_state.current_problem); amber, naming them, when SOME active
+    principal has no channel while another does (runner.unreachable_principals
+    over the snapshot's own roster, which is what active_principals() reads —
+    "Not reaching everyone: nothing is set up to send it to Grace", link
+    /people/<their id>), ranked below the red states because a brief that
+    reached one founder was still sent. That set includes the OWNER'S own
+    row: find_principal_person() is the lowest id, so when the unconnected
+    founder is that row the brief is still going out daily to the
+    co-principal, and the old "nowhere to send it" verdict read from the
+    owner's plan alone was false in both directions. Past that branch
+    delivery_order is non-empty, which is what the channel states below
+    index. Amber when the last brief got through
     on a later channel than the first one tried (that channel is broken:
     names it and points at its light); amber when nobody chose a time
     zone (no workspace zone and USER_TIMEZONE unset or UTC), saying the

@@ -357,6 +357,33 @@ def test_a_failed_send_still_outranks_an_unreachable_co_principal() -> None:
     assert check.summary == "Your last morning brief wasn't sent: every way of sending it failed."
 
 
+def test_an_unreachable_first_founder_is_named_while_the_brief_still_goes_out() -> None:
+    """The mirror of the bug above: `snap.principal` is the lowest-id row, so
+    when the unreachable founder is that one, judging "nowhere to send it"
+    from their plan alone claims the brief reaches nobody — while it is in
+    fact going to the co-principal every day."""
+    people = [
+        Person(id=3, full_name="Ada", is_principal=True),  # nothing connected
+        Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7"),
+    ]
+    check = check_brief(_snap(people=people, principal=people[0], brief_email_ready=False))
+    assert check.state == "warn"
+    assert check.summary == "Not reaching everyone: nothing is set up to send it to Ada."
+    assert check.link == "/people/3"
+
+
+def test_an_unreachable_roster_is_still_app_only() -> None:
+    people = [
+        Person(id=3, full_name="Ada", is_principal=True),
+        Person(id=7, full_name="Grace", is_principal=True),
+    ]
+    check = check_brief(_snap(people=people, principal=people[0], brief_email_ready=False))
+    assert check.state == "warn"
+    # Nobody can be reached, so "to you" is true for whoever is reading.
+    assert check.summary == "Kept in the app only: nothing is set up to send it to you."
+    assert check.link == "/people/3"
+
+
 def test_a_reachable_roster_leaves_the_light_green() -> None:
     people = [
         Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io"),

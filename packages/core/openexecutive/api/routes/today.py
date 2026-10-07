@@ -2010,9 +2010,11 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     tags=["today"],
 )
 async def get_brief_delivery(request: Request) -> BriefDeliveryNotice | None:
-    """The latest morning brief or end-of-day digest that didn't reach the
-    owner and still has a problem to fix, or null. Only the owner is told:
-    anyone else gets null, since it is about the owner's channels."""
+    """The latest morning brief or end-of-day digest that didn't reach every
+    principal and still has a problem to fix, or null. Only a principal is
+    told: anyone else gets null, since it is about the principals' channels.
+    With co-principals it may be about a founder other than the reader, and
+    says whose channel is missing rather than "you"."""
     from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
 
     if not await asyncio.to_thread(_caller_is_principal_or_unclaimed, request):

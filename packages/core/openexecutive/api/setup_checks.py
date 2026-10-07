@@ -1001,7 +1001,17 @@ def check_brief(snap: Snapshot) -> SetupCheck:
         problem, fix = DELIVERY_PROBLEMS["no_owner"]
         return _result("brief", "warn", f"Not sent: {problem}.", fix, link="/people")
     plan = delivery_order(principal, email_ready=snap.brief_email_ready)
-    if not plan:
+    # The briefs go out one DM per active principal, so every state below is
+    # about the whole roster, not `snap.principal`'s row. `snap.people` IS
+    # what `active_principals()` reads — both are `list_people()` (team, not
+    # archived) filtered on `is_principal`.
+    principals = [p for p in snap.people if p.is_principal]
+    missing = unreachable_principals(principals, email_ready=snap.brief_email_ready)
+    if not plan and len(missing) >= len(principals):
+        # Nobody can be reached, so the brief really is app-only. With some
+        # founder reachable it is not, even when this row is the unreachable
+        # one, so that case falls through to the partial below rather than
+        # telling the reader nothing can reach "you".
         problem, fix = DELIVERY_PROBLEMS["no_channel"]
         return _result(
             "brief",
@@ -1011,22 +1021,16 @@ def check_brief(snap: Snapshot) -> SetupCheck:
             link=f"/people/{principal.id}",
         )
     last = snap.brief_delivery
-    # `can_deliver=True`: `plan` is non-empty, so this principal can be
-    # reached. A co-principal who cannot is reported below instead — it is
-    # not "your last brief wasn't sent", and it outlives any one run.
+    # `can_deliver=True`: some principal can be reached, so a recorded
+    # `no_channel` is not the whole story. A founder who cannot is reported
+    # below instead — it is not "your last brief wasn't sent", and it
+    # outlives any one run.
     reason = current_problem(last, has_owner=True, can_deliver=True)
     if last is not None and reason is not None:
         problem, fix = DELIVERY_PROBLEMS[reason]
         return _result(
             "brief", "error", f"Your last {brief_name(last.kind)} wasn't sent: {problem}.", fix
         )
-    # `plan` above is this principal's. The briefs go out one DM per active
-    # principal, so a co-founder with nothing connected misses every brief
-    # while this light stays green on the other's success. `snap.people` is
-    # the roster `active_principals()` reads (team, not archived).
-    missing = unreachable_principals(
-        [p for p in snap.people if p.is_principal], email_ready=snap.brief_email_ready
-    )
     if missing:
         problem, fix = partial_delivery_problem([p.full_name for p in missing])
         return _result(
@@ -1036,6 +1040,8 @@ def check_brief(snap: Snapshot) -> SetupCheck:
             fix,
             link=f"/people/{missing[0].id}" if missing[0].id else "/people",
         )
+    # `plan` is non-empty from here: an empty one puts `principal` in
+    # `missing`, which the branch above returns on.
     if last is not None and last.channel and last.channel != plan[0]:
         # It got through, but not on the first channel it tried: that one is
         # broken, and every brief is going by the backup.
