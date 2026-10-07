@@ -1992,8 +1992,12 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
         return None
     problem, fix = DELIVERY_PROBLEMS[reason]
     if reason == "no_channel" and len(unreachable) < len(principals):
-        # Some founder did get it, so the "send it to you" copy would be
-        # wrong for whoever is reading the notice. Name who is missing out.
+        # Someone on the roster CAN be reached, so "nothing is set up to send
+        # it to you" may well be false for whoever is reading; name who is
+        # missing out instead. This is the roster as it stands now, not a
+        # claim about the recorded run — `current_problem` judges `no_channel`
+        # from the present for exactly that reason, so a founder added since
+        # the run counts, and the fix named is the one still outstanding.
         problem, fix = partial_delivery_problem([p.full_name for p in unreachable])
     return BriefDeliveryNotice(
         brief=brief_name(last.kind),

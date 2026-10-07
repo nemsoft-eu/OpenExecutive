@@ -1021,16 +1021,21 @@ def check_brief(snap: Snapshot) -> SetupCheck:
             link=f"/people/{principal.id}",
         )
     last = snap.brief_delivery
-    # `can_deliver=True`: some principal can be reached, so a recorded
-    # `no_channel` is not the whole story. A founder who cannot is reported
-    # below instead — it is not "your last brief wasn't sent", and it
-    # outlives any one run.
-    reason = current_problem(last, has_owner=True, can_deliver=True)
-    if last is not None and reason is not None:
+    # `can_deliver` carries the roster-wide answer the function documents, so
+    # this surface and the Briefing notice mean the same thing by it. Only the
+    # run-scoped reasons are rendered here: `no_channel` is the partial state
+    # below, which says who is missing out instead of "your last brief wasn't
+    # sent" — it is not about one run, and the brief did reach someone.
+    reason = current_problem(last, has_owner=True, can_deliver=not missing)
+    if last is not None and reason in ("send_failed", "not_written"):
         problem, fix = DELIVERY_PROBLEMS[reason]
         return _result(
             "brief", "error", f"Your last {brief_name(last.kind)} wasn't sent: {problem}.", fix
         )
+    # Ranked above the channel and time-zone warnings below: those are about
+    # how and when a brief that IS arriving goes out, while this founder gets
+    # none at all. Both of those are `warn` too, so the light's colour is the
+    # same either way — only one summary fits, and this is the worse news.
     if missing:
         problem, fix = partial_delivery_problem([p.full_name for p in missing])
         return _result(

@@ -27,6 +27,12 @@ Briefing's "not sent" notice and the Setup status page read it back through
 (``scheduler.runner.unreachable_principals``) and not just the lowest-id row:
 the briefs fan out, so a recorded partial failure has to survive the other
 founder's working channel.
+
+The record holds ONE reason and channel for a run that may have had several
+recipients, so it says that something went wrong, never to whom. That is why
+only ``no_channel`` can be re-phrased per person (``partial_delivery_problem``,
+from the roster as it stands now); ``send_failed`` and ``not_written`` are
+still reported as if the brief reached nobody.
 """
 from __future__ import annotations
 
@@ -171,9 +177,18 @@ DELIVERY_PROBLEMS: dict[str, tuple[str, str]] = {
 }
 
 
+_NAMELESS = "someone on the People list"
+
+
 def _and_list(names: Sequence[str]) -> str:
-    """``"Ada"``, ``"Ada and Grace"``, ``"Ada, Grace and Lin"``."""
-    items = [n for n in names if n.strip()] or ["someone on the People list"]
+    """``"Ada"``, ``"Ada and Grace"``, ``"Ada, Grace and Lin"``.
+
+    A blank name is DESCRIBED, never dropped: ``full_name`` has no
+    ``min_length``, and filtering the blanks out would quietly shorten the
+    list — telling a founder about one unreached co-principal when there are
+    two is the same silent omission this whole surface exists to prevent.
+    """
+    items = [n.strip() or _NAMELESS for n in names] or [_NAMELESS]
     if len(items) == 1:
         return items[0]
     return f"{', '.join(items[:-1])} and {items[-1]}"
@@ -271,6 +286,13 @@ def current_problem(
     lowest-id one — the briefs fan out, so a co-principal with nothing
     connected misses all of them while the other's channel would otherwise
     clear the reason here (``scheduler.runner.unreachable_principals``).
+    Both callers pass that roster-wide answer.
+
+    ``no_channel`` therefore says only "somebody who should get this cannot",
+    never which run or how many: with co-principals a brief that reached one
+    founder still reports it. A caller that distinguishes "nobody at all" from
+    "not everyone" must compare the unreachable list against the roster
+    itself and phrase the two differently — see ``partial_delivery_problem``.
     """
     if outcome is None or outcome.reason == "delivered":
         return None

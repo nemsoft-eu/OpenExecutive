@@ -384,6 +384,31 @@ def test_an_unreachable_roster_is_still_app_only() -> None:
     assert check.link == "/people/3"
 
 
+def test_an_unreached_founder_outranks_the_channel_and_zone_warnings() -> None:
+    """All three are `warn`, and only one summary fits. A founder getting no
+    brief at all is worse news than a backup channel carrying one, or than
+    the briefs running on UTC, so it is the one that shows."""
+    ada = Person(
+        id=3,
+        full_name="Ada",
+        is_principal=True,
+        email="ada@acme.io",
+        preferred_channel="slack",
+        slack_user_id="U3",
+    )
+    people = [ada, Person(id=7, full_name="Grace", is_principal=True)]
+    # Slack was tried first and failed; email carried it. And no time zone.
+    backup = DeliveryOutcome(MORNING, "delivered", "email", NOW)
+    snap = _snap(people=people, principal=ada, brief_delivery=backup, brief_zone=None)
+    check = check_brief(snap)
+    assert check.state == "warn"
+    assert check.summary == "Not reaching everyone: nothing is set up to send it to Grace."
+    # Both masked warnings still show once Grace can be reached.
+    people[1] = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    solo = check_brief(_snap(people=people, principal=ada, brief_delivery=backup, brief_zone=None))
+    assert solo.summary.startswith("Your last morning brief went by email")
+
+
 def test_a_reachable_roster_leaves_the_light_green() -> None:
     people = [
         Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io"),
@@ -399,6 +424,10 @@ def test_a_reachable_roster_leaves_the_light_green() -> None:
         (["Ada", "Grace"], "Ada and Grace"),
         (["Ada", "Grace", "Lin"], "Ada, Grace and Lin"),
         ([""], "someone on the People list"),  # a nameless row is never given its id
+        # A blank name among named ones is described, not dropped: shortening
+        # the list would hide one of the founders missing out.
+        (["Grace", "   "], "Grace and someone on the People list"),
+        (["", ""], "someone on the People list and someone on the People list"),
     ],
 )
 def test_the_unreached_are_named_in_a_readable_list(names: list[str], expected: str) -> None:
