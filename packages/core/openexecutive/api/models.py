@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+
+from openexecutive.memory.workspace_settings import RoleKind
 
 
 class PageFormField(BaseModel):
@@ -56,6 +58,44 @@ class ChatRequest(BaseModel):
     committee_review: bool = False
     # Set by the Ask OE side panel only; absent on the main chat page.
     page_context: PageContext | None = None
+    # Client-minted id for THIS turn, so the client can address it via
+    # POST /chat/stop from the moment Send is pressed. It is deliberately not
+    # the audit `turn_id` (that keeps its server-minted `t-` shape, which audit
+    # queries filter on) — see `_clean_client_turn_id` in api/routes/chat.py.
+    # Bounded, but deliberately NOT pattern-validated here: a malformed id only
+    # means this turn can't be stopped, and 422-ing the whole chat turn over it
+    # would contradict `_clean_client_turn_id`, which drops it and carries on.
+    # The max_length is a size bound, not a format check.
+    client_turn_id: str | None = Field(None, max_length=64)
+    # The caller's own words for this turn, when `message` carries text the
+    # caller did not write — a briefing handoff seeds the turn with the
+    # Executive's own card body. Peer memory records it, and episodic
+    # extraction and open loops quote commitments from it. Absent → `message`.
+    # Recorded under the caller's own peer and, like `message` would be, in
+    # the shared memory of each department consulted that turn; it is not in
+    # the transcript, so the chat_turn audit row keeps it next to `message`.
+    memory_text: str | None = Field(None, min_length=1, max_length=2000)
+
+
+class StopChatRequest(BaseModel):
+    """Body of POST /chat/stop — the `client_turn_id` sent with the turn."""
+
+    client_turn_id: str = Field(
+        ..., min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$"
+    )
+
+
+class AddChatMessageRequest(BaseModel):
+    """Body of POST /chat/add — a message for a turn that is still running."""
+
+    client_turn_id: str = Field(
+        ..., min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$"
+    )
+    # Client-minted, echoed back in the stream's `message_added` event.
+    message_id: str = Field(
+        ..., min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$"
+    )
+    message: str = Field(..., min_length=1, max_length=32000)
 
 
 class ChatResponse(BaseModel):
@@ -81,11 +121,15 @@ class OnboardAnswerRequest(BaseModel):
 
 class OnboardStatusResponse(BaseModel):
     session_id: str
+    # The step's place among the steps this wizard asks — a solo workspace
+    # skips the team steps, so this is not an index into WIZARD_STEPS.
     current_step: int
     total_steps: int
     current_question: str | None
     progress_percent: int
     completed: bool
+    # Whether the current step can be skipped.
+    optional: bool = False
 
 
 class DocumentUploadResponse(BaseModel):
@@ -100,6 +144,15 @@ class CompanyDocContent(BaseModel):
     content: str
 
 
+class SyncedDocContent(BaseModel):
+    """One Google Drive file or Notion page as the knowledge base stored it."""
+
+    id: str
+    name: str
+    url: str | None = None
+    content: str
+
+
 class HealthResponse(BaseModel):
     status: str
     builtin_knowledge_chunks: int
@@ -107,7 +160,23 @@ class HealthResponse(BaseModel):
     company_name: str | None = None
     builtin_skills: int = 0
     company_skills: int = 0
-    version: str = "0.1.0"
+    version: str = "0.5.2"  # x-release-please-version
+
+
+class VersionResponse(BaseModel):
+    """The running version and, when the update check is on, the latest release."""
+
+    current: str
+    latest: str | None = None
+    update_available: bool = False
+    release_url: str | None = None
+    check_enabled: bool = True
+
+
+class SkillWorkflowRef(BaseModel):
+    name: str
+    title: str
+    is_custom: bool = False
 
 
 class SkillMeta(BaseModel):
@@ -117,6 +186,10 @@ class SkillMeta(BaseModel):
     when_to_use: str
     source: str
     filename: str
+    customized: bool = False
+    hidden: bool = False
+    # Workflows whose steps follow this playbook (switched-off custom ones too).
+    used_by: list[SkillWorkflowRef] = []
 
 
 class SkillDetail(SkillMeta):
@@ -133,6 +206,50 @@ class SkillCreate(BaseModel):
 
 class SkillListResponse(BaseModel):
     skills: list[SkillMeta]
+
+
+class SkillDeleteResponse(BaseModel):
+    name: str
+    # "deleted" (company skill removed), "reverted" (customization removed,
+    # the built-in is back) or "hidden" (built-in hidden for this company).
+    outcome: Literal["deleted", "reverted", "hidden"]
+
+
+class SkillDraftOut(BaseModel):
+    """A playbook change the Executive proposed from chat, awaiting review."""
+
+    action: Literal["create", "update", "delete"]
+    name: str
+    category: str
+    description: str
+    when_to_use: str
+    body: str
+    proposed_at: str
+    # Version token: send it back to approve or discard exactly this draft.
+    id: str
+    # The playbook in effect now (None for a create) — what an update or
+    # delete would change.
+    current: SkillDetail | None = None
+    # Workflows that follow this name — for a create too, since a workflow
+    # may still name a playbook that was deleted.
+    followers: list[SkillWorkflowRef] = []
+
+
+class SkillDraftDecision(BaseModel):
+    id: str
+
+
+class SkillDraftListResponse(BaseModel):
+    drafts: list[SkillDraftOut]
+
+
+class SkillDraftApproval(BaseModel):
+    action: Literal["create", "update", "delete"]
+    name: str
+    # Set for an approved delete: deleted / reverted / hidden.
+    outcome: Literal["deleted", "reverted", "hidden"] | None = None
+    # Set for an approved create or update.
+    skill: SkillDetail | None = None
 
 
 class SkillSearchHit(BaseModel):
@@ -225,6 +342,81 @@ class CompanyProfileUpdateRequest(BaseModel):
     tickers: list[str] | None = None
 
 
+# ── workspace settings (/workspace) ──────────────────────────────────────────
+
+
+class WorkspaceResponse(BaseModel):
+    mode: Literal["solo", "team"]
+    # The zone the user set, or null when none is set.
+    timezone: str | None
+    # The zone in effect: `timezone`, else the USER_TIMEZONE setting, else UTC.
+    effective_timezone: str
+    # The principal's role (memory.workspace_settings.PrincipalRole); each is
+    # null when not set. Read by solo mode only.
+    role_kind: RoleKind | None = None
+    role_title: str | None = None
+    reports_to: str | None = None
+    remit: str | None = None
+    measured_on: str | None = None
+    # The company's own email domains: on one of them an address matches a
+    # teammate by its local part (people.identity). `company_domains_custom`
+    # is false when they are derived from the principal's addresses. Returned
+    # only to the principal, like the role; empty for anyone else.
+    company_domains: list[str] = Field(default_factory=list)
+    company_domains_custom: bool = False
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    """A partial update: only the fields present are changed. `timezone: null`
+    (or blank) clears the stored zone; `mode` may be omitted but not null.
+    The role fields work like `timezone`: null or blank clears one. Their
+    length caps are checked after trimming (ROLE_TEXT_MAX)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["solo", "team"] | None = None
+    timezone: str | None = Field(default=None, max_length=64)
+    role_kind: RoleKind | None = None
+    role_title: str | None = None
+    reports_to: str | None = None
+    remit: str | None = None
+    measured_on: str | None = None
+    # null (or []) goes back to deriving them from the principal's addresses.
+    company_domains: list[str] | None = None
+
+    @field_validator("company_domains", mode="before")
+    @classmethod
+    def _domains(cls, v: object) -> object:
+        from openexecutive.memory.workspace_settings import validate_company_domains
+
+        # Runs only when sent; the message never quotes the value.
+        return validate_company_domains(v)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _mode_not_null(cls, v: object) -> object:
+        # Runs only when the field is sent (defaults are not validated).
+        if v is None:
+            raise ValueError("mode must be 'solo' or 'team'")
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_zone(cls, v: str | None) -> str | None:
+        from openexecutive.memory.workspace_settings import validate_timezone
+
+        return validate_timezone(v)
+
+    @field_validator("role_kind", "role_title", "reports_to", "remit", "measured_on", mode="before")
+    @classmethod
+    def _role_field(cls, v: object, info: ValidationInfo) -> object:
+        from openexecutive.memory.workspace_settings import validate_role_field
+
+        # Runs only for fields that were sent; the message never quotes `v`.
+        assert info.field_name is not None
+        return validate_role_field(info.field_name, v)
+
+
 
 # ── conversational onboarding (/onboard/interview/*) ─────────────────────────
 
@@ -243,6 +435,17 @@ class OnboardMessageRequest(BaseModel):
     session_id: str
     # No Field(max_length=...) — see ONBOARD_MESSAGE_MAX_CHARS above.
     message: str
+
+
+class OnboardUnderstandingResponse(BaseModel):
+    """What the free-text description already says (see onboarding/understand.py)."""
+
+    mode: str | None = None
+    role_kind: str | None = None
+    role_title: str | None = None
+    reports_to: str | None = None
+    company: str | None = None
+    focus: str | None = None
 
 
 class OnboardSessionRequest(BaseModel):
@@ -305,3 +508,64 @@ class OnboardCommitRequest(BaseModel):
     profile: CompanyProfileUpdateRequest
     people: list[OnboardPersonDraft] = Field(default_factory=list)
     departments: list[OnboardDepartmentDraft] = Field(default_factory=list)
+    # The principal's sign-in email, confirmed by the user on the review
+    # screen (pre-filled from their own login). The one contact detail setup
+    # saves: without it the signed-in owner matches no Person, so their chat
+    # history stays empty until they add it on the People page. Never taken
+    # from the model's draft — the people drafts above still drop emails.
+    owner_email: str | None = None
+
+
+# ── /workflows/designer/* (conversational "New workflow" wizard) ─────────────
+# Bounded in the route, not with Field(max_length=...), so a rejection is a
+# fixed string instead of FastAPI's 422 echo of the whole message. The question
+# and transcript budgets live in workflows/designer.py, which enforces them.
+WORKFLOW_DESIGNER_MESSAGE_MAX_CHARS = 8_000
+
+
+class WorkflowDesignerStartRequest(BaseModel):
+    message: str
+
+
+class WorkflowDesignerEditRequest(BaseModel):
+    # A saved custom workflow's name (the same bound the definition enforces).
+    name: str = Field(max_length=64)
+
+
+class WorkflowDesignerMessageRequest(BaseModel):
+    session_id: str
+    message: str
+
+
+class WorkflowDesignerSessionRequest(BaseModel):
+    session_id: str
+
+
+class WorkflowDesignerTranscriptTurn(BaseModel):
+    role: str
+    text: str
+
+
+class WorkflowDesignerDraftResponse(BaseModel):
+    # A DynamicWorkflowDef dump — the exact body POST /workflows/custom takes.
+    definition: dict[str, Any]
+    summary: str = ""
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class WorkflowDesignerTurnResponse(BaseModel):
+    session_id: str
+    # "question" while designing, "draft" once a reviewable draft exists.
+    phase: str
+    questions_asked: int
+    max_questions: int
+    question: str | None = None
+    hint: str | None = None
+    options: list[str] = Field(default_factory=list)
+    draft: WorkflowDesignerDraftResponse | None = None
+    transcript: list[WorkflowDesignerTranscriptTurn] = Field(default_factory=list)
+    # Set when the session changes a saved workflow: its name, and the stored
+    # definition as it was when the session opened (what the draft is compared
+    # with). The draft is then saved with POST /workflows/custom/{editing}/save-edit.
+    editing: str | None = None
+    original: dict[str, Any] | None = None

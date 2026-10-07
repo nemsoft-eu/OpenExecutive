@@ -79,7 +79,16 @@ def test_route_parallel_ignores_a_stray_per_call_context() -> None:
     assert cso_mock.await_args.kwargs["context"] == "THE_TURN_CONTEXT"
 
 
-def test_route_to_specialist_passes_episodic_to_analyze() -> None:
+def test_route_to_specialist_passes_episodic_to_analyze(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openexecutive.orchestrator.router.load_company_stage", lambda: ""
+    )
+    monkeypatch.setattr(
+        "openexecutive.orchestrator.router.load_principal_role", lambda: ""
+    )
+    monkeypatch.setattr(
+        "openexecutive.memory.facts.render_facts_for_prompt", lambda: "STANDING FACTS — x"
+    )
     analyze_mock = AsyncMock(return_value="analysis result")
     with patch.object(SPECIALIST_REGISTRY["cso"], "analyze", analyze_mock):
         result = asyncio.run(
@@ -99,6 +108,9 @@ def test_route_to_specialist_passes_episodic_to_analyze() -> None:
         episodic_context="EPISODIC",
         failure_cases="",
         department_memory="",
+        company_stage="",
+        principal_role="",
+        standing_facts="STANDING FACTS — x",
         actor="specialist_workflow",
     )
 

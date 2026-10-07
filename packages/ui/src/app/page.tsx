@@ -2,17 +2,21 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
-import BrandMark from "@/components/BrandMark";
+import BriefDeliveryNotice, { useBriefDeliveryNotice } from "@/components/BriefDeliveryNotice";
 import Briefing from "@/components/Briefing";
 import Chat from "@/components/Chat";
 import DebugPanel from "@/components/DebugPanel";
 import Icon from "@/components/Icon";
-import RecentSessions from "@/components/RecentSessions";
-import SidebarNav from "@/components/SidebarNav";
+import { PROFILE_COPY } from "@/components/company-profile/profileCopy";
+import { useSessions } from "@/components/sessions/SessionsContext";
 import { MobileBottomNav } from "@/components/shell/AppShell";
-import { buildPrimaryNav, GUIDE_NAV_ITEM, SETTINGS_NAV_ITEM } from "@/components/shell/navConfig";
-import UserBadge from "@/components/UserBadge";
-import { ChatMessage, DebugEvent, ReviewStats, SessionSummary, deleteSession, getReviewStats, getSessionMessages, listSessions } from "@/lib/api";
+import AppSidebar from "@/components/shell/AppSidebar";
+import { profileWording } from "@/components/shell/navConfig";
+import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { useExecutiveStatus } from "@/components/executive/ExecutiveStatusContext";
+import PausedBanner from "@/components/executive/PausedBanner";
+import OverflowMenu from "@/components/ui/OverflowMenu";
+import { ChatMessage, DebugEvent, getSessionMessages } from "@/lib/api";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
@@ -22,19 +26,24 @@ interface HealthData {
   status: string;
 }
 
+// Upper bound on a `?draft=` seed — a deep link pre-fills a prompt, not a document.
+const MAX_DRAFT_PARAM_CHARS = 2000;
+
 export default function HomePage() {
   const { data: session } = useSession();
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
+  // What the profile is called here (a team's company; in solo, an owner's
+  // business or anyone else's work), for the no-profile banner.
+  const { mode: workspaceMode, role } = useWorkspace();
 
   const [health, setHealth] = useState<HealthData | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
   const activeTurnIdRef = useRef<string | null>(null);
   const [isTurnInFlight, setIsTurnInFlight] = useState(false);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const { sessions, loaded: sessionsLoaded, refresh: refreshSessions } = useSessions();
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>();
   const [activeMessages, setActiveMessages] = useState<ChatMessage[]>([]);
-  const [reviewStats, setReviewStats] = useState<ReviewStats | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   // Briefing-first landing: default to "briefing" so opening the app shows
   // what's been happening, not an empty chat. Switches to "chat" when the
@@ -44,6 +53,11 @@ export default function HomePage() {
   // Seeded into Chat's input when the user enters chat mode from a briefing
   // item. Cleared on every mode transition so it doesn't leak between turns.
   const [pendingPrompt, setPendingPrompt] = useState<string | undefined>(undefined);
+  // Companion to pendingPrompt: what peer memory records for the handoff turn.
+  const [pendingMemoryText, setPendingMemoryText] = useState<string | undefined>(undefined);
+  // Briefing handoffs auto-send pendingPrompt; a `?draft=` deep link only
+  // pre-fills it, since the text comes from a URL the user didn't type.
+  const [autoSubmitPending, setAutoSubmitPending] = useState(true);
 
   useEffect(() => {
     fetch("/api/backend/health")
@@ -52,35 +66,31 @@ export default function HomePage() {
       .catch(() => setHealth({ status: "error", company_profile_loaded: false }));
   }, []);
 
-  const refreshSessions = useCallback(() => {
-    listSessions()
-      .then(setSessions)
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    refreshSessions();
-  }, [refreshSessions]);
-
-  useEffect(() => {
-    getReviewStats().then(setReviewStats).catch(() => {});
-  }, []);
+  // Bumped by every navigation handler below. A session load that resolves
+  // after the user has already moved on (new chat, briefing, a hand-off, or
+  // another session) sees a stale generation and is dropped instead of
+  // yanking them into the old chat mid-turn.
+  const selectGenRef = useRef(0);
 
   const handleSelectSession = useCallback(async (sessionId: string) => {
+    const gen = ++selectGenRef.current;
     try {
       const msgs = await getSessionMessages(sessionId);
+      if (gen !== selectGenRef.current) return;
       setActiveSessionId(sessionId);
       setActiveMessages(msgs);
       setDebugEvents([]);
       setMobileNavOpen(false);
       setMode("chat");
       setPendingPrompt(undefined);
+      setPendingMemoryText(undefined);
     } catch {
       // ignore — session may not exist yet
     }
   }, []);
 
   const handleNewChat = useCallback(() => {
+    selectGenRef.current++;
     setActiveSessionId(undefined);
     setActiveMessages([]);
     setDebugEvents([]);
@@ -89,78 +99,92 @@ export default function HomePage() {
     setMobileNavOpen(false);
     setMode("chat");
     setPendingPrompt(undefined);
+    setPendingMemoryText(undefined);
   }, []);
 
   // Continue a briefing thread in chat — invoked when the user clicks a
   // Department card, proposal, or activity row. Switches mode to "chat"
   // and seeds the input with the briefing context. The user can edit
   // before sending, or just hit send.
-  const handleContinueFromBriefing = useCallback((prompt: string) => {
+  const handleContinueFromBriefing = useCallback((prompt: string, memoryText?: string) => {
+    selectGenRef.current++;
     setActiveSessionId(undefined);
     setActiveMessages([]);
     setDebugEvents([]);
     setMode("chat");
     setPendingPrompt(prompt);
+    setPendingMemoryText(memoryText);
+    setAutoSubmitPending(true);
   }, []);
 
   // Reset to the briefing view from anywhere. Used by the sidebar
   // brandmark/header — clicking it returns home from a chat session.
   const handleBackToBriefing = useCallback(() => {
+    selectGenRef.current++;
     setActiveSessionId(undefined);
     setActiveMessages([]);
     setDebugEvents([]);
     setMode("briefing");
     setPendingPrompt(undefined);
+    setPendingMemoryText(undefined);
     setMobileNavOpen(false);
   }, []);
 
-  const handleDeleteSession = useCallback(
-    async (sessionId: string) => {
-      if (!window.confirm("Delete this chat? This cannot be undone.")) return;
-      try {
-        await deleteSession(sessionId);
-      } catch (err) {
-        console.error(err);
-        window.alert("Failed to delete chat.");
-        return;
-      }
-      setActiveSessionId((current) => {
-        if (current === sessionId) {
-          setActiveMessages([]);
-          setDebugEvents([]);
-          return undefined;
-        }
-        return current;
-      });
-      refreshSessions();
-    },
-    [refreshSessions]
-  );
-
   const handleTurnComplete = useCallback((sessionId: string) => {
-    setActiveSessionId(sessionId);
+    // Only adopt a real id. A turn that ends without ever learning one (an
+    // aborted stream) would otherwise set this to "", which <Chat> reads as
+    // "the parent selected a different session" and clears the transcript
+    // with — losing the very reply the stop was meant to keep. The in-flight
+    // flag is cleared either way, so the Agent Activity panel never sticks.
+    if (sessionId) setActiveSessionId(sessionId);
     setIsTurnInFlight(false);
     refreshSessions();
   }, [refreshSessions]);
 
-  // Cross-route "New chat" entry: the AppShell rail and mobile bottom
-  // nav link to `/?new=1` from every inner route. When that param is
-  // present on mount, reset to a fresh chat and strip the query so a
-  // refresh doesn't reapply the action.
+  // Cross-route entries: from every inner route the sidebar and mobile
+  // bottom nav link to `/?new=1` (New chat) and `/?session=<id>` (a
+  // Recent chat, or a row on /chats). `/?new=1&draft=<text>` also seeds
+  // the new chat's input without sending it (Playbooks "Try in chat"). When either param is present on
+  // mount, apply it and strip the query so a refresh doesn't reapply it.
+  // A `session` id is held until the caller's own (owner-scoped) session
+  // list has loaded, and opened only if that list contains it: the id comes
+  // from the URL, and the per-session backend routes don't check ownership,
+  // so a crafted link must not open — or send turns into — someone else's
+  // conversation. It is also dropped if the user navigates first.
   //
   // Read directly from `window.location` rather than `useSearchParams`:
   // that hook opts the page out of static rendering in Next 15 unless
   // wrapped in <Suspense>, and the chat home is a heavy static page we
   // want to keep prerendered. The effect runs client-only anyway.
   const router = useRouter();
+  const deepLinkRef = useRef<{ sessionId: string; gen: number } | null>(null);
   useEffect(() => {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
+    const sessionParam = params.get("session");
+    const draftParam = params.get("draft");
     if (params.get("new") === "1") {
       handleNewChat();
+      if (draftParam) {
+        setPendingPrompt(draftParam.slice(0, MAX_DRAFT_PARAM_CHARS));
+        setAutoSubmitPending(false);
+      }
+      router.replace("/");
+    } else if (sessionParam) {
+      deepLinkRef.current = { sessionId: sessionParam, gen: selectGenRef.current };
       router.replace("/");
     }
   }, [handleNewChat, router]);
+
+  useEffect(() => {
+    const pending = deepLinkRef.current;
+    if (!pending || !sessionsLoaded) return;
+    deepLinkRef.current = null;
+    if (pending.gen !== selectGenRef.current) return;
+    if (sessions.some((s) => s.session_id === pending.sessionId)) {
+      void handleSelectSession(pending.sessionId);
+    }
+  }, [sessions, sessionsLoaded, handleSelectSession]);
 
   // Group debug events by turn_id. When we see a new turn_id, reset the
   // panel. Track the current turn_id in a ref — state updater functions
@@ -183,15 +207,27 @@ export default function HomePage() {
 
   const isOnboarded = health?.company_profile_loaded === true;
   const companyName = health?.company_name;
+  const profileCopy = PROFILE_COPY[profileWording(workspaceMode, role.role_kind)];
 
-  const reviewBadge = reviewStats != null ? reviewStats.pending + reviewStats.needs_revision : 0;
-  // Primary nav is built from the shared config in
-  // `components/shell/navConfig.ts` — the single source of truth the
-  // AppShell rail also uses, so the two navs can never drift. Admin /
-  // power tools are NOT here; they live on the Settings hub (linked from
-  // the footer below). "Today" is intentionally omitted — the Briefing
-  // button above is the in-app way back to that content.
-  const navSections = buildPrimaryNav({ isOnboarded, reviewBadge });
+  // The briefing's one banner slot shows the most important notice: paused,
+  // then no profile, then a brief that wasn't sent. With none, the briefing
+  // shows its quiet-day note there instead.
+  const { status: execStatus, unknown: execStatusUnknown } = useExecutiveStatus();
+  const deliveryNotice = useBriefDeliveryNotice();
+  const homeBanner = execStatus?.paused && !execStatusUnknown ? (
+    <div className="overflow-hidden rounded-2xl border border-amber-500/30 [&>div]:border-b-0">
+      <PausedBanner />
+    </div>
+  ) : !isOnboarded && health ? (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-accent/25 bg-accent/5 px-4 py-3">
+      <p className="text-[15px] text-fg-muted">{profileCopy.missingBanner}</p>
+      <Link href="/onboard" className="text-sm font-semibold text-accent hover:underline whitespace-nowrap">
+        Set up profile →
+      </Link>
+    </div>
+  ) : deliveryNotice ? (
+    <BriefDeliveryNotice notice={deliveryNotice} />
+  ) : undefined;
 
   return (
     <div className="flex h-full relative">
@@ -204,97 +240,23 @@ export default function HomePage() {
         />
       )}
 
-      {/* Sidebar — slides in on mobile, static on md+ */}
-      <aside
-        className={`
-          fixed top-8 bottom-0 left-0 z-40 w-64 md:w-56 md:top-0 flex-shrink-0
-          border-r border-line flex flex-col bg-surface-elevated
-          transform transition-transform duration-200
-          md:relative md:translate-x-0 md:transition-none
-          ${mobileNavOpen ? "translate-x-0" : "-translate-x-full"}
-        `}
-      >
-        {/* Logo — clicking returns to the briefing landing */}
-        <div className="px-4 py-5 border-b border-line flex items-center justify-between flex-shrink-0">
-          <button
-            type="button"
-            onClick={handleBackToBriefing}
-            aria-label="Back to briefing"
-            className="flex items-center gap-2.5 min-w-0 text-left cursor-pointer hover:opacity-80 transition-opacity"
-          >
-            <div className="flex-shrink-0">
-              <BrandMark size="sm" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-fg">Open Executive</p>
-              {companyName && (
-                <p className="text-xs text-fg-muted truncate">{companyName}</p>
-              )}
-            </div>
-          </button>
-          {/* Close button on mobile only */}
-          <button
-            type="button"
-            aria-label="Close menu"
-            onClick={() => setMobileNavOpen(false)}
-            className="md:hidden min-h-touch min-w-touch flex items-center justify-center text-fg-muted hover:text-fg cursor-pointer rounded-lg hover:bg-surface-overlay transition-colors"
-          >
-            <Icon name="close" size="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Nav region — own scroll; compresses/scrolls internally only when the
-            sidebar is too short, so Recent below always keeps a usable height */}
-        <div className="min-h-0 overflow-y-auto pt-3">
-        <SidebarNav
-          sections={navSections}
-          briefingActive={mode === "briefing"}
-          newChatActive={mode === "chat" && activeSessionId === undefined}
-          onBriefing={handleBackToBriefing}
-          onNewChat={handleNewChat}
-          onNavigate={() => setMobileNavOpen(false)}
-        />
-
-        </div>
-
-        {/* Recent conversations — date-grouped, searchable, own scroll region */}
-        <RecentSessions
-          sessions={sessions}
-          activeSessionId={activeSessionId}
-          onSelect={handleSelectSession}
-          onDelete={(id) => void handleDeleteSession(id)}
-        />
-
-        {/* Spacer — pins the footer to the bottom now that Recent is content-sized */}
-        <div className="flex-1 min-h-0" />
-
-        {/* Footer — User Guide (always-visible help) and Settings (the hub
-            for admin/power tools), kept out of the primary groups above so
-            day-to-day nav stays focused. */}
-        <div className="px-2 py-2 border-t border-line flex-shrink-0 space-y-0.5">
-          <Link
-            href={GUIDE_NAV_ITEM.href}
-            onClick={() => setMobileNavOpen(false)}
-            title={GUIDE_NAV_ITEM.description}
-            className="px-3 py-2.5 min-h-touch rounded-lg hover:bg-surface-overlay text-fg-muted hover:text-fg flex items-center gap-2.5 text-sm transition-colors cursor-pointer"
-          >
-            <Icon name={GUIDE_NAV_ITEM.icon} size="w-4 h-4" />
-            <span className="flex-1">{GUIDE_NAV_ITEM.label}</span>
-          </Link>
-          <Link
-            href={SETTINGS_NAV_ITEM.href}
-            onClick={() => setMobileNavOpen(false)}
-            title={SETTINGS_NAV_ITEM.description}
-            className="px-3 py-2.5 min-h-touch rounded-lg hover:bg-surface-overlay text-fg-muted hover:text-fg flex items-center gap-2.5 text-sm transition-colors cursor-pointer"
-          >
-            <Icon name={SETTINGS_NAV_ITEM.icon} size="w-4 h-4" />
-            <span className="flex-1">{SETTINGS_NAV_ITEM.label}</span>
-          </Link>
-        </div>
-
-        {/* Signed-in user */}
-        <UserBadge variant="sidebar" />
-      </aside>
+      {/* Sidebar — the same one every route renders (AppShell uses it
+          too); slides in on mobile, static on md+. On the home page its
+          entries drive this page's in-memory state instead of navigating. */}
+      <AppSidebar
+        pathname="/"
+        open={mobileNavOpen}
+        onClose={() => setMobileNavOpen(false)}
+        breakpoint="md"
+        isOnboarded={health ? isOnboarded : undefined}
+        companyName={companyName}
+        home={{
+          mode,
+          activeSessionId,
+          onBriefing: handleBackToBriefing,
+          onNewChat: handleNewChat,
+        }}
+      />
 
       {/* Main */}
       <main className="flex-1 flex flex-col min-w-0">
@@ -311,33 +273,30 @@ export default function HomePage() {
             >
               <Icon name="menu" size="w-5 h-5" />
             </button>
-            <span className="text-xs text-fg-muted font-medium truncate">
+            <span className="text-sm text-fg-muted font-medium truncate">
               {isOnboarded && companyName ? `${companyName} · Executive` : "Executive"}
             </span>
           </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <button
-              type="button"
-              onClick={() => setDebugOpen((o) => !o)}
-              className={`flex items-center gap-1.5 text-xs font-medium px-3 py-2 min-h-touch rounded-md transition-colors cursor-pointer ${
-                debugOpen
-                  ? "bg-violet-500/20 text-violet-300 border border-violet-500/30"
-                  : "text-fg-muted hover:text-fg hover:bg-surface-overlay"
-              }`}
-              aria-label={debugOpen ? "Hide agent activity" : "Show agent activity"}
-            >
-              <Icon name="activity" size="w-4 h-4" />
-              <span className="hidden sm:inline">{debugOpen ? "Hide activity" : "Agent activity"}</span>
-            </button>
-          </div>
+          {/* Agent activity (the live trace of the Executive's turn) lives in
+              this ⋯ menu; the panel itself opens on the right as before. */}
+          <OverflowMenu
+            label="Home options"
+            items={[
+              {
+                label: debugOpen ? "Hide agent activity" : "Show agent activity",
+                onSelect: () => setDebugOpen((o) => !o),
+              },
+            ]}
+          />
         </div>
 
-        {!isOnboarded && health && (
-          <div className="border-b border-line bg-indigo-500/5 px-4 sm:px-6 py-2.5 flex items-center justify-between gap-3">
-            <p className="text-xs text-fg-muted">
-              No company profile — responses will be generic.
-            </p>
-            <Link href="/onboard" className="text-xs text-indigo-400 hover:text-indigo-300 font-medium transition-colors whitespace-nowrap cursor-pointer">
+        {/* In chat the notices stay as strips above the conversation; on
+            the briefing they share one banner slot (see homeBanner). */}
+        {mode === "chat" && <PausedBanner />}
+        {mode === "chat" && !isOnboarded && health && (
+          <div className="border-b border-line bg-accent/5 px-4 sm:px-6 py-2.5 flex items-center justify-between gap-3">
+            <p className="text-sm text-fg-muted">{profileCopy.missingBanner}</p>
+            <Link href="/onboard" className="text-sm text-accent hover:underline font-medium whitespace-nowrap cursor-pointer">
               Set up profile →
             </Link>
           </div>
@@ -349,6 +308,7 @@ export default function HomePage() {
               onContinue={handleContinueFromBriefing}
               showHeader
               firstName={firstName ?? undefined}
+              banner={homeBanner}
             />
           ) : (
             // No `key` here — Chat handles undefined→sid session adoption
@@ -363,10 +323,11 @@ export default function HomePage() {
               initialSessionId={activeSessionId}
               initialInput={pendingPrompt}
               // Briefing handoffs (Discuss / Approve / Dismiss / Edit&Approve)
-              // are the only path that sets pendingPrompt; those are commit-
-              // ments, not drafts, so auto-fire the first turn instead of
-              // making the user hit Send again.
-              autoSubmitInitialInput={Boolean(pendingPrompt)}
+              // are commitments, not drafts, so they auto-fire the first
+              // turn. A `?draft=` deep link also sets pendingPrompt but
+              // clears autoSubmitPending, so it only pre-fills.
+              autoSubmitInitialInput={Boolean(pendingPrompt) && autoSubmitPending}
+              initialMemoryText={pendingMemoryText}
               onTurnComplete={handleTurnComplete}
               onTurnStart={() => setIsTurnInFlight(true)}
             />
@@ -376,7 +337,7 @@ export default function HomePage() {
         {/* Mobile bottom nav — the chat home owns its own layout (it's
             exempt from AppShell), so it renders the shared bar itself to
             match every other route. "More" opens this page's own drawer. */}
-        <MobileBottomNav pathname="/" hideFrom="md" onOpenDrawer={() => setMobileNavOpen(true)} />
+        <MobileBottomNav pathname="/" hideFrom="md" />
       </main>
 
       {/* Debug panel */}

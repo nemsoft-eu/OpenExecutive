@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
 from openexecutive.audit import log_event as audit_log
 
 if TYPE_CHECKING:
+    from openexecutive.memory.workspace_settings import PrincipalRole
     from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.agents.board_comms import BoardCommsAgent
 from openexecutive.agents.finance import FinanceAgent
@@ -16,8 +19,11 @@ from openexecutive.agents.legal import LegalAgent
 from openexecutive.agents.marketing import MarketingAgent
 from openexecutive.agents.operations import OperationsAgent
 from openexecutive.agents.product import ProductAgent
+from openexecutive.agents.sales import SalesAgent
 from openexecutive.agents.strategy import StrategyAgent
 from openexecutive.agents.triage import TriageAgent
+
+logger = logging.getLogger(__name__)
 
 SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "cso": StrategyAgent(),
@@ -27,6 +33,7 @@ SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "coo": OperationsAgent(),
     "cmo": MarketingAgent(),
     "cpo": ProductAgent(),
+    "sales": SalesAgent(),
     "board_comms": BoardCommsAgent(),
     "triage": TriageAgent(),
 }
@@ -39,6 +46,7 @@ SPECIALIST_DESCRIPTIONS = {
     "coo": "Chief Operating Officer — process design, vendor management, operational scaling, metrics",
     "cmo": "Chief Marketing Officer — GTM strategy, brand, messaging, PR, crisis communications",
     "cpo": "Chief Product Officer — product roadmap, prioritization frameworks, product strategy",
+    "sales": "Head of Sales — pipeline and qualification, discovery, founder-led sales, pricing conversations and discounting, proposals/SOWs, follow-up, forecasting",
     "board_comms": "Board Communications Director — board decks, investor relations, governance",
     "triage": "Chief of Staff — evaluates inbound events (email/Slack/docs) for significance and decides alerting",
 }
@@ -166,6 +174,94 @@ def audit_name_resolution(
     )
 
 
+def load_company_stage() -> str:
+    """The company's stage from the profile on disk, read fresh each call.
+
+    For callers with no session — workflow steps, the MCP server's
+    ``consult_specialist`` — so a profile edit reaches the next consult
+    without a restart. A chat turn passes its session's profile stage
+    instead (see ``route_parallel``). Never raises: a missing or unreadable
+    profile means no ``<company_stage>`` tag, not a failed consult.
+    """
+    try:
+        from openexecutive.onboarding.profile_builder import load_or_create_profile
+
+        return load_or_create_profile().stage.strip()
+    except Exception as exc:
+        # Type name only: a YAML error message can quote the profile's text.
+        logger.warning("company stage unavailable for specialists (%s)", type(exc).__name__)
+        return ""
+
+
+# Caps for the <principal_role> tag's fields (the stored caps are larger:
+# the tag is a calibration hint, not the full record — the Executive's org
+# block carries the rest).
+_ROLE_TAG_TITLE_CAP = 120
+_ROLE_TAG_REMIT_CAP = 300
+
+
+def _one_line(text: str, cap: int) -> str:
+    """Whitespace collapsed, angle brackets defanged (so the text cannot
+    close the tag it sits in, or open another), capped."""
+    line = " ".join(text.split()).replace("<", "‹").replace(">", "›")
+    return line if len(line) <= cap else line[: cap - 1] + "…"
+
+
+def principal_role_context(role: PrincipalRole | None) -> str:
+    """The body of a specialist's ``<principal_role>`` tag: what kind of
+    principal the advice is for (in plain words), their title and their
+    remit — or "" when none of the three is set. Reports-to and measured-on
+    stay in the Executive's org block: they matter to the answer's framing,
+    which the Executive owns, not to a specialist's analysis.
+
+    Solo mode only (callers decide). Specialists never see the Executive's
+    org block, and the kind changes which advice fits: a VP inside a large
+    company makes the case to their CFO rather than raising a round. Each
+    value is collapsed to one line and capped; the body rides in the USER
+    turn, so the specialist's cached system prompt never changes.
+    """
+    if role is None:
+        return ""
+    from openexecutive.memory.workspace_settings import ROLE_KIND_PHRASE
+
+    lines: list[str] = []
+    kind = ROLE_KIND_PHRASE.get(role.role_kind or "", "")
+    title = _one_line(role.role_title or "", _ROLE_TAG_TITLE_CAP)
+    if title and kind:
+        lines.append(f"The person you are advising: {title}, {kind}.")
+    elif title:
+        lines.append(f"The person you are advising: {title}.")
+    elif kind:
+        lines.append(f"The person you are advising is {kind}.")
+    remit = _one_line(role.remit or "", _ROLE_TAG_REMIT_CAP)
+    if remit:
+        lines.append(f"Responsible for: {remit}")
+    return "\n".join(lines)
+
+
+def load_principal_role() -> str:
+    """The ``<principal_role>`` body for callers with no chat turn —
+    workflow steps, the MCP server's ``consult_specialist`` — read fresh:
+    the current session's role override else the workspace's, and only
+    when the effective mode (the current session's, else the workspace's)
+    is solo. A chat turn resolves it itself (see ``route_parallel``).
+    Never raises: any failure means no tag, not a failed consult."""
+    try:
+        from openexecutive.memory.workspace_settings import (
+            effective_principal_role,
+            effective_workspace_mode,
+        )
+        from openexecutive.orchestrator.schedule_tools import current_session
+
+        session = current_session.get()
+        if effective_workspace_mode(session) != "solo":
+            return ""
+        return principal_role_context(effective_principal_role(session))
+    except Exception as exc:
+        logger.warning("principal role unavailable for specialists (%s)", type(exc).__name__)
+        return ""
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -175,6 +271,9 @@ async def route_to_specialist(
     failure_cases: str = "",
     department_memory: str = "",
     actor: str = "specialist_workflow",
+    company_stage: str | None = None,
+    principal_role: str | None = None,
+    standing_facts: str | None = None,
 ) -> str:
     """Run one specialist and return its prose analysis.
 
@@ -183,6 +282,18 @@ async def route_to_specialist(
     ``route_parallel`` passes ``specialist`` for the Executive's chat-turn
     consults so the two stay separable in the ``/audit/usage`` by-source
     breakdown.
+
+    ``company_stage`` becomes the specialist's ``<company_stage>`` user-turn
+    tag (skipped when empty). ``None`` means "not supplied": it is read
+    fresh from the profile on disk.
+
+    ``principal_role`` is the ``<principal_role>`` tag body the same way:
+    "" sends none, ``None`` reads it fresh (``load_principal_role`` — solo
+    only).
+
+    ``standing_facts`` is the STANDING FACTS block (``memory.facts``) the
+    same way: "" sends none, ``None`` reads the store — so a workflow step's
+    analysis uses the principal's corrections just as a chat consult does.
     """
     resolved = resolve_specialist_name(specialist_name)
     # `specialist_name` may be any JSON value off a local backend, so render it
@@ -203,6 +314,14 @@ async def route_to_specialist(
             specialist_name, resolved, source="route_to_specialist"
         )
     agent = SPECIALIST_REGISTRY[resolved]
+    if company_stage is None:
+        company_stage = await asyncio.to_thread(load_company_stage)
+    if principal_role is None:
+        principal_role = await asyncio.to_thread(load_principal_role)
+    if standing_facts is None:
+        from openexecutive.memory.facts import render_facts_for_prompt
+
+        standing_facts = await asyncio.to_thread(render_facts_for_prompt)
     return await agent.analyze(
         query=query,
         context=context,
@@ -210,6 +329,9 @@ async def route_to_specialist(
         episodic_context=episodic_context,
         failure_cases=failure_cases,
         department_memory=department_memory,
+        company_stage=company_stage,
+        principal_role=principal_role,
+        standing_facts=standing_facts,
         actor=actor,
     )
 
@@ -262,22 +384,71 @@ def partition_specialist_fanout(
     return run_tool_uses, run_calls, skipped_results, cap
 
 
-async def _retrieve_for_call(call: dict[str, str]) -> str:
-    """Run a per-specialist, domain-filtered vector retrieval for one tool call."""
+async def _retrieve_for_call(
+    call: dict[str, str], record_source: Callable[..., None] | None = None
+) -> str:
+    """Run a per-specialist, domain-filtered vector retrieval for one tool call.
+
+    A retrieval that fails leaves this specialist without knowledge context
+    rather than failing the turn: every specialist's retrieval is gathered
+    together, so one exception here used to lose the whole answer.
+    """
     from openexecutive.knowledge.retriever import retrieve
 
-    return await asyncio.to_thread(
-        retrieve, query=call["query"], specialist_name=call["specialist"]
-    )
+    try:
+        return await asyncio.to_thread(
+            retrieve,
+            query=call["query"],
+            specialist_name=call["specialist"],
+            record_source=record_source,
+        )
+    except Exception:
+        logger.warning(
+            "knowledge retrieval for %s failed; answering without it",
+            call["specialist"],
+            exc_info=True,
+        )
+        return ""
 
 
 async def _retrieve_failures_for_call(call: dict[str, str]) -> str:
-    """Domain-filtered failure case retrieval for one specialist call."""
+    """Domain-filtered failure case retrieval for one specialist call. Degrades
+    to no failure cases on error, for the same reason as `_retrieve_for_call`."""
     from openexecutive.knowledge.retriever import retrieve_failures
 
-    return await asyncio.to_thread(
-        retrieve_failures, query=call["query"], specialist_name=call["specialist"]
+    try:
+        return await asyncio.to_thread(
+            retrieve_failures, query=call["query"], specialist_name=call["specialist"]
+        )
+    except Exception:
+        logger.warning(
+            "failure-case retrieval for %s failed; answering without it",
+            call["specialist"],
+            exc_info=True,
+        )
+        return ""
+
+
+def specialist_unavailable_result(specialist: str, reason: str, *, tell_user: bool) -> str:
+    """The tool_result for a specialist that failed or returned nothing, so the
+    Executive answers from the others instead of losing the turn.
+
+    ``tell_user`` is False on the web chat, which shows the missing area under
+    the reply itself; elsewhere the reply is the only place to say it.
+    """
+    text = (
+        f"UNAVAILABLE: the {specialist} specialist could not answer this time "
+        f"({reason}). Its view is missing from this turn. Do not invent it and "
+        "do not consult it again this turn; answer from what the other "
+        "specialists said."
     )
+    if tell_user:
+        return text + (
+            " In your reply, say in one short sentence that this part of the "
+            "analysis is missing and that asking again may fill it in. Do not "
+            "mention specialists."
+        )
+    return text + " The app tells the user which part is missing, so you need not mention it."
 
 
 async def _prefetch_department_for_call(
@@ -311,6 +482,12 @@ async def route_parallel(
     session_id: str | None = None,
     debug_collector: DebugCollector | None = None,
     conversation_context: str = "",
+    company_stage: str | None = None,
+    *,
+    principal_role: str | None = None,
+    record_source: Callable[..., None] | None = None,
+    failed_calls_out: list[int] | None = None,
+    tell_user_when_unavailable: bool = True,
 ) -> list[str]:
     """Execute multiple specialist calls concurrently.
 
@@ -342,8 +519,29 @@ async def route_parallel(
     representation; specialists without an owning department (e.g.
     ``triage``) skip the prefetch entirely.
 
+    ``company_stage`` is per-turn like ``episodic_context``: every
+    specialist in the batch gets the same ``<company_stage>`` tag. The chat
+    turn passes its session's profile stage — the profile the Executive
+    itself reasons over, and the one an eval scenario injects — and ``None``
+    (no session profile) reads it once from disk for the whole batch.
+
+    ``principal_role`` is per-turn too: every specialist gets the same
+    ``<principal_role>`` tag. The chat turn passes the body it resolved in
+    the turn's mode ("" in team, so no tag); ``None`` reads it once for the
+    batch (``load_principal_role``).
+
     Returns results in the same order as ``calls`` so callers can zip
     with tool_use_ids.
+
+    One specialist that raises, or returns no text, no longer fails the
+    batch: its result becomes `specialist_unavailable_result`, its index in
+    ``calls`` goes into ``failed_calls_out`` (in call order), and the others'
+    results stand.
+    Cancellation (the user pressing Stop) still propagates. ``record_source``
+    receives each document the knowledge retrieval of a specialist that
+    answered returned, in call order (see ``orchestrator.answer_sources``).
+    A failed specialist's documents never reached the answer, so they are
+    not recorded.
     """
     # Normalise every name HERE, before retrieval, department prefetch and the
     # debug labels read it — not only inside route_to_specialist. Resolving
@@ -375,8 +573,22 @@ async def route_parallel(
         }
         for c in calls
     ]
+
+    if company_stage is None:
+        company_stage = await asyncio.to_thread(load_company_stage)
+    if principal_role is None:
+        principal_role = await asyncio.to_thread(load_principal_role)
+
+    # Each call's documents wait here until the batch is done.
+    held_sources: list[list[tuple[tuple[Any, ...], dict[str, Any]]]] = [[] for _ in calls]
+
+    def hold_for(idx: int) -> Callable[..., None] | None:
+        if record_source is None:
+            return None
+        return lambda *args, **kwargs: held_sources[idx].append((args, kwargs))
+
     if retrieved_knowledge_map is None:
-        knowledge_futures = [_retrieve_for_call(c) for c in calls]
+        knowledge_futures = [_retrieve_for_call(c, hold_for(i)) for i, c in enumerate(calls)]
         failures_futures = [_retrieve_failures_for_call(c) for c in calls]
         all_results = await asyncio.gather(*knowledge_futures, *failures_futures)
         mid = len(calls)
@@ -398,6 +610,20 @@ async def route_parallel(
         )
     )
 
+    failed: set[int] = set()
+
+    def unavailable(idx: int, specialist: str, reason: str, t_start: float) -> str:
+        failed.add(idx)
+        if debug_collector:
+            debug_collector.emit("specialist_unavailable", {
+                "specialist": specialist,
+                "reason": reason,
+                "duration_ms": round((time.monotonic() - t_start) * 1000),
+            })
+        return specialist_unavailable_result(
+            specialist, reason, tell_user=tell_user_when_unavailable
+        )
+
     async def call_one(idx: int, call: dict[str, str]) -> str:
         specialist = call["specialist"]
         if debug_collector:
@@ -409,16 +635,30 @@ async def route_parallel(
                 "department_memory_chars": len(dept_memory_per_call[idx]),
             })
         t_start = time.monotonic()
-        result = await route_to_specialist(
-            specialist_name=specialist,
-            query=call["query"],
-            context=conversation_context,
-            retrieved_knowledge=knowledge_per_call[idx],
-            episodic_context=episodic_context,
-            failure_cases=failures_per_call[idx],
-            department_memory=dept_memory_per_call[idx],
-            actor="specialist",
-        )
+        try:
+            result = await route_to_specialist(
+                specialist_name=specialist,
+                query=call["query"],
+                # The turn's rendered conversation tail, supplied once by the
+                # caller — NOT a per-call `context` the model wrote itself
+                # (issue #12: the routing turn spent 1,724 output tokens
+                # restating background the orchestrator already held).
+                context=conversation_context,
+                retrieved_knowledge=knowledge_per_call[idx],
+                episodic_context=episodic_context,
+                failure_cases=failures_per_call[idx],
+                department_memory=dept_memory_per_call[idx],
+                actor="specialist",
+                company_stage=company_stage,
+                principal_role=principal_role,
+            )
+        except Exception as exc:
+            logger.warning(
+                "specialist %s failed; answering without it", specialist, exc_info=True
+            )
+            return unavailable(idx, specialist, f"it failed with {type(exc).__name__}", t_start)
+        if not result.strip():
+            return unavailable(idx, specialist, "it returned no analysis", t_start)
         if debug_collector:
             debug_collector.emit("specialist_done", {
                 "specialist": specialist,
@@ -428,4 +668,15 @@ async def route_parallel(
             })
         return result
 
-    return list(await asyncio.gather(*(call_one(i, c) for i, c in enumerate(calls))))
+    results = list(await asyncio.gather(*(call_one(i, c) for i, c in enumerate(calls))))
+    if failed_calls_out is not None:
+        failed_calls_out.extend(sorted(failed))
+    if record_source is not None:
+        try:
+            for idx, held in enumerate(held_sources):
+                if idx not in failed:
+                    for args, kwargs in held:
+                        record_source(*args, **kwargs)
+        except Exception:
+            logger.warning("recording answer sources failed", exc_info=True)
+    return results

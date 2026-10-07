@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # hard schema-level rejection of anything outside the set — see ``SpecialistArg``
 # for why that is the wrong contract for a model-emitted value.
 SpecialistKey = Literal[
-    "board_comms", "cfo", "chro", "cmo", "coo", "cpo", "cso", "gc", "triage"
+    "board_comms", "cfo", "chro", "cmo", "coo", "cpo", "cso", "gc", "sales", "triage"
 ]
 
 # What the ``consult_specialist`` tool accepts on the wire. The roster above is
@@ -247,7 +247,8 @@ async def consult_specialist(
     domain-expert read. Specialists: cso (strategy/M&A/OKRs), cfo (finance/unit
     economics/fundraising), chro (people/comp/org design), gc (legal/contracts/
     compliance), coo (operations/process/metrics), cmo (GTM/brand/PR), cpo
-    (product/roadmap), board_comms (board decks/IR/governance),
+    (product/roadmap), sales (pipeline/deals/pricing conversations/forecast),
+    board_comms (board decks/IR/governance),
     triage (chief of staff — significance of inbound events).
 
     Args:
@@ -324,8 +325,11 @@ async def ask_executive(message: str, caller_email: str = "") -> str:
     Args:
         message: Your question for the Executive.
         caller_email: Optional — resolve the caller to a known person for
-            person-scoped memory; defaults to the company principal.
+            person-scoped memory; defaults to the company principal. Ignored
+            when the API checks signed callers: an MCP client then holds only
+            the shared secret, which vouches for no one, so it asks as no one.
     """
+    from openexecutive.api.caller import signing_on
     from openexecutive.orchestrator.executive import Executive
     from openexecutive.orchestrator.mcp_gateway import get_active_gateway
     from openexecutive.orchestrator.session import Session
@@ -335,6 +339,8 @@ async def ask_executive(message: str, caller_email: str = "") -> str:
     )
 
     def _resolve_person() -> int | None:
+        if signing_on():
+            return None
         # Degrade to None on a DB error rather than surfacing it to the client,
         # matching the chat route's caller resolution (api/routes/chat.py).
         try:
@@ -353,8 +359,14 @@ async def ask_executive(message: str, caller_email: str = "") -> str:
     from openexecutive.onboarding.profile_builder import load_or_create_profile
 
     profile = await asyncio.to_thread(load_or_create_profile)
+    from openexecutive.orchestrator.artifact_records import NOBODY
+
     session = Session(
         company_profile=profile if not profile.is_empty() else None,
+        # A client that resolves to no one reads and publishes no one's
+        # documents (``artifact_records.current_viewer`` would otherwise take
+        # a speakerless session for the principal's own work).
+        documents_viewer=NOBODY if person_id is None else None,
     )
 
     executive = Executive(mcp_gateway=get_active_gateway())

@@ -36,6 +36,8 @@ def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HONCHO_ENABLED", "true")
     monkeypatch.setenv("HONCHO_API_KEY", "test-key")
     monkeypatch.setenv("HONCHO_BASE_URL", "http://localhost:8000")
+    # These tests pin the dialectic prefetch and its scaled budgets.
+    monkeypatch.setenv("HONCHO_PREFETCH_MODE", "dialectic")
 
 
 # --------------------------------------------------------------------------- #
@@ -163,7 +165,7 @@ def test_medium_prefetch_survives_past_the_base_budget(
             return "deep synthesis"
 
     class _SlowAio:
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             return type("P", (), {"aio": _SlowAioPeer()})()
 
     fake = type("C", (), {"aio": _SlowAio()})()
@@ -196,7 +198,7 @@ def _answering_client(answer: str = "answer", delay: float = 0.0) -> Any:
             return answer
 
     class _Aio:
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             return type("P", (), {"aio": _AioPeer()})()
 
     return type("C", (), {"aio": _Aio()})()
@@ -299,7 +301,7 @@ class _CardClient:
         self._store = store
         self.aio = self
 
-    async def peer(self, peer_id: str) -> _CardPeer:
+    async def peer(self, peer_id: str, **kwargs: Any) -> _CardPeer:
         return _CardPeer(self._store, peer_id)
 
     async def session(self, session_id: str) -> _CardSession:
@@ -464,7 +466,7 @@ def test_messages_are_written_before_any_card_call(
     _roster(monkeypatch, {1: "Sarah Chen"})
 
     class _OrderedClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
             inner_get, inner_set = peer.get_card, peer.set_card
 
@@ -511,7 +513,7 @@ def test_card_write_failure_does_not_lose_the_message_sync(
     _roster(monkeypatch, {1: "Sarah Chen"})
 
     class _BrokenCardClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _boom(*a: Any, **k: Any) -> None:
@@ -536,7 +538,7 @@ def test_a_hanging_card_endpoint_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
     hang_attempts: list[int] = []
 
     class _HangingClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _hang() -> Any:
@@ -730,7 +732,7 @@ def test_a_degraded_card_endpoint_is_probed_once_per_interval(
     attempts: list[int] = []
 
     class _FailingClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _boom() -> Any:
@@ -886,7 +888,7 @@ def test_slow_seeding_never_masks_a_successful_persist(
     store: dict[str, Any] = {"cards": {}}
 
     class _SlowCardClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _slow() -> Any:
@@ -945,7 +947,7 @@ def test_seed_pass_ceiling_bounds_many_hanging_peers_and_memoizes_them(
         peers COMPLETE before the ceiling fires, which is what makes the
         classification of who gets marked failed observable at all."""
 
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
             inner_get = peer.get_card
 
@@ -1003,7 +1005,7 @@ def test_seed_row_reports_a_cut_off_pass_as_timeout(monkeypatch: pytest.MonkeyPa
     captured: list[dict[str, Any]] = []
 
     class _HangingClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _hang() -> Any:
@@ -1090,7 +1092,7 @@ def test_a_pass_where_every_peer_fails_is_not_reported_ok(monkeypatch: pytest.Mo
     store: dict[str, Any] = {"cards": {}}
 
     class _BrokenClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
 
             async def _boom() -> Any:
@@ -1117,7 +1119,7 @@ def test_a_partially_failing_pass_is_degraded_not_ok(monkeypatch: pytest.MonkeyP
     store: dict[str, Any] = {"cards": {}}
 
     class _HalfBrokenClient(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
             if peer_id != "7":
                 async def _boom() -> Any:
@@ -1150,7 +1152,7 @@ def test_pass_timeout_does_not_mark_an_already_correct_unreached_peer(
     hang = {"7": False}
 
     class _Client(_CardClient):
-        async def peer(self, peer_id: str) -> Any:
+        async def peer(self, peer_id: str, **kwargs: Any) -> Any:
             peer = await super().peer(peer_id)
             inner_get = peer.get_card
 

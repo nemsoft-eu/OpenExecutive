@@ -138,9 +138,19 @@ class OutboundContext(BaseModel):
 DB_PATH = Path(os.environ.get("EPISODIC_DB_PATH", "./episodic_memory.db"))
 
 
+def _resolve_db_path(db_path: Path | None) -> Path:
+    """Return the caller's path or the current module-level DB_PATH.
+
+    Reading DB_PATH dynamically (not via default-arg binding) lets tests
+    monkeypatch `openexecutive.memory.episodic.DB_PATH` and have it actually
+    take effect — default arguments capture the value at def time.
+    """
+    return db_path if db_path is not None else DB_PATH
+
+
 @contextmanager
-def _get_conn(db_path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(db_path))
+def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
+    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -149,8 +159,8 @@ def _get_conn(db_path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, No
         conn.close()
 
 
-def initialize_db(db_path: Path = DB_PATH) -> None:
-    with _get_conn(db_path) as conn:
+def initialize_db(db_path: Path | None = None) -> None:
+    with _get_conn(_resolve_db_path(db_path)) as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +200,7 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 action_chips TEXT,
+                stopped INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             CREATE TABLE IF NOT EXISTS scheduled_actions (
@@ -262,6 +273,50 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
                 if "duplicate column" not in str(exc).lower():
                     raise
 
+        # Additive migration: what an assistant reply looked at and which part
+        # of the analysis it had to leave out (orchestrator/answer_sources.py),
+        # shown under the reply in the web chat. Nullable JSON TEXT
+        # {"sources": [...], "unavailable": [...]}; legacy rows stay NULL.
+        if "sources" not in _cm_existing:
+            try:
+                conn.execute("ALTER TABLE chat_messages ADD COLUMN sources TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+
+        # Additive migration: flag an assistant message the user stopped
+        # mid-stream, so the "Stopped" marker survives a reload instead of a
+        # truncated reply reading as a complete one. Legacy rows default to 0.
+        if "stopped" not in _cm_existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE chat_messages "
+                    "ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+
+        # Attunement: who actually sent each message (the resolved rostered
+        # Person, never the session owner's principal fallback) and the
+        # explicit thumbs up/down on an assistant reply. Both nullable; legacy
+        # rows stay NULL and are never used for per-person learning.
+        for col, ddl in (
+            ("sender_person_id", "INTEGER"),
+            ("feedback", "TEXT"),
+            ("feedback_note", "TEXT"),
+            # Who left the feedback: the reply's own speaker's reaction is
+            # what their working-style profile learns from; the principal
+            # rating someone else's session is not that person's reaction.
+            ("feedback_by_person_id", "INTEGER"),
+        ):
+            if col not in _cm_existing:
+                try:
+                    conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+
         # Phase 4 additive columns for scheduled_actions only.
         _sa_existing = {
             row["name"]
@@ -298,6 +353,98 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             "WHERE scope_key IS NOT NULL"
         )
 
+        # Attunement: per-UTC-day ceiling on open-loop extraction model calls.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_usage ("
+            "  day TEXT PRIMARY KEY,"
+            "  calls INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+
+        # Attunement working-style profiles: at most a few short style rules
+        # per person, learned from their own reactions and requests, plus
+        # the bookkeeping that paces the learning pass
+        # (attunement/style.py). History keeps every change for review.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_profiles ("
+            "  person_id INTEGER PRIMARY KEY,"
+            "  rules TEXT NOT NULL DEFAULT '[]',"
+            "  locked INTEGER NOT NULL DEFAULT 0,"
+            "  updated_at TEXT,"
+            "  updated_by TEXT,"
+            "  last_pass_at TEXT,"
+            "  pass_day TEXT,"
+            "  passes_today INTEGER NOT NULL DEFAULT 0,"
+            "  last_message_id INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_profile_history ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  person_id INTEGER NOT NULL,"
+            "  created_at TEXT NOT NULL,"
+            "  rules TEXT NOT NULL,"
+            "  locked INTEGER NOT NULL DEFAULT 0,"
+            "  updated_by TEXT NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attunement_profile_history_person "
+            "ON attunement_profile_history(person_id, id)"
+        )
+
+        # Act as me: who has it on, and each person's "How I write" profile
+        # with its history (delegation/). Per company, like the rest.
+        from openexecutive.delegation.schema import ensure_schema as _ensure_delegation_schema
+
+        _ensure_delegation_schema(conn)
+
+        # Always in the loop: dated notes of what happened, each person's
+        # switches and the conversations not to remember (memory/history.py).
+        from openexecutive.memory.history_schema import ensure_schema as _ensure_history_schema
+
+        _ensure_history_schema(conn)
+
+        # Attunement outcome ledger: one row per proactive DM to a rostered
+        # person, resolved replied / acted / void / ignored
+        # (attunement/outcomes.py).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_outcomes ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  created_at TEXT NOT NULL,"
+            "  person_id INTEGER NOT NULL,"
+            "  source TEXT NOT NULL,"
+            "  ref TEXT,"
+            "  channel TEXT NOT NULL,"
+            "  channel_ref TEXT NOT NULL,"
+            "  outbound_context_id INTEGER,"
+            "  outcome TEXT,"
+            "  resolved_at TEXT"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_person "
+            "ON proactive_outcomes(person_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ref "
+            "ON proactive_outcomes(ref) WHERE ref IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ctx "
+            "ON proactive_outcomes(outbound_context_id) WHERE outbound_context_id IS NOT NULL"
+        )
+
+        # Attunement open loops: at most one OPEN loop per scope_key. Closing a
+        # loop clears awaiting_response_since, which takes it out of the index,
+        # so the same ask can be reopened later. The insert path relies on this
+        # to dedupe concurrent extraction passes (INSERT hits IntegrityError).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_open_loop_scope "
+            "ON scheduled_actions(scope_key) "
+            "WHERE kind = 'open_loop' AND awaiting_response_since IS NOT NULL"
+        )
+
         # Multi-user scoping: tag each session with the Person who started it
         # so the Recent-chats sidebar can filter by caller. Nullable for
         # legacy rows created before this column existed — those are hidden
@@ -310,6 +457,17 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             try:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN caller_person_id INTEGER"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Act as me: 1 once a turn here read or drafted in the speaker's own
+        # mailbox — from then on the conversation is its owner's alone, the
+        # principal included (session_store.mark_mail_private).
+        if "mail_private" not in _sessions_existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN mail_private INTEGER NOT NULL DEFAULT 0"
                 )
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
@@ -430,12 +588,12 @@ def store_decision(
     department: str = "",
     session_id: str = "",
     person_id: int | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
 ) -> None:
     now = datetime.now(UTC)
     dedup_window_start = (now - timedelta(days=7)).isoformat()
     summary_prefix = summary[:80]
-    with _get_conn(db_path) as conn:
+    with _get_conn(_resolve_db_path(db_path)) as conn:
         existing = conn.execute(
             "SELECT id, rationale FROM decisions"
             " WHERE domain = ? AND timestamp > ? AND substr(summary, 1, 80) = ? AND session_id = ?",
@@ -477,17 +635,23 @@ def store_initiative(
     summary: str = "",
     department: str = "",
     person_id: int | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
+    updated_by_person_id: int | None = None,
 ) -> None:
+    resolved = _resolve_db_path(db_path)
     now = datetime.now(UTC).isoformat()
     is_insert = False
     is_status_change = False
-    with _get_conn(db_path) as conn:
+    is_real_update = False
+    with _get_conn(resolved) as conn:
         existing = conn.execute(
-            "SELECT id, status FROM initiatives WHERE title = ?", (title,)
+            "SELECT id, status, summary FROM initiatives WHERE title = ?", (title,)
         ).fetchone()
         if existing:
             is_status_change = existing["status"] != status
+            is_real_update = is_status_change or (
+                bool(summary) and summary != (existing["summary"] or "")
+            )
             # Only overwrite an existing department when the caller actually
             # passed a non-empty value — preserves the original tag if the
             # update path is invoked without department context.
@@ -507,6 +671,10 @@ def store_initiative(
                 "INSERT INTO initiatives (title, status, created_at, updated_at, summary, department) VALUES (?, ?, ?, ?, ?, ?)",
                 (title, status, now, now, summary, department),
             )
+    if existing and is_real_update:
+        # Only a real change answers a check-in — a same-status re-mention
+        # during routine extraction does not.
+        _resolve_initiative_outreach(int(existing["id"]), updated_by_person_id, resolved)
     # Mirror only on a new initiative OR a real status transition.
     # Idempotent upserts (same title + same status) don't fire — that
     # would spam the dept peer with redundant notes on every routine
@@ -530,12 +698,12 @@ def store_advice(
     department: str = "",
     session_id: str = "",
     person_id: int | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
 ) -> None:
     now = datetime.now(UTC)
     dedup_window_start = (now - timedelta(days=7)).isoformat()
     advice_prefix = advice_summary[:80]
-    with _get_conn(db_path) as conn:
+    with _get_conn(_resolve_db_path(db_path)) as conn:
         existing = conn.execute(
             "SELECT id FROM advice_given"
             " WHERE domain = ? AND timestamp > ? AND substr(advice_summary, 1, 80) = ? AND session_id = ?",
@@ -602,10 +770,86 @@ def get_recent_decisions(
     return [Decision(**dict(row)) for row in rows]
 
 
-def get_active_initiatives(db_path: Path = DB_PATH) -> list[Initiative]:
-    if not db_path.exists():
+def has_department_decision_since(
+    department: str,
+    since: datetime,
+    db_path: Path | None = None,
+) -> bool:
+    """True when a decision tagged ``department`` was logged after ``since``.
+
+    Filtered in SQL, so a busy company's newest-N page of decisions cannot
+    hide one department's. Timestamps are UTC ISO strings, compared as text
+    (the same convention ``store_decision``'s dedup window uses).
+    """
+    if not department:
+        return False
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return False
+    bound = since.astimezone(UTC).isoformat() if since.tzinfo else since.isoformat()
+    with _get_conn(resolved) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM decisions WHERE department = ? AND timestamp > ? LIMIT 1",
+            (department, bound),
+        ).fetchone()
+    return row is not None
+
+
+def _utc_bound(moment: datetime) -> str:
+    """``moment`` as the UTC ISO text decisions are stamped with (a naive
+    value is read as UTC), for text comparison in SQL."""
+    aware = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat()
+
+
+def decisions_since(
+    since: datetime,
+    *,
+    limit: int = 20,
+    db_path: Path | None = None,
+) -> list[Decision]:
+    """Decisions logged after ``since``, newest first (the weekly review's
+    "this week's decisions"). Filtered in SQL, compared as UTC ISO text like
+    ``has_department_decision_since``."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return []
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?",
+            (_utc_bound(since), limit),
+        ).fetchall()
+    return [Decision(**dict(row)) for row in rows]
+
+
+def decisions_awaiting_outcome(
+    older_than: datetime,
+    *,
+    limit: int = 3,
+    db_path: Path | None = None,
+) -> list[Decision]:
+    """Decisions logged before ``older_than`` with no outcome recorded yet,
+    newest first — the weekly review asks "how did this turn out?" about
+    these, and ``record_decision_outcome`` fills the outcome in. An outcome
+    of only whitespace counts as empty."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(resolved) as conn:
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE timestamp < ? "
+            "AND TRIM(COALESCE(outcome, '')) = '' "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (_utc_bound(older_than), limit),
+        ).fetchall()
+    return [Decision(**dict(row)) for row in rows]
+
+
+def get_active_initiatives(db_path: Path | None = None) -> list[Initiative]:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(resolved) as conn:
         rows = conn.execute(
             "SELECT * FROM initiatives WHERE status != 'completed' ORDER BY updated_at DESC"
         ).fetchall()
@@ -618,10 +862,8 @@ def get_recent_initiatives(
 ) -> list[Initiative]:
     """Most recently kicked-off initiatives, newest first.
 
-    Resolves `db_path` lazily (mirrors `get_recent_decisions`/`get_recent_advice`)
-    so callers and tests pick up a monkeypatched/live `DB_PATH`, unlike
-    `list_initiatives`'s eager default. Ordered by `created_at` DESC — the
-    activity rail surfaces these as "kicked off initiative" events.
+    Ordered by `created_at` DESC — the activity rail surfaces these as
+    "kicked off initiative" events.
     """
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
@@ -633,60 +875,66 @@ def get_recent_initiatives(
     return [Initiative(**dict(row)) for row in rows]
 
 
-def list_decisions(db_path: Path = DB_PATH) -> list[Decision]:
-    if not db_path.exists():
+def list_decisions(db_path: Path | None = None) -> list[Decision]:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return []
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         rows = conn.execute(
             "SELECT * FROM decisions ORDER BY timestamp DESC"
         ).fetchall()
     return [Decision(**dict(row)) for row in rows]
 
 
-def list_initiatives(db_path: Path = DB_PATH) -> list[Initiative]:
-    if not db_path.exists():
+def list_initiatives(db_path: Path | None = None) -> list[Initiative]:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return []
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         rows = conn.execute(
             "SELECT * FROM initiatives ORDER BY updated_at DESC"
         ).fetchall()
     return [Initiative(**dict(row)) for row in rows]
 
 
-def list_advice(db_path: Path = DB_PATH) -> list[Advice]:
-    if not db_path.exists():
+def list_advice(db_path: Path | None = None) -> list[Advice]:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return []
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         rows = conn.execute(
             "SELECT * FROM advice_given ORDER BY timestamp DESC"
         ).fetchall()
     return [Advice(**dict(row)) for row in rows]
 
 
-def get_decision(decision_id: int, db_path: Path = DB_PATH) -> Decision | None:
-    if not db_path.exists():
+def get_decision(decision_id: int, db_path: Path | None = None) -> Decision | None:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return None
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         row = conn.execute(
             "SELECT * FROM decisions WHERE id = ?", (decision_id,)
         ).fetchone()
     return Decision(**dict(row)) if row else None
 
 
-def get_initiative(initiative_id: int, db_path: Path = DB_PATH) -> Initiative | None:
-    if not db_path.exists():
+def get_initiative(initiative_id: int, db_path: Path | None = None) -> Initiative | None:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return None
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         row = conn.execute(
             "SELECT * FROM initiatives WHERE id = ?", (initiative_id,)
         ).fetchone()
     return Initiative(**dict(row)) if row else None
 
 
-def get_advice(advice_id: int, db_path: Path = DB_PATH) -> Advice | None:
-    if not db_path.exists():
+def get_advice(advice_id: int, db_path: Path | None = None) -> Advice | None:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return None
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         row = conn.execute(
             "SELECT * FROM advice_given WHERE id = ?", (advice_id,)
         ).fetchone()
@@ -701,8 +949,9 @@ def update_decision(
     rationale: str | None = None,
     outcome: str | None = None,
     tags: str | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
 ) -> bool:
+    resolved = _resolve_db_path(db_path)
     fields: list[tuple[str, str]] = []
     if domain is not None:
         fields.append(("domain", domain))
@@ -715,10 +964,10 @@ def update_decision(
     if tags is not None:
         fields.append(("tags", tags))
     if not fields:
-        return get_decision(decision_id, db_path) is not None
+        return get_decision(decision_id, resolved) is not None
     set_clause = ", ".join(f"{name} = ?" for name, _ in fields)
     values = [value for _, value in fields] + [decision_id]
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute(
             f"UPDATE decisions SET {set_clause} WHERE id = ?", values
         )
@@ -731,8 +980,10 @@ def update_initiative(
     title: str | None = None,
     status: str | None = None,
     summary: str | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
+    updated_by_person_id: int | None = None,
 ) -> bool:
+    resolved = _resolve_db_path(db_path)
     fields: list[tuple[str, str]] = []
     if title is not None:
         fields.append(("title", title))
@@ -741,15 +992,48 @@ def update_initiative(
     if summary is not None:
         fields.append(("summary", summary))
     if not fields:
-        return get_initiative(initiative_id, db_path) is not None
+        return get_initiative(initiative_id, resolved) is not None
     fields.append(("updated_at", datetime.now(UTC).isoformat()))
     set_clause = ", ".join(f"{name} = ?" for name, _ in fields)
     values = [value for _, value in fields] + [initiative_id]
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute(
             f"UPDATE initiatives SET {set_clause} WHERE id = ?", values
         )
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+    if updated:
+        _resolve_initiative_outreach(initiative_id, updated_by_person_id, resolved)
+    return updated
+
+
+def _principal_person_id() -> int | None:
+    """The principal's roster id, or None when there is none. Never raises."""
+    try:
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+    except Exception:
+        logger.debug("principal lookup failed", exc_info=True)
+        return None
+    return principal.id if principal is not None else None
+
+
+def _resolve_initiative_outreach(
+    initiative_id: int, updated_by_person_id: int | None, db_path: Path | None
+) -> None:
+    """The person a check-in nudge went to updated the initiative, so it landed.
+
+    Credit goes only to the updater's own pending check-ins. An update from
+    someone else (the principal editing the card, an unauthenticated API call)
+    says nothing about whether the department head answered."""
+    if updated_by_person_id is None:
+        return
+    from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
+
+    resolve_by_ref(
+        f"nudge:initiative:{initiative_id}", OUTCOME_ACTED,
+        person_ids={updated_by_person_id}, db_path=db_path,
+    )
 
 
 def update_advice(
@@ -758,8 +1042,9 @@ def update_advice(
     domain: str | None = None,
     query_summary: str | None = None,
     advice_summary: str | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
 ) -> bool:
+    resolved = _resolve_db_path(db_path)
     fields: list[tuple[str, str]] = []
     if domain is not None:
         fields.append(("domain", domain))
@@ -768,36 +1053,39 @@ def update_advice(
     if advice_summary is not None:
         fields.append(("advice_summary", advice_summary))
     if not fields:
-        return get_advice(advice_id, db_path) is not None
+        return get_advice(advice_id, resolved) is not None
     set_clause = ", ".join(f"{name} = ?" for name, _ in fields)
     values = [value for _, value in fields] + [advice_id]
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute(
             f"UPDATE advice_given SET {set_clause} WHERE id = ?", values
         )
         return cursor.rowcount > 0
 
 
-def delete_decision(decision_id: int, db_path: Path = DB_PATH) -> bool:
-    if not db_path.exists():
+def delete_decision(decision_id: int, db_path: Path | None = None) -> bool:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return False
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute("DELETE FROM decisions WHERE id = ?", (decision_id,))
         return cursor.rowcount > 0
 
 
-def delete_initiative(initiative_id: int, db_path: Path = DB_PATH) -> bool:
-    if not db_path.exists():
+def delete_initiative(initiative_id: int, db_path: Path | None = None) -> bool:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return False
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute("DELETE FROM initiatives WHERE id = ?", (initiative_id,))
         return cursor.rowcount > 0
 
 
-def delete_advice(advice_id: int, db_path: Path = DB_PATH) -> bool:
-    if not db_path.exists():
+def delete_advice(advice_id: int, db_path: Path | None = None) -> bool:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
         return False
-    with _get_conn(db_path) as conn:
+    with _get_conn(resolved) as conn:
         cursor = conn.execute("DELETE FROM advice_given WHERE id = ?", (advice_id,))
         return cursor.rowcount > 0
 
@@ -819,16 +1107,6 @@ _VALID_OUTBOUND_CHANNELS = {"discord_dm", "telegram", "slack_dm", "email"}
 # bounding storage + the prompt-injection surface re-injected into the reply
 # turn.
 _MAX_OUTBOUND_CONTEXT_CHARS = 2000
-
-
-def _resolve_db_path(db_path: Path | None) -> Path:
-    """Return the caller's path or the current module-level DB_PATH.
-
-    Reading DB_PATH dynamically (not via default-arg binding) lets tests
-    monkeypatch `openexecutive.memory.episodic.DB_PATH` and have it actually
-    take effect — default arguments capture the value at def time.
-    """
-    return db_path if db_path is not None else DB_PATH
 
 
 _VALID_INSERT_STATUSES = {"pending", "done"}
@@ -964,7 +1242,13 @@ def mark_outbound_context_consumed(
             "WHERE id = ? AND status = 'open'",
             (datetime.now(UTC).isoformat(), context_id),
         )
-        return cursor.rowcount > 0
+        consumed = cursor.rowcount > 0
+    if consumed:
+        # A matched reply is the clearest sign a proactive DM landed.
+        from openexecutive.attunement.outcomes import OUTCOME_REPLIED, resolve_by_outbound_context
+
+        resolve_by_outbound_context(context_id, OUTCOME_REPLIED, db_path=db_path)
+    return consumed
 
 
 def scope_key_in_use(scope_key: str, db_path: Path | None = None) -> bool:
@@ -1126,9 +1410,14 @@ def count_activity_by_day(
         ("initiatives",
          "SELECT substr(created_at, 1, 10) AS day FROM initiatives"
          " WHERE substr(created_at, 1, 10) >= ?"),
+        # Private rows are left out, as the feed leaves them out: a decision
+        # or alert private to the principal (today._payload_is_private,
+        # alerts.models.PRIVATE_ALERT_TAG) is not everyone's heartbeat.
         ("decision_instances",
          "SELECT substr(resolved_at, 1, 10) AS day FROM decision_instances"
-         " WHERE resolved_at IS NOT NULL AND substr(resolved_at, 1, 10) >= ?"),
+         " WHERE resolved_at IS NOT NULL AND substr(resolved_at, 1, 10) >= ?"
+         " AND (CASE WHEN json_valid(proposed_payload_json)"
+         " THEN json_extract(proposed_payload_json, '$.private') END) IS NOT 1"),
         # source != 'decision_scheduling' mirrors `_build_activity`'s exclusion
         # (decision_ledger.DECISION_ALERT_SOURCE) so the heatmap matches the
         # feed: a resolved gated booking is counted once (decision_instances
@@ -1136,6 +1425,7 @@ def count_activity_by_day(
         ("alerts",
          "SELECT substr(created_at, 1, 10) AS day FROM alerts"
          " WHERE source != 'decision_scheduling'"
+         " AND lower(coalesce(topic_tags, '')) NOT LIKE '%\"private:principal\"%'"
          " AND substr(created_at, 1, 10) >= ?"),
     ]
     with _get_conn(resolved) as conn:
@@ -1274,6 +1564,20 @@ def mark_action_failed(action_id: int, error: str, db_path: Path | None = None) 
         return cursor.rowcount > 0
 
 
+def mark_action_cancelled(action_id: int, reason: str, db_path: Path | None = None) -> bool:
+    """Retire a claimed action without running it, recording why in
+    ``last_error`` (e.g. a department check-in in a solo workspace). Unlike
+    ``cancel_scheduled_action`` this also moves a ``running`` row — for the
+    runner, which holds the claim."""
+    with _get_conn(_resolve_db_path(db_path)) as conn:
+        cursor = conn.execute(
+            "UPDATE scheduled_actions SET status = 'cancelled', last_error = ? "
+            "WHERE id = ? AND status IN ('pending', 'running')",
+            (reason[:500], action_id),
+        )
+        return cursor.rowcount > 0
+
+
 def mark_action_failed_or_retry(
     action_id: int,
     error: str,
@@ -1317,10 +1621,16 @@ def cancel_scheduled_action(action_id: int, db_path: Path | None = None) -> str:
         current = row["status"]
         if current != "pending":
             return "not_cancellable"
-        conn.execute(
-            "UPDATE scheduled_actions SET status = 'cancelled' WHERE id = ?",
+        # Guard the write too: the scheduler's claim can flip the row to
+        # 'running' between the SELECT and here, and a cancel must never
+        # overwrite a claimed row (the dispatch would go ahead regardless).
+        cursor = conn.execute(
+            "UPDATE scheduled_actions SET status = 'cancelled' "
+            "WHERE id = ? AND status = 'pending'",
             (action_id,),
         )
+        if cursor.rowcount == 0:
+            return "not_cancellable"
         return "cancelled"
 
 
@@ -1411,9 +1721,14 @@ def list_scheduled_actions(
     status: str | None = None,
     limit: int = 100,
     order: str = "asc",
+    exclude_internal: bool = False,
     db_path: Path | None = None,
 ) -> list[ScheduledAction]:
     """List scheduled actions, optionally filtered by status.
+
+    ``exclude_internal`` drops ``__internal__``-channel rows in SQL, so a
+    caller that only wants real sends (the activity feed) is not starved by
+    internal rows — open loops, heartbeats — filling its ``limit``.
 
     `order` sorts by `run_at`: "asc" (default) puts the soonest-due pending
     rows first — the right default for the upcoming queue; "desc" puts the
@@ -1426,17 +1741,19 @@ def list_scheduled_actions(
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
         return []
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if exclude_internal:
+        clauses.append("channel != '__internal__'")
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     with _get_conn(resolved) as conn:
-        if status is None:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions ORDER BY run_at {direction} LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions WHERE status = ? ORDER BY run_at {direction} LIMIT ?",
-                (status, limit),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM scheduled_actions {where}ORDER BY run_at {direction} LIMIT ?",
+            (*params, limit),
+        ).fetchall()
     return [ScheduledAction(**dict(row)) for row in rows]
 
 
@@ -1503,7 +1820,12 @@ def list_awaiting_replies_by_person(
             "  AND assigned_to_person_id IS NOT NULL "
             "  AND status IN ('pending', 'done') "
             "  AND kind != 'proactive_nudge' "
-            "GROUP BY assigned_to_person_id"
+            # An open loop's awaiting_response_since is its DUE time: until
+            # then nobody is waiting on the owner (the nudge engine uses the
+            # same cut-off).
+            "  AND NOT (kind = 'open_loop' AND awaiting_response_since > ?) "
+            "GROUP BY assigned_to_person_id",
+            (datetime.now(UTC).isoformat(),),
         ).fetchall()
     return {int(r["pid"]): (int(r["cnt"]), r["oldest"]) for r in rows}
 
@@ -1529,13 +1851,38 @@ def last_contact_at_by_person(
             "FROM scheduled_actions "
             "WHERE assigned_to_person_id IS NOT NULL "
             "  AND status = 'done' "
+            # An open loop is a record of what someone owes, not a message
+            # we sent them — counting it would report contact that never
+            # happened.
+            "  AND kind != 'open_loop' "
             "GROUP BY assigned_to_person_id"
         ).fetchall()
     return {int(r["pid"]): r["last"] for r in rows}
 
 
+# Session-id prefixes the inbound channels mint (``email:<thread>``,
+# ``slack:dm:<user>``, …), and how a decision recorded on one is sourced in the
+# prompt. A web or CLI session id is a bare uuid and gets no tag.
+_DECISION_SOURCES = {
+    "email": "email",
+    "slack": "Slack",
+    "discord": "Discord",
+    "telegram": "Telegram",
+    "google_chat": "Google Chat",
+}
+
+
+def _decision_source(session_id: str) -> str:
+    """Where a decision was recorded, from its session id — "" for the web
+    app, the CLI or a row with none. Rendered next to the decision so a row
+    extracted from mail before the untrusted-content policy (when any sender's
+    body could be stored) reads as mail, not as the principal's own word."""
+    prefix, sep, _rest = (session_id or "").partition(":")
+    return _DECISION_SOURCES.get(prefix, "") if sep else ""
+
+
 def format_for_prompt(
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
     max_chars: int = 2500,
     session_id: str = "",
 ) -> str:
@@ -1549,9 +1896,10 @@ def format_for_prompt(
     Output is bounded by `max_chars`. When over budget, oldest advice is dropped
     first, then oldest decisions. Initiatives are always kept.
     """
-    decisions = get_recent_decisions(limit=5, db_path=db_path, session_id=session_id)
-    initiatives = get_active_initiatives(db_path=db_path)
-    advice_items = get_recent_advice(limit=2, db_path=db_path, session_id=session_id)
+    resolved = _resolve_db_path(db_path)
+    decisions = get_recent_decisions(limit=5, db_path=resolved, session_id=session_id)
+    initiatives = get_active_initiatives(db_path=resolved)
+    advice_items = get_recent_advice(limit=2, db_path=resolved, session_id=session_id)
 
     if not decisions and not initiatives and not advice_items:
         return ""
@@ -1559,7 +1907,9 @@ def format_for_prompt(
     decision_lines: list[str] = []
     for d in decisions:
         date = d.timestamp[:10]
-        line = f"- {date} [{d.domain}]: {d.summary}"
+        source = _decision_source(d.session_id)
+        via = f" (via {source})" if source else ""
+        line = f"- {date} [{d.domain}]{via}: {d.summary}"
         if d.outcome:
             line += f" (Outcome: {d.outcome})"
         decision_lines.append(line)
@@ -1740,7 +2090,8 @@ _EXTRACTION_SYSTEM = (
     "Required for every item: a `user_commitment_quote` field with verbatim text copied from "
     "the USER QUESTION block. The quote must be a declarative commitment — NOT a question, "
     "NOT a hypothetical, NOT a paraphrase. If you cannot find such a quote in the USER QUESTION "
-    "text, do not include the item at all. A deterministic post-extraction validator will "
+    "text, do not include the item at all. Copy it exactly as the user typed it — typos, "
+    "casing and punctuation included; never correct or tidy it. A deterministic post-extraction validator will "
     "drop any item whose quote does not appear verbatim in the USER QUESTION or whose quote "
     "ends in a question mark — fabricating quotes wastes a tool call.\n"
     "\n"
@@ -1851,12 +2202,7 @@ _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 # bad it is.
 _MAX_DROPPED_IN_AUDIT = 10
 
-def should_extract(
-    user_message: str,
-    *,
-    origin_channel: str = "",
-    person_id: int | None = None,
-) -> bool:
+def should_extract(user_message: str, *, session: Any) -> bool:
     """True when this turn is worth an extraction pass.
 
     **No length floor.** There used to be one on the combined user+assistant
@@ -1884,36 +2230,25 @@ def should_extract(
     attached, indistinguishable from the principal's own; an inbound email
     body is text the sender chose, and a self-quote is free.
 
-    Removing the length floor is what makes this matter — short channel
-    traffic used to fall under it incidentally — so the speaker check lands
-    with it. A turn with no `origin_channel` came from the web app, the CLI or
-    the API, all of which are the principal's own authenticated surfaces, and
-    `person_id` is legitimately None there in a single-user install. A turn
-    that names a channel must resolve to a person marked `is_principal`.
+    So the speaker must be the principal on a surface that proved it
+    (`orchestrator.content_trust.principal_speaking`) — the one rule the
+    untrusted-content policy keeps for every surface. It used to be keyed on
+    an empty `origin_channel` meaning "the web app", and the email poller left
+    it empty too, so every stranger's email ran through the extractor with its
+    body as the principal's words. The rule now asks for the principal's
+    surfaces by name and fails closed on anything else.
 
     The single decision point for both call sites in `orchestrator.executive`,
     so the rule is testable directly and the two paths cannot drift apart.
     """
-    if not user_message.strip():
-        return False
-    if not origin_channel:
-        return True
-    if person_id is None:
-        return False
-    try:
-        from openexecutive.people.store import get_person
+    from openexecutive.orchestrator.content_trust import (
+        principal_speaking,
+        strip_untrusted,
+    )
 
-        person = get_person(person_id)
-    except Exception:
-        # Fail closed: an unresolvable speaker is not the principal.
-        logger.warning(
-            "extraction_speaker_lookup_failed person_id=%s channel=%s",
-            person_id,
-            origin_channel,
-            exc_info=True,
-        )
+    if not strip_untrusted(user_message).strip():
         return False
-    return bool(person is not None and person.is_principal)
+    return principal_speaking(session)
 
 
 # Drop reasons for a payload SHAPE the model got wrong, as opposed to an item
@@ -1986,8 +2321,13 @@ def _accept(
     spec: _ItemSpec,
     user_message: str,
     dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] | None = None,
 ) -> bool:
     """True when ``item`` is complete and genuinely the user's own commitment.
+
+    ``rejected`` collects the full item on the bad-quote path so the retry can
+    show the model exactly what it wrote; the audit record keeps only the
+    truncated label.
 
     Shared by all three kinds so a drop is recorded on every rejecting path.
     Counting an item as proposed and then returning without a drop record is
@@ -2009,12 +2349,14 @@ def _accept(
         )
         return False
 
-    quote = str(item.get("user_commitment_quote", ""))
+    quote = _quote_of(item)
     label = str(item.get(spec.label, ""))
     if not _is_valid_user_commitment(quote, user_message):
         dropped.append(
-            {"kind": spec.kind, "reason": "bad_quote", "label": label[:60]}
+            {"kind": spec.kind, "reason": "bad_quote", "label": label[:_LABEL_CHARS]}
         )
+        if rejected is not None:
+            rejected.append((spec, item))
         logger.debug(
             "Dropping %s — invalid user_commitment_quote %r (%s=%r)",
             spec.kind,
@@ -2026,6 +2368,299 @@ def _accept(
     return True
 
 
+_ITEM_SPECS = (_DECISIONS, _INITIATIVES, _ADVICE)
+
+# How much of an item's label rides in its drop record, in the retry prompt and
+# in the identity the two passes use to recognise the same item. One number,
+# because a drop record and a re-submission must cut the label identically to
+# match up.
+_LABEL_CHARS = 60
+
+# How much of a rejected quote is echoed back to the model on the retry. The
+# quote is model output and uncapped, so this bounds the retry prompt.
+_RETRY_QUOTE_ECHO_CHARS = 200
+
+# Output budget for both extraction calls. Three short arrays of items; a
+# model that needs more is padding, not extracting.
+_EXTRACTION_MAX_TOKENS = 1024
+
+
+def _store_item(
+    spec: _ItemSpec, item: dict[str, Any], *, session_id: str, db_path: Path
+) -> None:
+    """Persist one accepted item. The three store functions take different
+    fields, so this is the one place the mapping lives; both extraction passes
+    go through it. Raises on a failed write — a locked database must surface
+    as the pass's `failure`, not as a healthy-looking `stored=0`."""
+    if spec is _DECISIONS:
+        store_decision(
+            domain=item.get("domain", "general"),
+            summary=item["summary"],
+            rationale=item.get("rationale", ""),
+            session_id=session_id,
+            db_path=db_path,
+        )
+    elif spec is _INITIATIVES:
+        # Extraction only runs on the principal's own words (should_extract),
+        # so the principal is the one updating it.
+        store_initiative(
+            title=item["title"],
+            status=item.get("status", "active"),
+            summary=item["summary"],
+            db_path=db_path,
+            updated_by_person_id=_principal_person_id(),
+        )
+    else:
+        store_advice(
+            domain=item.get("domain", "general"),
+            query_summary=item["query_summary"],
+            advice_summary=item["advice_summary"],
+            session_id=session_id,
+            db_path=db_path,
+        )
+
+
+def _run_items(
+    payload: dict[str, Any],
+    user_message: str,
+    *,
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """First pass over one tool payload: read → count → validate → store.
+
+    ``accepted`` receives the `_stored_quote_key` of every stored item so the retry
+    can tell a re-send of something already stored from a recovered or new
+    item.
+    """
+    for spec in _ITEM_SPECS:
+        for item in _iter_items(payload, spec, dropped):
+            proposed[spec.key] += 1
+            _validate_and_store(
+                item, spec, user_message,
+                dropped=dropped, rejected=rejected, stored=stored,
+                accepted=accepted, session_id=session_id, db_path=db_path,
+            )
+
+
+def _validate_and_store(
+    item: dict[str, Any],
+    spec: _ItemSpec,
+    user_message: str,
+    *,
+    dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] | None,
+    stored: dict[str, int],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> bool:
+    """First-pass item: validate and, if it passes, store and count it. The
+    retry classifies an accepted item first (recovery / re-send / new), so it
+    calls `_accept` and `_store_and_count` itself."""
+    if not _accept(item, spec, user_message, dropped, rejected):
+        return False
+    _store_and_count(
+        spec, item, stored=stored, accepted=accepted, session_id=session_id, db_path=db_path
+    )
+    return True
+
+
+def _store_and_count(
+    spec: _ItemSpec,
+    item: dict[str, Any],
+    *,
+    stored: dict[str, int],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """Store an accepted item and count it — after the write, never before."""
+    _store_item(spec, item, session_id=session_id, db_path=db_path)
+    stored[spec.key] += 1
+    accepted.add(_stored_quote_key(spec, item))
+
+
+def _quote_of(item: dict[str, Any]) -> str:
+    """The item's quote as text. A JSON `null` is no quote, not the word
+    "None" — which `str()` would make it, and which then matches any user
+    message containing that word."""
+    quote = item.get("user_commitment_quote")
+    return "" if quote is None else str(quote)
+
+
+def _drop_label_key(spec: _ItemSpec, item: dict[str, Any]) -> tuple[str, str]:
+    """How a re-submission is matched to its drop record: kind and label, cut
+    the way the record cuts it. A reworded label does not match — the item is
+    then stored as a new proposal and the original drop stands, because
+    "reworded" and "different" cannot be told apart."""
+    return spec.kind, str(item.get(spec.label, ""))[:_LABEL_CHARS]
+
+
+def _stored_quote_key(spec: _ItemSpec, item: dict[str, Any]) -> tuple[str, str]:
+    """How a re-sent, already-stored item is recognised: kind and the quote it
+    rests on, ignoring terminal punctuation. The model rewords labels freely
+    but keeps a quote that passed, so the quote is the stable identity; asked
+    to re-copy character-for-character it may gain or lose the full stop, so
+    that must not make a new identity. Checked only after the drop records:
+    a correctly re-quoted item whose label matches a pending drop is a
+    recovery even when its sentence already supports a stored item."""
+    return spec.kind, _normalize_for_quote_match(_quote_of(item)).strip(" .!")
+
+
+def _find_drop(dropped: list[dict[str, str]], key: tuple[str, str]) -> int | None:
+    """Index of the bad-quote drop record a re-submitted item was filed under.
+
+    Only an exact `(kind, label)` match counts. A looser rule — "any bad-quote
+    drop of this kind" — would let an unrelated valid item consume the record
+    and report a recovery that never happened, erasing the very `bad_quote`
+    census this row exists to show. None means the item is a new proposal,
+    whether or not the model meant it as a reworded re-send.
+    """
+    kind, label = key
+    for i, d in enumerate(dropped):
+        if d["kind"] == kind and d["reason"] == "bad_quote" and d.get("label") == label:
+            return i
+    return None
+
+
+def _retry_prompt(
+    turn_block: str, rejected: list[tuple[_ItemSpec, dict[str, Any]]]
+) -> str:
+    lines = []
+    for spec, item in rejected:
+        _, label = _drop_label_key(spec, item)
+        quote = _quote_of(item)[:_RETRY_QUOTE_ECHO_CHARS]
+        lines.append(f'- {spec.kind} "{label}": quote given "{quote}"')
+    return (
+        f"{turn_block}\n\n"
+        "REJECTED ITEMS — the user_commitment_quote you gave was NOT found "
+        "verbatim in USER QUESTION:\n"
+        + "\n".join(lines)
+        + "\n\nRe-submit ONLY these items. Copy user_commitment_quote "
+        "character-for-character from USER QUESTION, including typos and casing. "
+        "If USER QUESTION has no declarative sentence that supports an item, omit "
+        "it. Do not add new items. Return empty arrays for anything you cannot "
+        "re-quote."
+    )
+
+
+async def _retry_rejected(
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]],
+    *,
+    turn_block: str,
+    user_message: str,
+    routing_model: str,
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[dict[str, str]],
+    accepted: set[tuple[str, str]],
+    result: dict[str, Any],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """One corrective pass for items the first pass dropped as `bad_quote`.
+
+    The model has repeatedly paraphrased the user's words instead of copying
+    them, and the validator (rightly) rejects a paraphrase — so a real
+    commitment was lost on the first slip with no second chance. This shows
+    the model exactly which quotes failed and asks for the verbatim span, with
+    the tool forced so a text-only reply cannot happen. Cost: one utility-model
+    call, only on turns that dropped something.
+
+    Accounting keeps `proposed == stored + item drops` true. Every retry item
+    is validated first; a still-invalid one adds no second drop and is counted
+    under `still_invalid`. A valid item is then classified in this order: its
+    label matches a pending bad-quote drop record → a recovery, stored and the
+    record released; else its quote (same kind, terminal punctuation ignored)
+    already supports a stored item → a re-send, ignored and counted under
+    `repeated`; else a new proposal, stored and counted — including a
+    re-submission whose label the model reworded, since that cannot be told
+    from a different item, and its original drop then stands. Recovery is
+    checked before re-send because two items can rest on one sentence.
+    Malformed shapes at any level — a kind that is not a list, an item that is
+    not a dict, a tool payload that is not a dict, or a response with no
+    `store_memories` call at all — are counted under `malformed`, so a retry
+    that returned garbage does not read as one that obediently returned
+    nothing. The tool is forced where the provider supports tool choice.
+
+    ``result`` is the caller's `retry` block, mutated in place: work done
+    before a cancellation stays counted. An `Exception` here is recorded as
+    the retry's own `failure` and leaves the first pass's results untouched;
+    cancellation propagates so the whole pass is marked FAILED, as it is
+    today.
+    """
+    from openexecutive.audit.usage import log_model_usage
+    from openexecutive.providers import get_provider
+
+    scratch: list[dict[str, str]] = []
+    tool_calls: int | None = None  # None until a response arrives
+    try:
+        response = await get_provider(routing_model).messages_create(
+            model=routing_model,
+            max_tokens=_EXTRACTION_MAX_TOKENS,
+            system=_EXTRACTION_SYSTEM,
+            tools=[_EXTRACTION_TOOL],
+            tool_choice={"type": "tool", "name": "store_memories"},
+            messages=[{"role": "user", "content": _retry_prompt(turn_block, rejected)}],
+        )
+        log_model_usage(response, model=routing_model, actor="memory_extractor")
+
+        tool_calls = 0
+        for block in response.content:
+            if block.type != "tool_use" or block.name != "store_memories":
+                continue
+            tool_calls += 1
+            inp = block.input
+            if not isinstance(inp, dict):
+                scratch.append({"kind": "pass", "reason": "payload_not_a_dict"})
+                continue
+            for spec in _ITEM_SPECS:
+                for item in _iter_items(inp, spec, scratch):
+                    if not _accept(item, spec, user_message, scratch):
+                        continue
+                    drop_at = _find_drop(dropped, _drop_label_key(spec, item))
+                    if drop_at is None and _stored_quote_key(spec, item) in accepted:
+                        result["repeated"] += 1
+                        continue
+                    _store_and_count(
+                        spec, item, stored=stored, accepted=accepted,
+                        session_id=session_id, db_path=db_path,
+                    )
+                    if drop_at is None:
+                        proposed[spec.key] += 1
+                    else:
+                        del dropped[drop_at]
+                        result["recovered"] += 1
+    except Exception as exc:
+        result["failure"] = type(exc).__name__
+        logger.exception("Episodic memory extraction retry failed — keeping first pass")
+    finally:
+        # Counted in `finally` so a retry that died mid-loop still reports the
+        # drops it had already seen, not zeros beside its `failure`. A response
+        # with no tool call is one malformed shape; no response at all is not.
+        malformed = sum(1 for d in scratch if d["reason"] in _SHAPE_REASONS)
+        result["malformed"] = malformed + (1 if tool_calls == 0 else 0)
+        result["still_invalid"] = len(scratch) - malformed
+
+
+def _no_retry() -> dict[str, Any]:
+    """The `retry` audit shape when no corrective pass ran (or before it has)."""
+    return {
+        "rejected": 0,
+        "recovered": 0,
+        "repeated": 0,
+        "still_invalid": 0,
+        "malformed": 0,
+        "failure": "",
+    }
+
+
 def _audit_extraction(
     proposed: dict[str, int],
     stored: dict[str, int],
@@ -2033,8 +2668,13 @@ def _audit_extraction(
     *,
     session_id: str,
     failure: str = "",
+    retry: dict[str, Any] | None = None,
 ) -> None:
     """One `memory_extraction` audit row per extraction pass.
+
+    `retry` is always present in the details (zeros when nothing was rejected)
+    so a query never has to branch on key presence; it says how many bad-quote
+    drops a corrective pass was owed and how many it recovered.
 
     The point is that "the model proposed nothing" and "the model proposed
     things and every one was rejected" are different failures with different
@@ -2061,13 +2701,17 @@ def _audit_extraction(
     total_stored = sum(stored.values())
     malformed = sum(1 for d in dropped if d["reason"] in _SHAPE_REASONS)
     prefix = f"FAILED({failure}) " if failure else ""
+    retry = retry if retry is not None else _no_retry()
+    retry_note = (
+        f" retry={retry['recovered']}/{retry['rejected']}" if retry["rejected"] else ""
+    )
     try:
         from openexecutive.audit import log_event
 
         log_event(
             "memory_extraction",
             f"{prefix}proposed={total_proposed} stored={total_stored} "
-            f"dropped={len(dropped)} malformed={malformed}",
+            f"dropped={len(dropped)} malformed={malformed}{retry_note}",
             session_id=session_id or None,
             actor="memory_extractor",
             details={
@@ -2080,6 +2724,7 @@ def _audit_extraction(
                 # drops on decisions this week" is a query, not a string split
                 # over a field that can itself contain colons.
                 "dropped": dropped[:_MAX_DROPPED_IN_AUDIT],
+                "retry": retry,
             },
         )
     except Exception:
@@ -2089,7 +2734,7 @@ def _audit_extraction(
 async def extract_and_store(
     user_message: str,
     assistant_response: str,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
     session_id: str = "",
     audit_session_id: str | None = None,
     audit_turn_id: str | None = None,
@@ -2108,6 +2753,8 @@ async def extract_and_store(
     """
     from openexecutive.audit.context import get_active_ids, set_turn
 
+    resolved = _resolve_db_path(db_path)
+
     # Fall back per field, not as a pair. Binding a half-empty snapshot
     # would erase the ambient counterpart — a row under a session with no
     # turn, or a turn that joins to nothing — which is worse than either
@@ -2120,13 +2767,13 @@ async def extract_and_store(
 
     if (effective_session, effective_turn) == (ambient_session, ambient_turn):
         await _extract_and_store(
-            user_message, assistant_response, db_path, session_id
+            user_message, assistant_response, resolved, session_id
         )
         return
 
     with set_turn(session_id=effective_session, turn_id=effective_turn):
         await _extract_and_store(
-            user_message, assistant_response, db_path, session_id
+            user_message, assistant_response, resolved, session_id
         )
 
 
@@ -2139,6 +2786,9 @@ async def _extract_and_store(
     proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
     stored = {"decisions": 0, "initiatives": 0, "advice": 0}
     dropped: list[dict[str, str]] = []
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] = []
+    accepted: set[tuple[str, str]] = set()
+    retry = _no_retry()
     failure = ""
     try:
         from openexecutive.audit.usage import log_model_usage
@@ -2165,22 +2815,18 @@ async def _extract_and_store(
         else:
             existing_block = ""
 
+        turn_block = (
+            f"{existing_block}"
+            f"USER QUESTION:\n{user_message[:_MAX_INPUT_CHARS]}\n\n"
+            f"EXECUTIVE RESPONSE:\n{assistant_response[:_MAX_INPUT_CHARS]}"
+        )
         response = await get_provider(routing_model).messages_create(
             model=routing_model,
-            max_tokens=1024,
+            max_tokens=_EXTRACTION_MAX_TOKENS,
             system=_EXTRACTION_SYSTEM,
             tools=[_EXTRACTION_TOOL],
             tool_choice={"type": "auto"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"{existing_block}"
-                        f"USER QUESTION:\n{user_message[:_MAX_INPUT_CHARS]}\n\n"
-                        f"EXECUTIVE RESPONSE:\n{assistant_response[:_MAX_INPUT_CHARS]}"
-                    ),
-                }
-            ],
+            messages=[{"role": "user", "content": turn_block}],
         )
 
         log_model_usage(response, model=routing_model, actor="memory_extractor")
@@ -2200,45 +2846,32 @@ async def _extract_and_store(
             if not isinstance(inp, dict):
                 dropped.append({"kind": "pass", "reason": "payload_not_a_dict"})
                 continue
-            # Each loop is read → count → validate → store. The counting and
-            # validation are identical across the three kinds and live in
-            # `_accept`; only the store call differs, because the three store
-            # functions take different fields.
-            for d in _iter_items(inp, _DECISIONS, dropped):
-                proposed["decisions"] += 1
-                if not _accept(d, _DECISIONS, user_message, dropped):
-                    continue
-                store_decision(
-                    domain=d.get("domain", "general"),
-                    summary=d["summary"],
-                    rationale=d.get("rationale", ""),
-                    session_id=session_id,
-                    db_path=db_path,
-                )
-                stored["decisions"] += 1
-            for i in _iter_items(inp, _INITIATIVES, dropped):
-                proposed["initiatives"] += 1
-                if not _accept(i, _INITIATIVES, user_message, dropped):
-                    continue
-                store_initiative(
-                    title=i["title"],
-                    status=i.get("status", "active"),
-                    summary=i["summary"],
-                    db_path=db_path,
-                )
-                stored["initiatives"] += 1
-            for a in _iter_items(inp, _ADVICE, dropped):
-                proposed["advice"] += 1
-                if not _accept(a, _ADVICE, user_message, dropped):
-                    continue
-                store_advice(
-                    domain=a.get("domain", "general"),
-                    query_summary=a["query_summary"],
-                    advice_summary=a["advice_summary"],
-                    session_id=session_id,
-                    db_path=db_path,
-                )
-                stored["advice"] += 1
+            _run_items(
+                inp,
+                user_message,
+                proposed=proposed,
+                stored=stored,
+                dropped=dropped,
+                rejected=rejected,
+                accepted=accepted,
+                session_id=session_id,
+                db_path=db_path,
+            )
+
+        if rejected:
+            await _retry_rejected(
+                rejected,
+                turn_block=turn_block,
+                user_message=user_message,
+                routing_model=routing_model,
+                proposed=proposed,
+                stored=stored,
+                dropped=dropped,
+                accepted=accepted,
+                result=retry,
+                session_id=session_id,
+                db_path=db_path,
+            )
 
     except Exception as exc:
         # Recorded so the audit row can say the pass FAILED. Without it a
@@ -2258,9 +2891,13 @@ async def _extract_and_store(
         raise
     finally:
         # In `finally`, not the happy path: a pass that crashed is exactly the
-        # one an operator needs to see.
+        # one an operator needs to see. `rejected` is the count of bad-quote
+        # drops a corrective pass was owed, set here from the complete list so
+        # neither a store failure before the retry nor a cancellation during
+        # it can leave a block that denies the drop records beside it.
+        retry["rejected"] = len(rejected)
         _audit_extraction(
-            proposed, stored, dropped, session_id=session_id, failure=failure
+            proposed, stored, dropped, session_id=session_id, failure=failure, retry=retry
         )
 
 
@@ -2273,8 +2910,15 @@ def schedule_extraction(
 
     Pass `session_id` to tag extracted decisions and advice with the
     originating conversation so format_for_prompt can scope them later.
+
+    The extractor reads only the words outside every `<untrusted_content>`
+    block (an attached document's text, say): a sentence the principal did
+    not type can never be quoted back as their commitment.
     """
     from openexecutive.audit.context import get_active_ids
+    from openexecutive.orchestrator.content_trust import strip_untrusted
+
+    user_message = strip_untrusted(user_message)
 
     # Snapshot the audit ContextVars at scheduling time. By the time the
     # background task runs, the caller's ``with set_turn(...)`` block has

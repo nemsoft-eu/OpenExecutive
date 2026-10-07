@@ -5,14 +5,16 @@ Executive can recall facts about a user across Slack, Discord, Telegram,
 email, and the web UI in one peer card. This module exposes three
 surfaces the orchestrator calls per turn:
 
-- :func:`prefetch` — asks Honcho a dialectic question about the inbound
-  user and returns a short ``<peer_memory>`` block that the Executive
-  injects into the user turn (never the system block — see
-  ``CLAUDE.md`` / prompt caching rules). Bounded by
+- :func:`prefetch` — returns a short ``<peer_memory>`` block about the
+  inbound user that the Executive injects into the user turn (never the
+  system block — see ``CLAUDE.md`` / prompt caching rules). By default
+  (``HONCHO_PREFETCH_MODE=representation``) it reads the peer's derived
+  representation and card, ranked against the inbound message: a GET with
+  no LLM behind it. ``HONCHO_PREFETCH_MODE=dialectic`` asks Honcho a
+  reasoned question instead (``peer.aio.chat``, an LLM call), where
+  ``reasoning_level`` trades latency for synthesis depth. Bounded by
   ``Settings.honcho_prefetch_timeout_s`` so a Honcho outage can't stall
-  the chat turn. Accepts ``reasoning_level`` to trade latency for
-  synthesis depth (``"low"`` for the per-turn path, bumped to
-  ``"medium"``/``"high"`` for committee-reviewed turns).
+  the chat turn.
 - :func:`sync_turn` — fire-and-forget persist of the completed exchange
   so Honcho's server-side extraction can update the peer card. Accepts
   ``co_present_person_ids`` to add all distinct humans in a thread
@@ -40,7 +42,10 @@ import logging
 import re
 import time
 import unicodedata
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import Any, Literal, NamedTuple
+
+from pydantic import BaseModel
 
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.context import get_active_ids, set_turn
@@ -52,6 +57,23 @@ logger = logging.getLogger(__name__)
 # fixed id (rather than per-deployment) keeps the assistant's representation
 # consistent if a workspace is shared across environments.
 _EXECUTIVE_PEER_ID = "executive"
+
+
+async def _executive_peer(client: Any) -> Any:
+    """Resolve the Executive's own peer with observation of it switched off.
+
+    Every sync writes the Executive's reply under this peer so the person's
+    representation sees both sides of the exchange. Left at Honcho's default
+    the deriver would also build a representation OF the Executive from those
+    replies: pure cost, nothing here ever reads it, and the place where a
+    person's words get misattributed to the Executive. ``observe_me=False``
+    stops it. The async ``peer()`` is a get-or-create POST on every call and
+    the server applies a changed configuration to an existing peer, so passing
+    it is free and self-healing for peers created before this existed.
+    """
+    from honcho.api_types import PeerConfig
+
+    return await client.aio.peer(_EXECUTIVE_PEER_ID, configuration=PeerConfig(observe_me=False))
 
 
 def _strip_scaffolding(text: str) -> str:
@@ -97,6 +119,14 @@ def _safe_honcho_id(raw: str) -> str:
 # Executive entry points can annotate the kwarg they thread through.
 ReasoningLevel = Literal["minimal", "low", "medium", "high", "max"]
 
+# How ``prefetch`` reads the person's memory; see ``Settings.honcho_prefetch_mode``.
+PrefetchMode = Literal["representation", "dialectic"]
+
+# Cap on the rendered representation block. It lands in the (uncached) user
+# turn on every ordinary turn, so it is bounded by characters and not only by
+# conclusion count: N conclusions of unknown length is not a budget.
+_REPRESENTATION_MAX_CHARS = 4000
+
 # Honcho's dialectic latency scales steeply with ``reasoning_level``. Measured
 # against hosted Honcho on a warm workspace, same query: ``low`` ~2.1s,
 # ``minimal`` ~2.8s, ``medium`` ~8.1s. A single flat budget therefore makes the
@@ -121,6 +151,9 @@ ReasoningLevel = Literal["minimal", "low", "medium", "high", "max"]
 # ``high``/``max`` are extrapolated — no OE call site requests them yet, so
 # there is nothing to measure. Revisit with real numbers before relying on
 # either.
+#
+# None of this applies in representation mode: that prefetch is a GET with no
+# LLM behind it and runs on the base budget, unscaled.
 _REASONING_TIMEOUT_MULTIPLIER: dict[str, float] = {
     "minimal": 1.0,
     "low": 1.0,
@@ -160,9 +193,16 @@ _SYNC_TOTAL_TIMEOUT_S = 60.0
 _CLIENT_TIMEOUT_HEADROOM_S = 5.0
 
 
+def base_prefetch_timeout_s(base_timeout_s: float) -> float:
+    """The unscaled per-turn budget; a non-positive setting falls back to
+    the default (``wait_for`` with a timeout <= 0 fires before the request
+    is made)."""
+    return base_timeout_s if base_timeout_s > 0 else _DEFAULT_PREFETCH_TIMEOUT_S
+
+
 def prefetch_timeout_s(reasoning_level: ReasoningLevel, base_timeout_s: float) -> float:
     """The wall-clock budget for one dialectic prefetch at ``reasoning_level``."""
-    base = base_timeout_s if base_timeout_s > 0 else _DEFAULT_PREFETCH_TIMEOUT_S
+    base = base_prefetch_timeout_s(base_timeout_s)
     scaled = base * _REASONING_TIMEOUT_MULTIPLIER.get(reasoning_level, 1.0)
     return max(base, min(scaled, _PREFETCH_CEILING_S))
 
@@ -1067,23 +1107,23 @@ async def prefetch(
 ) -> str:
     """Return a short ``<peer_memory>`` block for ``person_id``, or ``""``.
 
-    Sent through Honcho's dialectic chat endpoint with the inbound user
-    message as the query, so the synthesized answer is targeted at what
-    the Executive actually needs to know right now — not a fixed
-    most-recent slice.
+    ``Settings.honcho_prefetch_mode`` picks how the block is produced:
 
-    ``reasoning_level`` trades latency for synthesis depth. The standard
-    per-turn path uses ``"low"`` (fast, fits the 3s prefetch budget);
-    committee-reviewed turns and explicit deep-research workflows can
-    bump to ``"medium"``/``"high"`` for a richer answer at the cost of
-    a few extra seconds and a Sonnet-tier OpenRouter call.
+    - ``representation`` (default): the peer's card and the derived
+      conclusions most relevant to the inbound message, read straight from
+      Honcho (``peer.aio.context(search_query=...)``). No LLM behind it, so
+      it runs on ``Settings.honcho_prefetch_timeout_s`` unscaled and
+      ``reasoning_level`` is ignored.
+    - ``dialectic``: Honcho's chat endpoint with the inbound message as the
+      question, so the answer is synthesized prose. ``reasoning_level``
+      trades latency for synthesis depth and scales the budget
+      (``prefetch_timeout_s``) so deeper levels can actually finish.
 
-    Times out at ``prefetch_timeout_s(reasoning_level, ...)`` — the
-    configured ``Settings.honcho_prefetch_timeout_s`` scaled for the level,
-    so a deeper level gets a budget it can actually meet; on any failure
-    we return an empty string so the turn still runs with whatever the
-    builtin episodic block provides. Every outcome (ok/timeout/error/
-    disabled/no_person/empty) emits one `peer_memory` audit row.
+    On timeout or any failure we return an empty string so the turn still
+    runs with whatever the builtin episodic block provides. Every outcome
+    (ok/empty/timeout/error/disabled/no_person) emits one `peer_memory`
+    audit row; ``empty`` means no block was produced — nothing to ask
+    (``reason: no_query``) or nothing known about the person yet.
     """
     t0 = time.monotonic()
     if person_id is None:
@@ -1097,7 +1137,9 @@ async def prefetch(
     # inbound hydration may have prepended for the LLM turn.
     query = _strip_scaffolding(query)
     if not query.strip():
-        _emit_peer_memory(op="prefetch", person_id=person_id, outcome="empty")
+        _emit_peer_memory(
+            op="prefetch", person_id=person_id, outcome="empty", details={"reason": "no_query"}
+        )
         return ""
     client = await _get_client()
     if client is None:
@@ -1105,22 +1147,21 @@ async def prefetch(
         # construction-failed case (logged by `_get_client`).
         _emit_peer_memory(op="prefetch", person_id=person_id, outcome="error")
         return ""
-    budget_s = prefetch_timeout_s(reasoning_level, settings.honcho_prefetch_timeout_s)
+    plan = _plan_prefetch(settings, reasoning_level)
     try:
-        answer = await asyncio.wait_for(
-            _do_prefetch(client, query, person_id, reasoning_level),
-            timeout=budget_s,
+        answer, sizes = await asyncio.wait_for(
+            _run_prefetch(plan, client, query, person_id), timeout=plan.budget_s
         )
         _emit_peer_memory(
             op="prefetch",
             person_id=person_id,
-            outcome="ok",
+            outcome=plan.outcome_for(answer),
             duration_ms=int((time.monotonic() - t0) * 1000),
             details={
                 "query_preview": query[:160],
                 "response_chars": len(answer),
-                "reasoning_level": reasoning_level,
-                "timeout_s": budget_s,
+                **plan.details,
+                **sizes,
             },
         )
         return answer
@@ -1131,19 +1172,64 @@ async def prefetch(
             person_id=person_id,
             outcome="timeout",
             duration_ms=int((time.monotonic() - t0) * 1000),
-            details={"reasoning_level": reasoning_level, "timeout_s": budget_s},
+            details=plan.details,
         )
         return ""
-    except Exception:
+    except Exception as exc:
         logger.exception("honcho: prefetch failed for person_id=%s", person_id)
         _emit_peer_memory(
             op="prefetch",
             person_id=person_id,
             outcome="error",
             duration_ms=int((time.monotonic() - t0) * 1000),
-            details={"reasoning_level": reasoning_level, "timeout_s": budget_s},
+            # The type is what distinguishes a server without the context
+            # route (an HTTP error) from a bug; the message may echo input.
+            details={**plan.details, "error_type": type(exc).__name__},
         )
         return ""
+
+
+class _PrefetchPlan(NamedTuple):
+    """Everything about one prefetch that depends on the configured mode,
+    decided once so ``prefetch`` itself has a single code path."""
+
+    mode: PrefetchMode
+    budget_s: float
+    # Audit details every row for this prefetch carries (ok, timeout, error).
+    details: dict[str, Any]
+    reasoning_level: ReasoningLevel
+    max_conclusions: int
+
+    @staticmethod
+    def outcome_for(answer: str) -> str:
+        # No block was produced: a person Honcho has nothing on yet, or a
+        # dialectic that answered nothing. Distinct from ``ok`` so the flow
+        # chart does not show a memory step that injected nothing.
+        return "ok" if answer else "empty"
+
+
+def _plan_prefetch(settings: Any, reasoning_level: ReasoningLevel) -> _PrefetchPlan:
+    mode: PrefetchMode = settings.honcho_prefetch_mode
+    max_conclusions: int = settings.honcho_prefetch_max_conclusions
+    if mode == "representation":
+        budget_s = base_prefetch_timeout_s(settings.honcho_prefetch_timeout_s)
+        details: dict[str, Any] = {"mode": mode, "timeout_s": budget_s, "max_conclusions": max_conclusions}
+    else:
+        budget_s = prefetch_timeout_s(reasoning_level, settings.honcho_prefetch_timeout_s)
+        details = {"mode": mode, "timeout_s": budget_s, "reasoning_level": reasoning_level}
+    return _PrefetchPlan(mode, budget_s, details, reasoning_level, max_conclusions)
+
+
+async def _run_prefetch(
+    plan: _PrefetchPlan, client: Any, query: str, person_id: int
+) -> tuple[str, dict[str, Any]]:
+    """The one mode dispatch: the block text plus any mode-specific sizes for
+    the audit row."""
+    if plan.mode == "representation":
+        return await _do_prefetch_representation(
+            client, query, person_id, max_conclusions=plan.max_conclusions
+        )
+    return await _do_prefetch(client, query, person_id, plan.reasoning_level), {}
 
 
 async def _do_prefetch(
@@ -1164,6 +1250,66 @@ async def _do_prefetch(
     # `chat()` returns `str | None`; treat None / whitespace as "nothing to
     # add" so callers can do a simple truthiness check.
     return (answer or "").strip()
+
+
+async def _do_prefetch_representation(
+    client: Any,
+    query: str,
+    person_id: int,
+    *,
+    max_conclusions: int,
+) -> tuple[str, dict[str, Any]]:
+    """The representation-mode body: the peer's card plus the conclusions
+    most relevant to ``query``, rendered for the ``<peer_memory>`` block,
+    with the sizes the audit row records."""
+    peer = await client.aio.peer(str(person_id))
+    # No `target=` (the peer's own representation) and no session, for the
+    # same reason `_do_prefetch` passes none: the GLOBAL view is what makes a
+    # fact learned on Slack surface in a later email turn.
+    resp = await peer.aio.context(
+        search_query=query,
+        search_top_k=max_conclusions,
+        max_conclusions=max_conclusions,
+    )
+    card = [line.strip() for line in (getattr(resp, "peer_card", None) or []) if line and line.strip()]
+    representation = (getattr(resp, "representation", None) or "").strip()
+    rendered = _render_peer_context(card, representation, max_chars=_REPRESENTATION_MAX_CHARS)
+    return rendered, {"card_lines": len(card), "representation_chars": len(representation)}
+
+
+_PEER_MEMORY_CLOSE = "</peer_memory>"
+
+
+def _block_safe_line(line: str) -> str:
+    """One line of Honcho text as it may appear inside ``<peer_memory>``.
+
+    Conclusions are derived from what people wrote, including inbound email
+    from anyone, so a line can carry control characters or the block's own
+    closing tag. Control and format characters go (the newline is handled by
+    the caller), and a literal closing tag is defanged so the block cannot
+    be ended early."""
+    from openexecutive.utils.prompt_blocks import scrub_block_line
+
+    return scrub_block_line(line, _PEER_MEMORY_CLOSE)
+
+
+def _render_peer_context(card: list[str], representation: str, *, max_chars: int) -> str:
+    """Card first — it carries ``IDENTITY: Name: ...``, which binds the bare
+    peer id the conclusions name the person by — then the representation.
+    Empty when Honcho has nothing. Whole lines only: a line that does not fit
+    the remaining budget is dropped, never cut, so a half observation never
+    reaches the model."""
+    parts = [part for part in ("\n".join(card), representation) if part]
+    kept: list[str] = []
+    used = 0
+    for raw in "\n\n".join(parts).split("\n"):
+        line = _block_safe_line(raw)
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > max_chars:
+            continue
+        kept.append(line)
+        used += cost
+    return "\n".join(kept).strip()
 
 
 async def _do_directional(
@@ -1216,7 +1362,7 @@ async def directional_chat(
     (which is capped at ``_PREFETCH_CEILING_S``) because the model
     deliberately invoked this tool, but still a ceiling — without one a
     Honcho hang would pin the entire tool-call loop until
-    CHAT_STREAM_TIMEOUT_S fires (~2 min), starving every other tool
+    CHAT_STREAM_TIMEOUT_S fires (5 min by default), starving every other tool
     call in the same turn.
     """
     t0 = time.monotonic()
@@ -1302,11 +1448,15 @@ def sync_turn(
     own retention is best-effort and we don't want a sync error to
     surface after the user already has their answer.
 
-    ``user_message`` is recorded as the person's own words, so the
-    ``<outbound_reply_context>`` block inbound hydration prepends for the
-    LLM turn is stripped first. Left in, Honcho's deriver attributes the
-    Executive's own DM to the person who replied to it ("<person> created
-    the tracker", "<person>'s email is the Executive's").
+    ``user_message`` is recorded as the person's own words, so callers pass
+    what the person actually wrote rather than the framed prompt the LLM saw
+    (see ``memory_text`` on ``Executive.stream_chat``): an inbound email's
+    headers, a briefing card's body or an attachment's extracted text
+    recorded here teach Honcho that the person did what the Executive did.
+    The ``<outbound_reply_context>`` block inbound hydration prepends for the
+    LLM turn is still stripped here as a backstop. Left in, Honcho's deriver
+    attributes the Executive's own DM to the person who replied to it
+    ("<person> created the tracker", "<person>'s email is the Executive's").
     """
     if person_id is None:
         _emit_peer_memory(op="sync_turn", person_id=None, outcome="no_person")
@@ -1414,7 +1564,7 @@ async def _do_sync_body(
         return
     try:
         user_peer = await client.aio.peer(str(person_id))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         sess = await client.aio.session(
             _safe_honcho_id(session_id or f"person-{person_id}")
         )
@@ -1777,7 +1927,7 @@ async def _do_sync_department_body(
         return
     try:
         dept_peer = await client.aio.peer(_department_peer_id(department_slug))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         # Dept session id keeps dept and person syncs from colliding in
         # the same Honcho session. Without the `dept-<slug>-` prefix,
         # the same session_id would host both the person and the dept as
@@ -2005,7 +2155,7 @@ async def _do_append_department_note_body(
         return
     try:
         dept_peer = await client.aio.peer(_department_peer_id(department_slug))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         session_id = _safe_honcho_id(f"dept-{department_slug}-notes")
         sess = await client.aio.session(session_id)
         # The dept peer must be in the notes session for Honcho to derive
@@ -2054,3 +2204,339 @@ async def _do_append_department_note_body(
                 "error_msg": str(exc)[:300],
             },
         )
+
+
+# --------------------------------------------------------------------------- #
+# People overview — what peer memory knows about each rostered person, for the
+# Pulse page. Read-only, no LLM call: one peers listing plus, per person, one
+# conclusions page and one card read.
+# --------------------------------------------------------------------------- #
+
+
+# Bounds for the overview, matching the two precedents in this module: the
+# per-person reads share the per-loop client with the live chat prefetch, so
+# they are capped like the session purge (socket exhaustion), and the peers
+# listing walks every page, so it gets an outer clock like the sync bodies (a
+# blackholing endpoint must not pin the task for minutes).
+_OVERVIEW_CONCURRENCY = 8
+_OVERVIEW_LISTING_TIMEOUT_S = 15.0
+
+
+class PersonConclusion(BaseModel):
+    content: str
+    created_at: str
+
+
+class PersonMemory(BaseModel):
+    person_id: int
+    full_name: str
+    is_principal: bool
+    card: list[str]
+    """Peer card lines minus the identity lines OE writes itself."""
+    conclusion_count: int
+    """The server's total when it reports one, else the page length."""
+    last_observed_at: str | None
+    recent: list[PersonConclusion]
+    """Newest first."""
+    error: str | None = None
+    """Exception type name when this person's read failed; the rest is empty."""
+
+
+class PeopleMemory(BaseModel):
+    status: Literal["ok", "disabled", "error"]
+    people: list[PersonMemory]
+    conclusion_total: int
+
+
+def _overview_error(error_type: str, *, started: float) -> PeopleMemory:
+    _emit_peer_memory(
+        op="overview",
+        person_id=None,
+        outcome="error",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        details={"error_type": error_type},
+    )
+    return PeopleMemory(status="error", people=[], conclusion_total=0)
+
+
+def _iso(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _as_instant(value: Any) -> datetime:
+    """A sortable UTC instant for a ``created_at`` of any shape the server
+    might send: an aware datetime, a naive one (taken as UTC), or an ISO
+    string. Byte order on the rendered string is not chronological across
+    offsets (``13:00+05:00`` sorts after ``12:00Z`` yet is five hours older),
+    so ordering never uses the string. Unparseable values sort oldest."""
+    try:
+        if not isinstance(value, datetime):
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    except (ValueError, TypeError, OverflowError, OSError):
+        # Covers the conversion too: a stamp within one offset of the
+        # datetime range parses fine and overflows on `astimezone`.
+        return datetime.min.replace(tzinfo=UTC)
+
+
+def _safe_lines(text: Any) -> list[str]:
+    """Physical lines of one Honcho text value, each scrubbed, blanks dropped.
+    Split before the scrub: the scrub deletes newlines, and a value spanning
+    two lines would otherwise be glued into one that hides what its second
+    line starts with."""
+    lines = (_block_safe_line(line) for line in str(text).splitlines())
+    return [line for line in lines if line]
+
+
+def _to_conclusion(c: Any) -> PersonConclusion:
+    """One Honcho conclusion as the page shows it, every line scrubbed."""
+    return PersonConclusion(
+        content=" ".join(_safe_lines(c.content)),
+        created_at=_block_safe_line(_iso(c.created_at)),
+    )
+
+
+async def _person_memory(person: Any, peer: Any, *, recent: int) -> PersonMemory:
+    """One person's view: the self-conclusions (observer == observed == the
+    peer, the same scope the per-turn prefetch reads) newest first, their
+    total, and the card without the identity lines the roster already
+    supplies. Every line goes through ``_block_safe_line`` because the text
+    was derived from what people wrote, inbound email included."""
+    page = await peer.conclusions.aio.list(size=recent, reverse=False)
+    # The server's own default is newest-first ("ordered by recency unless
+    # reverse is true" — Honcho's server-side conclusions/list route
+    # docstring); `reverse=True` would flip that to oldest-first, which is
+    # not what this function wants. The symptom, if this regresses: a
+    # person's newest notes never surface past the `size`-bounded page
+    # boundary, however recently they were added — the re-sort below only
+    # reorders whatever the wrong page happened to contain, it cannot
+    # recover items the page never fetched. The order within the returned
+    # page is
+    # still re-sorted here by instant, since ties and near-boundary
+    # timestamps are not guaranteed to already match this function's
+    # definition of "newest". When the page carries no total, the count is
+    # at best the page length.
+    items = sorted(page.items, key=lambda c: _as_instant(c.created_at), reverse=True)
+    total = getattr(page, "total", None)
+    if total is None:
+        total = len(items)
+    conclusions = [_to_conclusion(c) for c in items]
+    # Split and scrub before the identity test: a control character ahead of
+    # ``IDENTITY:``, or an identity claim on the second line of one card
+    # element, would otherwise pass the test and reach the page.
+    card = [
+        line
+        for element in (await peer.aio.get_card() or [])
+        for line in _safe_lines(element)
+        if not _is_identity_line(line)
+    ]
+    return PersonMemory(
+        person_id=person.id,
+        full_name=person.full_name,
+        is_principal=person.is_principal,
+        card=card,
+        conclusion_count=int(total),
+        last_observed_at=conclusions[0].created_at if conclusions else None,
+        recent=conclusions,
+    )
+
+
+def _person_memory_failed(person: Any, exc: BaseException) -> PersonMemory:
+    return PersonMemory(
+        person_id=person.id,
+        full_name=person.full_name,
+        is_principal=person.is_principal,
+        card=[],
+        conclusion_count=0,
+        last_observed_at=None,
+        recent=[],
+        error=type(exc).__name__,
+    )
+
+
+async def _matched_peers(client: Any, roster: dict[int, Any]) -> list[tuple[Any, Any]]:
+    """(person, peer) for every rostered person the workspace listing holds.
+
+    Keyed by person: the page walk can yield a peer twice if the listing
+    shifts under it, and a person must appear once. Only a peer id spelled
+    exactly as OE writes it (``str(person_id)``) matches — ``int()`` would
+    also accept "007" or non-ASCII digits, and a stray id must skip one peer,
+    never fail the listing."""
+    found: dict[int, tuple[Any, Any]] = {}
+    async for peer in await client.aio.peers():
+        peer_id = str(getattr(peer, "id", ""))
+        if not (peer_id.isascii() and peer_id.isdigit()):
+            continue
+        person_id = int(peer_id)
+        if str(person_id) == peer_id and person_id in roster and person_id not in found:
+            found[person_id] = (roster[person_id], peer)
+            if len(found) == len(roster):
+                break
+    return list(found.values())
+
+
+async def people_overview(*, recent: int) -> PeopleMemory:
+    """What peer memory knows about each rostered person.
+
+    Peers are taken from the workspace listing and matched to the roster by
+    id, never created: ``client.aio.peer(id)`` is a get-or-create POST and a
+    read-only page must not mint peers for people who have never talked.
+    Non-person peers (the Executive, departments) are skipped. The listing
+    runs under one outer clock; each person is then read under the unscaled
+    prefetch budget, at most ``_OVERVIEW_CONCURRENCY`` at a time, and one
+    person's failure or timeout yields an entry with ``error`` set and
+    leaves the others intact. Principal first, then by person id. One
+    ``peer_memory`` audit row per call, ``op=overview``.
+    """
+    from openexecutive.people import registry
+
+    settings = get_settings()
+    if not settings.honcho_enabled:
+        _emit_peer_memory(op="overview", person_id=None, outcome="disabled")
+        return PeopleMemory(status="disabled", people=[], conclusion_total=0)
+
+    started = time.monotonic()
+    client = await _get_client()
+    if client is None:
+        return _overview_error("ClientConstructionFailed", started=started)
+
+    roster = {p.id: p for p in registry.list_people() if p.id is not None}
+
+    try:
+        matched = await asyncio.wait_for(
+            _matched_peers(client, roster), timeout=_OVERVIEW_LISTING_TIMEOUT_S
+        )
+    except Exception as exc:
+        logger.warning("Honcho peers listing failed: %s", type(exc).__name__)
+        return _overview_error(type(exc).__name__, started=started)
+
+    budget = base_prefetch_timeout_s(settings.honcho_prefetch_timeout_s)
+    gate = asyncio.Semaphore(_OVERVIEW_CONCURRENCY)
+
+    async def _read(person: Any, peer: Any) -> PersonMemory:
+        async with gate:
+            return await asyncio.wait_for(_person_memory(person, peer, recent=recent), timeout=budget)
+
+    results = await asyncio.gather(
+        *(_read(person, peer) for person, peer in matched), return_exceptions=True
+    )
+    people: list[PersonMemory] = []
+    for (person, _peer), result in zip(matched, results, strict=True):
+        if isinstance(result, PersonMemory):
+            people.append(result)
+        elif isinstance(result, Exception):
+            people.append(_person_memory_failed(person, result))
+        else:
+            raise result  # a BaseException (cancellation) is not ours to swallow
+    people.sort(key=lambda m: (not m.is_principal, m.person_id))
+    total = sum(m.conclusion_count for m in people)
+    errors = sum(1 for m in people if m.error)
+    _emit_peer_memory(
+        op="overview",
+        person_id=None,
+        outcome="ok",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        details={"people": len(people), "conclusions": total, "errors": errors},
+    )
+    return PeopleMemory(status="ok", people=people, conclusion_total=total)
+
+
+# Honcho's list routes cap a page at 100 items.
+PERSON_CONCLUSIONS_MAX_PAGE = 100
+
+
+class PersonConclusionsPage(BaseModel):
+    status: Literal["ok", "disabled", "error"]
+    person_id: int
+    items: list[PersonConclusion]
+    """Newest first, continuing where the previous page stopped."""
+    page: int
+    size: int
+    total: int | None
+    """The server's total when it reports one."""
+    has_more: bool
+
+
+async def person_conclusions(person_id: int, *, page: int, size: int) -> PersonConclusionsPage | None:
+    """One page of everything peer memory has concluded about one person,
+    newest first — the About you card's "show all" reads it page by page.
+
+    ``None`` when the person is not an active rostered person or has no peer
+    yet (the route answers 404). The peer is found through the workspace
+    listing, as in ``people_overview``, never ``client.aio.peer(id)``: that
+    is a get-or-create and a read must not mint peers. Same clocks as the
+    overview, same scrub, one ``peer_memory`` audit row, ``op=conclusions``.
+    """
+    from openexecutive.people import registry
+
+    def _empty(status: Literal["disabled", "error"]) -> PersonConclusionsPage:
+        return PersonConclusionsPage(
+            status=status, person_id=person_id, items=[], page=page, size=size,
+            total=None, has_more=False,
+        )
+
+    settings = get_settings()
+    if not settings.honcho_enabled:
+        _emit_peer_memory(op="conclusions", person_id=person_id, outcome="disabled")
+        return _empty("disabled")
+
+    started = time.monotonic()
+
+    def _failed(error_type: str) -> PersonConclusionsPage:
+        _emit_peer_memory(
+            op="conclusions",
+            person_id=person_id,
+            outcome="error",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            details={"error_type": error_type},
+        )
+        return _empty("error")
+
+    client = await _get_client()
+    if client is None:
+        return _failed("ClientConstructionFailed")
+
+    person = registry.get_person(person_id)
+    if person is None:
+        return None
+    try:
+        matched = await asyncio.wait_for(
+            _matched_peers(client, {person_id: person}), timeout=_OVERVIEW_LISTING_TIMEOUT_S
+        )
+        if not matched:
+            return None
+        _, peer = matched[0]
+        # reverse=False is the server's newest-first default; see
+        # `_person_memory` for why reverse=True would be the wrong page.
+        result = await asyncio.wait_for(
+            peer.conclusions.aio.list(page=page, size=size, reverse=False),
+            timeout=base_prefetch_timeout_s(settings.honcho_prefetch_timeout_s),
+        )
+        # Inside the try: a malformed page is an error status, not a bare 500.
+        items = sorted(result.items, key=lambda c: _as_instant(c.created_at), reverse=True)
+        conclusions = [_to_conclusion(c) for c in items]
+        raw_total = getattr(result, "total", None)
+        total = None if raw_total is None else int(raw_total)
+    except Exception as exc:
+        logger.warning("Honcho conclusions read failed: %s", type(exc).__name__)
+        return _failed(type(exc).__name__)
+
+    has_more = page * size < total if total is not None else len(items) == size
+    _emit_peer_memory(
+        op="conclusions",
+        person_id=person_id,
+        outcome="ok",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        details={"page": page, "size": size, "items": len(items)},
+    )
+    return PersonConclusionsPage(
+        status="ok",
+        person_id=person_id,
+        items=conclusions,
+        page=page,
+        size=size,
+        total=total,
+        has_more=has_more,
+    )

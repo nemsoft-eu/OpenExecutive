@@ -37,7 +37,11 @@ from typing import Any
 
 import httpx
 
-from openexecutive.providers.feature_gate import FeatureSpec, apply_feature_gates
+from openexecutive.providers.feature_gate import (
+    FeatureSpec,
+    apply_feature_gates,
+    relax_forced_tool_choice,
+)
 from openexecutive.providers.translator import (
     StreamAccumulator,
     from_openai_response,
@@ -64,6 +68,23 @@ def _announce_reasoning(slug: str, body: dict[str, Any]) -> None:
         )
 
 
+# Slugs for which we've already logged the LOCAL_REASONING_EFFORT being
+# sent. A missing or wrong effort is what makes a thinking-only model burn
+# its whole max_tokens budget, so the log shows which value is in play.
+_effort_announced: set[str] = set()
+
+
+def _announce_effort(slug: str, effort: str) -> None:
+    if slug not in _effort_announced:
+        _effort_announced.add(slug)
+        logger.info(
+            "reasoning_effort=%s sent to %s via OpenAI-compatible backend "
+            "(LOCAL_REASONING_EFFORT)",
+            effort,
+            slug,
+        )
+
+
 class OpenAICompatibleProvider:
     """LLMProvider implementation backed by any OpenAI-compatible endpoint.
 
@@ -85,8 +106,6 @@ class OpenAICompatibleProvider:
         include_usage_accounting: bool = False,
     ) -> None:
         self._api_key = api_key
-        # only the local backend sets this; OpenRouter uses the translator's nested `reasoning`
-        self._reasoning_effort = reasoning_effort
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
@@ -109,6 +128,10 @@ class OpenAICompatibleProvider:
         # behind a LiteLLM gateway), which rejects an unrecognized top-level
         # `usage` field outright rather than ignoring it.
         self._include_usage_accounting = include_usage_accounting
+        # Top-level `reasoning_effort` for thinking-only backends
+        # (LOCAL_REASONING_EFFORT). None = not sent. Only the local backend
+        # sets it; OpenRouter uses the translator's nested `reasoning`.
+        self._reasoning_effort = reasoning_effort
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -130,21 +153,10 @@ class OpenAICompatibleProvider:
                 supports_thinking=False,
                 supports_web_search=False,
                 supports_tool_use=True,
+                supports_pdf_input=False,
             ),
         )
         return slug, spec
-
-    def _build_body(self, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        model = kwargs.pop("model", "")
-        slug, spec = self._resolve(model)
-        gated = apply_feature_gates(spec, kwargs)
-        body = to_openai_request(
-            slug, gated, include_usage=self._include_usage_accounting
-        )
-        if self._reasoning_effort is not None:
-            body["reasoning_effort"] = self._reasoning_effort
-        _announce_reasoning(slug, body)
-        return slug, body
 
     def _auth_headers(self) -> dict[str, str]:
         # Local backends (Ollama, LM Studio) typically need no auth — omit
@@ -157,6 +169,20 @@ class OpenAICompatibleProvider:
     # LLMProvider surface
     # ------------------------------------------------------------------
 
+    def _extend_body(self, slug: str, body: dict[str, Any]) -> None:
+        """Backend-specific request fields, added to the translated body in
+        place. A plain OpenAI-compatible server gets only what the operator
+        opted into: an unknown top-level field can 400 there (see
+        include_usage_accounting).
+
+        ``reasoning_effort`` is sent unconditionally when configured. Local
+        slugs never carry a per-call ``reasoning`` object (their spec has
+        ``supports_thinking=False``), so there is nothing for it to clash
+        with."""
+        if self._reasoning_effort:
+            body["reasoning_effort"] = self._reasoning_effort
+            _announce_effort(slug, self._reasoning_effort)
+
     def messages_create(self, **kwargs: Any) -> Awaitable[Any]:
         return self._messages_create(kwargs)
 
@@ -164,7 +190,14 @@ class OpenAICompatibleProvider:
         # Strip the SDK's own ``timeout`` kwarg — httpx already has it from
         # the client; passing it into the body would break the request.
         request_timeout = kwargs.pop("timeout", None)
-        slug, body = self._build_body(kwargs)
+        model = kwargs.pop("model", "")
+        slug, spec = self._resolve(model)
+        gated = relax_forced_tool_choice(slug, apply_feature_gates(spec, kwargs))
+        body = to_openai_request(
+            slug, gated, include_usage=self._include_usage_accounting
+        )
+        self._extend_body(slug, body)
+        _announce_reasoning(slug, body)
 
         try:
             resp = await self._client.post(
@@ -186,7 +219,14 @@ class OpenAICompatibleProvider:
 
     def messages_stream(self, **kwargs: Any) -> AbstractAsyncContextManager[Any]:
         request_timeout = kwargs.pop("timeout", None)
-        _, body = self._build_body(kwargs)
+        model = kwargs.pop("model", "")
+        slug, spec = self._resolve(model)
+        gated = relax_forced_tool_choice(slug, apply_feature_gates(spec, kwargs))
+        body = to_openai_request(
+            slug, gated, include_usage=self._include_usage_accounting
+        )
+        self._extend_body(slug, body)
+        _announce_reasoning(slug, body)
         body["stream"] = True
         # Opt in to the usage block: without it a plain OpenAI-compatible
         # backend (Ollama, LM Studio, vLLM) sends no usage at all on a streamed

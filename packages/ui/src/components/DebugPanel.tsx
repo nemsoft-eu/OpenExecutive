@@ -18,6 +18,7 @@ const SPECIALIST_LABELS: Record<string, string> = {
   coo: "COO",
   cmo: "CMO",
   cpo: "CPO",
+  sales: "Sales",
   board_comms: "BoardComms",
 };
 
@@ -157,7 +158,7 @@ function summarize(event: DebugEvent): string {
   }
 }
 
-function EventCard({ event, index }: { event: DebugEvent; index: number }) {
+function EventCard({ event }: { event: DebugEvent; index: number }) {
   const [expanded, setExpanded] = useState(false);
   const cfg = KIND_CONFIG[event.kind] ?? {
     border: "border-l-fg-subtle",
