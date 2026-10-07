@@ -990,8 +990,9 @@ def check_brief(snap: Snapshot) -> SetupCheck:
         brief_name,
         channel_phrase,
         current_problem,
+        partial_delivery_problem,
     )
-    from openexecutive.scheduler.runner import delivery_order
+    from openexecutive.scheduler.runner import delivery_order, unreachable_principals
 
     if not snap.settings.scheduler_enabled:
         return _result("brief", "off", "Off, because the scheduler is turned off.")
@@ -1010,11 +1011,30 @@ def check_brief(snap: Snapshot) -> SetupCheck:
             link=f"/people/{principal.id}",
         )
     last = snap.brief_delivery
+    # `can_deliver=True`: `plan` is non-empty, so this principal can be
+    # reached. A co-principal who cannot is reported below instead — it is
+    # not "your last brief wasn't sent", and it outlives any one run.
     reason = current_problem(last, has_owner=True, can_deliver=True)
     if last is not None and reason is not None:
         problem, fix = DELIVERY_PROBLEMS[reason]
         return _result(
             "brief", "error", f"Your last {brief_name(last.kind)} wasn't sent: {problem}.", fix
+        )
+    # `plan` above is this principal's. The briefs go out one DM per active
+    # principal, so a co-founder with nothing connected misses every brief
+    # while this light stays green on the other's success. `snap.people` is
+    # the roster `active_principals()` reads (team, not archived).
+    missing = unreachable_principals(
+        [p for p in snap.people if p.is_principal], email_ready=snap.brief_email_ready
+    )
+    if missing:
+        problem, fix = partial_delivery_problem([p.full_name for p in missing])
+        return _result(
+            "brief",
+            "warn",
+            f"Not reaching everyone: {problem}.",
+            fix,
+            link=f"/people/{missing[0].id}" if missing[0].id else "/people",
         )
     if last is not None and last.channel and last.channel != plan[0]:
         # It got through, but not on the first channel it tried: that one is

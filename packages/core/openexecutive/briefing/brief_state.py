@@ -23,7 +23,10 @@ Each run's outcome, sent or not, goes under ``brief_delivery:<kind>``
 (``record_delivery_outcome``): the reason in ``input_hash`` and the channel
 that sent it in ``narrative_text`` — a channel name, never an address. The
 Briefing's "not sent" notice and the Setup status page read it back through
-``current_problem``.
+``current_problem``, whose ``can_deliver`` is about EVERY active principal
+(``scheduler.runner.unreachable_principals``) and not just the lowest-id row:
+the briefs fan out, so a recorded partial failure has to survive the other
+founder's working channel.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast, get_args
@@ -167,6 +171,30 @@ DELIVERY_PROBLEMS: dict[str, tuple[str, str]] = {
 }
 
 
+def _and_list(names: Sequence[str]) -> str:
+    """``"Ada"``, ``"Ada and Grace"``, ``"Ada, Grace and Lin"``."""
+    items = [n for n in names if n.strip()] or ["someone on the People list"]
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def partial_delivery_problem(names: Sequence[str]) -> tuple[str, str]:
+    """``(problem, fix)`` for a brief that reaches some principals but not all.
+
+    ``DELIVERY_PROBLEMS["no_channel"]`` is written for the only recipient
+    there is — "nothing is set up to send it to *you*" — so on a co-founded
+    roster it would tell whichever founder is reading it that nothing can
+    reach them, about a brief they do receive. Names the ones it isn't
+    reaching instead; a nameless row is described rather than given an id,
+    which is not something to show a reader.
+    """
+    return (
+        f"nothing is set up to send it to {_and_list(names)}",
+        "Connect Gmail, or add their Slack, Telegram or Discord to their People profile.",
+    )
+
+
 def brief_name(kind: str) -> str:
     """The brief's name in the app ("morning brief"): the scheduler's own label."""
     from openexecutive.scheduler.action_phrasing import KIND_LABEL
@@ -238,6 +266,11 @@ def current_problem(
     from now (``has_owner``, ``can_deliver``), not from the record, so a
     partial fix reports the problem that is left: once a channel exists the
     next brief will go, and there is nothing to report.
+
+    ``can_deliver`` means every active principal can be reached, not the
+    lowest-id one — the briefs fan out, so a co-principal with nothing
+    connected misses all of them while the other's channel would otherwise
+    clear the reason here (``scheduler.runner.unreachable_principals``).
     """
     if outcome is None or outcome.reason == "delivered":
         return None
@@ -518,6 +551,7 @@ __all__ = [
     "handled_since",
     "last_delivered",
     "last_delivery_outcome",
+    "partial_delivery_problem",
     "pending_watch_suggestions",
     "record_delivered",
     "record_delivery_outcome",

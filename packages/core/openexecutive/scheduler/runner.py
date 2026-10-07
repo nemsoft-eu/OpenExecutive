@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
@@ -1837,6 +1838,23 @@ def principal_delivery_plan() -> tuple[Person | None, list[str]]:
 
     principal = find_principal_person()
     return principal, delivery_order(principal, email_ready=email_ready())
+
+
+def unreachable_principals(
+    principals: Iterable[Person], *, email_ready: bool
+) -> list[Person]:
+    """Those of ``principals`` no channel can reach (``delivery_order`` empty).
+
+    Whether a standing brief can be delivered is a question about EVERY
+    recipient, not about the lowest-id row. The fan-out records a partial
+    failure as ``no_channel``, but ``brief_state.current_problem`` judges that
+    reason from the present — so a surface that asks only about
+    ``find_principal_person()`` clears it the moment the oldest founder has a
+    channel, and the co-principal who receives nothing goes back behind a
+    green light. The Briefing notice and the Setup status light both pass the
+    whole active roster through here instead.
+    """
+    return [p for p in principals if not delivery_order(p, email_ready=email_ready)]
 
 
 def next_brief_runs(after: datetime) -> dict[str, datetime]:

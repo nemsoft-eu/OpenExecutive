@@ -221,11 +221,19 @@ def test_off_with_the_scheduler() -> None:
 def notice_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     from openexecutive.api.routes import chat as chat_route
     from openexecutive.api.routes import today as today_route
+    from openexecutive.people import store as people_store
     from openexecutive.scheduler import runner
 
-    state: dict[str, Any] = {"owner": True, "principal": object(), "plan": []}
+    # Ada is reachable only by email, so `email_ready` is what decides whether
+    # anything can carry the brief — the real `delivery_order` does the rest.
+    state: dict[str, Any] = {
+        "owner": True,
+        "principals": [Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io")],
+        "email_ready": False,
+    }
     monkeypatch.setattr(chat_route, "_caller_is_principal_or_unclaimed", lambda _r: state["owner"])
-    monkeypatch.setattr(runner, "principal_delivery_plan", lambda: (state["principal"], state["plan"]))
+    monkeypatch.setattr(people_store, "active_principals", lambda: state["principals"])
+    monkeypatch.setattr(runner, "email_ready", lambda: state["email_ready"])
     app = FastAPI()
     app.include_router(today_route.router)
     return TestClient(app), state
@@ -250,7 +258,7 @@ def test_the_notice_names_what_is_left_after_a_partial_fix(notice_client: Any) -
 
 def test_a_brief_that_couldnt_be_written_has_nothing_to_read(notice_client: Any) -> None:
     client, state = notice_client
-    state["plan"] = ["email"]
+    state["email_ready"] = True
     brief_state.record_delivery_outcome(EVENING, reason="not_written", channel=None)
     body = client.get("/today/brief-delivery").json()
     assert (body["brief"], body["readable"]) == ("end-of-day digest", False)
@@ -273,16 +281,10 @@ def test_nobody_else_does(notice_client: Any) -> None:
     assert client.get("/today/brief-delivery").json() is None
 
 
-@pytest.mark.parametrize(
-    ("reason", "plan"),
-    [
-        ("delivered", ["email"]),
-        ("no_channel", ["email"]),  # fixed since
-    ],
-)
-def test_nothing_to_say(notice_client: Any, reason: str, plan: list[str]) -> None:
+@pytest.mark.parametrize("reason", ["delivered", "no_channel"])  # the second: fixed since
+def test_nothing_to_say(notice_client: Any, reason: str) -> None:
     client, state = notice_client
-    state["plan"] = plan
+    state["email_ready"] = True
     brief_state.record_delivery_outcome(MORNING, reason=reason, channel="email")  # type: ignore[arg-type]
     assert client.get("/today/brief-delivery").json() is None
 
@@ -290,3 +292,88 @@ def test_nothing_to_say(notice_client: Any, reason: str, plan: list[str]) -> Non
 def test_nothing_recorded_yet(notice_client: Any) -> None:
     client, _ = notice_client
     assert client.get("/today/brief-delivery").json() is None
+
+
+def test_no_principal_at_all_reads_as_no_owner(notice_client: Any) -> None:
+    client, state = notice_client
+    state["principals"] = []
+    brief_state.record_delivery_outcome(MORNING, reason="no_channel", channel=None)
+    body = client.get("/today/brief-delivery").json()
+    assert body["problem"] == "there's no owner on the People list to send it to"
+
+
+# ---------------------------------------------------------------------------
+# Co-principals: one working channel must not clear the other's failure
+# ---------------------------------------------------------------------------
+
+
+def _co_principals() -> list[Person]:
+    """Ada reachable by email, Grace on nothing at all."""
+    return [
+        Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io"),
+        Person(id=7, full_name="Grace", is_principal=True),
+    ]
+
+
+def test_the_notice_names_the_co_principal_the_brief_isnt_reaching(
+    notice_client: Any,
+) -> None:
+    client, state = notice_client
+    state["principals"] = _co_principals()
+    state["email_ready"] = True  # Ada's channel works; Grace has none
+    brief_state.record_delivery_outcome(MORNING, reason="no_channel", channel=None)
+    body = client.get("/today/brief-delivery").json()
+    # Not "send it to you": the reader may well be the founder who got it.
+    assert body["problem"] == "nothing is set up to send it to Grace"
+    assert body["fix"] == (
+        "Connect Gmail, or add their Slack, Telegram or Discord to their People profile."
+    )
+    assert "@" not in str(body)
+
+
+def test_the_light_names_the_co_principal_the_brief_isnt_reaching() -> None:
+    people = _co_principals()
+    check = check_brief(_snap(people=people, principal=people[0]))
+    assert check.state == "warn"
+    assert check.summary == "Not reaching everyone: nothing is set up to send it to Grace."
+    assert check.link == "/people/7"
+
+
+def test_the_light_names_every_unreached_co_principal() -> None:
+    people = [
+        *_co_principals(),
+        Person(id=9, full_name="Lin", is_principal=True),
+        Person(id=11, full_name="Sam", is_principal=False),  # not a principal: not a recipient
+    ]
+    check = check_brief(_snap(people=people, principal=people[0]))
+    assert check.summary == "Not reaching everyone: nothing is set up to send it to Grace and Lin."
+
+
+def test_a_failed_send_still_outranks_an_unreachable_co_principal() -> None:
+    people = _co_principals()
+    failed = DeliveryOutcome(MORNING, "send_failed", None, NOW)
+    check = check_brief(_snap(people=people, principal=people[0], brief_delivery=failed))
+    assert check.state == "error"
+    assert check.summary == "Your last morning brief wasn't sent: every way of sending it failed."
+
+
+def test_a_reachable_roster_leaves_the_light_green() -> None:
+    people = [
+        Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io"),
+        Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7"),
+    ]
+    assert check_brief(_snap(people=people, principal=people[0])).state == "ok"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        (["Ada"], "Ada"),
+        (["Ada", "Grace"], "Ada and Grace"),
+        (["Ada", "Grace", "Lin"], "Ada, Grace and Lin"),
+        ([""], "someone on the People list"),  # a nameless row is never given its id
+    ],
+)
+def test_the_unreached_are_named_in_a_readable_list(names: list[str], expected: str) -> None:
+    problem, _ = brief_state.partial_delivery_problem(names)
+    assert problem == f"nothing is set up to send it to {expected}"

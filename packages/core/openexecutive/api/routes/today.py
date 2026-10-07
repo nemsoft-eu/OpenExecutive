@@ -1967,9 +1967,11 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
         brief_name,
         current_problem,
         last_delivery_outcome,
+        partial_delivery_problem,
     )
     from openexecutive.config import get_settings
-    from openexecutive.scheduler.runner import principal_delivery_plan
+    from openexecutive.people.store import active_principals
+    from openexecutive.scheduler.runner import email_ready, unreachable_principals
 
     # With the scheduler off no brief is coming; the Setup status page says so.
     if not get_settings().scheduler_enabled:
@@ -1977,11 +1979,22 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     last = last_delivery_outcome()
     if last is None:
         return None
-    principal, plan = principal_delivery_plan()
-    reason = current_problem(last, has_owner=principal is not None, can_deliver=bool(plan))
+    # The whole roster, not `find_principal_person()`: the briefs go out one
+    # DM per active principal, so a co-principal with no channel misses every
+    # one of them, and asking only about the lowest-id row would let the
+    # other founder's working channel clear the recorded failure.
+    principals = active_principals()
+    unreachable = unreachable_principals(principals, email_ready=email_ready())
+    reason = current_problem(
+        last, has_owner=bool(principals), can_deliver=bool(principals) and not unreachable
+    )
     if reason is None:
         return None
     problem, fix = DELIVERY_PROBLEMS[reason]
+    if reason == "no_channel" and len(unreachable) < len(principals):
+        # Some founder did get it, so the "send it to you" copy would be
+        # wrong for whoever is reading the notice. Name who is missing out.
+        problem, fix = partial_delivery_problem([p.full_name for p in unreachable])
     return BriefDeliveryNotice(
         brief=brief_name(last.kind),
         at=last.at.isoformat(),
