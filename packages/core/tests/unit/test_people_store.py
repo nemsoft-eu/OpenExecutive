@@ -256,21 +256,17 @@ def test_find_principal_skips_archived(db: Path) -> None:
     assert principal is not None and principal.id == new
 
 
-def test_archive_last_principal_refused(db: Path) -> None:
+def test_archive_last_principal_is_allowed(db: Path) -> None:
+    """A zero-principal roster is reachable on purpose — it is how you re-run
+    onboarding, and the install then reads as "unclaimed" until someone
+    claims it. The fork briefly refused this (PR #29); the guard was dropped
+    in the 2026-10-07 upstream sync once upstream's `_require_roster_owner`
+    made the principal the only caller who can reach the route at all.
+    """
     pid = people_store.upsert_person(full_name="The Boss", is_principal=True)
     people_store.upsert_person(full_name="Staff")
-    with pytest.raises(people_store.LastPrincipalError):
-        people_store.archive_person(pid)
-    principal = people_store.find_principal_person()
-    assert principal is not None and principal.id == pid
-
-
-def test_archive_co_principal_allowed_until_one_remains(db: Path) -> None:
-    first = people_store.upsert_person(full_name="Founder A", is_principal=True)
-    second = people_store.upsert_person(full_name="Founder B", is_principal=True)
-    assert people_store.archive_person(first) is True
-    with pytest.raises(people_store.LastPrincipalError):
-        people_store.archive_person(second)
+    assert people_store.archive_person(pid) is True
+    assert people_store.find_principal_person() is None
 
 
 def test_archive_non_principal_unaffected_by_guard(db: Path) -> None:

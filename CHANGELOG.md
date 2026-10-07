@@ -5,7 +5,341 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+From 0.3.0 on, entries are written by release-please from the titles of the
+merged pull requests (`feat` → Added, `fix` → Fixed). The open release PR holds
+the next entry; edit it there before merging if a line needs rewording.
+
+## [0.5.2](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.5.1...v0.5.2) (2026-10-06)
+
+
+### Added
+
+* **delegation:** let people describe how they write in their own words ([#362](https://github.com/SenteLabsAI/OpenExecutive/issues/362)) ([593741e](https://github.com/SenteLabsAI/OpenExecutive/commit/593741ee2b24ba3ced6294683a8e09f1fd05909a))
+* **onboarding:** describe your work first, then ask what's missing ([#377](https://github.com/SenteLabsAI/OpenExecutive/issues/377)) ([8e112dc](https://github.com/SenteLabsAI/OpenExecutive/commit/8e112dcf3e82901c78d9a3677a119217768ca51e))
+* **providers:** default to Claude Sonnet 5.5 and Opus 5.5 ([#371](https://github.com/SenteLabsAI/OpenExecutive/issues/371)) ([12b89ce](https://github.com/SenteLabsAI/OpenExecutive/commit/12b89cec4aef884b88cebe9e8522c0731608224e))
+* **ui:** move your own memory card to Settings as About you ([#359](https://github.com/SenteLabsAI/OpenExecutive/issues/359)) ([dad7384](https://github.com/SenteLabsAI/OpenExecutive/commit/dad7384202a14657f287b8c1dff8e16ba29f9582))
+* **ui:** play the Council Consult animation while the Executive works ([#368](https://github.com/SenteLabsAI/OpenExecutive/issues/368)) ([639f968](https://github.com/SenteLabsAI/OpenExecutive/commit/639f968d2eaa784054202f38a1e74280996511e4))
+* **ui:** reword the who-is-it-for setup choice as Personal and Team ([#375](https://github.com/SenteLabsAI/OpenExecutive/issues/375)) ([892e96b](https://github.com/SenteLabsAI/OpenExecutive/commit/892e96b07aad98a0cc448ee0d926c0ad80b03250))
+* **workflows:** let the morning reflection search the knowledge base ([#364](https://github.com/SenteLabsAI/OpenExecutive/issues/364)) ([e7106ab](https://github.com/SenteLabsAI/OpenExecutive/commit/e7106ab6d298dd719c830e06247d9298db0f2176))
+
+
+### Fixed
+
+* **delegation:** let the email's own greeting decide who a group email asks ([#365](https://github.com/SenteLabsAI/OpenExecutive/issues/365)) ([8145855](https://github.com/SenteLabsAI/OpenExecutive/commit/814585594ab802e3f5c714d3a7c5af311cae832b))
+* **integrations:** stop logging the start of each email body ([#367](https://github.com/SenteLabsAI/OpenExecutive/issues/367)) ([35a1e6c](https://github.com/SenteLabsAI/OpenExecutive/commit/35a1e6c6158d9f3033ca3970a4cc6b22eaaf9937))
+* **onboarding:** keep going when a setup turn returns prose or a null hint ([#378](https://github.com/SenteLabsAI/OpenExecutive/issues/378)) ([fd3e7bb](https://github.com/SenteLabsAI/OpenExecutive/commit/fd3e7bb7dbd8f540cae0d112f9c22a8a1550d7b8))
+* **people:** point roster emails at Home and name who a reply is about ([#366](https://github.com/SenteLabsAI/OpenExecutive/issues/366)) ([8c15b9d](https://github.com/SenteLabsAI/OpenExecutive/commit/8c15b9d8b7376671bed6997331dd626eee56415b))
+* **ui:** hide the Always asks first switches while Take the lead is off ([#360](https://github.com/SenteLabsAI/OpenExecutive/issues/360)) ([f1988d6](https://github.com/SenteLabsAI/OpenExecutive/commit/f1988d657a34a9919c07afb17922ae6ad4f0dc50))
+* **ui:** keep the watch list page from scrolling the whole screen on phones ([#363](https://github.com/SenteLabsAI/OpenExecutive/issues/363)) ([4cd1136](https://github.com/SenteLabsAI/OpenExecutive/commit/4cd1136e3672ac5e3f4de6fe8abc8017f7e16edb))
+* **ui:** put Dismiss and Edit in Gmail beside Send on reply cards ([#358](https://github.com/SenteLabsAI/OpenExecutive/issues/358)) ([7a278fa](https://github.com/SenteLabsAI/OpenExecutive/commit/7a278fae8e022283f0eb3985b737afd0eb4e9799))
+
+## [0.5.1](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.5.0...v0.5.1) (2026-10-04)
+
+
+### Added
+
+* **delegation:** send inbox replies on their own under Handle it for me ([#353](https://github.com/SenteLabsAI/OpenExecutive/issues/353)) ([23af959](https://github.com/SenteLabsAI/OpenExecutive/commit/23af959100f7d66b87c9caa54df3370907f4b546))
+* **orchestrator:** let the Executive take the lead behind one approval gate ([#355](https://github.com/SenteLabsAI/OpenExecutive/issues/355)) ([f341051](https://github.com/SenteLabsAI/OpenExecutive/commit/f3410516d10c623eb301276cebf6193d8b9a5553))
+
+
+### Fixed
+
+* **ui:** harden the UI for phones, readability and plain wording ([#357](https://github.com/SenteLabsAI/OpenExecutive/issues/357)) ([d46eee5](https://github.com/SenteLabsAI/OpenExecutive/commit/d46eee56d274823ee90f238de463d812d6244a39))
+
+## [0.5.0](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.6...v0.5.0) (2026-10-03)
+
+
+### Added
+
+* **chat:** fold messages sent mid-turn into the running answer ([#352](https://github.com/SenteLabsAI/OpenExecutive/issues/352)) ([bba990f](https://github.com/SenteLabsAI/OpenExecutive/commit/bba990f20dab7559967010e65b65630f1a35c684))
+* **delegation:** check Act as me drafts against what the writer already told those people ([#350](https://github.com/SenteLabsAI/OpenExecutive/issues/350)) ([0543e92](https://github.com/SenteLabsAI/OpenExecutive/commit/0543e928543f456586dbed04b38b1280753dbbab))
+* **memory:** bring Always in the loop notes into the owner's briefs and remind when due ([#348](https://github.com/SenteLabsAI/OpenExecutive/issues/348)) ([a5b399d](https://github.com/SenteLabsAI/OpenExecutive/commit/a5b399d1da2708e07299b80b99ad146db3731835))
+* **memory:** keep notes of what people say in chat ([#346](https://github.com/SenteLabsAI/OpenExecutive/issues/346)) ([eebda07](https://github.com/SenteLabsAI/OpenExecutive/commit/eebda072821a3294c2ce09b9c3cd2f7372a44885))
+* **memory:** keep private notes from replies you approve and send ([#342](https://github.com/SenteLabsAI/OpenExecutive/issues/342)) ([96098b7](https://github.com/SenteLabsAI/OpenExecutive/commit/96098b7d2a5898c5970a207582a8b982580ea329))
+* **ui:** add the History tab and settings for Always in the loop ([#344](https://github.com/SenteLabsAI/OpenExecutive/issues/344)) ([870ff2b](https://github.com/SenteLabsAI/OpenExecutive/commit/870ff2b146b84faf12892eba132ae3b42b8e9e1d))
+* **ui:** move the Agent Council's Advanced toggle into the agent panel ([#345](https://github.com/SenteLabsAI/OpenExecutive/issues/345)) ([29de6ca](https://github.com/SenteLabsAI/OpenExecutive/commit/29de6ca9eb869b49c42f611cc03e039e8f8f20ce))
+* **ui:** simplify every screen with a six-place menu and focused pages ([3155921](https://github.com/SenteLabsAI/OpenExecutive/commit/3155921a77a77057115f3c5c40018d1997ce749a))
+
+
+### Fixed
+
+* **artifacts:** keep each document private to the person who made it ([#351](https://github.com/SenteLabsAI/OpenExecutive/issues/351)) ([cbaad6f](https://github.com/SenteLabsAI/OpenExecutive/commit/cbaad6fc8109bde49cce6b9644a51f6de9ccd2d9))
+* **delegation:** stop drafting inbox replies to group emails that ask someone else ([#343](https://github.com/SenteLabsAI/OpenExecutive/issues/343)) ([5da0b29](https://github.com/SenteLabsAI/OpenExecutive/commit/5da0b29821e54bc2651d51280a14388636160ca6))
+
+
+### Changed
+
+* **ci:** run tests with temp files in RAM and parse the package once ([#339](https://github.com/SenteLabsAI/OpenExecutive/issues/339)) ([75e3163](https://github.com/SenteLabsAI/OpenExecutive/commit/75e31638496feed9f28f6258be7f8ea8089d667b))
+
+## [0.4.6](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.5...v0.4.6) (2026-10-02)
+
+
+### Added
+
+* **auth:** add SSO sign-in through any OpenID Connect provider ([#338](https://github.com/SenteLabsAI/OpenExecutive/issues/338)) ([d338f1f](https://github.com/SenteLabsAI/OpenExecutive/commit/d338f1f9088fefca2d6cbe4e760bd1261b33813a))
+* **delegation:** let Act as me use an Outlook mailbox ([#336](https://github.com/SenteLabsAI/OpenExecutive/issues/336)) ([6b7957e](https://github.com/SenteLabsAI/OpenExecutive/commit/6b7957eef63a6e113944a0601e2681efb91013f8))
+* **integrations:** add a Microsoft 365 (Outlook) mail and calendar backend ([#326](https://github.com/SenteLabsAI/OpenExecutive/issues/326)) ([5ec59a4](https://github.com/SenteLabsAI/OpenExecutive/commit/5ec59a4ccc2a8291693fbd22ec683bcf55da16cd))
+* **integrations:** sync OneDrive folders into knowledge and add OneDrive tools in chat ([#331](https://github.com/SenteLabsAI/OpenExecutive/issues/331)) ([29d3037](https://github.com/SenteLabsAI/OpenExecutive/commit/29d3037b328b969e833428bb9f6ac3269d5f7d95))
+* **knowledge:** sync Confluence spaces into the knowledge base ([#324](https://github.com/SenteLabsAI/OpenExecutive/issues/324)) ([27b44bc](https://github.com/SenteLabsAI/OpenExecutive/commit/27b44bc7baa59e4bc8488e1d8fad1781611bcee9))
+* **settings:** show the running version and when a newer release is out ([#323](https://github.com/SenteLabsAI/OpenExecutive/issues/323)) ([5d23f29](https://github.com/SenteLabsAI/OpenExecutive/commit/5d23f299dea5cb786bb5b402ef2ba416565f15b9))
+
+
+### Fixed
+
+* **ui:** make `npm run lint` real again, package-wide, and enforce it in CI ([#327](https://github.com/SenteLabsAI/OpenExecutive/issues/327)) ([398519f](https://github.com/SenteLabsAI/OpenExecutive/commit/398519f3c53194bf0abb677cf5716858672e3f5f))
+* **ui:** make the web app readable and usable on phones ([#335](https://github.com/SenteLabsAI/OpenExecutive/issues/335)) ([3ff5f50](https://github.com/SenteLabsAI/OpenExecutive/commit/3ff5f50d3982e3b0b5a36d0129a6bbc1ebc39523))
+
+## [0.4.5](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.4...v0.4.5) (2026-10-01)
+
+
+### Added
+
+* **agents:** add additional instructions to Agent Council agents ([#308](https://github.com/SenteLabsAI/OpenExecutive/issues/308)) ([4bc9567](https://github.com/SenteLabsAI/OpenExecutive/commit/4bc9567cd1391456b0d03e2bb636bcf9de07c65b))
+* **agents:** add Fast, Balanced and Thorough quality presets to the Agent Council ([#309](https://github.com/SenteLabsAI/OpenExecutive/issues/309)) ([58ba2ec](https://github.com/SenteLabsAI/OpenExecutive/commit/58ba2ec105b9cdfd842487b952fc1210669dba9e))
+* **agents:** offer Direct, Supportive and Analytical voices in setup and Settings ([#310](https://github.com/SenteLabsAI/OpenExecutive/issues/310)) ([c99d9d1](https://github.com/SenteLabsAI/OpenExecutive/commit/c99d9d1edcc23870ff2c20f108e73e425128fb2e))
+* **agents:** open the Agent Council in a simple view ([#311](https://github.com/SenteLabsAI/OpenExecutive/issues/311)) ([4e45588](https://github.com/SenteLabsAI/OpenExecutive/commit/4e45588f4a70507ab3fb8412511d99a669cc1be7))
+* **delegation:** draft replies to your inbox and send them on your tap ([#287](https://github.com/SenteLabsAI/OpenExecutive/issues/287)) ([0980b75](https://github.com/SenteLabsAI/OpenExecutive/commit/0980b75774d7b43bd31acccf38deb686703b51d7))
+* **delegation:** let team members use Act as me, with their mail private to them ([#320](https://github.com/SenteLabsAI/OpenExecutive/issues/320)) ([4b370b0](https://github.com/SenteLabsAI/OpenExecutive/commit/4b370b0b8e6939c247d5a3541de86617408f7462))
+* **knowledge:** put company documents first and list Drive and Notion files ([#306](https://github.com/SenteLabsAI/OpenExecutive/issues/306)) ([7f1acd8](https://github.com/SenteLabsAI/OpenExecutive/commit/7f1acd8dfe0e528d0f79e16551ee1fc34eee3a5c))
+
+
+### Fixed
+
+* **knowledge:** accept Excel and CSV uploads on the documents page ([#318](https://github.com/SenteLabsAI/OpenExecutive/issues/318)) ([6ae0e6b](https://github.com/SenteLabsAI/OpenExecutive/commit/6ae0e6b8bbca56ef6a3f60e490483598910cf4a4)), closes [#316](https://github.com/SenteLabsAI/OpenExecutive/issues/316)
+* **knowledge:** start one sync per double click and report partial sync failures ([#307](https://github.com/SenteLabsAI/OpenExecutive/issues/307)) ([649cdd8](https://github.com/SenteLabsAI/OpenExecutive/commit/649cdd8a85960c76c054712a2773bc8ce64fc50e))
+* **slack:** show senders when a thread message goes unanswered ([#319](https://github.com/SenteLabsAI/OpenExecutive/issues/319)) ([6293b6f](https://github.com/SenteLabsAI/OpenExecutive/commit/6293b6f5ed420a43574af67c1c9508182d77c4fe))
+* **ui:** pass uploads up to the api's limit through the middleware ([#303](https://github.com/SenteLabsAI/OpenExecutive/issues/303)) ([0977d06](https://github.com/SenteLabsAI/OpenExecutive/commit/0977d06be19494fde2958c5a24bde647cd3c2fd5))
+
+
+### Changed
+
+* **knowledge:** parse uploaded documents in a short-lived child process ([#305](https://github.com/SenteLabsAI/OpenExecutive/issues/305)) ([cd8b3ec](https://github.com/SenteLabsAI/OpenExecutive/commit/cd8b3ec7209c95bcafbf83693c0e3154a4d892e4))
+
+## [0.4.4](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.3...v0.4.4) (2026-09-30)
+
+
+### Added
+
+* **alerts:** let the principal find and clear alerts off the live board ([#299](https://github.com/SenteLabsAI/OpenExecutive/issues/299)) ([7bee3dc](https://github.com/SenteLabsAI/OpenExecutive/commit/7bee3dc4fa0e4a4c32e3704ccf3ee23e9264001f))
+* **attunement:** let people assign a task to a teammate ([#285](https://github.com/SenteLabsAI/OpenExecutive/issues/285)) ([13da433](https://github.com/SenteLabsAI/OpenExecutive/commit/13da433bc6f3ae97e78bb8c90f06bb5e49953447))
+* **knowledge:** add the files in chosen Google Drive folders to the knowledge base ([#279](https://github.com/SenteLabsAI/OpenExecutive/issues/279)) ([354ddb4](https://github.com/SenteLabsAI/OpenExecutive/commit/354ddb4c4f1ea66365e0530b583667a16447962d))
+* **memory:** let teammates record attributed standing facts ([#280](https://github.com/SenteLabsAI/OpenExecutive/issues/280)) ([ede7b86](https://github.com/SenteLabsAI/OpenExecutive/commit/ede7b86a83275dd973dd7cd454ed0f11d2bf9247))
+
+
+### Fixed
+
+* **deps:** move the mcp gateway's dependency cutoff past fastembed 0.8.0 ([#288](https://github.com/SenteLabsAI/OpenExecutive/issues/288)) ([8098ed5](https://github.com/SenteLabsAI/OpenExecutive/commit/8098ed552e5b80c50ec3565f4e483921644504ac))
+* **integrations:** acknowledge a new email sender only when Gmail authenticated them ([#283](https://github.com/SenteLabsAI/OpenExecutive/issues/283)) ([35e00d3](https://github.com/SenteLabsAI/OpenExecutive/commit/35e00d34771f85d036fc2c8c684d7a5fcffe886d))
+* **integrations:** pin the mcp gateway to extensible-mcp with a leaner tool index ([#291](https://github.com/SenteLabsAI/OpenExecutive/issues/291)) ([1a49047](https://github.com/SenteLabsAI/OpenExecutive/commit/1a4904797ffc8c1aa4d947ba9c5e8bd74396f9d2))
+* **integrations:** pin the mcp gateway to extensible-mcp with batched embedding ([#290](https://github.com/SenteLabsAI/OpenExecutive/issues/290)) ([5b342bc](https://github.com/SenteLabsAI/OpenExecutive/commit/5b342bc9bc0acff103075f2146511b03d8bc8bd3))
+* **knowledge:** share one lean embedding session across chroma collections ([#292](https://github.com/SenteLabsAI/OpenExecutive/issues/292)) ([b05a75b](https://github.com/SenteLabsAI/OpenExecutive/commit/b05a75b5f43fb1f4b619fecb3550ecea9e4c9cfb))
+* **mcp:** pin extensible-mcp to the commit that supports mcp 2.x ([#298](https://github.com/SenteLabsAI/OpenExecutive/issues/298)) ([d06bae2](https://github.com/SenteLabsAI/OpenExecutive/commit/d06bae2f4fae1ff16d0b2950d21b64336b89ac71))
+* **memory:** keep strangers' email out of decisions under one untrusted-content policy ([#284](https://github.com/SenteLabsAI/OpenExecutive/issues/284)) ([966821a](https://github.com/SenteLabsAI/OpenExecutive/commit/966821aeff3e7162f99704f836f3a6f1aae17c73))
+
+## [0.4.3](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.2...v0.4.3) (2026-09-29)
+
+
+### Added
+
+* **briefing:** feed the principal's live day into the header and the brief ([#263](https://github.com/SenteLabsAI/OpenExecutive/issues/263)) ([7fea2d5](https://github.com/SenteLabsAI/OpenExecutive/commit/7fea2d514c0d6dc4b567b1266a5275d5312318c4))
+* **briefing:** ground names and figures in unattended prose before delivery ([#272](https://github.com/SenteLabsAI/OpenExecutive/issues/272)) ([a565c30](https://github.com/SenteLabsAI/OpenExecutive/commit/a565c30634c1a0d2413522f8d724e2283f47fb45))
+* **memory:** keep chat corrections as standing facts in prompts ([#270](https://github.com/SenteLabsAI/OpenExecutive/issues/270)) ([4e2a42b](https://github.com/SenteLabsAI/OpenExecutive/commit/4e2a42b8816a3254c7bfbab58058a36e8e185b04))
+* **memory:** remember the Drive files a conversation found or read ([#276](https://github.com/SenteLabsAI/OpenExecutive/issues/276)) ([f200cd9](https://github.com/SenteLabsAI/OpenExecutive/commit/f200cd99ceb571681cf4ad8e8319897883de77b5))
+* **orchestrator:** tell the executive which systems are connected ([#271](https://github.com/SenteLabsAI/OpenExecutive/issues/271)) ([8c742b3](https://github.com/SenteLabsAI/OpenExecutive/commit/8c742b3c4c7362f1ca16127bd989556cb44d41e5))
+* **people:** let the owner confirm and add unknown senders ([#273](https://github.com/SenteLabsAI/OpenExecutive/issues/273)) ([ff693ae](https://github.com/SenteLabsAI/OpenExecutive/commit/ff693ae50cc7a05ddf9d63ea2d57bc727dae82b8))
+* **providers:** add LOCAL_REASONING_EFFORT for thinking-only models ([#274](https://github.com/SenteLabsAI/OpenExecutive/issues/274)) ([ed06025](https://github.com/SenteLabsAI/OpenExecutive/commit/ed06025aabf3a3c381a690f13192d0bd2e104904))
+
+
+### Fixed
+
+* **ui:** show turn progress while the executive is still working ([#261](https://github.com/SenteLabsAI/OpenExecutive/issues/261)) ([29f634b](https://github.com/SenteLabsAI/OpenExecutive/commit/29f634ba9d69b1c91d35230e0e08d3fd3622872c))
+* update the Apache license file ([#275](https://github.com/SenteLabsAI/OpenExecutive/issues/275)) ([421db3c](https://github.com/SenteLabsAI/OpenExecutive/commit/421db3c402a652ae9e0693e922f3b4c96283e807))
+
+## [0.4.2](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.1...v0.4.2) (2026-09-28)
+
+
+### Added
+
+* **delegation:** draft replies in your voice from your own Gmail ([#242](https://github.com/SenteLabsAI/OpenExecutive/issues/242)) ([cc2e95f](https://github.com/SenteLabsAI/OpenExecutive/commit/cc2e95f386d3ac1a65ed923a16cac6b2f2e70216))
+* **knowledge:** read scanned PDFs on every channel ([#254](https://github.com/SenteLabsAI/OpenExecutive/issues/254)) ([a083f18](https://github.com/SenteLabsAI/OpenExecutive/commit/a083f1851492b529047c1b2ae2b30505a07ac170))
+* **providers:** read PDFs through each provider's own file support ([#257](https://github.com/SenteLabsAI/OpenExecutive/issues/257)) ([9e0bbc4](https://github.com/SenteLabsAI/OpenExecutive/commit/9e0bbc4dea179a1342f239572081989c2c523817))
+* **ui:** give the settings page a section nav and grouped tools ([#260](https://github.com/SenteLabsAI/OpenExecutive/issues/260)) ([f896562](https://github.com/SenteLabsAI/OpenExecutive/commit/f89656265e9f1bc84de7ed4967cb13ae44a020fc))
+* **ui:** make goals quick to add with one required field ([#239](https://github.com/SenteLabsAI/OpenExecutive/issues/239)) ([5219d0a](https://github.com/SenteLabsAI/OpenExecutive/commit/5219d0a84d6691b5e08ff01a7b755961f868dd58))
+* **ui:** open workflows on a start-here panel ([#236](https://github.com/SenteLabsAI/OpenExecutive/issues/236)) ([ab37898](https://github.com/SenteLabsAI/OpenExecutive/commit/ab37898471e1cb1d92ee26fd2a8c086899ead18c))
+
+
+### Fixed
+
+* **delegation:** show your whole writing profile and keep its line breaks ([#252](https://github.com/SenteLabsAI/OpenExecutive/issues/252)) ([3f6ba5b](https://github.com/SenteLabsAI/OpenExecutive/commit/3f6ba5bf7cffb881b15f0ef05524e045e28a17e0))
+* **evals:** point make eval and docs at the packaged scenarios ([#240](https://github.com/SenteLabsAI/OpenExecutive/issues/240)) ([a0f31d9](https://github.com/SenteLabsAI/OpenExecutive/commit/a0f31d907f6c68bee27712ebdf56bbea8ea9c329))
+* **integrations:** record the inbound email's text in its audit row ([#259](https://github.com/SenteLabsAI/OpenExecutive/issues/259)) ([8d1ca4b](https://github.com/SenteLabsAI/OpenExecutive/commit/8d1ca4b8b55362538bef4676d54d09340c1853bb))
+* **orchestrator:** close the paths around the Google Workspace egress gates ([#258](https://github.com/SenteLabsAI/OpenExecutive/issues/258)) ([eb230cc](https://github.com/SenteLabsAI/OpenExecutive/commit/eb230cc759d1cd9eb84ac56a2a88060cb639ef4d))
+* **ui:** anchor the auth middleware's path exclusions ([#251](https://github.com/SenteLabsAI/OpenExecutive/issues/251)) ([b90c611](https://github.com/SenteLabsAI/OpenExecutive/commit/b90c611d0889472a35469d81f81ed052cbef2fee))
+
+## [0.4.1](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.4.0...v0.4.1) (2026-09-25)
+
+
+### Added
+
+* add local login for make dev and link the owner at setup ([#218](https://github.com/SenteLabsAI/OpenExecutive/issues/218)) ([a8efeed](https://github.com/SenteLabsAI/OpenExecutive/commit/a8efeeddf3f969a9c2439ce88f4aca9a644d050f))
+* **agents:** add a sales specialist and advice for bootstrapped founders ([#220](https://github.com/SenteLabsAI/OpenExecutive/issues/220)) ([fd7a8aa](https://github.com/SenteLabsAI/OpenExecutive/commit/fd7a8aae60dbb8d68678cee86901fc9775368c97))
+* **briefing:** email briefs as a backup and show when one isn't sent ([#226](https://github.com/SenteLabsAI/OpenExecutive/issues/226)) ([71a75c8](https://github.com/SenteLabsAI/OpenExecutive/commit/71a75c818f7bedc526a37c72fb951c77089c6146))
+* **chat:** keep answers when an expert fails and show their sources ([#222](https://github.com/SenteLabsAI/OpenExecutive/issues/222)) ([90ca2b2](https://github.com/SenteLabsAI/OpenExecutive/commit/90ca2b2d3c708ef160a3b049c99d584e74add4c5))
+* **core:** add workspace settings for your time zone and a solo mode ([#221](https://github.com/SenteLabsAI/OpenExecutive/issues/221)) ([345a91a](https://github.com/SenteLabsAI/OpenExecutive/commit/345a91a65f36c713280878337dee04a0e62f6867))
+* **goals:** track your goals and dated commitments in solo mode ([#228](https://github.com/SenteLabsAI/OpenExecutive/issues/228)) ([242af54](https://github.com/SenteLabsAI/OpenExecutive/commit/242af54c771de5a593421ae8b79e91ce8fbf541e))
+* **onboarding:** ask what your role is when you use Open Executive just for yourself ([#230](https://github.com/SenteLabsAI/OpenExecutive/issues/230)) ([5dc3a43](https://github.com/SenteLabsAI/OpenExecutive/commit/5dc3a438694000c9373008ca54757afbde602c7b))
+* **orchestrator:** work for one person in solo mode ([#225](https://github.com/SenteLabsAI/OpenExecutive/issues/225)) ([1c35275](https://github.com/SenteLabsAI/OpenExecutive/commit/1c35275d306ae684edeba329ed422f737b4d5bc7))
+* **people:** keep contacts apart from your team and act on mail you forward ([#233](https://github.com/SenteLabsAI/OpenExecutive/issues/233)) ([1bf703d](https://github.com/SenteLabsAI/OpenExecutive/commit/1bf703d17e191e093bff6c388628ff511bfeba5d))
+* **ui:** add a setup status page that tests each part of the install ([#219](https://github.com/SenteLabsAI/OpenExecutive/issues/219)) ([a95f924](https://github.com/SenteLabsAI/OpenExecutive/commit/a95f924dd54813c708d279419f0654c6f5810e33))
+* **ui:** describe Just me for any role, not only someone running a business ([#234](https://github.com/SenteLabsAI/OpenExecutive/issues/234)) ([7d97b8d](https://github.com/SenteLabsAI/OpenExecutive/commit/7d97b8d006f6fd01df2e3d64f194f110ca4c2040))
+* **ui:** set up and run Open Executive just for yourself ([#224](https://github.com/SenteLabsAI/OpenExecutive/issues/224)) ([bf3670a](https://github.com/SenteLabsAI/OpenExecutive/commit/bf3670a882418ee1abe14bcfba0cee3559c0188f))
+* **workflows:** add a weekly review and a daily top three ([#232](https://github.com/SenteLabsAI/OpenExecutive/issues/232)) ([62b283f](https://github.com/SenteLabsAI/OpenExecutive/commit/62b283f2bcd4399eef861e7df39ef486ef59a5cc))
+
+
+### Fixed
+
+* hold escalations, allow cancel, and keep roster edits owner-only ([#216](https://github.com/SenteLabsAI/OpenExecutive/issues/216)) ([4975dff](https://github.com/SenteLabsAI/OpenExecutive/commit/4975dfffc9bedadf0d94b0efaee4c18fcf2a6566))
+* **people:** stop teammates taking over the owner's entry ([#227](https://github.com/SenteLabsAI/OpenExecutive/issues/227)) ([9325113](https://github.com/SenteLabsAI/OpenExecutive/commit/9325113ea395fa2d78a3015e4284e1ce3f2b0354))
+* **scheduler:** run check-ins, chase idle initiatives and honour brief channels ([#223](https://github.com/SenteLabsAI/OpenExecutive/issues/223)) ([2a31596](https://github.com/SenteLabsAI/OpenExecutive/commit/2a3159653750702709f36f0d4e891cf3d1a95422))
+
+## [0.4.0](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.3.2...v0.4.0) (2026-09-24)
+
+
+### Added
+
+* **artifacts:** deliver artifacts by message link or email attachment ([#209](https://github.com/SenteLabsAI/OpenExecutive/issues/209)) ([212cfaf](https://github.com/SenteLabsAI/OpenExecutive/commit/212cfafc2c2e7a6cc9cf734581d7dc65b05e59f8))
+* **artifacts:** publish, reread and revise artifacts in html, docx, xlsx or links ([#207](https://github.com/SenteLabsAI/OpenExecutive/issues/207)) ([066abd3](https://github.com/SenteLabsAI/OpenExecutive/commit/066abd320928397cf1044ce7a5704de1fd5c4514))
+* **knowledge:** make chat-proposed playbooks drafts a person approves ([#208](https://github.com/SenteLabsAI/OpenExecutive/issues/208)) ([b775dea](https://github.com/SenteLabsAI/OpenExecutive/commit/b775deac7231b779830d1939499edaead3caf689))
+* **scheduler:** add a global pause for the executive's autonomous work ([812a39e](https://github.com/SenteLabsAI/OpenExecutive/commit/812a39ee220d639c33d7006c1be2c9e461cfa903))
+* **ui:** add a vitals panel to the Pulse heartbeat card ([#203](https://github.com/SenteLabsAI/OpenExecutive/issues/203)) ([4101207](https://github.com/SenteLabsAI/OpenExecutive/commit/4101207b487cc5718ef451b0e330998cd9e0772f))
+* **ui:** manage skills as playbooks on the Workflows page ([#202](https://github.com/SenteLabsAI/OpenExecutive/issues/202)) ([4691e48](https://github.com/SenteLabsAI/OpenExecutive/commit/4691e489c520323acd18a43a2c2722a0dff6d11d))
+* **ui:** rename Artifacts to Documents for users and the Executive ([#214](https://github.com/SenteLabsAI/OpenExecutive/issues/214)) ([67ee80d](https://github.com/SenteLabsAI/OpenExecutive/commit/67ee80d6bdbecf8d36be1498b595317d8a2e83c6))
+* **ui:** share one sidebar with a short recent-chats list on every page ([#195](https://github.com/SenteLabsAI/OpenExecutive/issues/195)) ([59b7d35](https://github.com/SenteLabsAI/OpenExecutive/commit/59b7d35813e26ac123f72be4fc1c72318a6f1d94))
+* **ui:** show every peer-memory note in a scrollable People tab ([#201](https://github.com/SenteLabsAI/OpenExecutive/issues/201)) ([daabb99](https://github.com/SenteLabsAI/OpenExecutive/commit/daabb99c5ea92fefd9dfe5e9eda813f12b657d77))
+* **workflows:** confirm a workflow's first write to a new target ([#199](https://github.com/SenteLabsAI/OpenExecutive/issues/199)) ([d63d11d](https://github.com/SenteLabsAI/OpenExecutive/commit/d63d11dcb570750ee43f50628324c8579597f197))
+* **workflows:** have workflows follow playbooks ([#206](https://github.com/SenteLabsAI/OpenExecutive/issues/206)) ([1c61e18](https://github.com/SenteLabsAI/OpenExecutive/commit/1c61e187005c9dc5d43bf0160e9334de88b00e64))
+* **workflows:** let workflow steps use tools ([#193](https://github.com/SenteLabsAI/OpenExecutive/issues/193)) ([429aeda](https://github.com/SenteLabsAI/OpenExecutive/commit/429aeda507373e3536313c25f2793f7983740900))
+
+
+### Fixed
+
+* **api:** check session ownership on every per-session route ([#197](https://github.com/SenteLabsAI/OpenExecutive/issues/197)) ([cf61609](https://github.com/SenteLabsAI/OpenExecutive/commit/cf61609ff8a3bb44879e365c232f24ab3a254b83))
+* **api:** remove the unauthenticated /debug/last-turn endpoint ([#200](https://github.com/SenteLabsAI/OpenExecutive/issues/200)) ([112486d](https://github.com/SenteLabsAI/OpenExecutive/commit/112486dfc6d560e3695d575df6f1a50ad1c894fa))
+* **ui:** call the Jobs page "Workflows" ([#194](https://github.com/SenteLabsAI/OpenExecutive/issues/194)) ([d3e48cb](https://github.com/SenteLabsAI/OpenExecutive/commit/d3e48cbc9558f6eab97d07cc1145ff317918adec))
+* **ui:** compare complete days only in the heartbeat trend ([#204](https://github.com/SenteLabsAI/OpenExecutive/issues/204)) ([f4a68b6](https://github.com/SenteLabsAI/OpenExecutive/commit/f4a68b60092e08365ad267c11d2fdf135ebd6b34))
+
+
+### Changed
+
+* **core:** parallelize unit tests with pytest-xdist ([#213](https://github.com/SenteLabsAI/OpenExecutive/issues/213)) ([8b9a822](https://github.com/SenteLabsAI/OpenExecutive/commit/8b9a82289ccba4feadf9b09b62597e3be15b0e1f))
+
+
+### Documentation
+
+* **release:** document forcing a version with Release-As ([e71a025](https://github.com/SenteLabsAI/OpenExecutive/commit/e71a025af7bc8ea4848a8c428da4b4570f4498e1))
+
+## [0.3.2](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.3.1...v0.3.2) (2026-09-23)
+
+
+### Added
+
+* **ui:** add an assistant-led workflow wizard and compact the jobs catalog ([#189](https://github.com/SenteLabsAI/OpenExecutive/issues/189)) ([c52b96c](https://github.com/SenteLabsAI/OpenExecutive/commit/c52b96c551143246e15fc938806f9fe9b6975de9))
+
+
+### Fixed
+
+* **ui:** validate check-in cadences and clear emptied leave dates ([#191](https://github.com/SenteLabsAI/OpenExecutive/issues/191)) ([5940557](https://github.com/SenteLabsAI/OpenExecutive/commit/594055792c346622fb174d65164c67cc77e346bd))
+
+## [0.3.1](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.3.0...v0.3.1) (2026-09-23)
+
+
+### Added
+
+* **chat:** suggest a follow-up in the composer ([#182](https://github.com/SenteLabsAI/OpenExecutive/issues/182)) ([7f7c1c1](https://github.com/SenteLabsAI/OpenExecutive/commit/7f7c1c1e2304c7333f83282fdcfb544f54fb47f0))
+* **ui:** group council model picker by provider ([#186](https://github.com/SenteLabsAI/OpenExecutive/issues/186)) ([8b3fb2f](https://github.com/SenteLabsAI/OpenExecutive/commit/8b3fb2fdf531eab1687443b99aa7f439c5dfd16f))
+
+
+### Fixed
+
+* **memory:** quote extraction and open loops from the speaker's own words ([#187](https://github.com/SenteLabsAI/OpenExecutive/issues/187)) ([100f7d9](https://github.com/SenteLabsAI/OpenExecutive/commit/100f7d9ba07de8ce06a8a0434815f173a39271ee))
+* **memory:** record only the person's own words in peer memory ([#185](https://github.com/SenteLabsAI/OpenExecutive/issues/185)) ([c32cf49](https://github.com/SenteLabsAI/OpenExecutive/commit/c32cf49c43137d20b325a29e2f576e1cda6e7fa9))
+
+## [0.3.0] - 2026-09-23
+
+### Added
+- **Attunement: the Executive follows up on what people owe** (#175). When
+  anyone on the roster commits to something in chat ("I'll send the vendor
+  quote Thursday"), asks for something, or the principal says a teammate will
+  do something, it becomes an open loop. Loops come due, get chased by the
+  nudge engine through the usual routing and outbound checks, and close when
+  their owner says it's done. The Executive can list them ("what is Sara
+  waiting on?") and close one on request. Each person's page lists their open
+  loops with Mark done. Every chat message now records who actually sent it,
+  so nothing an outsider writes is read as someone on the roster.
+- **👍/👎 on replies** (#175), in the main chat and the Ask OE panel.
+- **Attunement: learning which proactive messages land** (#176). Every
+  proactive DM (nudges, follow-ups, reflection, research and alert-review
+  messages) is resolved as replied, acted on, ignored after 72 hours, or void
+  when it stopped mattering. Credit only goes to the person who acted. A kind
+  of nudge a person's last five resolved sends all went unanswered on ranks
+  last for them on a longer cooldown until they answer one. The morning
+  reflection gets a "What lands" summary, and each person's page a "How they
+  respond" card.
+- **Attunement: per-person working style** (#177). Up to four short rules on
+  how to write replies for each person ("lead with the recommendation, then
+  the numbers"), learned only from their own messages and 👍/👎 and pinned
+  into their own conversations. Rules are checked before they are stored and
+  every time they are used, and must be about how replies read, never an
+  action. A "How I work with them" card lets the principal or the person
+  edit, lock or reset them.
+- New settings, all with defaults: `ATTUNEMENT_*` in `.env.example`.
+  `ATTUNEMENT_ENABLED=false` turns off open-loop tracking and style learning;
+  the outcome ledger has no switch and always records. None of it needs
+  Honcho.
+
+## [0.2.2] - 2026-09-22
+
+### Changed
+- **The MCP gateway runs a pinned extensible-mcp commit.** It was launched from
+  the repo's default branch, so every container start ran whatever that
+  branch held that day: a versioned image did not pin its gateway, rolling
+  back an image did not roll the gateway back, and a start without network
+  failed. The gateway and the image's pre-warm now launch the same commit
+  with the same `--exclude-newer` cutoff, which also freezes extensible-mcp's
+  own dependencies (uvx re-resolved those against PyPI on every start), and a
+  unit test keeps the two in step. An image whose pre-warm succeeded now
+  starts the gateway without network; the pre-warm is still best-effort, so
+  a build during a GitHub outage ships an image that fetches it at first
+  start. Updating the gateway is a deliberate bump of the commit and cutoff.
+
+### Fixed
+- **The compose health check no longer fails on a healthy API.** It runs
+  `curl -f http://localhost:8000/health` inside the API container, but the
+  image never installed `curl`, so the check failed on every run and compose
+  reported a working API as unhealthy. The API image now includes `curl`.
+- **The People tab shows the newest notes about a person** (#174). Its
+  "recent" list and "learned" date asked Honcho for conclusions with
+  `reverse=True`, which returns the oldest page, so a person's correction
+  made in chat never appeared there. It now reads the newest page.
+
+## [0.2.1] - 2026-09-22
+
+### Changed
+- **The API image installs the CPU-only build of torch.** torch is only
+  present because `sentence-transformers` needs it, and the container runs on
+  CPU hosts, but the default Linux wheel is the CUDA build and pulled in
+  nineteen packages the image never used — fifteen `nvidia-*` libraries,
+  three `cuda-*` shims and triton, about 2.2 GB of compressed wheels. torch
+  now resolves from PyTorch's CPU index (2.13.0 → 2.14.0+cpu on Linux, plain
+  2.14.0 on macOS, both from that index) and the Dockerfile installs from the
+  lock with `uv sync` instead of an exported requirements file, so each
+  package comes from the index the lock names. Expect the API image to shrink
+  by several GB and cold builds and pulls to get much faster. `uv sync` gets
+  the same wheels locally; a GPU deployment would need to override the index,
+  and a plain `pip install` of the package (which ignores uv sources) still
+  gets the CUDA build.
+
+## [0.2.0] - 2026-09-22
 
 ### Security
 - **The sign-in allow-list is now the union of `ALLOWED_EMAILS` and the People
@@ -53,6 +387,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `app_migrations` table); the sweep can be deleted in the release after
   next.
 
+### Changed
+- **The chat turn ceiling is now 300s (360s with Committee review)**, up from
+  120s/180s: deep multi-specialist turns were being cut off mid-answer. A
+  ceiling this generous is only reasonable because a turn can now be ended by
+  the user, so the two changes ship together. The onboarding interview, which
+  previously borrowed `CHAT_STREAM_TIMEOUT_S`, gets its own
+  `INTERVIEW_TIMEOUT_S` (still 120s) — it retries twice, so inheriting the new
+  ceiling would have meant a 10-minute hang before the wizard surfaced a
+  timeout.
+
+### Fixed
+- **A turn broken off early is no longer missing from the next turn's
+  context.** On the disconnect and timeout paths the route persisted the
+  partial turn to SQLite, but the Executive's post-turn block — which mirrors
+  it into the live in-memory session — was skipped, and a cached session never
+  re-reads its history from the DB. The next turn in the same process then
+  prompted as though the turn had never happened, while a page reload showed
+  it. The route now mirrors the turn itself on every broken-out path.
+- **The UI proxy now forwards client disconnects upstream.** `signal:
+  req.signal` was missing from the backend proxy's `fetch`, so the API never
+  saw `http.disconnect` and its `request.is_disconnected()` check could not
+  fire in production: closing a tab left the turn running to completion against
+  Anthropic and the partial reply was never saved.
+- **A disconnected turn no longer keeps working after the client is gone.**
+  The SSE driver races the stop switch with `asyncio.wait`, which — unlike the
+  `asyncio.wait_for` it replaced — does not cancel its futures when the task
+  awaiting it is cancelled. Since Starlette cancels the response body on
+  `http.disconnect`, the in-flight step is now cancelled in a `finally`, so a
+  closed tab cannot leave a specialist or tool round running with no deadline
+  and no persistence.
+
 ### Added
 - **Slack runs inside the API.** Nothing used to start the Slack bot. It now
   starts in the FastAPI lifespan whenever both `SLACK_BOT_TOKEN` and
@@ -72,6 +437,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `python -m openexecutive.integrations.slack_bot` entry point remains for
   development only; running it next to an API with the tokens answers every
   message twice.
+- **Versioned container images on GitHub Container Registry** (#142). Every
+  push to `main` publishes `ghcr.io/sentelabsai/openexecutive-api:main` and
+  `…/openexecutive-ui:main`; pushing a `vX.Y.Z` git tag publishes `X.Y.Z`,
+  `X.Y` and `latest`. Deployments can pull a pinned version instead of
+  building from source. See `docs/deployment.md` → Images.
+- **Stop button in chat.** A reply can now be halted mid-stream, from the main
+  chat composer and the Ask OE side panel (Escape works too). Whatever the
+  Executive had written is kept, persisted and marked *Stopped by you*, so a
+  truncated answer is not read back as a complete one after a reload. The
+  client mints a `client_turn_id` and sends it with the turn; `POST /chat/stop`
+  halts it. Keying on a client-minted id is what makes the button live from the
+  moment Send is pressed — the server spends several seconds fetching context
+  before the response stream exists, and a stop inside that window costs
+  nothing because no model call has been made yet. An unknown id and another
+  caller's turn both return 404, so the endpoint cannot be used to probe which
+  turns are live.
 - **Conversational onboarding.** `/onboard` now opens with "tell me about your
   company" instead of a 12-step form. The user writes a paragraph (and can
   attach a deck, one-pager or brief), the new `onboarding_interviewer` agent
@@ -336,5 +717,8 @@ Initial public release.
 - Open-source project setup: Apache-2.0 license, contribution guide, code of
   conduct, security policy, issue/PR templates, and CI.
 
-[Unreleased]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.1.0...HEAD
+[0.3.0]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SenteLabsAI/OpenExecutive/releases/tag/v0.1.0

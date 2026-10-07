@@ -7,6 +7,13 @@ Also exposes a session-scoped read at GET /audit/sessions/{session_id} that
 returns the full ordered timeline for one inbound request plus a derived
 graph (nodes + edges) so the UI can render a flow-chart view without
 re-deriving causality from event types client-side.
+
+Rows private to the principal (``AuditEvent.private`` — see
+``audit.logger``) are read by the principal alone: every read route leaves
+them out for anyone else, in SQL, so totals and pages stay honest, and a
+private row's id answers 404 exactly like a missing one. A team member's own
+rows (``AuditEvent.private_to_person``, Act as me) are left out for everyone,
+the principal included.
 """
 from __future__ import annotations
 
@@ -190,6 +197,17 @@ def _resolve_logger(request: Request) -> AuditLogger:
     return get_audit_logger()
 
 
+def _sees_private_rows(request: Request) -> bool:
+    """Whether the caller may read rows private to the principal — the rule
+    ``/alerts`` and ``/decisions`` use (``people.caller_is_principal``): the
+    principal's signed-in email, or no ``x-caller-email`` (the CLI, direct
+    curl, local login) once a principal is on the roster. With no principal
+    yet, nobody. Fails closed."""
+    from openexecutive.api.routes.people import caller_is_principal
+
+    return caller_is_principal(request)
+
+
 class AuditLogRequest(BaseModel):
     event_type: str
     summary: str
@@ -219,7 +237,13 @@ def create_audit_log(body: AuditLogRequest, request: Request) -> dict[str, int |
 def get_audit_log(event_id: int, request: Request) -> AuditEventDetailOut:
     audit = _resolve_logger(request)
     event = audit.get(event_id)
-    if event is None:
+    # A private row reads exactly like a missing one to anyone else, and a
+    # team member's own row (Act as me) to everyone, the principal included.
+    if (
+        event is None
+        or event.private_to_person is not None
+        or (event.private and not _sees_private_rows(request))
+    ):
         raise HTTPException(status_code=404, detail="audit event not found")
     return AuditEventDetailOut(
         id=event.id,
@@ -506,7 +530,9 @@ def get_audit_session(session_id: str, request: Request) -> AuditSessionResponse
     if not _SESSION_ID_RE.match(session_id):
         raise HTTPException(status_code=400, detail="invalid session_id format")
     audit = _resolve_logger(request)
-    events = audit.query(session_id=session_id, limit=1000)
+    events = audit.query(
+        session_id=session_id, limit=1000, include_private=_sees_private_rows(request)
+    )
     if not events:
         raise HTTPException(status_code=404, detail="no events for session_id")
     graph, channel = _build_session_graph(events)
@@ -545,6 +571,7 @@ def list_audit_logs(
     offset: int = Query(default=0, ge=0),
 ) -> AuditListResponse:
     audit = _resolve_logger(request)
+    include_private = _sees_private_rows(request)
     events = audit.query(
         event_type=event_type,
         session_id=session_id,
@@ -554,6 +581,7 @@ def list_audit_logs(
         until=until,
         limit=limit,
         offset=offset,
+        include_private=include_private,
     )
     total = audit.count(
         event_type=event_type,
@@ -562,6 +590,7 @@ def list_audit_logs(
         q=q,
         since=since,
         until=until,
+        include_private=include_private,
     )
     return AuditListResponse(
         items=[
@@ -597,7 +626,9 @@ def get_audit_usage(
     so an operator can see overall token spend and where it goes.
     """
     audit = _resolve_logger(request)
-    data = audit.usage_summary(since=since, until=until)
+    data = audit.usage_summary(
+        since=since, until=until, include_private=_sees_private_rows(request)
+    )
     return UsageSummary(
         since=since,
         until=until,

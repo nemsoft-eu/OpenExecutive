@@ -503,6 +503,48 @@ def test_cancel_nonexistent_returns_error() -> None:
     assert "error" in json.loads(raw)
 
 
+def _instance(decision_class: str, payload: dict[str, Any]) -> int:
+    from openexecutive.memory.decision_ledger import create_decision_instance
+
+    return create_decision_instance(
+        decision_class=decision_class, department="", originating_session_id=None,
+        proposed_payload=payload, idempotency_key=None, gate_mode="propose",
+        approver_person_id=None, confidence=0.9,
+    )
+
+
+def test_cancel_touches_only_meeting_bookings() -> None:
+    """Another class (a reply drafted in the owner's own Gmail) reads exactly
+    like a missing id: the tool can't close it, nor tell that it exists."""
+    from openexecutive.memory.decision_ledger import get_decision_instance, mark_reversed
+
+    iid = _instance("delegation_reply", {"private": True, "draft_id": "d1"})
+    gw = _fake_gateway()
+    with patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw):
+        raw = asyncio.run(handle_cancel_calendar_event({"decision_instance_id": iid}))
+    assert json.loads(raw) == {"error": f"decision_instance {iid} not found"}
+    assert get_decision_instance(iid).status == "proposed"  # type: ignore[union-attr]
+    gw.call_tool.assert_not_awaited()
+    # And the ledger itself refuses a reversal of the wrong class.
+    assert mark_reversed(iid, reason="x", decision_class="meeting_scheduling") is False
+    assert get_decision_instance(iid).status == "proposed"  # type: ignore[union-attr]
+
+
+def test_a_private_booking_is_the_owners_to_cancel() -> None:
+    from openexecutive.memory.decision_ledger import get_decision_instance
+    from openexecutive.orchestrator.people_tools import grant_contact_egress
+
+    iid = _instance("meeting_scheduling", {"private": True, "title": "Sync"})
+    with patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=_fake_gateway()):
+        # Not the owner's own verified turn: it doesn't exist.
+        raw = asyncio.run(handle_cancel_calendar_event({"decision_instance_id": iid}))
+        assert json.loads(raw) == {"error": f"decision_instance {iid} not found"}
+        assert get_decision_instance(iid).status == "proposed"  # type: ignore[union-attr]
+        with grant_contact_egress():
+            raw = asyncio.run(handle_cancel_calendar_event({"decision_instance_id": iid}))
+    assert json.loads(raw)["status"] == "cancelled"
+
+
 # ---------------------------------------------------------------------------
 # Google Meet links
 # ---------------------------------------------------------------------------
@@ -718,3 +760,106 @@ def test_instant_meeting_tool_gated_on_calendar_configured() -> None:
     assert "create_instant_meeting" in on_names
     assert "create_calendar_event" in on_names
     assert "create_instant_meeting" not in off_names
+
+
+# ---------------------------------------------------------------------------
+# Provider switch: add_video_link (+ legacy add_google_meet alias) and the
+# Microsoft backend behind the same typed tool
+# ---------------------------------------------------------------------------
+
+def _fake_gateway_with_teams(
+    event_id: str = "evt-teams", link: str = "https://teams.microsoft.com/l/meetup-join/abc"
+) -> Any:
+    gw = MagicMock()
+    gw.call_tool = AsyncMock(return_value=json.dumps({
+        "id": event_id, "onlineMeeting": {"joinUrl": link},
+    }))
+    return gw
+
+
+def test_add_video_link_false_omits_meet_request() -> None:
+    pid = _add_person("Alice", "alice@example.com")
+    gw = _fake_gateway("evt-novid2")
+    s = _settings()
+    with (
+        patch("openexecutive.config.get_settings", return_value=s),
+        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw),
+        patch("openexecutive.departments.authority.gate_action") as mock_gate,
+        patch("openexecutive.memory.decision_ledger.get_class_mode", return_value="auto_execute"),
+    ):
+        mock_gate.return_value = SimpleNamespace(action="execute", assignee_person_id=None)
+        raw = asyncio.run(handle_create_calendar_event({
+            "title": "In person", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+            "attendee_person_ids": [pid], "confidence": 0.9, "add_video_link": False,
+        }))
+    result = json.loads(raw)
+    assert result["status"] == "created"
+    assert result.get("meet_link") is None
+    assert "add_google_meet" not in _last_manage_event_args(gw)
+
+
+def test_tool_schema_exposes_add_video_link_not_the_old_key() -> None:
+    from openexecutive.orchestrator.calendar_tools import CREATE_CALENDAR_EVENT_TOOL
+
+    props = CREATE_CALENDAR_EVENT_TOOL["input_schema"]["properties"]
+    assert "add_video_link" in props
+    assert "add_google_meet" not in props
+    assert "Google Meet" not in CREATE_CALENDAR_EVENT_TOOL["description"].replace(
+        "Google Meet or Microsoft Teams", ""
+    )
+
+
+def test_microsoft_provider_books_a_teams_meeting() -> None:
+    pid = _add_person("Alice", "alice@example.com")
+    gw = _fake_gateway_with_teams()
+    s = _settings(calendar_provider="microsoft")
+    with (
+        patch("openexecutive.config.get_settings", return_value=s),
+        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw),
+        patch("openexecutive.departments.authority.gate_action") as mock_gate,
+        patch("openexecutive.memory.decision_ledger.get_class_mode", return_value="auto_execute"),
+    ):
+        mock_gate.return_value = SimpleNamespace(action="execute", assignee_person_id=None)
+        raw = asyncio.run(handle_create_calendar_event({
+            "title": "Synced", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+            "attendee_person_ids": [pid], "confidence": 0.95,
+        }))
+    result = json.loads(raw)
+    assert result["status"] == "created"
+    assert result["event_id"] == "evt-teams"
+    assert result["meet_link"] == "https://teams.microsoft.com/l/meetup-join/abc"
+    call = gw.call_tool.call_args.args[0]
+    assert call["name"] == "microsoft_365__create-calendar-event"
+    body = call["arguments"]["body"]
+    assert body["isOnlineMeeting"] is True
+    assert body["onlineMeetingProvider"] == "teamsForBusiness"
+    assert body["attendees"] == [{"emailAddress": {"address": "alice@example.com"}, "type": "required"}]
+
+
+def test_microsoft_provider_cancels_through_delete_calendar_event() -> None:
+    from openexecutive.memory.decision_ledger import (
+        create_decision_instance,
+        get_decision_instance,
+        mark_executed,
+    )
+    from openexecutive.orchestrator.calendar_tools import handle_cancel_calendar_event
+
+    iid = create_decision_instance(
+        decision_class="meeting_scheduling", department="operations",
+        originating_session_id=None, proposed_payload={"title": "x"},
+        idempotency_key="idem-ms-cancel", gate_mode="execute",
+        approver_person_id=None, confidence=0.9,
+    )
+    mark_executed(iid, external_event_id="evt-ms", final_payload={"title": "x"})
+    gw = MagicMock()
+    gw.call_tool = AsyncMock(return_value=json.dumps({"success": True}))
+    with (
+        patch("openexecutive.config.get_settings", return_value=_settings(calendar_provider="microsoft")),
+        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw),
+    ):
+        raw = asyncio.run(handle_cancel_calendar_event({"decision_instance_id": iid}))
+    assert json.loads(raw)["status"] == "cancelled"
+    assert gw.call_tool.call_args.args[0] == {
+        "name": "microsoft_365__delete-calendar-event", "arguments": {"eventId": "evt-ms"},
+    }
+    assert get_decision_instance(iid).status == "reversed"

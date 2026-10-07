@@ -14,6 +14,36 @@ os.environ.setdefault("EXEC_EMAIL_ADDRESS", "ceo.test@example.com")
 # full-app test errors at construction — the same trap BACKEND_SHARED_SECRET sets
 # (see CLAUDE.md → Testing). Clear it so the suite matches CI either way.
 os.environ.pop("OE_PUBLIC_DEPLOYMENT", None)
+# Same for signed callers: with public keys in the shell, every full-app test
+# that names its caller with x-caller-email is refused with 401.
+os.environ.pop("CALLER_ASSERTION_PUBLIC_KEYS", None)
+# The RAG distance gates are read by retrieve() at call time and several
+# retrieval tests hard-code distances either side of the 0.55 default. Because
+# config.py loads a developer's .env, putting a tuning value there — the
+# documented way to use these levers — would otherwise change the gate for the
+# whole suite and fail those tests for a reason nothing in them mentions.
+os.environ.pop("KNOWLEDGE_DISTANCE_THRESHOLD", None)
+os.environ.pop("KNOWLEDGE_BUILTIN_DISTANCE_THRESHOLD", None)
+
+# The same trap, one layer down. `Settings` reads the deployment's `.env`, so
+# the suite inherits whatever the developer's machine happens to be running.
+#
+# That is untidy until a `.env` is valid for a service and not for a test, at
+# which point it breaks collection. A deployment that keeps its secrets in a
+# manager and hydrates them at boot writes `HONCHO_ENABLED=true` with no
+# `HONCHO_API_KEY` beside it — correct for that service, and fatal for a
+# `Settings()` built in a test: "HONCHO_ENABLED=true requires HONCHO_API_KEY",
+# raised at COLLECTION time, so 32 tests across 7 modules died before one of
+# them ran. Nothing in the suite touched any of them.
+#
+# Cutting the file out is the fix, not clearing whichever flags happen to hurt
+# today: os.environ is something this file controls and a test can monkeypatch,
+# `.env` is neither, and a test that does `monkeypatch.delenv("HONCHO_ENABLED")`
+# to assert the default would have the deployment's value quietly reappear
+# underneath it. Everything Settings genuinely requires is set above.
+from openexecutive.config import Settings  # noqa: E402
+
+Settings.model_config["env_file"] = None
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +53,28 @@ def reset_active_gateway():
     set_active_gateway(None)
     yield
     set_active_gateway(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_background_open_loop_pass(monkeypatch: pytest.MonkeyPatch):
+    """Keep the post-turn open-loop pass from firing in unrelated tests.
+
+    Every Executive turn schedules it fire-and-forget; left live it would make
+    a provider call with the fake key and write audit / usage rows into the
+    default ``./episodic_memory.db`` (the audit-pollution trap in CLAUDE.md).
+    Tests of the pass itself call ``run_open_loop_pass`` directly, or undo
+    this patch."""
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.schedule_open_loop_pass",
+        lambda *args, **kwargs: None,
+    )
+    # Same for the working-style pass (attunement.style): tests of it call
+    # run_style_pass directly.
+    monkeypatch.setattr(
+        "openexecutive.attunement.style.schedule_style_pass",
+        lambda *args, **kwargs: None,
+    )
+    yield
 
 
 @pytest.fixture
@@ -57,3 +109,18 @@ def install_source_feed(monkeypatch: pytest.MonkeyPatch):
         return captured
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def _no_artifact_indexing(monkeypatch: pytest.MonkeyPatch):
+    """Keep draft_artifact from indexing into a real ChromaDB store.
+
+    `draft_artifact` (and the alert review's draft move, which calls it)
+    indexes every artifact into the knowledge store. Left live, any test
+    that drafts one would create ./chroma_db and load an embedding model.
+    Tests that exercise indexing patch `_knowledge_store` to a fake.
+    """
+    monkeypatch.setattr(
+        "openexecutive.orchestrator.artifact_tools._knowledge_store", lambda: None
+    )
+    yield

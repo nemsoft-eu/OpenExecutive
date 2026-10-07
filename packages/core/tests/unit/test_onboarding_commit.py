@@ -9,13 +9,17 @@ behaviour so nobody "simplifies" it into the fixture seeder later.
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from openexecutive.departments import store as dept_store
 from openexecutive.onboarding.commit import (
+    OwnerEmailError,
+    check_owner_email,
     derive_org_structure,
+    link_owner_email,
     reconcile_onboarding_departments,
     save_onboarding_people,
 )
@@ -480,3 +484,151 @@ def test_case_variant_names_collapse_onto_one_row_not_two(people_db: Path) -> No
     assert len(set(ids.values())) == 1
     everyone = people_store.list_people(db_path=people_db)
     assert len(everyone) == 1, f"duplicate rows: {[p.full_name for p in everyone]}"
+
+
+# ── the owner's sign-in email ────────────────────────────────────────────────
+# Setup collects no contact details, so without this step the signed-in owner
+# matched no Person: their chat list stayed empty until they found the People
+# page on their own.
+
+
+def test_blank_owner_email_means_none(people_db: Path) -> None:
+    assert check_owner_email(None, "Dana Reyes") is None
+    assert check_owner_email("   ", "Dana Reyes") is None
+
+
+def test_owner_email_is_trimmed_and_lowercased(people_db: Path) -> None:
+    assert check_owner_email("  Dana@Example.COM ", "Dana Reyes") == "dana@example.com"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "dana",
+        "dana@",
+        "@example.com",
+        "dana@example",
+        "dana @example.com",
+        "dana@exa mple.com",
+        "dana@example.com, sam@example.com",
+        "a@b@example.com",
+        f"{'d' * 250}@example.com",
+    ],
+)
+def test_malformed_owner_email_is_rejected_without_echoing_it(
+    people_db: Path, bad: str
+) -> None:
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email(bad, "Dana Reyes")
+    assert bad.strip().lower() not in str(err.value)
+
+
+def test_owner_email_held_by_someone_else_is_rejected(people_db: Path) -> None:
+    """Two rows with one email would make sign-in resolve to the older one."""
+    people_store.upsert_person(full_name="Sam Okafor", email="sam@example.com")
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("SAM@example.com", "Dana Reyes")
+    assert "sam@example.com" not in str(err.value)
+
+
+def test_owner_email_already_on_the_principals_own_row_is_fine(people_db: Path) -> None:
+    """Re-running setup: the drafted principal maps onto their existing row by
+    case-insensitive name, so their own email is not a conflict."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    assert check_owner_email("dana@example.com", "  dana reyes ") == "dana@example.com"
+
+
+def test_an_archived_holder_does_not_block_the_owner_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(full_name="Former CEO", email="dana@example.com")
+    people_store.archive_person(pid)
+    assert check_owner_email("dana@example.com", "Dana Reyes") == "dana@example.com"
+
+
+def test_an_unreadable_roster_rejects_rather_than_risking_a_duplicate(
+    people_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _locked(email: str, *_a: object, **_kw: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    # The owner-email check matches aliases too (find_person_by_address).
+    monkeypatch.setattr(people_store, "find_person_by_address", _locked)
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("dana@example.com", "Dana Reyes")
+
+
+def test_linking_makes_the_owner_resolvable_by_their_sign_in(people_db: Path) -> None:
+    ids = save_onboarding_people(
+        [PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True)]
+    )
+    assert link_owner_email(ids["Dana Reyes"], "dana@example.com") is True
+
+    found = people_store.find_person_by_email("Dana@Example.com", db_path=people_db)
+    assert found is not None and found.id == ids["Dana Reyes"]
+    assert found.is_principal
+
+
+def test_link_failure_is_swallowed(people_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid = people_store.upsert_person(full_name="Dana Reyes", is_principal=True)
+
+    def _boom(*a: object, **k: object) -> bool:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(people_store, "update_person", _boom)
+    assert link_owner_email(pid, "dana@example.com") is False
+
+
+def test_setup_never_replaces_the_principals_existing_email(people_db: Path) -> None:
+    """Re-run by someone else who kept their own login in the field: replacing
+    Dana's address would sign her out, since sign-in and caller resolution
+    both key on it, and hand her seat to the re-runner."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ops@example.com", "Dana Reyes")
+    assert "People page" in str(err.value)
+    assert "ops@example.com" not in str(err.value)
+
+
+def test_a_renamed_owner_is_told_it_is_their_own_entry(people_db: Path) -> None:
+    """The upsert keys on the name, so a renamed principal is a new row and
+    their old one still holds the email. The message must not call that
+    "someone else"."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("dana@example.com", "Dana Reyes-Kim")
+    assert "current owner" in str(err.value)
+    assert "someone else" not in str(err.value)
+
+
+def test_two_entries_sharing_the_owners_name_cannot_split_the_email(people_db: Path) -> None:
+    """The name-keyed upsert updates the LAST row with that name. If that is
+    not the row holding the email, linking would give two people one email
+    and resolve the owner's sign-in to the row being demoted."""
+    people_store.upsert_person(full_name="Ann Lee", email="ann@example.com", is_principal=True)
+    people_store.upsert_person(full_name="Ann Lee")
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ann@example.com", "Ann Lee")
+    assert "current owner" in str(err.value)
+
+
+def test_link_refuses_an_email_another_entry_holds(people_db: Path) -> None:
+    people_store.upsert_person(full_name="Sam Okafor", email="sam@example.com")
+    pid = people_store.upsert_person(full_name="Dana Reyes", is_principal=True)
+    assert link_owner_email(pid, "sam@example.com") is False
+    person = people_store.get_person(pid, db_path=people_db)
+    assert person is not None and person.email is None
+
+
+def test_link_never_replaces_a_different_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(
+        full_name="Dana Reyes", email="dana@example.com", is_principal=True
+    )
+    assert link_owner_email(pid, "ops@example.com") is False
+    person = people_store.get_person(pid, db_path=people_db)
+    assert person is not None and person.email == "dana@example.com"
+
+
+def test_someone_elses_alias_is_not_the_owners_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(full_name="Ben Teammate", email="ben@example.com")
+    people_store.set_person_emails(pid, ["dana@example.com"])
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("dana@example.com", "Dana Reyes")

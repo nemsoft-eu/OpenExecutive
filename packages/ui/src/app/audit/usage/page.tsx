@@ -118,7 +118,7 @@ export default function TokenUsagePage() {
   return (
     <div className="flex flex-col h-full bg-surface text-fg">
       <main className="flex-1 overflow-y-auto">
-        <div className="max-w-6xl mx-auto px-6 py-6">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
           <div className="flex items-center justify-between gap-4">
             <h1 className="text-xl font-semibold text-fg">Token usage</h1>
             <Link
@@ -129,7 +129,7 @@ export default function TokenUsagePage() {
             </Link>
           </div>
           <p className="mt-1 text-sm text-fg-muted">
-            Aggregate token usage and cost across all sessions, summed from the
+            What the AI has cost across every conversation, added up from the
             audit log. Days are UTC. Cost is the actual OpenRouter charge captured
             per call — it accrues from when cost tracking went live, so calls
             logged before then count tokens but $0.

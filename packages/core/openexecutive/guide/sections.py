@@ -1,10 +1,11 @@
 """The fixed registry of user-guide sections.
 
 The ``/guide`` page is a plain-language overview of every user-facing
-feature — "what it is, what it does" — kept separate from the technical
-``/architecture`` reference. Like the architecture page, each section is
-rendered from a static, version-controlled JSON file under
-``guide/prebuilt/<id>.json``; nothing on the serving path calls an LLM.
+feature — "what it is, what it does, how to use it" — kept separate from
+the technical ``/architecture`` reference. Like the architecture page,
+each section is rendered from a static, version-controlled JSON file
+under ``guide/prebuilt/<id>.json``; nothing on the serving path calls an
+LLM.
 
 The section IDs must match the ``GUIDE_SECTIONS`` const in
 ``packages/ui/src/app/guide/page.tsx`` so deep links keep working and the
@@ -42,21 +43,21 @@ GUIDE_SECTIONS: list[GuideSection] = [
     GuideSection(
         id="pulse",
         title="Pulse (Memory)",
-        sub="The Executive's running memory — decisions made, initiatives in flight, advice gathered.",
+        sub="The Executive's running memory — decisions made, initiatives in flight, advice gathered, corrections kept.",
     ),
     GuideSection(
         id="review",
         title="Review Queue",
-        sub="Approve, reject, or correct incoming knowledge before the Executive relies on it.",
+        sub="On Knowledge, under Advanced: approve, reject, or correct knowledge before the Executive relies on it.",
     ),
     GuideSection(
         id="jobs",
-        title="Jobs (Workflows)",
+        title="Workflows",
         sub="Multi-step workflows that produce a deliverable — board prep, GTM plan, perf review.",
     ),
     GuideSection(
         id="artifacts",
-        title="Artifacts",
+        title="Documents",
         sub="Your library of finished documents — drafts and workflow outputs in one place.",
     ),
     GuideSection(
@@ -86,8 +87,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="skills",
-        title="Skills",
-        sub="Reusable how-to procedures the Executive can pull up — checklists, playbooks, templates.",
+        title="Playbooks",
+        sub="How the Executive does a piece of work — methods, templates, checklists. A tab on Workflows.",
     ),
     GuideSection(
         id="council",
@@ -122,7 +123,7 @@ GUIDE_SECTIONS: list[GuideSection] = [
     GuideSection(
         id="settings",
         title="Settings & Advanced",
-        sub="The hub for power-user tools that sit outside the day-to-day nav — including this guide.",
+        sub="Your Executive, workspace, Act as me, and the Advanced tools outside the day-to-day nav — including this guide.",
     ),
 ]
 

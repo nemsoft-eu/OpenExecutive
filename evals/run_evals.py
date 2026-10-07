@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Eval runner for Open Executive.
 
-Usage:
-    python run_evals.py --scenarios scenarios/ --output results/
+Usage (or just `make eval`), from packages/core:
+    uv run python ../../evals/run_evals.py --scenarios openexecutive/evals/_scenarios/ --output ../../evals/results/
 """
 from __future__ import annotations
 
@@ -37,7 +37,16 @@ async def run_eval(scenario: dict, executive, session_factory) -> dict:
     if ctx.get("runway_months"):
         profile.financials.runway_months = ctx["runway_months"]
 
-    session = Session(company_profile=profile)
+    from openexecutive.evals.scenarios import scenario_principal_role
+
+    # `workspace_mode: solo` runs the scenario as solo mode on this session
+    # only (see openexecutive.evals.runner), and a `principal_role` block
+    # plays a principal with that role; unset uses the install's settings.
+    session = Session(
+        company_profile=profile,
+        workspace_mode=scenario.get("workspace_mode"),
+        principal_role=scenario_principal_role(scenario),
+    )
 
     response = await executive.chat(
         user_message=scenario["query"],
@@ -70,9 +79,11 @@ Rate each dimension (1=poor, 3=acceptable, 5=excellent):
 3. actionability: Does it give concrete next steps with clear recommendations?
 4. topic_coverage: Does it address the expected topics?
 5. specificity: Is it specific to the situation, not generic advice?
+6. concision: Is the length proportional to the question? Penalize padding, restating the question, and unsolicited closing offers. A genuinely complex question earns its length.
+7. overall: Your holistic assessment of the response.
 
 Respond in JSON format:
-{{"persona_coherence": N, "domain_accuracy": N, "actionability": N, "topic_coverage": N, "specificity": N, "overall": N, "notes": "brief explanation"}}"""
+{{"persona_coherence": N, "domain_accuracy": N, "actionability": N, "topic_coverage": N, "specificity": N, "concision": N, "overall": N, "notes": "brief explanation"}}"""
 
     message = await client.messages.create(
         model="claude-opus-4-7",
@@ -218,6 +229,11 @@ async def main() -> None:
         help="Run type=workflow scenarios via WORKFLOW_REGISTRY (skip the Executive loop)",
     )
     parser.add_argument(
+        "--inbox",
+        action="store_true",
+        help="Run the inbox watcher's scenarios (type: inbox): whether it drafts, and the draft.",
+    )
+    parser.add_argument(
         "--mcp",
         action="store_true",
         help=(
@@ -226,9 +242,9 @@ async def main() -> None:
         ),
     )
     args = parser.parse_args()
-    mode_flags = [args.triage, args.workflow, args.mcp]
+    mode_flags = [args.triage, args.workflow, args.mcp, args.inbox]
     if sum(mode_flags) > 1:
-        parser.error("--triage, --workflow, and --mcp are mutually exclusive")
+        parser.error("--triage, --workflow, --mcp and --inbox are mutually exclusive")
 
     os.environ.setdefault("COMPANY_PROFILE_PATH", "./company/profile.yaml")
     os.environ.setdefault("VECTOR_STORE_PATH", "./chroma_db")
@@ -262,6 +278,8 @@ async def main() -> None:
             return "triage"
         if s.get("type") == "workflow":
             return "workflow"
+        if s.get("type") == "inbox":
+            return "inbox"
         if s.get("requires_mcp"):
             return "mcp"
         return "chat"
@@ -272,6 +290,8 @@ async def main() -> None:
         target_kind = "workflow"
     elif args.mcp:
         target_kind = "mcp"
+    elif args.inbox:
+        target_kind = "inbox"
     else:
         target_kind = "chat"
 
@@ -302,6 +322,20 @@ async def main() -> None:
                 results.append(result)
                 status = "PASS" if result["passed"] else "FAIL"
                 print(f"    → {status} (overall: {scores.get('overall', 0):.1f}/5)")
+            except Exception as e:
+                print(f"    → ERROR: {e}")
+                results.append({"id": scenario["id"], "error": str(e), "passed": False})
+    elif target_kind == "inbox":
+        # The inbox watcher's two model calls, judged in the package runner.
+        from openexecutive.evals.runner import run_inbox_scenario
+
+        for scenario in scenarios:
+            print(f"  [{scenario['id']}] {scenario['description']}")
+            try:
+                result = {"id": scenario["id"], **await run_inbox_scenario(scenario)}
+                results.append(result)
+                status = "PASS" if result["passed"] else "FAIL"
+                print(f"    → {status} (overall: {result['scores'].get('overall', 0):.1f}/5)")
             except Exception as e:
                 print(f"    → ERROR: {e}")
                 results.append({"id": scenario["id"], "error": str(e), "passed": False})

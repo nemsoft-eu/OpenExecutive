@@ -9,6 +9,7 @@ the same guarantees — a caller cannot accidentally ship a request with
 """
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -18,7 +19,7 @@ from typing import Any
 class FeatureSpec:
     """What a given model is allowed to receive.
 
-    All four flags default to True for Claude family; the registry's
+    All flags default to True for Claude family; the registry's
     ``MODEL_SPECS`` table flips them off for non-Claude models so a
     misconfigured caller can't bypass the gate.
     """
@@ -27,6 +28,50 @@ class FeatureSpec:
     supports_thinking: bool = True
     supports_web_search: bool = True
     supports_tool_use: bool = True
+    # Whether a PDF ``document`` block may be sent. Anthropic reads it
+    # natively and OpenRouter parses one for any model; a self-hosted
+    # OpenAI-compatible server usually cannot (LOCAL_PDF_INPUT says it can).
+    supports_pdf_input: bool = True
+
+
+# Claude models that reject a forced ``tool_choice`` (``any`` or a named
+# ``tool``) with HTTP 400: Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1.
+# Matched as an Anthropic id (``claude-opus-5-5``, optionally date-pinned)
+# or an OpenRouter slug (``anthropic/claude-opus-5.5``).
+_NO_FORCED_TOOL_CHOICE_RE = re.compile(
+    r"^(?:anthropic/)?claude-(?:(?:opus|sonnet)-5[-.]5|(?:fable|mythos)-5[-.]1)(?:-\d{8})?$"
+)
+
+
+def rejects_forced_tool_choice(model: str) -> bool:
+    """Whether ``model`` 400s on ``tool_choice`` ``any`` / ``tool``."""
+    return bool(_NO_FORCED_TOOL_CHOICE_RE.match(model.lower()))
+
+
+def relax_forced_tool_choice(model: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Turn a forced ``tool_choice`` into ``auto`` for models that reject it.
+
+    Callers that force a tool (the emit-a-structured-result pattern) already
+    name that tool in their prompt and handle a reply without a ``tool_use``
+    block, so ``auto`` keeps them working where the forced form would 400.
+    ``disable_parallel_tool_use`` is kept. Returns ``kwargs`` itself when
+    nothing changes, else a shallow copy — the caller's dict is never mutated.
+    """
+    choice = kwargs.get("tool_choice")
+    if not (
+        isinstance(choice, dict)
+        and choice.get("type") in ("any", "tool")
+        and rejects_forced_tool_choice(model)
+    ):
+        return kwargs
+    relaxed: dict[str, Any] = {"type": "auto"}
+    if "disable_parallel_tool_use" in choice:
+        relaxed["disable_parallel_tool_use"] = choice["disable_parallel_tool_use"]
+    return {**kwargs, "tool_choice": relaxed}
+
+
+# What a PDF becomes for a model that cannot read one: said, never dropped.
+PDF_OMITTED_NOTE = "[PDF omitted: this model can't read PDF files]"
 
 
 def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -40,6 +85,7 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
         and spec.supports_thinking
         and spec.supports_web_search
         and spec.supports_tool_use
+        and spec.supports_pdf_input
     ):
         # Fast path: nothing to strip.
         return kwargs
@@ -59,6 +105,9 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
     if not spec.supports_tool_use:
         out.pop("tools", None)
         out.pop("tool_choice", None)
+
+    if not spec.supports_pdf_input:
+        _replace_documents(out)
 
     return out
 
@@ -117,3 +166,19 @@ def _strip_web_search_tools(kwargs: dict[str, Any]) -> None:
     ]
     if not kwargs["tools"]:
         kwargs.pop("tools", None)
+
+
+def _replace_documents(kwargs: dict[str, Any]) -> None:
+    """Swap every ``document`` block in the messages for a text note, so the
+    model is told a PDF was there instead of the block vanishing in
+    translation."""
+    for message in kwargs.get("messages") or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        message["content"] = [
+            {"type": "text", "text": PDF_OMITTED_NOTE}
+            if isinstance(block, dict) and block.get("type") == "document"
+            else block
+            for block in content
+        ]

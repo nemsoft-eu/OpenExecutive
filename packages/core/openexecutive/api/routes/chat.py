@@ -8,15 +8,25 @@ import re
 import sqlite3
 import time
 import uuid
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Literal, NamedTuple
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from openexecutive.api.models import ChatRequest, PageContext
+from openexecutive.api import caller as api_caller
+from openexecutive.api.models import (
+    AddChatMessageRequest,
+    ChatRequest,
+    PageContext,
+    StopChatRequest,
+)
 from openexecutive.audit import log_event as audit_log
+from openexecutive.audit import principal_turn_rows, rows_for_person
 from openexecutive.integrations.attachments import build_attachment_output
+from openexecutive.orchestrator.answer_sources import TurnSources
 from openexecutive.orchestrator.debug_events import DebugCollector
+from openexecutive.orchestrator.turn_inbox import TurnInbox
 
 # Per-file size cap. Mirrors `_DEFAULT_MAX_BYTES` in
 # `openexecutive/integrations/attachments.py` so the web chat behaves the same
@@ -30,11 +40,6 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _sessions: dict[str, Any] = {}
-
-# Most-recent completed turn's debug events, for the /debug/last-turn endpoint.
-# Single-process only; replaced wholesale at the end of every turn.
-_last_turn_events: list[dict[str, Any]] = []
-_last_turn_meta: dict[str, Any] = {}
 
 _TITLE_MAX_LEN = 60
 
@@ -67,6 +72,498 @@ def _clean_session_id(session_id: str | None) -> str | None:
     return session_id
 
 
+# Client-minted turn ids address an in-flight turn from POST /chat/stop. The
+# charset is deliberately NARROWER than _SESSION_ID_RE: this value reaches log
+# lines (same log-injection argument as above) and nothing here needs the
+# integration-shaped ids a session id has to carry — a uuid4 is the only
+# expected shape.
+# `\Z`, not `$`: `$` also matches before a trailing newline, so `re.match`
+# would accept "aaaaaaaa\n" and register an id with a newline in it.
+_CLIENT_TURN_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}\Z")
+
+# Upper bound on the live-turn registry. Entries are popped in _sse_body's
+# `finally`, so this only matters if a turn dies somewhere that bypasses it;
+# the cap keeps such a leak from growing without limit.
+_STOP_REGISTRY_MAX = 512
+
+# Headroom on top of the whole-turn deadline before a registry entry is
+# considered stranded. Covers the pre-stream context fetch and the post-stream
+# persistence, neither of which counts against the turn deadline.
+_STOP_TTL_GRACE_S = 120.0
+
+
+class _StopEntry(NamedTuple):
+    event: asyncio.Event
+    # Who may stop this turn. NOT the raw `caller_person_id`: that resolves to
+    # None for a signed-in user who isn't on the People roster yet, for a fresh
+    # install with no principal, and on any transient DB error during lookup —
+    # so comparing person ids directly would make every such caller the owner
+    # of every other such caller's turn. See `_stop_owner_key`.
+    owner: str
+    turn_id: str
+    # Monotonic registration time, used to reclaim entries stranded by a path
+    # that never reaches `_sse_body`'s `finally`.
+    started_at: float
+    # Messages the owner sends while this turn runs (POST /chat/add), folded
+    # into the turn at its next step. See `orchestrator.turn_inbox`.
+    inbox: TurnInbox | None = None
+
+
+# client_turn_id -> stop switch for every currently-streaming chat turn. Same
+# shape as `_active_cancellations` in api/routes/evals.py — structurally the
+# identical mechanism (id -> event registry, a POST that flips it, a terminal
+# SSE event, the streamer popping the entry in its `finally`).
+#
+# The vocabulary differs on purpose and the split is worth knowing about when
+# grepping: evals "cancels" a RUN the user started and may not be watching, and
+# says `canceled`; chat "stops" a reply that is being written in front of the
+# user, and says `stopped`, because that is the word on the button. If you are
+# looking for every stoppable-async pattern in this codebase, grep both.
+#
+# Single-process only — exactly like `_sessions` above. A second
+# uvicorn worker would break in-flight session continuity before it broke this.
+_active_stops: dict[str, _StopEntry] = {}
+
+
+def _clean_client_turn_id(client_turn_id: str | None) -> str | None:
+    """Drop a client-supplied turn id that isn't a plausible id.
+
+    Dropped rather than rejected, following `_clean_session_id`: a malformed id
+    only means this turn cannot be stopped, which is never a reason to fail the
+    turn itself.
+    """
+    if client_turn_id is None:
+        return None
+    if not _CLIENT_TURN_ID_RE.match(client_turn_id):
+        logger.warning("chat.client_turn_id_rejected len=%d", len(client_turn_id))
+        return None
+    return client_turn_id
+
+
+# Strong references to detached rename tasks, so GC cannot cancel one
+# mid-flight. Mirrors `memory.episodic._background_tasks`.
+_rename_tasks: set[asyncio.Task[None]] = set()
+
+
+def _rename_session_in_background(
+    session_id: str, message: str, full_response: str, turn_id: str
+) -> None:
+    """Generate and store a session title without holding up the stream.
+
+    Used on the stop path only. Everywhere else the rename is awaited so the
+    sidebar has the good title by the time the client acts on `done`.
+    """
+    from openexecutive.config import get_settings
+    from openexecutive.memory.session_store import update_session_title
+    from openexecutive.utils.session_title import generate_session_title
+
+    async def _run() -> None:
+        try:
+            new_title = await asyncio.wait_for(
+                generate_session_title(message, full_response),
+                timeout=get_settings().utility_fast_timeout_s,
+            )
+            if new_title:
+                update_session_title(session_id, new_title)
+        except Exception:
+            # asyncio.TimeoutError is an Exception subclass in 3.11+, so this
+            # covers the timeout and any DB failure. A missed rename only
+            # leaves the placeholder title.
+            logger.exception("chat.title_update_failed turn_id=%s", turn_id)
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:  # pragma: no cover - no running loop (CLI context)
+        return
+    _rename_tasks.add(task)
+    task.add_done_callback(_rename_tasks.discard)
+
+
+def _stop_owner_key(request: Request, caller_person_id: int | None) -> str:
+    """A stable identity for "who may stop this turn".
+
+    Prefers the roster Person id, then the verified caller email, then a
+    local-trust sentinel. The email step matters: `_resolve_caller_person_id`
+    collapses every unrostered signed-in user to None, and two different people
+    must not end up owning each other's turns just because neither is on the
+    roster yet. The UI proxy strips client-sent `x-caller-*` and re-stamps the
+    header from the verified session, so the email cannot be spoofed.
+
+    The sentinel is only reached when there is no header at all — CLI and
+    direct curl against a local API, where there is no identity to separate
+    (``api.caller.identity_key``).
+    """
+    if caller_person_id is not None:
+        return f"person:{caller_person_id}"
+    return api_caller.identity_key(request)
+
+
+def _sweep_stale_stops() -> None:
+    """Reclaim entries that outlived any turn that could still be running.
+
+    Entries are normally popped in `_sse_body`'s `finally`, but that only runs
+    once Starlette starts consuming the generator. Anything that strands an
+    entry would otherwise hold its slot for the life of the process — and since
+    a full registry now refuses NEW turns rather than evicting live ones, 512
+    strandings would silently take the Stop button away from everybody until a
+    restart. The TTL is generous: it only needs to exceed the longest a turn
+    can legitimately hold a slot.
+    """
+    # Imported lazily, like every other `get_settings` use in this module.
+    from openexecutive.config import get_settings
+
+    settings = get_settings()
+    ttl = (
+        settings.chat_stream_timeout_s
+        + settings.committee_extra_timeout_s
+        + _STOP_TTL_GRACE_S
+    )
+    cutoff = time.monotonic() - ttl
+    stale = [k for k, e in _active_stops.items() if e.started_at < cutoff]
+    for key in stale:
+        _active_stops.pop(key, None)
+    if stale:
+        logger.warning("chat.stop_registry_swept count=%d", len(stale))
+
+
+def _register_stop(
+    client_turn_id: str, owner: str, turn_id: str
+) -> asyncio.Event | None:
+    """Register a stop switch for a turn that is about to stream.
+
+    Returns None when the turn could not be registered, which only costs it the
+    Stop button — never the turn itself.
+    """
+    _sweep_stale_stops()
+    if client_turn_id in _active_stops:
+        # A live turn already owns this id (client retry, double submit, a
+        # scripted caller reusing a value). Overwriting would make the first
+        # turn permanently unstoppable and point Stop at the wrong one, and
+        # whichever finished first would pop the other's entry.
+        logger.warning("chat.stop_id_collision turn_id=%s", turn_id)
+        return None
+    if len(_active_stops) >= _STOP_REGISTRY_MAX:
+        # Deliberately refuse the NEW turn rather than evicting the oldest
+        # entry: entries are popped when their turn ends, so the oldest is
+        # typically a long-running LIVE turn, and evicting it would silently
+        # take the Stop button away from the person most likely to want it.
+        logger.warning("chat.stop_registry_full turn_id=%s", turn_id)
+        return None
+    event = asyncio.Event()
+    _active_stops[client_turn_id] = _StopEntry(
+        event, owner, turn_id, time.monotonic(), TurnInbox()
+    )
+    return event
+
+
+def _release_stop(client_turn_id: str | None, turn_id: str | None = None) -> None:
+    """Drop a turn's registry entry, but only if it is still that turn's.
+
+    The identity check stops one turn from popping an entry belonging to a
+    different turn that reused the same client id.
+    """
+    if not client_turn_id:
+        return
+    entry = _active_stops.get(client_turn_id)
+    if entry is None:
+        return
+    if turn_id is not None and entry.turn_id != turn_id:
+        return
+    _active_stops.pop(client_turn_id, None)
+
+
+class _StreamStep(NamedTuple):
+    """One step of the SSE driver loop.
+
+    Exactly one of these is true: `item` holds a produced value, or `exhausted`
+    / `stopped` / `timed_out` says why nothing was produced.
+    """
+
+    item: Any = None
+    produced: bool = False
+    exhausted: bool = False
+    stopped: bool = False
+    timed_out: bool = False
+
+
+async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> None:
+    """Cancel an in-flight `__anext__` step and wait for it to unwind.
+
+    `cancel()` only *requests* cancellation; the throw is not delivered until
+    the task next runs. Two things depend on actually awaiting it:
+
+    - `aclose()` on an async generator whose `__anext__` task is still running
+      raises RuntimeError("asynchronous generator is already running").
+    - The await is what stops the work. The CancelledError propagates into
+      whatever the Executive is awaiting — the Anthropic stream, a tool call, a
+      specialist gather — which is why executive.py re-raises CancelledError
+      out of its `gather(return_exceptions=True)` calls rather than treating it
+      as a tool failure.
+    """
+    if anext_task.done():
+        return
+    anext_task.cancel()
+    try:
+        await anext_task
+    except (asyncio.CancelledError, StopAsyncIteration):
+        # Deliberately not `suppress(BaseException)`: that would hide real
+        # cleanup errors. Catching CancelledError here can also swallow an
+        # OUTER cancel re-delivered during this await, but we are called from a
+        # `finally` while that cancellation is already propagating, so it
+        # continues on its way regardless — and the inner `cancel()` above has
+        # already been requested, which is the part that must not be skipped.
+        pass
+    except Exception:
+        logger.exception("chat.stream_step_failed turn_id=%s", turn_id)
+
+
+async def _next_stream_step(
+    stream: Any,
+    stop_waiter: asyncio.Task[bool] | None,
+    remaining: float,
+    turn_id: str,
+) -> _StreamStep:
+    """Advance `stream` one step, racing the stop switch and the deadline.
+
+    Extracted from the driver loop because the ordering here is load-bearing in
+    several ways and is much easier to reason about — and to test — on its own.
+
+    `asyncio.wait_for` cannot be used: it owns its inner task and cancels it on
+    timeout, leaving nothing to race a second future against. But that also
+    means we inherit a duty `wait_for` used to discharge for us. `asyncio.wait`
+    does NOT cancel its futures when the task awaiting it is cancelled, and
+    Starlette cancels this whole body on `http.disconnect` — so without the
+    `finally` below, a closed tab would leave `__anext__` running a full
+    specialist or tool round with no deadline, no registry entry and no
+    persistence. The `finally` is the load-bearing part of this function.
+    """
+    # One Task per step — exactly what `asyncio.wait_for` built here before,
+    # and like it this COPIES the current context, so the `set_turn` /
+    # `set_session` bindings made in `event_generator` are inherited by every
+    # step. See that function's comment for why that matters.
+    anext_task: asyncio.Task[Any] = asyncio.ensure_future(stream.__anext__())
+    try:
+        waiters: set[asyncio.Future[Any]] = {anext_task}
+        if stop_waiter is not None:
+            waiters.add(stop_waiter)
+        await asyncio.wait(
+            waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if anext_task.done():
+            # Deliver a produced item even when the stop fired in the same
+            # tick. The work is already paid for, and an `action_taken` here
+            # would otherwise be dropped from the chips we persist. There is no
+            # await between the `wait` above and this check, so nothing can slip
+            # in between them.
+            try:
+                return _StreamStep(item=anext_task.result(), produced=True)
+            except StopAsyncIteration:
+                return _StreamStep(exhausted=True)
+
+        if stop_waiter is not None and stop_waiter.done():
+            return _StreamStep(stopped=True)
+        return _StreamStep(timed_out=True)
+    finally:
+        # Every exit: stop, deadline, AND an outer cancellation from a client
+        # disconnect. Never leave the step running.
+        await _cancel_stream_step(anext_task, turn_id)
+
+
+def _request_stop(client_turn_id: str, owner: str) -> str | None:
+    """Flip a turn's stop switch. Returns its server `turn_id`, or None.
+
+    None covers BOTH "no such live turn" and "not yours" on purpose: the two
+    must be indistinguishable to the caller, or the endpoint becomes an oracle
+    for which turn ids are live.
+    """
+    entry = _active_stops.get(client_turn_id)
+    if entry is None or entry.owner != owner:
+        return None
+    entry.event.set()
+    return entry.turn_id
+
+
+def _add_to_turn(client_turn_id: str, owner: str, message_id: str, text: str) -> str | None:
+    """Hand a message to a running turn's inbox. Returns its server
+    `turn_id`, or None.
+
+    None covers "no such live turn", "not yours" and "the turn won't take it
+    any more" alike, for the same reason as `_request_stop`; the client then
+    sends the message as the next turn.
+    """
+    entry = _active_stops.get(client_turn_id)
+    if entry is None or entry.owner != owner or entry.inbox is None:
+        return None
+    if entry.event.is_set() or not entry.inbox.add(message_id, text):
+        return None
+    return entry.turn_id
+
+
+# One turn at a time per conversation. A second /chat on a conversation that
+# is still answering (another tab, a retry) waits for the first to finish and
+# persist, rather than running beside it on the same history. The web chat's
+# own box never sends one: a message typed mid-turn goes to POST /chat/add.
+_session_turn_locks: dict[str, asyncio.Lock] = {}
+# How many turns hold or wait on each conversation's lock. An idle lock is
+# dropped only at zero: `release()` wakes the next waiter but `locked()` reads
+# False until it runs, so "not locked" alone would drop a lock someone still
+# queues on, and the next turn would make a fresh one and run beside them.
+_session_turn_users: dict[str, int] = {}
+
+
+async def _acquire_session_turn(session_id: str, timeout_s: float) -> asyncio.Lock | None:
+    """Wait for this conversation's turn lock; None if the wait timed out.
+
+    Bounded so a turn stranded holding the lock (a path that never reaches
+    `_sse_body`'s `finally`) can't wedge the conversation for good: past the
+    deadline the turn runs anyway, as every turn did before the lock.
+    """
+    lock = _session_turn_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_turn_locks[session_id] = lock
+    _session_turn_users[session_id] = _session_turn_users.get(session_id, 0) + 1
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
+    except BaseException as exc:
+        _leave_session_turn(session_id)
+        if isinstance(exc, TimeoutError):
+            logger.warning("chat.session_lock_timeout session_id=%s", session_id)
+            return None
+        raise
+    return lock
+
+
+def _leave_session_turn(session_id: str) -> None:
+    left = _session_turn_users.get(session_id, 1) - 1
+    if left > 0:
+        _session_turn_users[session_id] = left
+        return
+    # Nobody holds or waits on it: drop it so the maps track live
+    # conversations only.
+    _session_turn_users.pop(session_id, None)
+    _session_turn_locks.pop(session_id, None)
+
+
+def _release_session_turn(session_id: str, lock: asyncio.Lock | None) -> None:
+    if lock is None or not lock.locked():
+        return
+    lock.release()
+    _leave_session_turn(session_id)
+
+
+# Who started each chat this process has served. Lets a caller the roster
+# can't resolve (a fresh install with no principal yet, or an allowlisted user
+# who isn't on the roster) keep talking in a chat they started, without opening
+# every ownerless session to every unresolved caller. In-memory like
+# `_sessions`, so it does not survive a restart.
+_session_starters: dict[str, frozenset[str]] = {}
+
+SessionAccess = Literal["missing", "allowed", "forbidden", "orphaned"]
+
+
+def _caller_keys(request: Request, caller_person_id: int | None) -> frozenset[str]:
+    """Every identity the caller holds: their Person id and their verified
+    email (the UI proxy re-stamps `x-caller-email` from the signed-in session).
+
+    Both are kept so a starter still matches after they become resolvable: a
+    user who started a chat before being added to the roster (or while the
+    lookup failed) carries the same email once they resolve to a Person. With
+    neither — CLI or direct curl, no principal yet — it is local trust."""
+    keys: set[str] = set()
+    if caller_person_id is not None:
+        keys.add(f"person:{caller_person_id}")
+    email = api_caller.caller_email(request)
+    if email:
+        keys.add(f"email:{email}")
+    return frozenset(keys or {api_caller.identity_key(request)})
+
+
+def _is_session_starter(
+    request: Request, session_id: str, caller_person_id: int | None
+) -> bool:
+    starter = _session_starters.get(session_id)
+    return starter is not None and bool(starter & _caller_keys(request, caller_person_id))
+
+
+def _is_channel_namespaced(session_id: str) -> bool:
+    """Ids with a `prefix:` namespace (`slack:dm:…`, `telegram:…`) belong to
+    the channel adapters, which create their rows server-side. Web chats get a
+    bare uuid."""
+    return ":" in session_id
+
+
+def _mail_private(session_id: str) -> bool:
+    """Whether ``session_id`` is its owner's alone. Fails closed."""
+    from openexecutive.memory.session_store import session_mail_private
+
+    try:
+        return session_mail_private(session_id)
+    except Exception:
+        logger.exception("chat: couldn't read whether session %s is private — treating it as private", session_id)
+        return True
+
+
+def _session_access(
+    request: Request, session_id: str, caller_person_id: int | None
+) -> SessionAccess:
+    """May this caller read, continue or delete ``session_id``?
+
+    The session's owner or the principal may (`is_principal_or_self`, the same
+    rule as feedback and followup; an ownerless legacy row is the principal's
+    alone). The one other way in is having started it in this process: that is
+    how an unresolved caller continues their own chat, whose row has no owner.
+    A conversation that read its owner's own mail (Act as me,
+    `session_store.mark_mail_private`) is its owner's alone: not the
+    principal's, unless it is theirs. A check that can't be read refuses
+    everyone but the owner.
+
+    - "missing": neither a stored row nor a live chat has that id.
+    - "orphaned": a stored row with no owner that nobody in this process
+      started — typically an unresolved caller's chat after a restart. Refused
+      like "forbidden", but /chat starts a fresh chat instead of failing.
+    """
+    from openexecutive.memory.session_store import get_session_owner
+    from openexecutive.people.store import is_principal_or_self
+
+    exists, owner = get_session_owner(session_id)
+    started_here = session_id in _session_starters
+    if not exists and not started_here:
+        return "missing"
+    if exists and _mail_private(session_id):
+        if owner is not None and caller_person_id == owner:
+            return "allowed"
+        if owner is None and _is_session_starter(request, session_id, caller_person_id):
+            return "allowed"
+        return "forbidden"
+    if exists and is_principal_or_self(caller_person_id, owner):
+        return "allowed"
+    if (not exists or owner is None) and _is_session_starter(
+        request, session_id, caller_person_id
+    ):
+        return "allowed"
+    if exists and owner is None and not started_here:
+        return "orphaned"
+    return "forbidden"
+
+
+def _is_current_session(session: Any) -> bool:
+    """Whether ``session`` is still the live one for its id — False once it was
+    deleted (or its id reclaimed after a reset) while a turn held it."""
+    return _sessions.get(session.session_id) is session
+
+
+def forget_session(session_id: str) -> bool:
+    """Drop a deleted session's in-process state; True if there was any.
+
+    Without this, a later turn naming the deleted id would pick the cached
+    `Session` (history and all) back up out of `_sessions`."""
+    had_starter = _session_starters.pop(session_id, None) is not None
+    had_session = _sessions.pop(session_id, None) is not None
+    return had_starter or had_session
+
+
 def _get_or_create_session(session_id: str | None, request: Request) -> Any:
     from openexecutive.memory.session_store import load_messages
     from openexecutive.onboarding.profile_builder import load_or_create_profile
@@ -78,7 +575,11 @@ def _get_or_create_session(session_id: str | None, request: Request) -> Any:
 
     new_id = session_id or str(uuid.uuid4())
     profile = load_or_create_profile()
-    session = Session(session_id=new_id, company_profile=profile if not profile.is_empty() else None)
+    session = Session(
+        session_id=new_id,
+        company_profile=profile if not profile.is_empty() else None,
+        from_web_chat=True,
+    )
 
     if session_id:
         # Server may have restarted — reload history from DB so conversation continues.
@@ -152,6 +653,46 @@ def _build_page_context_block(page_context: PageContext | None) -> str:
     return "\n".join(lines)
 
 
+def _seed_seen_channel_refs(session: Any, person_id: int | None) -> None:
+    """Record the caller's OWN channel addresses as seen on this session.
+
+    `schedule_followup` refuses to queue a send to a `(channel, channel_ref)`
+    the session has not seen — an anti-spam gate, and the reason an injected
+    "email this to attacker@evil" in an alert body cannot become a scheduled
+    send. The chat adapters populate it from the inbound message; nothing
+    populated it for a browser turn.
+
+    The gate was unreachable on web until `set_session` bound the session for
+    the whole stream, so it silently allowed ANY address; reachable, it reads
+    an empty set as "seen nothing" and refuses even the principal's own,
+    breaking "remind me tomorrow at 9am". Seeding the caller's own refs is
+    what makes the gate mean on web what it means everywhere else: you may
+    schedule to yourself, and to whatever this conversation actually used.
+
+    Adds only. An address removed from the roster stays in the set for the
+    life of the in-memory session.
+    """
+    if person_id is None:
+        return
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        logger.warning("chat.seen_refs_seed_failed person_id=%s", person_id, exc_info=True)
+        return
+    if person is None:
+        return
+    for channel, ref in (
+        ("email", getattr(person, "email", None)),
+        ("slack_dm", getattr(person, "slack_user_id", None)),
+        ("discord_dm", getattr(person, "discord_user_id", None)),
+        ("telegram", getattr(person, "telegram_chat_id", None)),
+    ):
+        if ref:
+            session.seen_channel_refs.add((channel, str(ref)))
+
+
 def _resolve_caller_person_id(request: Request) -> int | None:
     """Resolve the calling Person from the `x-caller-email` header.
 
@@ -161,21 +702,46 @@ def _resolve_caller_person_id(request: Request) -> int | None:
         must not be silently fused with the principal's data).
       - header absent → fall back to the principal (CLI / direct curl,
         plus channel paths without the header).
+      - a verified service call (``api.caller``) names no one and is never
+        the principal → None.
     """
-    caller_email = (request.headers.get("x-caller-email") or "").strip().lower()
+    who = api_caller.caller(request)
     try:
         from openexecutive.people.store import (
             find_person_by_email,
             find_principal_person,
         )
-        if caller_email:
-            caller = find_person_by_email(caller_email)
-            return caller.id if caller is not None else None
+        if who.email:
+            person = find_person_by_email(who.email)
+            return person.id if person is not None else None
+        if not who.defaults_to_principal:
+            return None
         principal = find_principal_person()
         return principal.id if principal is not None else None
     except (OSError, sqlite3.Error) as exc:
         logger.warning("caller_lookup_failed err=%s", exc)
         return None
+
+
+def _caller_is_principal_or_unclaimed(request: Request) -> bool:
+    """Whether the caller may make an install-wide change that is the
+    principal's call (resuming the Executive, changing the workspace
+    settings): the caller resolves to the principal — a request with no
+    ``x-caller-email`` does, see ``_resolve_caller_person_id`` — or no
+    principal is on the roster yet, so a first-run install is never locked
+    out. That never covers a service (signed callers on, no assertion): it
+    names no one, so it can't set up an install it doesn't own. Fails closed:
+    if the roster cannot be read, the answer is no.
+    """
+    from openexecutive.people import store as people_store
+
+    try:
+        if people_store.find_principal_person() is None:
+            return api_caller.caller(request).kind != "service"
+        return people_store.is_principal_or_self(_resolve_caller_person_id(request), None)
+    except Exception:
+        logger.exception("principal check failed — refusing the principal-only change")
+        return False
 
 
 async def _run_chat_turn(
@@ -186,19 +752,24 @@ async def _run_chat_turn(
     attachment_blocks: list[dict[str, Any]] | None,
     request: Request,
     page_context: PageContext | None = None,
+    client_turn_id: str | None = None,
+    memory_text: str | None = None,
 ) -> StreamingResponse:
     """Shared streaming-chat handler for both the JSON and multipart routes.
 
     `message` is the (already attachment-augmented) text the Executive will
     see and that we persist as the user turn. `attachment_blocks` carries
     image content blocks; document text is expected to already be inlined in
-    `message` by the caller.
+    `message` by the caller. `memory_text`, when set, is what peer memory
+    records as the caller's words instead of `message` (see
+    `Executive.stream_chat`).
     """
     from openexecutive.config import get_settings
     from openexecutive.knowledge.retriever import retrieve
     from openexecutive.memory.episodic import format_for_prompt
     from openexecutive.memory.session_store import create_session
     from openexecutive.orchestrator.executive import Executive
+    from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
 
     t0 = time.monotonic()
     # Same shape every other entry point mints (Executive.stream_chat), so
@@ -206,7 +777,123 @@ async def _run_chat_turn(
     turn_id = f"t-{uuid.uuid4().hex[:12]}"
     collector = DebugCollector(t0=t0, turn_id=turn_id)
 
-    session = _get_or_create_session(session_id, request)
+    # Resolve the caller and arm the stop switch FIRST, before the session
+    # load, the audit write and the context fan-out below. Every one of those
+    # happens before the StreamingResponse exists, so the client has no SSE
+    # byte to learn a server id from and can only address the turn by the id it
+    # minted itself. Registering here makes the Stop button live from as close
+    # to "the moment Send was pressed" as the server can manage; a stop landing
+    # in this window also costs zero tokens, because the Executive is never
+    # asked for a first step.
+    #
+    # `_resolve_caller_person_id` is used for Honcho's per-person memory and
+    # for tagging the session row's owner (so /sessions can filter the sidebar
+    # by signed-in user); see its docstring for the precedence rule that
+    # protects against cross-identity leakage.
+    caller_person_id = _resolve_caller_person_id(request)
+    # The rows written before the Executive binds this caller to the session
+    # (the "User:" row, the knowledge retrieval, the start of the stream) are
+    # private, as the rest of the turn's are, when the principal sent the
+    # message and they name one of their contacts.
+    principal_turn = is_principal_on_verified_surface(
+        SimpleNamespace(from_web_chat=True, caller_person_id=caller_person_id)
+    )
+    # A client-supplied id must be the caller's own chat; any other id the
+    # turn can't use is swapped for a fresh chat before the stop switch arms.
+    requested_id = _clean_session_id(session_id)
+    access: SessionAccess = "missing"
+    if requested_id is not None:
+        access = _session_access(request, requested_id, caller_person_id)
+        if access in ("forbidden", "orphaned"):
+            # Someone else's chat, or an ownerless one nobody here can vouch
+            # for (its starter was lost to a restart). Continue in a fresh
+            # chat: that neither fails every send nor answers differently for
+            # "exists but not yours" than for an unknown namespaced id, so the
+            # guessable ones (`slack:dm:<user id>`) can't be probed for which
+            # chats exist. (A bare web id is a uuid4, so not guessable.)
+            logger.warning("chat.session_refused access=%s session_id=%s", access, requested_id)
+            requested_id, access = None, "missing"
+        elif access == "missing":
+            # No stored row and no live starter, so any cached Session under
+            # this id is stale — its row was removed by a fixture reset or a
+            # client-slot switch, neither of which clears `_sessions`. Never
+            # hand that transcript to whoever names the id next.
+            _sessions.pop(requested_id, None)
+        if access == "missing" and requested_id and _is_channel_namespaced(requested_id):
+            # A web caller minting an adapter's id would squat it: the
+            # adapter's INSERT OR IGNORE keeps the first owner, so whoever
+            # claimed `slack:dm:<someone>` first would own that person's DM
+            # history. Start a fresh chat instead.
+            logger.warning("chat.session_id_reserved session_id=%s", requested_id)
+            requested_id = None
+        if access == "missing" and requested_id:
+            # Claiming an unused id. Any messages already stored under it are
+            # orphans (a delete that raced a streaming turn, a reset mid-turn,
+            # or rows left before this check existed): clear them so this
+            # caller neither loads them as history nor becomes their owner.
+            from openexecutive.memory.session_store import delete_session
+
+            delete_session(requested_id)
+    # Only the chat's starter binds an ownerless row to themselves. Anyone else
+    # allowed in (the principal) must not take it over just by continuing it.
+    bind_owner = requested_id is None or (
+        requested_id not in _session_starters
+        or _is_session_starter(request, requested_id, caller_person_id)
+    )
+    client_turn_id = _clean_client_turn_id(client_turn_id)
+    stop_event: asyncio.Event | None = None
+    if client_turn_id:
+        stop_event = _register_stop(
+            client_turn_id, _stop_owner_key(request, caller_person_id), turn_id
+        )
+        if stop_event is None:
+            # Refused (id collision, or the registry is at its cap). The turn
+            # still runs; it just isn't stoppable. Drop our handle so the
+            # `finally` below can't pop an entry belonging to another turn.
+            client_turn_id = None
+        else:
+            logger.info("chat.stop_registered turn_id=%s", turn_id)
+    inbox: TurnInbox | None = (
+        _active_stops[client_turn_id].inbox if client_turn_id else None
+    )
+
+    # Guarded for the same reason as the gather further down: the stop switch
+    # is already registered, and `_sse_body`'s `finally` — which normally
+    # releases it — only runs once Starlette starts consuming the generator.
+    # This call can realistically raise (a hand-edited `company/profile.yaml`
+    # that no longer parses, or a locked SQLite DB), and a stranded entry is
+    # now permanent-ish: the registry refuses new turns at its cap rather than
+    # evicting live ones, so enough of them would disable Stop for everybody.
+    # Wait for any turn still answering in this conversation, so this one
+    # loads its finished history. A fresh chat has nobody to wait for.
+    turn_lock: asyncio.Lock | None = None
+    lock_key = requested_id
+    if lock_key is not None:
+        from openexecutive.config import get_settings as _lock_settings
+
+        _ls = _lock_settings()
+        try:
+            turn_lock = await _acquire_session_turn(
+                lock_key, _ls.chat_stream_timeout_s + _ls.committee_extra_timeout_s
+            )
+        except BaseException:
+            _release_stop(client_turn_id, turn_id)
+            raise
+    try:
+        session = _get_or_create_session(requested_id, request)
+    except BaseException:
+        _release_stop(client_turn_id, turn_id)
+        if lock_key is not None:
+            _release_session_turn(lock_key, turn_lock)
+        raise
+    if access == "missing":
+        _session_starters.setdefault(
+            session.session_id, _caller_keys(request, caller_person_id)
+        )
+    # Per turn, like the caller: whether this request carried a sign-in (the UI
+    # proxy stamps x-caller-email from it). A header-less request resolves to
+    # the principal but is no sign-in, so it never gets Act as me.
+    session.web_caller_signed_in = api_caller.signed_in(request)
     is_first_turn = len(session.conversation_history) == 0
 
     logger.info(
@@ -214,26 +901,36 @@ async def _run_chat_turn(
         turn_id, session.session_id, is_first_turn, len(message),
         len(attachment_blocks or []),
     )
-    audit_log(
-        "chat_turn",
-        f"User: {message[:200]}",
-        session_id=session.session_id,
-        turn_id=turn_id,
-        actor="user",
-        details={
-            "direction": "in",
-            "msg_len": len(message),
-            "is_first_turn": is_first_turn,
-            "attachment_count": len(attachment_blocks or []),
-        },
-        full={"message": message},
-    )
+    # A conversation that once read the caller's own mail stays theirs: so
+    # does what they say in it (the turn itself is pinned the same way).
+    kept_private = _mail_private(session.session_id)
+    with (
+        principal_turn_rows(principal_turn),
+        rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext(),
+    ):
+        audit_log(
+            "chat_turn",
+            f"User: {message[:200]}",
+            session_id=session.session_id,
+            turn_id=turn_id,
+            actor="user",
+            details={
+                "direction": "in",
+                "msg_len": len(message),
+                "is_first_turn": is_first_turn,
+                "attachment_count": len(attachment_blocks or []),
+            },
+            # memory_text reaches the caller's peer AND every consulted
+            # department's shared memory, but never the transcript: keep it
+            # auditable next to the message it stood in for.
+            full={"message": message, "memory_text": memory_text},
+        )
 
-    # Resolve the caller. Used for Honcho's per-person memory AND for
-    # tagging the session row's owner (so /sessions can filter the
-    # sidebar by signed-in user). See `_resolve_caller_person_id` for
-    # the precedence rule that protects against cross-identity leakage.
-    caller_person_id = _resolve_caller_person_id(request)
+    # Let the caller schedule to their own addresses. Runs per turn rather than
+    # only on session creation so a newly-added address works without a fresh
+    # session; note it only ever ADDS, so an address removed from the roster
+    # stays scheduleable for the life of this in-memory session.
+    _seed_seen_channel_refs(session, caller_person_id)
 
     # Persist the session row immediately (idempotent INSERT OR IGNORE) so a
     # mid-turn failure never leaves a ghost in-memory session with no DB row.
@@ -245,7 +942,7 @@ async def _run_chat_turn(
             session.session_id,
             title,
             session.created_at.isoformat(),
-            caller_person_id=caller_person_id,
+            caller_person_id=caller_person_id if bind_owner else None,
         )
     except Exception:  # pragma: no cover - DB write should not block the turn
         logger.exception("chat.session_persist_failed turn_id=%s", turn_id)
@@ -261,6 +958,7 @@ async def _run_chat_turn(
     # on timeout, so failure modes are unchanged.
     from openexecutive.audit import set_turn
     from openexecutive.memory.honcho_client import prefetch as _honcho_prefetch
+    from openexecutive.orchestrator.schedule_tools import set_session
 
     async def _do_episodic() -> str:
         try:
@@ -284,6 +982,9 @@ async def _run_chat_turn(
         # return_exceptions=True so a digest raising never discards the others —
         # each formatter already swallows its own errors, this just guards the
         # to_thread wrappers themselves.
+        # This turn's speaker, not whoever spoke last in this session: the
+        # digest shows a drafted document's card only to its owner.
+        session.caller_person_id = caller_person_id
         results = await asyncio.gather(
             asyncio.to_thread(render_and_trust, session),
             return_exceptions=True,
@@ -310,6 +1011,7 @@ async def _run_chat_turn(
                     message,
                     person_id=caller_person_id,
                     session_id=session.session_id,
+                    # Dialectic mode only; representation mode ignores it.
                     reasoning_level="medium" if committee_review else "low",
                 )
             except Exception:
@@ -327,58 +1029,103 @@ async def _run_chat_turn(
     # Clearing here makes "shown nothing, can ack nothing" hold on every path
     # instead of only the ones that reach the recorder.
     session.trusted_alert_ids = set()
+    session.trusted_roster_request_ids = set()
+    session.principal_board_shown = False
+    session.found_alert_ids = set()
 
-    retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
-        asyncio.to_thread(
-            retrieve,
-            query=message,
-            specialist_name=None,
-            store=request.app.state.store if hasattr(request.app.state, "store") else None,
-        ),
-        _do_episodic(),
-        _do_prefetch(),
-        _do_briefing(),
-    )
+    # What this reply looks at, from this search on, and which areas it has to
+    # leave out. Owned here rather than by the Executive so it is sent and
+    # saved on every ending, a stopped or timed-out reply included.
+    turn_sources = TurnSources()
 
-    sources = _extract_sources(retrieved_context)
-    collector.emit("knowledge_retrieved", {
-        "query": message,
-        "chunk_count": len(sources),
-        "sources": sources,
-    })
-    logger.info("chat.knowledge_done turn_id=%s chunks=%d", turn_id, len(sources))
+    # `_sse_body`'s `finally` is what normally releases the registry entry, but
+    # it only runs once Starlette starts consuming the generator. Everything
+    # from here to the `StreamingResponse` below therefore needs its own
+    # guard — the gather, the page-context builder and the settings load can
+    # all raise, and the entry would otherwise be stranded until the registry
+    # cap evicted it.
+    try:
+        from openexecutive.orchestrator.artifact_records import (
+            pinned_viewer,
+            viewer_for_person,
+        )
 
-    page_context_block = _build_page_context_block(page_context)
+        with (
+            principal_turn_rows(principal_turn),
+            rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext(),
+            # The session isn't bound yet: recall the speaker's own documents.
+            pinned_viewer(viewer_for_person(caller_person_id)),
+        ):
+            (
+                retrieved_context, episodic_context, peer_memory_context, briefing_context,
+            ) = await asyncio.gather(
+                asyncio.to_thread(
+                    retrieve,
+                    query=message,
+                    specialist_name=None,
+                    store=request.app.state.store if hasattr(request.app.state, "store") else None,
+                    record_source=turn_sources.add,
+                ),
+                _do_episodic(),
+                _do_prefetch(),
+                _do_briefing(),
+            )
+        sources = _extract_sources(retrieved_context)
+        collector.emit("knowledge_retrieved", {
+            "query": message,
+            "chunk_count": len(sources),
+            "sources": sources,
+        })
+        logger.info("chat.knowledge_done turn_id=%s chunks=%d", turn_id, len(sources))
 
-    executive = Executive(mcp_gateway=getattr(request.app.state, "mcp_gateway", None))
-    settings = get_settings()
-    timeout_s = settings.chat_stream_timeout_s
+        page_context_block = _build_page_context_block(page_context)
 
-    if committee_review:
-        # Committee adds reviewer fan-out + a full revision pass on top of
-        # the draft. Extend the whole-turn deadline so the route doesn't
-        # cut us off mid-revision.
-        timeout_s += settings.committee_extra_timeout_s
+        executive = Executive(
+            mcp_gateway=getattr(request.app.state, "mcp_gateway", None)
+        )
+        settings = get_settings()
+        timeout_s = settings.chat_stream_timeout_s
+
+        if committee_review:
+            # Committee adds reviewer fan-out + a full revision pass on top of
+            # the draft. Extend the whole-turn deadline so the route doesn't
+            # cut us off mid-revision.
+            timeout_s += settings.committee_extra_timeout_s
+    except BaseException:
+        _release_stop(client_turn_id, turn_id)
+        if lock_key is not None:
+            _release_session_turn(lock_key, turn_lock)
+        raise
 
     async def event_generator():
-        # Bind the turn for the whole SSE body, not just its first step.
-        # `_sse_body` drives the executive with `asyncio.wait_for`, which
-        # wraps every `__anext__()` in a fresh Task that copies the context
-        # at that moment — so a binding made *inside* the executive's own
-        # generator lands in a throwaway per-step context and is gone by the
-        # next resume. Everything after step one (the whole tool-call loop
+        # Bind the turn AND the session for the whole SSE body, not just its
+        # first step. `_sse_body` drives the executive with `asyncio.wait_for`,
+        # which wraps every `__anext__()` in a fresh Task that copies the
+        # context at that moment — so a binding made *inside* the executive's
+        # own generator lands in a throwaway per-step context and is gone by
+        # the next resume. Everything after step one (the whole tool-call loop
         # and the specialist fan-out) then records with no session or turn.
         # Bound out here, in the generator Starlette itself drives, every
-        # step inherits it. `set_turn` saves and restores rather than using
-        # Token.reset precisely so it survives that task-hopping.
+        # step inherits it. Both managers save and restore rather than using
+        # Token.reset precisely so they survive that task-hopping.
+        #
+        # `set_session` is here for exactly the same reason `set_turn` is, and
+        # was missing until it cost a production incident — see its docstring
+        # in `orchestrator.schedule_tools` for the mechanism and the blast
+        # radius. Every tool handler that reads `current_session` mid-turn
+        # depends on this binding.
         # aclosing is load-bearing, not decoration: `async for` does NOT
         # close its sub-iterator when the enclosing generator is closed. This
         # body used to BE event_generator, so a client disconnect ran its
-        # `finally` directly (the /debug/last-turn snapshot, and the
+        # `finally` directly (releasing the stop switch, and the
         # Executive's upstream stream aclose). Wrapping it in a plain
         # `async for` would leave `_sse_body` suspended at its yield until a
         # later GC hop — or never, if the loop closes first.
-        with set_turn(session_id=session.session_id, turn_id=turn_id):
+        with (
+            set_turn(session_id=session.session_id, turn_id=turn_id),
+            set_session(session),
+            principal_turn_rows(principal_turn),
+        ):
             async with contextlib.aclosing(_sse_body()) as body:
                 async for evt in body:
                     yield evt
@@ -390,10 +1137,17 @@ async def _run_chat_turn(
         )
 
         full_response = ""
+        # Messages folded into this turn (POST /chat/add), filled once the
+        # turn's inbox closes and persisted with it.
+        added_texts: list[str] = []
+        # Row id of the persisted assistant reply, handed to the client on
+        # `done` so it can attach 👍/👎 without a second roundtrip.
+        persisted: dict[str, int] = {}
         chunk_count = 0
         exec_t0 = time.monotonic()
         timed_out = False
         client_disconnected = False
+        stopped = False
 
         try:
             # Flush knowledge_retrieved (and any other pre-stream events) first.
@@ -415,6 +1169,9 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
+                    memory_text=memory_text,
+                    turn_sources=turn_sources,
+                    inbox=inbox,
                 ).__aiter__()
             else:
                 stream = executive.stream_chat(
@@ -429,6 +1186,9 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
+                    memory_text=memory_text,
+                    turn_sources=turn_sources,
+                    inbox=inbox,
                 ).__aiter__()
 
             # Whole-turn deadline, not per-chunk: a stream that drips bytes
@@ -439,6 +1199,8 @@ async def _run_chat_turn(
             # persist with the assistant message (the live UI loses them on
             # reload otherwise) — the same dicts the client renders inline.
             action_chips: list[dict[str, Any]] = []
+            # `turn_sources` as sent and saved once the reply is over.
+            answer_sources: dict[str, Any] | None = None
 
             async def _persist_turn() -> None:
                 # Persist the turn on every terminal path — normal completion,
@@ -458,18 +1220,50 @@ async def _run_chat_turn(
                 # the response uniformly. Don't duplicate it here.
                 if not full_response:
                     return
+                if not _is_current_session(session):
+                    # Deleted (or reset) while this turn streamed. Writing now
+                    # would leave messages under an id with no session row,
+                    # which the next caller to claim that id would inherit.
+                    logger.info(
+                        "chat.persist_skipped_deleted session_id=%s", session.session_id
+                    )
+                    return
                 if not is_first_turn:
                     update_session_timestamp(session.session_id)
-                save_message(session.session_id, "user", message)
                 save_message(
+                    session.session_id, "user", message, sender_person_id=caller_person_id
+                )
+                # Messages sent while it worked and folded into this reply,
+                # in the order they arrived, before the reply that answers
+                # them.
+                for added_text in added_texts:
+                    save_message(
+                        session.session_id, "user", added_text, sender_person_id=caller_person_id
+                    )
+                persisted["assistant_message_id"] = save_message(
                     session.session_id,
                     "assistant",
                     full_response,
                     action_chips=json.dumps(action_chips) if action_chips else None,
+                    stopped=stopped,
+                    sources=json.dumps(answer_sources) if answer_sources else None,
                 )
+                # The Executive's own post-turn block (executive.py, after its
+                # `async for`) is what normally mirrors the turn into the live
+                # in-memory Session. On every broken-out path it is skipped,
+                # because the generator is closed at its yield — and
+                # `_get_or_create_session` never re-reads history for a session
+                # already in `_sessions`. Without this the NEXT turn in this
+                # process would build its prompt as though the stopped turn had
+                # never happened, while a page reload showed it.
+                if stopped or client_disconnected or timed_out:
+                    session.add_user_message(message)
+                    for added_text in added_texts:
+                        session.add_user_message(added_text)
+                    session.add_assistant_message(full_response)
                 logger.info(
-                    "chat.turn_persisted turn_id=%s is_first_turn=%s disconnected=%s",
-                    turn_id, is_first_turn, client_disconnected,
+                    "chat.turn_persisted turn_id=%s is_first_turn=%s disconnected=%s stopped=%s",
+                    turn_id, is_first_turn, client_disconnected, stopped,
                 )
 
                 # First-turn rename: replace the truncated-message
@@ -481,7 +1275,22 @@ async def _run_chat_turn(
                 # Hard timeout on the title call so a slow/hung Haiku can't
                 # stall the SSE `done` event indefinitely. On timeout we
                 # leave the placeholder title in place.
-                if is_first_turn:
+                if is_first_turn and stopped:
+                    # The rename is a Haiku round-trip with a
+                    # `utility_fast_timeout_s` budget (10s by default), and on
+                    # the stop path the user is waiting on the stream to close
+                    # — a stop that takes ten seconds to finish is not a stop.
+                    # But it cannot simply be skipped either: the rename only
+                    # ever runs on a first turn, and the mirror above has
+                    # already made this turn part of the history, so turn 2
+                    # would not be a first turn and the session would keep its
+                    # truncated-message placeholder title forever. Run it
+                    # detached instead, so the stream closes immediately and
+                    # the sidebar picks the title up on its next refresh.
+                    _rename_session_in_background(
+                        session.session_id, message, full_response, turn_id
+                    )
+                elif is_first_turn:
                     from openexecutive.memory.session_store import (
                         update_session_title,
                     )
@@ -503,64 +1312,132 @@ async def _run_chat_turn(
                             "chat.title_update_failed turn_id=%s", turn_id
                         )
 
-            while True:
-                if await request.is_disconnected():
-                    client_disconnected = True
-                    logger.info("chat.client_disconnected turn_id=%s", turn_id)
-                    break
+            # One long-lived waiter, created once. Re-creating it per iteration
+            # would race `Event.set()` and could miss a stop that landed
+            # between two steps.
+            stop_waiter: asyncio.Task[bool] | None = (
+                asyncio.ensure_future(stop_event.wait())
+                if stop_event is not None
+                else None
+            )
+            try:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        # Catches a stop that landed before this step — including
+                        # during the pre-stream context gather, where we have not
+                        # asked the Executive for anything yet and the stop
+                        # therefore costs nothing.
+                        stopped = True
+                        logger.info(
+                            "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                        )
+                        break
 
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    logger.warning(
-                        "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
-                        turn_id, timeout_s, chunk_count,
+                    if await request.is_disconnected():
+                        client_disconnected = True
+                        logger.info("chat.client_disconnected turn_id=%s", turn_id)
+                        break
+
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        logger.warning(
+                            "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
+                            turn_id, timeout_s, chunk_count,
+                        )
+                        break
+
+                    step = await _next_stream_step(
+                        stream, stop_waiter, remaining, turn_id
                     )
-                    break
 
-                try:
-                    item = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
-                except StopAsyncIteration:
-                    break
-                except TimeoutError:
-                    timed_out = True
-                    logger.warning(
-                        "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
-                        turn_id, timeout_s, chunk_count,
-                    )
-                    break
+                    if step.exhausted:
+                        break
 
-                if isinstance(item, str):
-                    if item == Executive._THINKING:
-                        data = json.dumps({
-                            "type": "thinking",
-                            "session_id": session.session_id,
-                        })
+                    if step.produced:
+                        item = step.item
+                        if isinstance(item, str):
+                            if item == Executive._THINKING:
+                                data = json.dumps({
+                                    "type": "thinking",
+                                    "session_id": session.session_id,
+                                })
+                            else:
+                                full_response += item
+                                chunk_count += 1
+                                data = json.dumps({
+                                    "type": "chunk",
+                                    "content": item,
+                                    "session_id": session.session_id,
+                                })
+                            yield f"data: {data}\n\n"
+                        else:
+                            if isinstance(item, dict) and item.get("type") == "action_taken":
+                                action_chips.append(item)
+                            yield f"data: {json.dumps(item)}\n\n"
+
+                        if stop_event is not None and stop_event.is_set():
+                            stopped = True
+                            logger.info(
+                                "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                            )
+                            break
+                        continue
+
+                    if step.stopped:
+                        stopped = True
+                        logger.info(
+                            "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                        )
                     else:
-                        full_response += item
-                        chunk_count += 1
-                        data = json.dumps({
-                            "type": "chunk",
-                            "content": item,
-                            "session_id": session.session_id,
-                        })
-                    yield f"data: {data}\n\n"
-                else:
-                    if isinstance(item, dict) and item.get("type") == "action_taken":
-                        action_chips.append(item)
-                    yield f"data: {json.dumps(item)}\n\n"
+                        timed_out = True
+                        logger.warning(
+                            "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
+                            turn_id, timeout_s, chunk_count,
+                        )
+                    break
+            finally:
+                if stop_waiter is not None:
+                    # Otherwise: "Task was destroyed but it is pending".
+                    stop_waiter.cancel()
+
+            # Nothing more can reach this turn: anything still waiting in the
+            # inbox was never seen, and the client sends it as the next turn.
+            if inbox is not None:
+                inbox.close()
+                added_texts.extend(inbox.taken_texts())
+                # Audited like the turn's own "User:" row: private, and the
+                # caller's own, in a conversation that read their mail.
+                with rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext():
+                    for added_text in added_texts:
+                        audit_log(
+                            "chat_turn",
+                            f"User (added while working): {added_text[:200]}",
+                            session_id=session.session_id,
+                            turn_id=turn_id,
+                            actor="user",
+                            details={"direction": "in", "added_mid_turn": True, "msg_len": len(added_text)},
+                            full={"message": added_text},
+                        )
 
             logger.info(
-                "chat.executive_done turn_id=%s chunks=%d duration_s=%.2f timed_out=%s disconnected=%s",
-                turn_id, chunk_count, time.monotonic() - exec_t0, timed_out, client_disconnected,
+                "chat.executive_done turn_id=%s chunks=%d duration_s=%.2f timed_out=%s disconnected=%s stopped=%s",
+                turn_id, chunk_count, time.monotonic() - exec_t0, timed_out,
+                client_disconnected, stopped,
             )
 
             # Best-effort cancel of the underlying iterator if we broke out early.
-            if timed_out or client_disconnected:
+            # On the stop path the awaited cancellation above has already closed
+            # the generator, so this is a no-op there; it stays as the safety net
+            # for the other break-outs.
+            if timed_out or client_disconnected or stopped:
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     with contextlib.suppress(Exception):
                         await aclose()
+
+            if not turn_sources.is_empty():
+                answer_sources = turn_sources.payload()
 
             if client_disconnected:
                 # Connection is gone, so we can't yield anything more — but we
@@ -570,7 +1447,41 @@ async def _run_chat_turn(
                 await _persist_turn()
                 return
 
+            # Persist BEFORE the terminal frames on every path, including the
+            # stop. Yielding first would mean that closing the tab in the gap
+            # between the `stopped` frame and this call loses the partial reply
+            # — which is the one thing the feature exists to preserve. The
+            # first-turn title call, which used to make that gap ~10s wide, is
+            # skipped on the stop path above, so persisting first no longer
+            # makes the button feel dead.
             await _persist_turn()
+
+            # Before the terminal frames, which is when the UI finishes the
+            # reply. Shown under it: what it looked at, and any area missing.
+            if answer_sources is not None and full_response:
+                sources_evt = {"type": "sources", "session_id": session.session_id, **answer_sources}
+                yield f"data: {json.dumps(sources_evt)}\n\n"
+
+            if stopped:
+                # Not an `error` event — a stop is a user decision, not a
+                # failure.
+                yield f"data: {json.dumps({'type': 'stopped', 'session_id': session.session_id})}\n\n"
+                # The Executive is cancelled before its own post-turn block runs,
+                # so the outbound `chat_turn` row it would have written never
+                # happens. Record the stop here instead, or the audit log shows
+                # an inbound turn with no response side at all.
+                audit_log(
+                    "chat_turn",
+                    f"Stopped by user after {chunk_count} chunk(s)",
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    actor="executive",
+                    details={
+                        "direction": "out",
+                        "stopped": True,
+                        "chunks": chunk_count,
+                    },
+                )
 
             if timed_out:
                 err_evt = collector.emit("turn_error", {"reason": "timeout", "timeout_s": timeout_s})
@@ -586,10 +1497,14 @@ async def _run_chat_turn(
                 "chunks": chunk_count,
                 "duration_s": round(time.monotonic() - exec_t0, 3),
                 "timed_out": timed_out,
+                "stopped": stopped,
             })
             yield f"data: {json.dumps(collector.to_sse_dict(complete_evt))}\n\n"
 
-            done = json.dumps({"type": "done", "session_id": session.session_id})
+            done_payload: dict[str, Any] = {"type": "done", "session_id": session.session_id}
+            if persisted.get("assistant_message_id"):
+                done_payload["message_id"] = persisted["assistant_message_id"]
+            done = json.dumps(done_payload)
             yield f"data: {done}\n\n"
 
         except Exception:
@@ -604,18 +1519,11 @@ async def _run_chat_turn(
             done = json.dumps({"type": "done", "session_id": session.session_id})
             yield f"data: {done}\n\n"
         finally:
-            # Snapshot for /debug/last-turn.
-            global _last_turn_events, _last_turn_meta
-            _last_turn_events = [collector.to_sse_dict(e) for e in collector._events]
-            _last_turn_meta = {
-                "turn_id": turn_id,
-                "session_id": session.session_id,
-                "is_first_turn": is_first_turn,
-                "chunks": chunk_count,
-                "duration_s": round(time.monotonic() - exec_t0, 3),
-                "timed_out": timed_out,
-                "client_disconnected": client_disconnected,
-            }
+            if inbox is not None:
+                inbox.close()
+            _release_stop(client_turn_id, turn_id)
+            if lock_key is not None:
+                _release_session_turn(lock_key, turn_lock)
 
     return StreamingResponse(
         event_generator(),
@@ -636,7 +1544,64 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
         attachment_blocks=None,
         request=request,
         page_context=body.page_context,
+        client_turn_id=body.client_turn_id,
+        memory_text=body.memory_text,
     )
+
+
+@router.post("/chat/stop")
+async def chat_stop(body: StopChatRequest, request: Request) -> dict[str, str]:
+    """Stop an in-flight /chat turn, addressed by its `client_turn_id`.
+
+    404 means "no live turn of yours with that id" — a turn that already
+    finished and a turn belonging to someone else are deliberately
+    indistinguishable from here, so this can't be used to probe which ids are
+    live. Stopping is best-effort by design: the SSE stream stays open and
+    remains the authority on how the turn actually ended.
+    """
+    client_turn_id = _clean_client_turn_id(body.client_turn_id)
+    stopped_turn_id = (
+        _request_stop(
+            client_turn_id,
+            _stop_owner_key(request, _resolve_caller_person_id(request)),
+        )
+        if client_turn_id
+        else None
+    )
+    if stopped_turn_id is None:
+        raise HTTPException(status_code=404, detail="No in-flight turn with that id")
+    logger.info("chat.stop_requested turn_id=%s", stopped_turn_id)
+    return {"status": "stopping", "turn_id": stopped_turn_id}
+
+
+@router.post("/chat/add")
+async def chat_add(body: AddChatMessageRequest, request: Request) -> dict[str, str]:
+    """Add a message to an in-flight /chat turn, addressed by its
+    `client_turn_id`, while the Executive is still working on it.
+
+    The turn takes it at its next step and the stream names it in a
+    `message_added` event. 404 means the turn won't take it (finished,
+    stopped, full, or not yours, indistinguishably); the client then sends it
+    as the next turn. A message the turn accepted but never reached (it was
+    already writing its final answer) is not named in any `message_added`
+    event, and the client sends that one as the next turn too.
+    """
+    client_turn_id = _clean_client_turn_id(body.client_turn_id)
+    message_id = _clean_client_turn_id(body.message_id)
+    turn_id = (
+        _add_to_turn(
+            client_turn_id,
+            _stop_owner_key(request, _resolve_caller_person_id(request)),
+            message_id,
+            body.message,
+        )
+        if client_turn_id and message_id
+        else None
+    )
+    if turn_id is None:
+        raise HTTPException(status_code=404, detail="No in-flight turn with that id")
+    logger.info("chat.message_added turn_id=%s len=%d", turn_id, len(body.message))
+    return {"status": "added", "turn_id": turn_id}
 
 
 @router.post("/chat/upload")
@@ -645,6 +1610,9 @@ async def chat_upload(
     message: str = Form(..., min_length=1, max_length=32000),
     session_id: str | None = Form(None),
     committee_review: bool = Form(False),
+    # Size bound only — see the note on ChatRequest.client_turn_id for why the
+    # format is checked by `_clean_client_turn_id` instead of rejected here.
+    client_turn_id: str | None = Form(None, max_length=64),
     files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI multipart marker, mirrors the pattern for File parameters
 ) -> StreamingResponse:
     """Streaming chat turn with file/photo attachments.
@@ -666,9 +1634,11 @@ async def chat_upload(
 
     text_parts: list[str] = []
     image_blocks: list[dict[str, Any]] = []
+    filenames: list[str] = []
 
     for upload in files:
         filename = upload.filename or "attachment"
+        filenames.append(filename)
         data = await upload.read()
         if len(data) > _MAX_BYTES_PER_FILE:
             raise HTTPException(
@@ -681,8 +1651,9 @@ async def chat_upload(
             )
 
         try:
-            extra_text, blocks = build_attachment_output(
-                filename, data, upload.content_type or "",
+            # The signed-in user sent it, so it is not metered as inbound.
+            extra_text, blocks = await build_attachment_output(
+                filename, data, upload.content_type or "", inbound=False,
             )
         except Exception:
             logger.exception("chat_upload: processing failed for %s", filename)
@@ -705,16 +1676,13 @@ async def chat_upload(
         committee_review=committee_review,
         attachment_blocks=image_blocks or None,
         request=request,
+        client_turn_id=client_turn_id,
+        # The extracted document text is the document's words, not the
+        # caller's: recorded in peer memory it becomes facts about the caller.
+        # "(Attached files: …)", not the "[Attached: …]" label that marks
+        # inlined document text — the open-loop pass skips turns carrying that.
+        memory_text=f"{message}\n\n(Attached files: {', '.join(filenames)})",
     )
-
-
-@router.get("/debug/last-turn")
-def get_last_turn() -> dict[str, Any]:
-    """Returns the most recently completed turn's debug events.
-
-    Single-process only — for local debugging when SSE itself failed.
-    """
-    return {"meta": _last_turn_meta, "events": _last_turn_events}
 
 
 # ---------------------------------------------------------------------------
@@ -859,18 +1827,14 @@ def _cache_key(
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-async def _generate_prompts_via_llm(
-    user_content: str,
-) -> tuple[list[str], str] | None:
-    """Returns (prompts, subtitle) on success, None on any failure.
+async def _fast_json_call(
+    system: str, user_content: str, max_tokens: int, log_tag: str
+) -> dict[str, Any] | None:
+    """One utility-fast call that must answer with a JSON object.
 
-    Both fields must validate: prompts >= 4 non-empty strings, subtitle a
-    non-empty string. Any short-fall returns None so the caller can fall
-    back rather than render a half-broken empty state.
+    Returns the parsed object, or None on any failure (timeout, API error,
+    malformed or non-object JSON) — callers fall back rather than raise.
     """
-    import asyncio
-    import json as _json
-
     from openexecutive.agents.utility_fast import get_fast_model
     from openexecutive.config import get_settings
     from openexecutive.providers import get_provider
@@ -880,8 +1844,8 @@ async def _generate_prompts_via_llm(
         response = await asyncio.wait_for(
             get_provider(model).messages_create(
                 model=model,
-                max_tokens=500,
-                system=_PROMPTS_SYSTEM,
+                max_tokens=max_tokens,
+                system=system,
                 messages=[{"role": "user", "content": user_content}],
             ),
             timeout=get_settings().utility_fast_timeout_s,
@@ -895,21 +1859,91 @@ async def _generate_prompts_via_llm(
             parts = raw.split("```")
             if len(parts) >= 2:
                 raw = parts[1].removeprefix("json").strip()
-        data = _json.loads(raw)
-        if not isinstance(data, dict):
-            return None
-        prompts_raw = data.get("prompts")
-        subtitle_raw = data.get("subtitle")
-        if not isinstance(prompts_raw, list) or not isinstance(subtitle_raw, str):
-            return None
-        prompts = [str(p).strip() for p in prompts_raw if isinstance(p, str) and p.strip()]
-        subtitle = subtitle_raw.strip()
-        if len(prompts) < 4 or not subtitle:
-            return None
-        return prompts[:4], subtitle
+        data = json.loads(raw)
     except Exception:
-        logger.exception("suggested_prompts: LLM call failed")
+        logger.exception("%s: LLM call failed", log_tag)
         return None
+    return data if isinstance(data, dict) else None
+
+
+async def _generate_prompts_via_llm(
+    user_content: str,
+) -> tuple[list[str], str] | None:
+    """Returns (prompts, subtitle) on success, None on any failure.
+
+    Both fields must validate: prompts >= 4 non-empty strings, subtitle a
+    non-empty string. Any short-fall returns None so the caller can fall
+    back rather than render a half-broken empty state.
+    """
+    data = await _fast_json_call(_PROMPTS_SYSTEM, user_content, 500, "suggested_prompts")
+    if data is None:
+        return None
+    prompts_raw = data.get("prompts")
+    subtitle_raw = data.get("subtitle")
+    if not isinstance(prompts_raw, list) or not isinstance(subtitle_raw, str):
+        return None
+    prompts = [str(p).strip() for p in prompts_raw if isinstance(p, str) and p.strip()]
+    subtitle = subtitle_raw.strip()
+    if len(prompts) < 4 or not subtitle:
+        return None
+    return prompts[:4], subtitle
+
+
+# ---------------------------------------------------------------------------
+# Suggested follow-up for the chat composer, shown after each reply.
+# ---------------------------------------------------------------------------
+
+_FOLLOWUP_SYSTEM = (
+    "You suggest the user's next message in a conversation with their "
+    "virtual executive — a peer on their executive team who helps them "
+    "think, decide, draft, prioritize, and pull the right people in.\n\n"
+    "Read the transcript and write the ONE message the user would most "
+    "naturally send next, in the user's own voice (first person, "
+    "addressed to the executive). Build on the executive's last reply: "
+    "take the obvious next step it opens up — go deeper on one point, "
+    "act on a recommendation, get a draft, pressure-test a claim, or "
+    "decide between options it laid out. Name the concrete thing "
+    "(the person, metric, draft, or decision) rather than saying 'this' "
+    "or 'that'. Never repeat a question the user already asked. Never "
+    "suggest looping in, messaging, or following up with the user "
+    "themselves.\n\n"
+    "Output ONLY a JSON object with exactly one key — no prose, no "
+    "markdown, no fences:\n"
+    '  "suggestion": one sentence, 4-14 words, no greeting, no '
+    "exclamation marks, ending with a period or question mark."
+)
+
+# Per-message budget when building the transcript. The follow-up only
+# needs the thread's gist, and the reply being followed up on can be long.
+_FOLLOWUP_MAX_MESSAGES = 6
+_FOLLOWUP_MAX_CHARS_PER_MESSAGE = 1500
+_FOLLOWUP_MAX_WORDS = 24
+
+
+def _build_followup_transcript(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for m in messages[-_FOLLOWUP_MAX_MESSAGES:]:
+        speaker = "EXECUTIVE" if m.get("role") == "assistant" else "USER"
+        text = str(m.get("content") or "").strip()
+        if len(text) > _FOLLOWUP_MAX_CHARS_PER_MESSAGE:
+            text = text[:_FOLLOWUP_MAX_CHARS_PER_MESSAGE] + " […]"
+        lines.append(f"{speaker}: {text}")
+    return "\n\n".join(lines)
+
+
+async def _generate_followup_via_llm(transcript: str) -> str | None:
+    """Returns one suggested next user message, or None on any failure."""
+    data = await _fast_json_call(_FOLLOWUP_SYSTEM, transcript, 150, "followup_suggestion")
+    if data is None:
+        return None
+    raw = data.get("suggestion")
+    if not isinstance(raw, str):
+        return None
+    suggestion = " ".join(raw.split())
+    # A runaway or empty answer is worse than no suggestion in the composer.
+    if not suggestion or len(suggestion.split()) > _FOLLOWUP_MAX_WORDS:
+        return None
+    return suggestion
 
 
 @router.get("/chat/suggested-prompts")

@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import sqlite3
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
+from openexecutive.api import caller as api_caller
 from openexecutive.api.intake_uploads import (
     _INTAKE_GEN_CHARS_PER_FILE,
     _gather_intake_attachments,
@@ -28,6 +30,7 @@ from openexecutive.api.models import (
     OnboardStatusResponse,
     OnboardTranscriptTurn,
     OnboardTurnResponse,
+    OnboardUnderstandingResponse,
 )
 from openexecutive.config import get_settings
 from openexecutive.memory.company_profile import CompanyProfile
@@ -41,9 +44,9 @@ from openexecutive.onboarding.interview import (
     validate_draft,
 )
 from openexecutive.onboarding.wizard import (
-    TOTAL_STEPS,
     WizardState,
     get_current_question,
+    get_step,
     process_answer,
 )
 from openexecutive.workflows.gate import ensure_workflow_event
@@ -69,27 +72,34 @@ _onboarding_research_fired: set[str] = set()
 _RESEARCH_WALLCLOCK_TIMEOUT_SECONDS = 600
 
 
-@router.get("/onboard/start", response_model=OnboardStatusResponse)
-async def start_onboarding() -> OnboardStatusResponse:
-    session_id = str(uuid.uuid4())
-    state = WizardState()
-    _wizard_sessions[session_id] = state
-
-    question = get_current_question(state)
-    progress = state.get_progress()
-
+def _wizard_status(session_id: str, state: WizardState) -> OnboardStatusResponse:
+    question = get_current_question(state) if not state.completed else None
+    step = get_step(state.current_step)
     return OnboardStatusResponse(
         session_id=session_id,
-        current_step=state.current_step,
-        total_steps=TOTAL_STEPS,
+        current_step=state.position(),
+        total_steps=state.total_steps(),
         current_question=question,
-        progress_percent=progress["percent"],
+        progress_percent=state.get_progress()["percent"],
         completed=state.completed,
+        optional=bool(step is not None and not state.completed and not step["required"]),
     )
 
 
+@router.get("/onboard/start", response_model=OnboardStatusResponse)
+async def start_onboarding() -> OnboardStatusResponse:
+    from openexecutive.memory.workspace_settings import get_workspace
+
+    session_id = str(uuid.uuid4())
+    # The mode is read once, here: a solo workspace skips the team steps, and
+    # the first-run choice screen sets it before this is called.
+    state = WizardState(solo=get_workspace().mode == "solo")
+    _wizard_sessions[session_id] = state
+    return _wizard_status(session_id, state)
+
+
 @router.post("/onboard/answer", response_model=OnboardStatusResponse)
-async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
+async def submit_answer(body: OnboardAnswerRequest, request: Request) -> OnboardStatusResponse:
     state = _wizard_sessions.get(body.session_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Onboarding session not found")
@@ -109,8 +119,19 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
     state = process_answer(state, body.answer)
 
     if state.completed:
+        from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
         from openexecutive.onboarding.profile_builder import build_and_save_profile
 
+        # Saving adds people with their emails (the web sign-in allow-list)
+        # and a principal, so once there is an owner it is theirs to do — the
+        # People routes' rule. Rolled back like a failed build, so the owner
+        # can still finish this session.
+        if not _caller_is_principal_or_unclaimed(request):
+            _wizard_sessions[body.session_id] = snapshot
+            raise HTTPException(
+                status_code=403,
+                detail="Only the owner can save this form, because it adds people and their emails.",
+            )
         try:
             build_and_save_profile(state)
         except Exception as exc:
@@ -149,18 +170,7 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
             task.add_done_callback(_background_research_tasks.discard)
 
     _wizard_sessions[body.session_id] = state
-
-    question = get_current_question(state) if not state.completed else None
-    progress = state.get_progress()
-
-    return OnboardStatusResponse(
-        session_id=body.session_id,
-        current_step=state.current_step,
-        total_steps=TOTAL_STEPS,
-        current_question=question,
-        progress_percent=progress["percent"],
-        completed=state.completed,
-    )
+    return _wizard_status(body.session_id, state)
 
 
 async def _fire_post_onboarding_research(session_id: str) -> None:
@@ -247,18 +257,7 @@ async def get_onboard_status(session_id: str) -> OnboardStatusResponse:
     state = _wizard_sessions.get(session_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Onboarding session not found")
-
-    question = get_current_question(state) if not state.completed else None
-    progress = state.get_progress()
-
-    return OnboardStatusResponse(
-        session_id=session_id,
-        current_step=state.current_step,
-        total_steps=TOTAL_STEPS,
-        current_question=question,
-        progress_percent=progress["percent"],
-        completed=state.completed,
-    )
+    return _wizard_status(session_id, state)
 
 
 # ── conversational onboarding (/onboard/interview/*) ─────────────────────────
@@ -467,6 +466,42 @@ async def start_interview(
         raise
 
 
+@router.post("/onboard/interview/understand", response_model=OnboardUnderstandingResponse)
+async def understand_description(
+    description: str = Form(""),
+    files: list[UploadFile] = File(  # noqa: B008 — FastAPI multipart marker, as in start_interview
+        default_factory=list
+    ),
+) -> OnboardUnderstandingResponse:
+    """Read the first free-text description (plus files) once, before any session.
+
+    Reports personal-or-team, role and company where the text says so, so the
+    UI can confirm them and the interview asks only for what is missing. It
+    stores nothing; a failure here is not fatal, the UI just asks instead.
+    """
+    from openexecutive.onboarding.interview import InterviewError, InterviewTimeout
+    from openexecutive.onboarding.understand import understand
+
+    if len(description) > ONBOARD_MESSAGE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Description is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
+        )
+    extracted = await _gather_intake_attachments(files or [])
+    text = description.strip()
+    for name, body in extracted:
+        text += f"\n\n=== Attached: {name} ===\n{body[:_INTAKE_GEN_CHARS_PER_FILE]}"
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="Tell me a little about your work first.")
+    try:
+        result = await understand(text.strip())
+    except InterviewTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except InterviewError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return OnboardUnderstandingResponse(**result.model_dump())
+
+
 @router.post("/onboard/interview/message", response_model=OnboardTurnResponse)
 async def interview_message(body: OnboardMessageRequest) -> OnboardTurnResponse:
     # Bounded here, not with Field(max_length=...) — FastAPI's 422 body echoes
@@ -530,7 +565,7 @@ async def get_interview(session_id: str) -> OnboardSessionResponse:
 
 
 @router.post("/onboard/interview/commit", response_model=CompanyProfileResponse)
-async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse:
+async def commit_interview(body: OnboardCommitRequest, request: Request) -> CompanyProfileResponse:
     """Save the reviewed draft. The single write in this whole flow.
 
     Ordering matters and is load-bearing — see the section header above.
@@ -538,7 +573,12 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
     rejection leaves the session untouched and the user can edit and retry.
     """
     from openexecutive.onboarding.commit import (
+        OwnerEmailError,
+        check_owner_email,
         derive_org_structure,
+        link_owner_email,
+        owner_change_blocked,
+        owner_email_blocked,
         reconcile_onboarding_departments,
         save_onboarding_people,
     )
@@ -553,6 +593,11 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
                 "profile on the Company Profile page."
             ),
         )
+    # A service (signed callers on, no assertion) names no one. On a first
+    # setup the owner checks below let anyone choose the owner and their
+    # sign-in email, which must be someone signed in.
+    if api_caller.caller(request).kind == "service":
+        raise HTTPException(status_code=403, detail="Sign in to save setup.")
 
     settings = get_settings()
 
@@ -593,6 +638,52 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
         logger.info("onboarding commit: rejected draft (%d error(s))", len(errors))
         raise HTTPException(status_code=422, detail=errors[0].safe)
 
+    # validate_draft guarantees exactly one principal. Their sign-in email is
+    # checked now, while a rejection still leaves the draft editable.
+    principal_name = next(p.full_name.strip() for p in people if p.is_principal)
+    # Setup demotes the current owner when it drafts someone else, so only the
+    # owner may do that (owner_change_blocked explains the rule).
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    caller_person_id = _resolve_caller_person_id(request)
+    try:
+        blocked = owner_change_blocked(principal_name, caller_person_id)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("onboarding commit: owner lookup failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Could not check who owns this workspace. Try again."
+        ) from exc
+    if blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the current owner can make someone else the owner. Mark the current "
+                'owner as "This is me", or ask them to run setup.'
+            ),
+        )
+    try:
+        owner_email = check_owner_email(body.owner_email, principal_name)
+    except OwnerEmailError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Someone who isn't the owner may fill in the owner's missing email only
+    # with the address they signed in with (owner_email_blocked explains why).
+    caller_email = api_caller.caller_email(request)
+    try:
+        email_blocked = owner_email_blocked(owner_email, caller_person_id, caller_email)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("onboarding commit: owner lookup failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Could not check who owns this workspace. Try again."
+        ) from exc
+    if email_blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the owner can put another address on the owner's entry. If you "
+                "are the owner, use the email you signed in with; if not, leave it blank."
+            ),
+        )
+
     profile = derive_org_structure(profile, people, departments)
 
     # 2. is_empty() keys off the name — a nameless profile is invisible to
@@ -616,6 +707,9 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
     # 5-6. Best-effort seeding. Departments are reconciled additively — see
     #      onboarding/commit.py for why this must not mirror the fixture loader.
     person_ids = save_onboarding_people(people)
+    principal_id = person_ids.get(principal_name)
+    if owner_email and principal_id is not None:
+        link_owner_email(principal_id, owner_email)
     reconcile_onboarding_departments(departments, person_ids)
 
     # 7. Same post-onboarding research fire the wizard does, same dedup set.

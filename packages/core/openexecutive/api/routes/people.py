@@ -2,14 +2,27 @@
 
 Phase 3 surface: CRUD + archive + approver lookup.
 All mutations invalidate the 60s registry cache so the next
-Executive turn picks up the change.
+Executive turn picks up the change. Adding, editing and archiving
+people are the principal's alone (``_require_roster_owner``).
+
+``GET /people`` lists team members only unless ``include_contacts=true`` (the
+People page asks for both; pickers such as a department head or a workflow
+approver keep the default and never offer a contact).
+
+Contacts are private to the principal. ``include_contacts`` is honoured only
+for a caller that resolves to the principal (``caller_is_principal``), a
+contact's id reads as 404 for anyone else on the read routes — and the write
+routes refuse anyone else before looking the id up — so its existence is not
+revealed, and only the principal may create a contact or turn someone into
+one. ``GET /people/me`` tells the UI whether to offer contacts at all.
 """
 from __future__ import annotations
 
 import logging
 from datetime import date
+from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from openexecutive.people import registry as people_registry
@@ -18,9 +31,13 @@ from openexecutive.people.models import (
     AuthorityScope,
     AvailabilityWindow,
     Person,
+    PersonKind,
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from openexecutive.attunement.style import StyleProfile
 
 router = APIRouter()
 
@@ -33,8 +50,12 @@ class PersonCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=200)
     role: str = Field(default="", max_length=200)
     is_principal: bool = False
+    kind: PersonKind = "team"
     department_slugs: list[str] = Field(default_factory=list)
     email: str | None = None
+    # Other addresses they write from: they match their mail and may be
+    # emailed, but never sign in (``Person.email_aliases``).
+    email_aliases: list[str] = Field(default_factory=list, max_length=10)
     slack_user_id: str | None = None
     telegram_chat_id: str | None = None
     discord_user_id: str | None = None
@@ -49,7 +70,10 @@ class PersonCreate(BaseModel):
 class PersonPatch(BaseModel):
     full_name: str | None = Field(default=None, max_length=200)
     role: str | None = Field(default=None, max_length=200)
+    kind: PersonKind | None = None
     email: str | None = None
+    # The full list; replaces the current one. Omit to leave it unchanged.
+    email_aliases: list[str] | None = Field(default=None, max_length=10)
     slack_user_id: str | None = None
     telegram_chat_id: str | None = None
     discord_user_id: str | None = None
@@ -64,12 +88,63 @@ class PersonPatch(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Who is asking (contacts are the principal's alone)
+# --------------------------------------------------------------------------- #
+
+def caller_is_principal(request: Request) -> bool:
+    """Whether the caller resolves to the principal: their signed-in email is
+    the principal's, or there is no ``x-caller-email`` (the CLI, direct curl,
+    local login — see ``chat._resolve_caller_person_id``). Stricter than
+    ``_caller_is_principal_or_unclaimed``: with no principal on the roster
+    nobody is. Fails closed."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    try:
+        return people_store.is_principal_or_self(_resolve_caller_person_id(request), None)
+    except Exception:
+        logger.exception("people: principal check failed — contacts stay hidden")
+        return False
+
+
+def _visible_person(person_id: int, request: Request) -> Person:
+    """The person, or 404 — also for a contact when the caller is not the
+    principal, exactly as for an id that does not exist."""
+    person = people_store.get_person(person_id)
+    if person is None or (person.kind != "team" and not caller_is_principal(request)):
+        raise HTTPException(status_code=404, detail="Person not found")
+    return person
+
+
+class PeopleViewer(BaseModel):
+    person_id: int | None
+    is_principal: bool
+
+
+# --------------------------------------------------------------------------- #
 # Read routes
 # --------------------------------------------------------------------------- #
 
 @router.get("/people", response_model=list[Person])
-def list_people(include_archived: bool = False) -> list[Person]:
-    return people_store.list_people(include_archived=include_archived)
+def list_people(
+    request: Request, include_archived: bool = False, include_contacts: bool = False
+) -> list[Person]:
+    return people_store.list_people(
+        include_archived=include_archived,
+        # Anyone but the principal gets the team, as if no contact existed.
+        include_contacts=include_contacts and caller_is_principal(request),
+    )
+
+
+@router.get("/people/me", response_model=PeopleViewer)
+def people_viewer(request: Request) -> PeopleViewer:
+    """Who the caller is on the roster, so the UI can offer contacts (the
+    principal's alone) only to the principal."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    return PeopleViewer(
+        person_id=_resolve_caller_person_id(request),
+        is_principal=caller_is_principal(request),
+    )
 
 
 @router.get("/people/by-scope/{token}", response_model=list[Person])
@@ -85,20 +160,202 @@ def people_by_scope(token: str) -> list[Person]:
     return people_store.find_approvers(scope)
 
 
+# --------------------------------------------------------------------------- #
+# Roster requests — "who is this new sender?" (people.roster_requests)
+#
+# Declared before ``/people/{person_id}``: that route's int parameter would
+# otherwise answer ``/people/requests`` with a 422. The principal's alone: a
+# request names someone who wrote to them, and anyone else gets a 404, as for
+# an id that does not exist.
+# --------------------------------------------------------------------------- #
+
+class RosterRequestOut(BaseModel):
+    id: int
+    channel: str
+    channel_ref: str
+    display_name: str
+    profile_email: str | None
+    on_company_domain: bool
+    suggested_kind: str | None
+    suggested_person_id: int | None
+    suggested_person_name: str | None = None
+    status: str
+    resolved_person_id: int | None
+    resolved_kind: str | None
+    message_count: int
+    first_seen_at: str
+    last_seen_at: str
+    expires_at: str
+    ack_sent: bool
+    # The held messages' first lines — shown on the card, never to a model.
+    previews: list[str] = Field(default_factory=list)
+
+
+class RosterRequestApprove(BaseModel):
+    """Either ``link_person_id`` (they are someone already on the list) or
+    ``full_name`` + ``kind`` (add them). ``kind`` has no default: the
+    principal says whether they are on the team."""
+
+    link_person_id: int | None = None
+    full_name: str | None = Field(default=None, max_length=200)
+    kind: PersonKind | None = None
+    role: str = Field(default="", max_length=200)
+    replace_channel_id: bool = False
+
+
+def _require_principal_requests(request: Request) -> None:
+    if not caller_is_principal(request):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _request_out(req: object) -> RosterRequestOut:
+    from openexecutive.people import roster_requests as rr
+
+    assert isinstance(req, rr.RosterRequest)
+    suggested = (
+        people_store.get_person(req.suggested_person_id)
+        if req.suggested_person_id is not None else None
+    )
+    return RosterRequestOut(
+        id=req.id,
+        channel=req.channel,
+        channel_ref=req.channel_ref,
+        display_name=req.display_name,
+        profile_email=req.profile_email,
+        on_company_domain=req.on_company_domain,
+        suggested_kind=req.suggested_kind,
+        suggested_person_id=req.suggested_person_id if suggested is not None else None,
+        suggested_person_name=suggested.full_name if suggested is not None else None,
+        status=req.status,
+        resolved_person_id=req.resolved_person_id,
+        resolved_kind=req.resolved_kind,
+        message_count=req.message_count,
+        first_seen_at=req.first_seen_at,
+        last_seen_at=req.last_seen_at,
+        expires_at=req.expires_at,
+        ack_sent=req.ack_sent_at is not None,
+        previews=rr.previews(req.id) if req.status == "pending" else [],
+    )
+
+
+@router.get("/people/requests", response_model=list[RosterRequestOut])
+def list_roster_requests(request: Request, status: str = "pending") -> list[RosterRequestOut]:
+    from openexecutive.people import roster_requests as rr
+
+    _require_principal_requests(request)
+    wanted = None if status == "all" else status
+    return [_request_out(r) for r in rr.list_requests(wanted, limit=100)]
+
+
+@router.get("/people/requests/{request_id}", response_model=RosterRequestOut)
+def get_roster_request(request_id: int, request: Request) -> RosterRequestOut:
+    from openexecutive.people import roster_requests as rr
+
+    _require_principal_requests(request)
+    req = rr.get_request(request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _request_out(req)
+
+
+async def _answer_request(
+    request_id: int, decision: str, body: RosterRequestApprove | None
+) -> RosterRequestOut:
+    from openexecutive.integrations.roster_intake import answer
+    from openexecutive.people import roster_requests as rr
+
+    kwargs: dict[str, object] = {}
+    if body is not None:
+        if body.link_person_id is not None:
+            decision = "link"
+            kwargs["link_person_id"] = body.link_person_id
+            kwargs["replace_channel_id"] = body.replace_channel_id
+        else:
+            if not (body.full_name or "").strip() or body.kind is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Give their name and say whether they are on the team or a contact.",
+                )
+            kwargs.update(full_name=body.full_name, kind=body.kind, role=body.role)
+    try:
+        done = await answer(request_id, decision, via="web", **kwargs)  # type: ignore[arg-type]
+    except rr.RequestNotFound as exc:
+        raise HTTPException(status_code=404, detail="Not found") from exc
+    except rr.RequestNotPending as exc:
+        raise HTTPException(status_code=409, detail="That request was already answered.") from exc
+    except (rr.ChannelIdConflict, people_store.AddressInUseError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _request_out(done)
+
+
+@router.post("/people/requests/{request_id}/approve", response_model=RosterRequestOut)
+async def approve_roster_request(
+    request_id: int, body: RosterRequestApprove, request: Request
+) -> RosterRequestOut:
+    """Add the sender (or link them to someone on the list); their held
+    messages are then answered."""
+    _require_principal_requests(request)
+    return await _answer_request(request_id, "approve", body)
+
+
+@router.post("/people/requests/{request_id}/decline", response_model=RosterRequestOut)
+async def decline_roster_request(request_id: int, request: Request) -> RosterRequestOut:
+    """Leave the sender off the list; their held messages are dropped."""
+    _require_principal_requests(request)
+    return await _answer_request(request_id, "decline", None)
+
+
 @router.get("/people/{person_id}", response_model=Person)
-def get_person(person_id: int) -> Person:
-    person = people_store.get_person(person_id)
-    if person is None:
-        raise HTTPException(status_code=404, detail="Person not found")
-    return person
+def get_person(person_id: int, request: Request) -> Person:
+    return _visible_person(person_id, request)
 
 
 # --------------------------------------------------------------------------- #
 # Mutation routes
 # --------------------------------------------------------------------------- #
 
+_PRINCIPAL_CONTACT_DETAIL = "The principal is always on the team and cannot be a contact."
+_CONTACTS_ARE_PRIVATE = "Only the principal can add contacts or make someone a contact."
+
+
+def _require_roster_owner(request: Request) -> None:
+    """403 unless the caller may change the roster: the principal, or anyone
+    while no one is principal yet, so a first setup can add its owner.
+
+    A People row is also the web sign-in allow-list, the outbound-email
+    allow-list and approval routing, so without this any signed-in teammate
+    could put their own address on the principal's row and sign in as them.
+    The same owner rule as the workspace settings; the Executive's roster
+    tools (``orchestrator.people_tools``) are the principal's too.
+
+    A person can't edit their own row either: its email and chat ids are how
+    they sign in and how the Executive reaches them, and the rest decides
+    their approvals and how they are chased. Their working style and open
+    loops, further down, stay theirs.
+
+    Called before the id lookup, so a refused caller can't probe which ids
+    exist.
+    """
+    from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
+
+    if not _caller_is_principal_or_unclaimed(request):
+        raise HTTPException(status_code=403, detail="Only the principal can change the People list")
+
+
 @router.post("/people", response_model=Person, status_code=status.HTTP_201_CREATED)
-def create_person(body: PersonCreate) -> Person:
+def create_person(body: PersonCreate, request: Request) -> Person:
+    _require_roster_owner(request)
+    if body.is_principal and body.kind != "team":
+        raise HTTPException(status_code=422, detail=_PRINCIPAL_CONTACT_DETAIL)
+    if body.kind != "team" and not caller_is_principal(request):
+        # Before a principal exists anyone may add people, but not contacts:
+        # a contact is private to a principal there is not yet.
+        raise HTTPException(status_code=403, detail=_CONTACTS_ARE_PRIVATE)
+    aliases = _checked_aliases(body.email_aliases, primary=body.email, person_id=None)
+    if body.email and people_store.alias_holder(body.email) is not None:
+        raise HTTPException(status_code=409, detail=_ADDRESS_IN_USE)
     pid = people_store.upsert_person(
         full_name=body.full_name,
         role=body.role,
@@ -112,24 +369,75 @@ def create_person(body: PersonCreate) -> Person:
         response_sla_hours=body.response_sla_hours,
         on_leave_until=body.on_leave_until,
         reports_to_person_id=body.reports_to_person_id,
+        kind=body.kind,
     )
     if body.authority_scope:
         people_store.set_authority_scope(pid, body.authority_scope)
     if body.availability:
         people_store.set_availability(pid, body.availability)
+    if aliases:
+        _store_aliases(pid, aliases)
     people_registry.invalidate()
+    _after_roster_write()
     person = people_store.get_person(pid)
     if person is None:
         raise HTTPException(status_code=500, detail="Person vanished after insert")
     return person
 
 
+_ADDRESS_IN_USE = "That address is already on another person."
+
+
+def _checked_aliases(
+    emails: list[str], *, primary: str | None, person_id: int | None
+) -> list[str]:
+    """``emails`` cleaned (``people.store.clean_aliases``), or 422 for a
+    value that is not an address and 409 for one that is someone else's."""
+    try:
+        clean = people_store.clean_aliases(emails, primary=primary)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    for addr in clean:
+        if people_store.address_holder(addr, exclude_person_id=person_id) is not None:
+            raise HTTPException(status_code=409, detail=_ADDRESS_IN_USE)
+    return clean
+
+
+def _store_aliases(person_id: int, aliases: list[str]) -> None:
+    try:
+        people_store.set_person_emails(person_id, aliases)
+    except people_store.AddressInUseError as exc:
+        raise HTTPException(status_code=409, detail=_ADDRESS_IN_USE) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _after_roster_write() -> None:
+    """A pending roster request whose sender now matches someone is closed
+    and its messages answered (``roster_intake.after_roster_write``)."""
+    from openexecutive.integrations.roster_intake import after_roster_write
+
+    after_roster_write()
+
+
 @router.patch("/people/{person_id}", response_model=Person)
-def patch_person(person_id: int, body: PersonPatch) -> Person:
-    if people_store.get_person(person_id) is None:
-        raise HTTPException(status_code=404, detail="Person not found")
+def patch_person(person_id: int, body: PersonPatch, request: Request) -> Person:
+    _require_roster_owner(request)
+    existing = _visible_person(person_id, request)
+    if body.kind is not None and body.kind != "team" and existing.is_principal:
+        raise HTTPException(status_code=422, detail=_PRINCIPAL_CONTACT_DETAIL)
+    if body.kind == "contact" and existing.kind == "team" and not caller_is_principal(request):
+        raise HTTPException(status_code=403, detail=_CONTACTS_ARE_PRIVATE)
 
     raw = body.model_dump(exclude_unset=True)
+    new_primary = body.email if body.email is not None else existing.email
+    aliases: list[str] | None = None
+    if body.email_aliases is not None:
+        aliases = _checked_aliases(
+            body.email_aliases, primary=new_primary, person_id=person_id
+        )
+    if body.email and people_store.alias_holder(body.email, exclude_person_id=person_id) is not None:
+        raise HTTPException(status_code=409, detail=_ADDRESS_IN_USE)
     if raw:
         people_store.update_person(
             person_id,
@@ -145,6 +453,7 @@ def patch_person(person_id: int, body: PersonPatch) -> Person:
             clear_on_leave=body.clear_on_leave,
             reports_to_person_id=body.reports_to_person_id,
             department_slugs=body.department_slugs,
+            kind=body.kind,
         )
     if "authority_scope" in raw:
         people_store.set_authority_scope(
@@ -154,7 +463,10 @@ def patch_person(person_id: int, body: PersonPatch) -> Person:
         people_store.set_availability(
             person_id, body.availability or []
         )
+    if aliases is not None:
+        _store_aliases(person_id, aliases)
     people_registry.invalidate()
+    _after_roster_write()
     person = people_store.get_person(person_id)
     if person is None:
         raise HTTPException(status_code=500, detail="Person vanished")
@@ -162,15 +474,269 @@ def patch_person(person_id: int, body: PersonPatch) -> Person:
 
 
 @router.post("/people/{person_id}/archive", status_code=status.HTTP_204_NO_CONTENT)
-def archive_person(person_id: int) -> Response:
+def archive_person(person_id: int, request: Request) -> Response:
+    _require_roster_owner(request)
+    _visible_person(person_id, request)
+    people_store.archive_person(person_id)
+    people_registry.invalidate()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Open loops (attunement) — what each person owes
+# --------------------------------------------------------------------------- #
+
+class OpenLoopOut(BaseModel):
+    loop_id: int
+    owner_person_id: int
+    owner_name: str
+    description: str
+    due_at: str
+    created_at: str
+
+
+class OpenLoopClose(BaseModel):
+    reason: str = Field(default="done", pattern="^(done|not_needed|cancelled)$")
+
+
+def _require_principal_or(person_id: int, request: Request) -> int:
+    """The resolved caller, if it is ``person_id`` or the principal; else 403."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    caller = _resolve_caller_person_id(request)
+    if caller is None or not people_store.is_principal_or_self(caller, person_id):
+        raise HTTPException(status_code=403, detail="Only the principal or the owner")
+    return int(caller)
+
+
+@router.get("/people/{person_id}/open-loops", response_model=list[OpenLoopOut])
+def get_person_open_loops(person_id: int, request: Request) -> list[OpenLoopOut]:
+    """Open loops this person owns, soonest due first. The principal or that
+    person only — what someone owes is not roster-public."""
+    from openexecutive.attunement.open_loops import list_open_loops
+
+    _visible_person(person_id, request)
+    _require_principal_or(person_id, request)
+    return [
+        OpenLoopOut(
+            loop_id=loop.id,
+            owner_person_id=loop.owner_person_id,
+            owner_name=loop.owner_name,
+            description=loop.description,
+            due_at=loop.due_at,
+            created_at=loop.created_at,
+        )
+        for loop in list_open_loops(person_id=person_id, limit=100)
+    ]
+
+
+class OpenLoopCreate(BaseModel):
+    task: str = Field(min_length=1, max_length=200)
+    # A local date; the loop is due at 17:00 that day in the user's timezone
+    # (clamped to 60 days out). Omit for the default due window.
+    due_date: date | None = None
+
+
+# Why an assignment was refused, as the People page shows it.
+_ASSIGN_REFUSED: dict[str, tuple[int, str]] = {
+    "disabled": (409, "Open loops are turned off for this workspace"),
+    "unknown_owner": (404, "Person not found"),
+    "owner_is_contact": (409, "Tasks are assigned to team members, not contacts"),
+    "owner_archived": (409, "This person is archived"),
+    "unknown_assigner": (403, "Only someone on the team can assign a task"),
+    "missing_text": (422, "Describe the task"),
+    "owner_at_cap": (409, "They already have as many open loops as they can carry — close some first"),
+    "duplicate": (409, "That task is already open for them"),
+}
+
+
+@router.post(
+    "/people/{person_id}/open-loops",
+    response_model=OpenLoopOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def assign_person_open_loop(person_id: int, body: OpenLoopCreate, request: Request) -> OpenLoopOut:
+    """Assign this person a task: an open loop, followed up once it is due.
+
+    The principal or any active team member may assign one to anyone on the
+    team (themselves included); nobody is messaged now. Listing stays the
+    principal's or the owner's (``GET`` above), so a teammate who assigns Ben
+    a task gets it back here but does not see Ben's other loops."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.attunement.open_loops import assign_open_loop, get_open_loop
+
+    _visible_person(person_id, request)
+    caller = _resolve_caller_person_id(request)
+    assigner = people_store.get_person(caller) if caller is not None else None
+    if assigner is None or assigner.id is None or assigner.archived or assigner.kind != "team":
+        raise HTTPException(status_code=403, detail="Only someone on the team can assign a task")
+    result = assign_open_loop(
+        owner_person_id=person_id, text=body.task, assigned_by_person_id=assigner.id,
+        due_date=body.due_date,
+    )
+    loop = get_open_loop(result.loop_id) if result.loop_id is not None else None
+    if loop is None:
+        reason = result.reason or ""
+        if reason == "owner_is_contact" and not caller_is_principal(request):
+            # Became a contact after the check above: still not theirs to see.
+            reason = "unknown_owner"
+        code, detail = _ASSIGN_REFUSED.get(reason, (409, "Could not assign the task"))
+        raise HTTPException(status_code=code, detail=detail)
+    return OpenLoopOut(
+        loop_id=loop.id,
+        owner_person_id=loop.owner_person_id,
+        owner_name=loop.owner_name,
+        description=loop.description,
+        due_at=loop.due_at,
+        created_at=loop.created_at,
+    )
+
+
+@router.post("/open-loops/{loop_id}/close", status_code=status.HTTP_204_NO_CONTENT)
+def close_open_loop_route(loop_id: int, body: OpenLoopClose, request: Request) -> Response:
+    """Close one open loop. Only the principal or the loop's owner may."""
+    from openexecutive.attunement.open_loops import close_open_loop, get_open_loop
+
+    loop = get_open_loop(loop_id)
+    if loop is None:
+        raise HTTPException(status_code=404, detail="Open loop not found")
+    caller = _require_principal_or(loop.owner_person_id, request)
+    close_open_loop(loop_id, reason=body.reason, closed_by_person_id=caller)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class OutreachStat(BaseModel):
+    source: str
+    label: str
+    sent: int
+    replied: int
+    acted: int
+    ignored: int
+    pending: int
+
+
+@router.get("/people/{person_id}/outreach", response_model=list[OutreachStat])
+def get_person_outreach(person_id: int, request: Request) -> list[OutreachStat]:
+    """How this person responded to proactive outreach over the last 30 days,
+    per kind of outreach. The principal or that person only."""
+    from openexecutive.attunement import outcomes
+
+    # Authorize first, so a non-principal can't probe which ids exist.
+    _require_principal_or(person_id, request)
     if people_store.get_person(person_id) is None:
         raise HTTPException(status_code=404, detail="Person not found")
-    try:
-        people_store.archive_person(person_id)
-    except people_store.LastPrincipalError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot archive the last active principal",
-        ) from exc
-    people_registry.invalidate()
+    rows: list[OutreachStat] = []
+    for (_, source), s in sorted(outcomes.acceptance(person_id=person_id).items()):
+        rows.append(OutreachStat(
+            source=source,
+            label=outcomes.SOURCE_LABELS.get(source, source),
+            sent=s.sent,
+            replied=s.counts.get(outcomes.OUTCOME_REPLIED, 0),
+            acted=s.counts.get(outcomes.OUTCOME_ACTED, 0),
+            ignored=s.counts.get(outcomes.OUTCOME_IGNORED, 0),
+            pending=s.pending,
+        ))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Working style (attunement) — how this person likes replies
+# ---------------------------------------------------------------------------
+
+
+class WorkingStyleRule(BaseModel):
+    text: str
+    basis: str
+
+
+class WorkingStyleOut(BaseModel):
+    rules: list[WorkingStyleRule]
+    locked: bool
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class WorkingStyleIn(BaseModel):
+    """``rules`` omitted keeps the current rules (and their provenance) and
+    only sets the lock."""
+
+    rules: list[str] | None = Field(default=None, max_length=4)
+    locked: bool = False
+
+
+def _style_out(profile: StyleProfile) -> WorkingStyleOut:
+    return WorkingStyleOut(
+        rules=[WorkingStyleRule(text=r.text, basis=r.basis) for r in profile.rules],
+        locked=profile.locked,
+        updated_at=profile.updated_at,
+        updated_by=profile.updated_by,
+    )
+
+
+def _style_person(person_id: int, request: Request) -> int:
+    """Authorize (principal or that person), then 404 an unknown or archived
+    id — archiving drops the profile, and nothing may re-create it."""
+    caller = _require_principal_or(person_id, request)
+    person = people_store.get_person(person_id)
+    if person is None or person.archived:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return caller
+
+
+@router.get("/people/{person_id}/attunement", response_model=WorkingStyleOut)
+def get_person_working_style(person_id: int, request: Request) -> WorkingStyleOut:
+    """The short working-style rules pinned into this person's turns. The
+    principal or that person only."""
+    from openexecutive.attunement.style import get_profile
+
+    _style_person(person_id, request)
+    return _style_out(get_profile(person_id))
+
+
+@router.put("/people/{person_id}/attunement", response_model=WorkingStyleOut)
+def put_person_working_style(
+    person_id: int, body: WorkingStyleIn, request: Request
+) -> WorkingStyleOut:
+    """Replace the rules and set the lock. Rules pass the same style-only
+    checks as learned ones (they reach a tool-capable turn). Rules typed here
+    are kept by the learning pass, which only fills the remaining slots; a
+    locked profile is never rewritten by it at all."""
+    from openexecutive.attunement.style import (
+        BASIS_EDITED,
+        StyleRule,
+        get_profile,
+        save_profile,
+        validate_edited_rule,
+    )
+
+    caller = _style_person(person_id, request)
+    if body.rules is None:
+        # Only the lock changes; rules stored under an older check that no
+        # longer pass it are dropped rather than carried forward.
+        current = [r for r in get_profile(person_id).rules if validate_edited_rule(r.text)[1] is None]
+        return _style_out(save_profile(person_id, current, locked=body.locked,
+                                       updated_by=f"person:{caller}"))
+    rules: list[StyleRule] = []
+    for raw in body.rules:
+        text, rejection = validate_edited_rule(raw)
+        if rejection:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Rule not accepted ({rejection}): keep each rule to one short "
+                "sentence about how replies are written — no actions, people, links "
+                "or amounts.",
+            )
+        if text.lower() not in {r.text.lower() for r in rules}:
+            rules.append(StyleRule(text=text, basis=BASIS_EDITED))
+    return _style_out(save_profile(person_id, rules, locked=body.locked,
+                                   updated_by=f"person:{caller}"))
+
+
+@router.delete("/people/{person_id}/attunement", status_code=status.HTTP_204_NO_CONTENT)
+def delete_person_working_style(person_id: int, request: Request) -> Response:
+    """Forget the rules and unlock, so they are re-learned from scratch."""
+    from openexecutive.attunement.style import reset_profile
+
+    caller = _style_person(person_id, request)
+    reset_profile(person_id, updated_by=f"person:{caller}")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

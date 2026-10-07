@@ -5,8 +5,9 @@ import contextlib
 import hmac
 import logging
 import os
+import re
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from openexecutive import mcp_server
+from openexecutive.api import caller as api_caller
 from openexecutive.api.routes import (
     agents,
     alerts,
@@ -25,13 +27,16 @@ from openexecutive.api.routes import (
     clients,
     company_profile,
     decisions,
+    delegation,
     departments,
     documents,
     episodic,
     evals,
+    executive,
     fixtures,
     guide,
     health,
+    history,
     knowledge,
     onboarding,
     people,
@@ -39,16 +44,23 @@ from openexecutive.api.routes import (
     review,
     scheduled,
     sessions,
+    setup_status,
+    skill_drafts,
     skills,
+    take_the_lead,
     today,
+    version,
     watchlist,
+    workflow_designer,
     workflows,
+    workspace,
 )
 from openexecutive.api.routes import (
     auth as auth_route,
 )
 from openexecutive.integrations.google_chat import router as google_chat_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
+from openexecutive.utils.deployment import is_local_login, is_public_deployment
 
 if TYPE_CHECKING:
     from openexecutive.config import Settings
@@ -57,22 +69,6 @@ if TYPE_CHECKING:
 # stalls during a reconnect must not hold the lifespan open. Slack has its own
 # bound (SLACK_SHUTDOWN_TIMEOUT_S) alongside its handler below.
 _BOT_SHUTDOWN_TIMEOUT_S = 10.0
-
-
-def _log_bot_crash(bot_name: str) -> Callable[[asyncio.Task[None]], None]:
-    """Done-callback that surfaces an embedded bot's crash (invalid token,
-    gateway error, network) when it happens instead of at shutdown."""
-
-    def _on_done(task: asyncio.Task[None]) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logging.getLogger("openexecutive").error(
-                "%s bot exited unexpectedly", bot_name, exc_info=exc
-            )
-
-    return _on_done
 
 
 class _OELogFormatter(logging.Formatter):
@@ -288,6 +284,16 @@ async def _start_mcp_gateway(
 
     app.state.mcp_gateway = gateway
     set_active_gateway(gateway)
+    if "google_workspace" in servers:
+        # Discover the pinned Google tools now, so the model's first direct
+        # call_tool doesn't wait on the search. Held on app.state: a bare
+        # create_task is only weakly referenced.
+        app.state.mcp_prime_task = asyncio.create_task(gateway.prime_pinned_tools())
+
+    # Say which mail/calendar backends the fixed code paths will use, and warn
+    # (never fail) when a chosen backend's server is not in the config.
+    from openexecutive.integrations.workspace.registry import log_provider_status
+    log_provider_status(settings, config_path)
 
     from openexecutive.integrations.email_poller import run_email_poller
     return asyncio.create_task(run_email_poller(gateway))
@@ -393,6 +399,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     initialize_db()
     initialize_alerts_db()
 
+    # Solo / team mode and the user's time zone (memory.workspace_settings).
+    # Right after the episodic DB so every bootstrap below reads it.
+    from openexecutive.memory.workspace_settings import (
+        get_workspace,
+        init_workspace_settings_db,
+    )
+    init_workspace_settings_db()
+
     # User-generated company fixtures (DB-backed; persists on the data volume).
     from openexecutive.fixtures.store import initialize_db as initialize_fixtures_db
     initialize_fixtures_db()
@@ -404,6 +418,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # departments code references person IDs (FK ordering).
     from openexecutive.people.store import initialize_db as initialize_people_db
     initialize_people_db()
+    # Replays of held roster-request messages run on this loop, whichever
+    # thread resolves the request (integrations.roster_intake).
+    from openexecutive.integrations.roster_intake import bind_loop
+    bind_loop()
 
     # One-shot cleanup of reminders the removed talent / staff-onboarding
     # workflows left pending on the principal's DM channel (see the function's
@@ -432,10 +450,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     initialize_departments_db()
     seed_default_departments()
 
-    from openexecutive.departments.completeness import check_org_completeness
-    _org_warnings = check_org_completeness()
-    for _w in _org_warnings:
-        logging.getLogger("openexecutive").warning("org-completeness: %s", _w)
+    # Solo installs have no team to be incomplete: the check only warns
+    # about departments with no head, which is every department there.
+    if get_workspace().mode != "solo":
+        from openexecutive.departments.completeness import check_org_completeness
+        _org_warnings = check_org_completeness()
+        for _w in _org_warnings:
+            logging.getLogger("openexecutive").warning("org-completeness: %s", _w)
 
     from openexecutive.departments.cadence import (
         bootstrap_cadences,
@@ -475,6 +496,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.notion_sync_enabled:
         from openexecutive.knowledge.notion_sync import bootstrap_notion_sync_scan
         bootstrap_notion_sync_scan()
+    if settings.drive_sync_enabled:
+        from openexecutive.knowledge.drive_sync import bootstrap_drive_sync_scan
+
+        bootstrap_drive_sync_scan()
+    if settings.onedrive_sync_enabled:
+        from openexecutive.knowledge.onedrive_sync import bootstrap_onedrive_sync_scan
+
+        bootstrap_onedrive_sync_scan()
+    if settings.confluence_sync_enabled:
+        from openexecutive.knowledge.confluence_sync import bootstrap_confluence_sync_scan
+
+        bootstrap_confluence_sync_scan()
 
     audit_logger = AuditLogger()
     app.state.audit = audit_logger
@@ -523,6 +556,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     initialize_runs_db()
     initialize_dynamic_workflows_db()
+    from openexecutive.scheduler.pause import initialize_pause_db, is_paused
+
+    initialize_pause_db()
+    if is_paused():
+        logging.getLogger("openexecutive").warning(
+            "Executive is PAUSED — scheduler, email poller and workflow "
+            "resumer are holding all autonomous work until resumed"
+        )
     initialize_eval_runs_db()
     initialize_user_scenarios_db()
 
@@ -548,6 +589,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     discord_bot_task: asyncio.Task[None] | None = None
     slack_handler: Any = None
     slack_connect_task: asyncio.Task[None] | None = None
+    # Read by the Setup status page (api/setup_checks.py) to tell a
+    # connected bot from one that is still trying or has given up.
+    app.state.discord_bot = None
+    app.state.discord_bot_task = None
+    app.state.slack_handler = None
 
     email_poller_task = await _start_mcp_gateway(app, settings)
 
@@ -585,7 +631,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     discord_bot.start(settings.discord_bot_token)
                 )
 
-                discord_bot_task.add_done_callback(_log_bot_crash("Discord"))
+                # Surface bot crashes (invalid token, gateway 4004, network)
+                # immediately instead of waiting for shutdown to discover them.
+                def _on_discord_done(task: asyncio.Task[None]) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        _discord_log.error(
+                            "Discord bot exited unexpectedly", exc_info=exc
+                        )
+
+                discord_bot_task.add_done_callback(_on_discord_done)
+                app.state.discord_bot = discord_bot
+                app.state.discord_bot_task = discord_bot_task
             except Exception:
                 _discord_log.exception(
                     "Failed to start Discord bot; continuing without it"
@@ -637,6 +696,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     _slack_log.info("Slack socket mode listener connected")
 
             slack_connect_task.add_done_callback(_on_slack_connect_done)
+            app.state.slack_handler = slack_handler
         except Exception:
             # Covers a missing slack_bolt, a malformed token, and any
             # failure building the app. Nothing to release here: the
@@ -739,6 +799,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await catalog_refresh_task
 
+    prime_task = getattr(app.state, "mcp_prime_task", None)
+    if prime_task is not None:
+        prime_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await prime_task
+
     if getattr(app.state, "mcp_gateway", None) is not None:
         from openexecutive.orchestrator.mcp_gateway import set_active_gateway
         set_active_gateway(None)
@@ -747,27 +813,45 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Cleanup if needed (ChromaDB handles persistence)
 
 
-# Values that explicitly mean "not a public deployment". Anything else
-# non-empty arms the guard: for a fail-closed check, an unrecognised value
-# must err toward requiring the secret, never toward skipping it.
-_FALSEY_ENV = frozenset({"", "0", "false", "no", "off"})
+# The deployment flags live in utils.deployment, shared with code that must
+# not import this module (it builds the app at import). Kept under their
+# old names here for the guards below and their callers.
+_is_public_deployment = is_public_deployment
+_is_local_login = is_local_login
 
 
-def _is_public_deployment() -> bool:
-    """Whether this process is serving an internet-reachable deployment.
+# A raw Host header naming this machine, with an optional port — the same rule
+# as isLoopbackHost in packages/ui/src/lib/localLogin.ts, and
+# packages/ui/scripts/localLogin.test.mjs fails if the two ever disagree.
+_LOOPBACK_HOST_RE = re.compile(r"(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?", re.IGNORECASE)
 
-    Driven by the explicit ``OE_PUBLIC_DEPLOYMENT`` env var rather than any
-    hosting provider's injected variables, so the check works identically on
-    every platform (and in plain Docker). See docs/deployment.md.
-    """
-    return os.environ.get("OE_PUBLIC_DEPLOYMENT", "").strip().lower() not in _FALSEY_ENV
+# Sec-Fetch-Site values a browser sends when the page's own origin (or a typed
+# URL) made the request — the same set as OWN_PAGE_FETCH_SITES in
+# packages/ui/src/lib/crossSite.ts, and packages/ui/scripts/crossSite.test.mjs
+# fails if the two ever disagree.
+_OWN_PAGE_FETCH_SITES = frozenset({"same-origin", "none"})
+_READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _webhook_verifies_its_caller(path: str) -> bool:
+    """Whether this webhook authenticates its caller by itself. Google Chat
+    always checks the signed JWT; Telegram only when TELEGRAM_WEBHOOK_SECRET is
+    set to a value Telegram can send — without it, it accepts anyone's
+    update."""
+    if path == "/webhook/google-chat":
+        return True
+    if path == "/webhook/telegram":
+        from openexecutive.config import get_settings
+
+        return get_settings().telegram_webhook_secret_valid
+    return False
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.1.0",
+        version="0.5.2",  # x-release-please-version
         lifespan=lifespan,
     )
 
@@ -786,6 +870,21 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Signed callers (api/caller.py). With CALLER_ASSERTION_PUBLIC_KEYS set, who
+    # is calling comes from an assertion the UI proxy signs, never from the
+    # x-caller-email header alone. Added before the shared-secret gate so it
+    # runs after it. Keys that can't be read stop the boot: carrying on would
+    # trust the header again, i.e. fail open.
+    try:
+        caller_keys = api_caller.public_keys_from_env()
+    except api_caller.CallerKeysError as exc:
+        raise RuntimeError(f"CALLER_ASSERTION_PUBLIC_KEYS can't be used: {exc}") from exc
+    if caller_keys:
+        app.middleware("http")(api_caller.caller_gate(caller_keys))
+        logging.getLogger("openexecutive").info(
+            "Signed callers on (%d key%s)", len(caller_keys), "" if len(caller_keys) == 1 else "s"
+        )
 
     # Shared-secret gate. If BACKEND_SHARED_SECRET is set, every non-exempt
     # request must include a matching x-api-key header. If unset, the gate is
@@ -814,6 +913,36 @@ def create_app() -> FastAPI:
             "public internet."
         )
 
+    # Local login: the UI admits the owner with no password, guarded by where
+    # requests come from, and this API needs the same guard — it usually has
+    # no shared secret, and a request with no x-caller-email runs as the
+    # principal. Two ways a web page could otherwise drive it from the
+    # owner's browser:
+    #   - DNS rebinding: a page re-points its own hostname at 127.0.0.1 and
+    #     calls this API same-origin. A browser always sends the page's real
+    #     hostname as Host, and scripts cannot change it. A webhook that
+    #     verifies its caller may arrive via a tunnel under another name.
+    #   - A plain form POST from any other site or localhost port: no cookie
+    #     or preflight is needed. Browsers stamp Sec-Fetch-Site on it; the UI
+    #     proxy, the CLI and the webhook senders don't send it at all.
+    if _is_local_login():
+        @app.middleware("http")
+        async def _local_login_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
+            addressed_here = _LOOPBACK_HOST_RE.fullmatch(request.headers.get("host", "").strip())
+            if not addressed_here and not _webhook_verifies_its_caller(request.url.path):
+                return JSONResponse(
+                    {"error": "local login only accepts requests addressed to this computer"},
+                    status_code=403,
+                )
+            fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+            if (
+                request.method not in _READ_ONLY_METHODS
+                and fetch_site
+                and fetch_site not in _OWN_PAGE_FETCH_SITES
+            ):
+                return JSONResponse({"error": "cross-site request refused"}, status_code=403)
+            return await call_next(request)
+
     app.include_router(auth_route.router, tags=["auth"])
     app.include_router(fixtures.router, tags=["fixtures"])
     app.include_router(clients.router, tags=["clients"])
@@ -826,6 +955,10 @@ def create_app() -> FastAPI:
     app.include_router(documents.router, tags=["documents"])
     app.include_router(knowledge.router, tags=["knowledge"])
     app.include_router(skills.router, tags=["skills"])
+    app.include_router(skill_drafts.router, tags=["skills"])
+    # Ahead of workflows.router so no /workflows/{name}/... pattern can shadow
+    # the literal /workflows/designer/* paths.
+    app.include_router(workflow_designer.router, tags=["workflows"])
     app.include_router(workflows.router, tags=["workflows"])
     app.include_router(evals.router, tags=["evals"])
     app.include_router(episodic.router, tags=["memories"])
@@ -833,17 +966,24 @@ def create_app() -> FastAPI:
     app.include_router(alerts.router, tags=["alerts"])
     app.include_router(artifacts.router, tags=["artifacts"])
     app.include_router(decisions.router, tags=["decisions"])
+    app.include_router(delegation.router, tags=["delegation"])
+    app.include_router(take_the_lead.router, tags=["take-the-lead"])
+    app.include_router(history.router, tags=["memories"])
     app.include_router(audit.router, tags=["audit"])
     app.include_router(departments.router, tags=["departments"])
     app.include_router(people.router, tags=["people"])
     app.include_router(today.router, tags=["today"])
     app.include_router(scheduled.router, tags=["scheduled"])
+    app.include_router(executive.router, tags=["executive"])
+    app.include_router(workspace.router, tags=["workspace"])
     app.include_router(watchlist.router, tags=["watchlist"])
     app.include_router(google_chat_router, tags=["google-chat"])
     app.include_router(telegram_router, tags=["telegram"])
     app.include_router(architecture.router, tags=["architecture"])
     app.include_router(guide.router, tags=["guide"])
     app.include_router(health.router, tags=["health"])
+    app.include_router(version.router, tags=["health"])
+    app.include_router(setup_status.router, tags=["setup"])
 
     # Expose Open Executive as an MCP server at /mcp (Streamable-HTTP). Gated
     # by the same shared-secret middleware as every other route — clients pass
