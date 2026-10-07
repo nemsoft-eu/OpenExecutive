@@ -158,6 +158,49 @@ def test_sampling_sent_on_stream() -> None:
     assert stream._body["top_p"] == 0.8  # type: ignore[attr-defined]
 
 
+def test_sampling_suppressed_once_reasoning_is_turned_on() -> None:
+    """A strict reasoning backend (OpenAI's o-series, and hosted gateways are
+    documented as reachable through LOCAL_BASE_URL) requires temperature and
+    top_p to be ABSENT, so sending them 400s every call. They are also the
+    wrong numbers there: the defaults are Qwen's non-thinking preset."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8, reasoning_effort="high"))
+    assert captured["json"]["reasoning_effort"] == "high"
+    assert "temperature" not in captured["json"]
+    assert "top_p" not in captured["json"]
+
+
+def test_sampling_still_sent_with_reasoning_explicitly_off() -> None:
+    """`none` is the deployment's own setting and the condition the preset was
+    chosen for, so it must NOT suppress them — that is the Ollama Modelfile
+    override this pair exists to stop."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8, reasoning_effort="none"))
+    assert captured["json"]["temperature"] == 0.7
+    assert captured["json"]["top_p"] == 0.8
+
+
+def test_sampling_suppressed_on_stream_too_when_reasoning_is_on() -> None:
+    stream = _local_provider(temperature=0.7, top_p=0.8, reasoning_effort="low").messages_stream(
+        model="llama3.3",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert "temperature" not in stream._body  # type: ignore[attr-defined]
+    assert "top_p" not in stream._body  # type: ignore[attr-defined]
+
+
+def test_an_explicit_caller_temperature_survives_reasoning_being_on() -> None:
+    """Only the CONFIGURED defaults are suppressed, never a value the caller
+    asked for. integrations/response_gate.py passes temperature=0 because the
+    outbound gate must be deterministic; stripping it on a reasoning backend
+    would make the gate stochastic silently, which is worse than the 400 that
+    backend will raise and which an operator can actually diagnose."""
+    captured = _run_create(
+        _local_provider(temperature=0.7, top_p=0.8, reasoning_effort="high"), temperature=0
+    )
+    assert captured["json"]["temperature"] == 0
+    assert "top_p" not in captured["json"]
+
+
 def test_no_top_k_is_sent() -> None:
     """Negative control for a setting we deliberately did NOT add: top_k is
     not in the OpenAI schema and Ollama's /v1 silently drops it (verified

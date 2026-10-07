@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Walk up from this file to find the repo root .env. If no .env exists
@@ -326,6 +326,13 @@ class Settings(BaseSettings):
     # a plausible mechanism for CAUSING malformed tool calls.
     # Bounded here rather than at the server: an out-of-range value comes
     # back as an opaque 400 mid-turn, long after the typo.
+    #
+    # `off` (or `none`) is the opt-out, and it needs a WORD rather than a
+    # blank: `env_ignore_empty=True` above drops `LOCAL_TEMPERATURE=` before
+    # validation, so a blank falls back to this default and the `| None` in
+    # the annotation would be unreachable from a `.env` — which is the shape
+    # .env.example documents. A backend that rejects sampling fields outright
+    # needs some way to say so.
     local_temperature: float | None = Field(0.7, ge=0.0, le=2.0, alias="LOCAL_TEMPERATURE")
     local_top_p: float | None = Field(0.8, gt=0.0, le=1.0, alias="LOCAL_TOP_P")
     # OpenAI-format `reasoning_effort` for local calls; the gate strips
@@ -346,6 +353,21 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
         return _parse_csv_list(v)
+
+    @field_validator("local_temperature", "local_top_p", mode="before")
+    @classmethod
+    def _parse_local_sampling(cls, v: Any, info: ValidationInfo) -> Any:
+        # `off` / `none` means "do not send this field at all", for a backend
+        # that rejects it (a strict reasoning model). A blank cannot carry
+        # that meaning: `env_ignore_empty` drops it and the default wins.
+        if isinstance(v, str) and v.strip().lower() in ("off", "none"):
+            return None
+        # ...but `env_ignore_empty` only drops a TRULY empty string, so a
+        # stray space or an inline `# comment` reaches float parsing and
+        # takes the whole app down at startup. Treat those as unsupplied.
+        if _blank_or_comment(v) and info.field_name:
+            return cls.model_fields[info.field_name].default
+        return v
 
     @field_validator("local_reasoning_effort", mode="before")
     @classmethod

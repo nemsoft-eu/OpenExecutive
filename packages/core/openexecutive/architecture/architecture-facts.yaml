@@ -84,7 +84,29 @@ system:
       local-backend request, streamed or not, from the same ``_extend_body``
       hook — but via setdefault, so a caller that passes its own value wins
       (integrations/response_gate.py sends temperature=0 and must stay
-      deterministic). They are wired only into the local provider;
+      deterministic). They are NOT sent once LOCAL_REASONING_EFFORT names a
+      real effort: they are Qwen's NON-thinking preset, so they were never the
+      right numbers for a thinking request, and a strict reasoning backend
+      rejects both fields outright rather than ignoring them (OpenAI's
+      o-series requires them absent, and LOCAL_BASE_URL is documented as
+      taking hosted gateways, so that backend is reachable) — sending them
+      anyway 400s every call on such a setup. `none` does NOT suppress them:
+      that is the condition the preset was picked for, and suppressing there
+      would reinstate the Ollama Modelfile override below. An UNSET effort
+      does not suppress them either, even though Ollama reads unset as xhigh,
+      because unset ALSO triggers that override — the two cannot both be
+      satisfied from one unset value, so the override wins and an operator who
+      wants neither writes LOCAL_TEMPERATURE=off. Only the configured values
+      are withheld; a caller's own temperature is left alone, since dropping
+      response_gate's temperature=0 would make the outbound gate stochastic
+      silently, which is worse than a 400 that names the field. `off`/`none`
+      as the VALUE maps to None (field_validator ``_parse_local_sampling``),
+      and that word is load-bearing: ``env_ignore_empty=True`` drops
+      ``LOCAL_TEMPERATURE=`` before validation, so a blank is the DEFAULT and
+      the ``| None`` in the annotation is otherwise unreachable from a .env.
+      The same validator maps whitespace-only and inline-comment values to the
+      default — ``env_ignore_empty`` drops only a truly EMPTY string, so a
+      stray space previously reached float parsing and failed startup. They are wired only into the local provider;
       OpenRouterProvider overrides ``_extend_body`` without calling super(),
       so neither can leak onto an OpenRouter or Anthropic request. They have
       DEFAULTS rather than being unset because unset is not neutral on

@@ -194,10 +194,34 @@ class OpenAICompatibleProvider:
         ``temperature != 1`` alongside thinking, so a per-call temperature
         kwarg would 400 the Claude path. This method is local-only —
         OpenRouterProvider overrides it and never calls super(), and
-        Anthropic has its own provider."""
+        Anthropic has its own provider.
+
+        They are NOT sent once reasoning is explicitly turned on. The values
+        are Qwen's *non-thinking* preset, so they were never the right numbers
+        for a thinking request, and a strict reasoning backend rejects the two
+        fields outright rather than ignoring them — OpenAI's own o-series
+        requires them absent, and ``LOCAL_BASE_URL`` is documented as
+        supporting hosted gateways, so that backend is reachable here. Sending
+        them regardless would 400 every call on such a setup, which is why
+        this is keyed to the effort rather than left to the operator.
+
+        "Explicitly turned on" excludes an UNSET effort on purpose. Unset is
+        not neutral either way: Ollama's /v1 reads a missing
+        ``reasoning_effort`` as xhigh, but it also substitutes
+        temperature/top_p 1.0 over the Modelfile when they are missing, and
+        that substitution is the regression these defaults exist to stop. An
+        operator who wants neither sets ``LOCAL_TEMPERATURE=off``.
+
+        Only the CONFIGURED values are withheld; a value the caller passed is
+        left alone. ``response_gate`` sends ``temperature=0`` because the
+        outbound gate has to be deterministic, and quietly dropping it would
+        make the gate stochastic — worse than the 400 a strict backend raises,
+        which at least names the field."""
         if self._reasoning_effort:
             body["reasoning_effort"] = self._reasoning_effort
             _announce_effort(slug, self._reasoning_effort)
+        if self._reasoning_effort and self._reasoning_effort != "none":
+            return
         if self._temperature is not None:
             body.setdefault("temperature", self._temperature)
         if self._top_p is not None:
