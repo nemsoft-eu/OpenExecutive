@@ -793,6 +793,25 @@ def find_principal_person(db_path: Path | None = None) -> Person | None:
         return _row_to_person(row, conn)
 
 
+def active_principals(db_path: Path | None = None) -> list[Person]:
+    """Every active principal, oldest id first.
+
+    ``find_principal_person`` answers a different question and must keep
+    returning ONE row: "whose peer card does an unauthenticated web turn
+    belong to". This answers "who owns this business", which in a
+    co-founded company is more than one person — so a standing report
+    addressed to "the principal" reaches all of them rather than silently
+    only the oldest row.
+
+    Not interchangeable with ``find_principal_person``: every *private*
+    reader in the briefing path (notes, conversations, calendar) resolves
+    the owner through that function, so private content belongs to one
+    person and must not be fanned out. See ``scheduler.runner``'s brief
+    delivery, which drops to a shared brief when this returns more than one.
+    """
+    return [p for p in list_people(db_path=db_path) if p.is_principal]
+
+
 def list_people(
     include_archived: bool = False,
     db_path: Path | None = None,

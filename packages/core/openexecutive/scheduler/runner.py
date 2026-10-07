@@ -748,7 +748,11 @@ async def _execute_action(
                 digest = result.get("digest") or ""
                 if digest:
                     try:
-                        await _deliver_to_principal(digest, label="Across your clients")
+                        # Client data, not principal-private: every owner
+                        # gets it.
+                        await deliver_to_each_principal(
+                            digest, label="Across your clients"
+                        )
                     except Exception:
                         logger.exception(
                             "scheduler: client_rotation digest delivery failed"
@@ -1894,19 +1898,39 @@ class PrincipalDelivery:
     channel: str | None = None
 
 
-async def _deliver_to_principal(text: str, *, label: str = "Update") -> PrincipalDelivery:
-    """Send ``text`` to the principal on their preferred channel.
+async def deliver_to_each_principal(
+    text: str, *, label: str = "Update", recipients: list[Person] | None = None
+) -> list[tuple[Person, PrincipalDelivery]]:
+    """Send ``text`` to every active principal, one DM each.
 
-    Tries the channels from ``principal_delivery_plan`` in order until one
-    sends; ``label`` names the message in the email subject. Not ok when no
-    channel is configured or every send failed — the caller still marks the
-    action done (no point retrying the same misconfiguration) but audits the
-    failure.
+    ``recipients`` pins the audience instead of reading the roster now. A
+    caller whose CONTENT depends on who the recipients are must pass the
+    same list it gated on: the principal brief decides
+    ``PRINCIPAL_DELIVERY`` from the roster and then spends minutes
+    generating, so re-reading here would hand a founder added inside that
+    window a brief built as private to someone else. The audience is pinned
+    in both directions — a principal archived mid-run still gets this one,
+    and a roster change takes effect from the next brief.
+
+    Returns one result PER RECIPIENT rather than a single verdict, on
+    purpose. ``brief_state.record_delivery_outcome`` stores one
+    reason/channel that the Briefing notice and Setup checks render, so
+    collapsing N results into "ok if any succeeded" would make a founder
+    whose channel is broken invisible on every surface — their brief would
+    fail silently every day behind the other founder's success. The caller
+    decides what a partial delivery means and audits each recipient.
+
+    Empty list when there is no principal at all, which the caller records
+    as ``no_owner``. A not-ok result means no channel was configured or
+    every send failed: the caller still marks the action done — there is no
+    point retrying the same misconfiguration on the next tick — and audits
+    the failure instead.
     """
-    principal, plan = principal_delivery_plan()
-    if principal is None:
-        return PrincipalDelivery(False, "no principal Person row found", "no_owner")
-    return await _send_on_plan(principal, plan, text, label=label)
+    if recipients is None:
+        from openexecutive.people import store as people_store
+
+        recipients = people_store.active_principals()
+    return [(p, await deliver_to_person(p, text, label=label)) for p in recipients]
 
 
 async def deliver_to_person(person: Person, text: str, *, label: str = "Update") -> PrincipalDelivery:
@@ -2131,11 +2155,33 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         fingerprint: str | None = None
         suppressed = False
         private_to_principal = False
-        # This run goes to the principal alone, so the brief may read what is
-        # private to them (morning_brief.PRINCIPAL_DELIVERY).
+        # Who this brief is for, resolved BEFORE the run because it decides
+        # what the brief may contain.
+        #
+        # PRINCIPAL_DELIVERY lets the brief read what is private to *the*
+        # principal — their contacts' mail, their chat titles, their
+        # calendar, their own notes, their Act-as-me drafts. None of those
+        # readers is keyed to a recipient: three resolve the owner through
+        # `find_principal_person()` (the lowest-id principal) —
+        # `live_signals._conversations`, `top_three`'s calendar block,
+        # `history_brief`'s notes — and `live_signals._drafts` is keyed to
+        # nothing at all, counting every `delegation_drafted` audit row the
+        # install has. So "private" here means one specific person's data
+        # (or worse, everyone's), never "each recipient's own".
+        #
+        # The flag is therefore only safe with exactly one recipient. With
+        # co-principals the brief goes out shared: fanning a private run out
+        # would put one founder's mail and calendar in the other's DM, and
+        # generating it per principal would not help — it would hand every
+        # recipient the SAME person's private data. Making the feature
+        # per-person means re-keying those readers, a larger change.
+        from openexecutive.people import store as people_store
+
+        recipients = people_store.active_principals()
+        private_run = len(recipients) == 1
         from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
 
-        delivery_token = PRINCIPAL_DELIVERY.set(True)
+        delivery_token = PRINCIPAL_DELIVERY.set(private_run)
         try:
             async for event in workflow.run(inputs=wf_inputs, store=store):
                 event = ensure_workflow_event(event, site="scheduler.principal_brief")
@@ -2160,35 +2206,82 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             recorded = True
         else:
             sending = True
-            delivery = await _deliver_to_principal(artifact, label=workflow.title)
-            ok, detail = delivery.ok, delivery.detail
-            brief_state.record_delivery_outcome(
-                kind, reason=delivery.reason, channel=delivery.channel
+            # `recipients`, not a fresh lookup: the audience that gated the
+            # content has to be the audience that receives it.
+            sends = await deliver_to_each_principal(
+                artifact, label=workflow.title, recipients=recipients
             )
-            recorded = True
-            if ok:
-                logger.info("scheduler: %s delivered (%s)", kind, detail)
+            delivered = [(p, d) for p, d in sends if d.ok]
+            failed = [(p, d) for p, d in sends if not d.ok]
+
+            # One audit row per recipient: a founder whose channel is broken
+            # has to be visible on its own, not folded into a sibling's
+            # success. Written before the outcome so the rows exist even if
+            # the summary below changes shape later.
+            for person, d in sends:
                 audit_log(
                     "scheduled_action",
-                    f"{kind} delivered ({detail})",
+                    f"{kind} {'delivered' if d.ok else 'NOT delivered'} "
+                    f"to {person.full_name or person.id} ({d.detail})",
                     actor="scheduler",
                     details={
-                        "phase": "delivered", "kind": kind, "channel_detail": detail,
-                        "suppressed": suppressed,
+                        "phase": "delivered" if d.ok else "delivery_failed",
+                        "kind": kind, "person_id": person.id,
+                        "channel": d.channel, "reason": d.reason,
+                        "channel_detail": d.detail, "suppressed": suppressed,
                     },
                 )
+
+            if not sends:
+                brief_state.record_delivery_outcome(
+                    kind, reason="no_owner", channel=None
+                )
+            elif failed:
+                # Any recipient missing is a problem worth surfacing — the
+                # Briefing notice and Setup checks render this single
+                # reason, so reporting the failure (not the success) is what
+                # keeps a permanently-broken channel visible.
+                first_failure = failed[0][1]
+                brief_state.record_delivery_outcome(
+                    kind, reason=first_failure.reason, channel=first_failure.channel
+                )
+            else:
+                first = delivered[0][1]
+                brief_state.record_delivery_outcome(
+                    kind, reason=first.reason, channel=first.channel
+                )
+            recorded = True
+
+            ok = bool(delivered)
+            detail = "; ".join(
+                f"{p.full_name or p.id}: {d.detail}" for p, d in sends
+            ) or "no principal Person row found"
+            if ok:
+                logger.info(
+                    "scheduler: %s delivered to %d/%d principals (%s)",
+                    kind, len(delivered), len(sends), detail,
+                )
                 # Only a delivered brief advances the "since last brief"
-                # window and the unchanged-detection fingerprint.
+                # window and the unchanged-detection fingerprint. Keyed to
+                # the shared artifact, so ANY recipient receiving it is
+                # enough: not advancing would replay yesterday's window to
+                # the founder who did get it. A recipient who got nothing is
+                # surfaced by the outcome above, not by re-sending.
                 if fingerprint:
                     brief_state.record_delivered(kind, fingerprint, artifact)
             else:
                 logger.warning("scheduler: %s NOT delivered — %s", kind, detail)
-                audit_log(
-                    "scheduled_action",
-                    f"{kind} NOT delivered — {detail}",
-                    actor="scheduler",
-                    details={"phase": "delivery_failed", "kind": kind, "reason": detail},
-                )
+                if not sends:
+                    # No principal at all: there is no per-recipient row to
+                    # carry this, so the summary row is the only trace.
+                    audit_log(
+                        "scheduled_action",
+                        f"{kind} NOT delivered — {detail}",
+                        actor="scheduler",
+                        details={
+                            "phase": "delivery_failed", "kind": kind, "reason": detail,
+                        },
+                    )
     except Exception as exc:
         logger.exception("scheduler: %s (action %d) failed", kind, action.id)
         import contextlib

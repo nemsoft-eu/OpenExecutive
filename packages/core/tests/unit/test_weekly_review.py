@@ -505,14 +505,18 @@ def _fire(
     monkeypatch.setitem(WORKFLOW_REGISTRY, "weekly_review", _fake_review())
     sent: list[tuple[str, str]] = []
 
-    async def _deliver(text: str, *, label: str = "") -> runner.PrincipalDelivery:
+    # One principal, so the review runs as private and fans out to exactly
+    # one recipient; the seam is the per-recipient one the fan-out calls.
+    people_store.upsert_person(full_name="Owner", is_principal=True, telegram_chat_id="5")
+
+    async def _deliver(person: Any, text: str, *, label: str = "") -> runner.PrincipalDelivery:
         sent.append((text, label))
         if deliver_ok:
             return runner.PrincipalDelivery(True, "telegram → 5", "delivered", "telegram")
         return runner.PrincipalDelivery(False, "no channel", "no_channel")
 
     chained: list[str] = []
-    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver)
     if not real_chain:
         monkeypatch.setattr(
             runner, "_enqueue_next_principal_brief", lambda kind, after: chained.append(kind)

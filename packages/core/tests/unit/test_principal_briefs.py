@@ -221,16 +221,37 @@ def _run_brief(
     deliver_ok: bool = True,
     workflow: object | None = None,
     deliver: object | None = None,
-) -> None:
+    deliver_person: object | None = None,
+    principals: int = 1,
+) -> list[tuple[int, str]]:
+    """Run one morning brief against isolated DBs; returns the recorded sends
+    as ``(person_id, text)``, in the order the fan-out made them.
+
+    The seam patched here is ``deliver_to_person`` — the per-recipient one —
+    so ``deliver_to_each_principal`` and its ``active_principals()`` lookup
+    run for real and the number of sends is the behaviour under test.
+    ``principals`` seeds that many principal rows; ``deliver`` is a
+    text-only stub shared by every recipient, ``deliver_person`` one that
+    sees the Person (for asymmetric outcomes).
+    """
     import asyncio
 
     from openexecutive.briefing import narrative_cache
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
     from openexecutive.workflows import persistence as wf_persistence
 
     db = tmp_path / "brief.db"
     _setup_isolated_db(db, monkeypatch)
     monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
     monkeypatch.setattr(wf_persistence, "DB_PATH", db)
+    monkeypatch.setattr(people_store, "DB_PATH", db)
+    people_store.initialize_db(db)
+    people_registry.invalidate()
+    for n in range(principals):
+        people_store.upsert_person(
+            full_name=f"Founder {n}", is_principal=True, slack_user_id=f"U{n}"
+        )
     monkeypatch.setitem(
         WORKFLOW_REGISTRY, "morning_brief", workflow or _fake_brief_workflow("fp-123")
     )
@@ -240,7 +261,17 @@ def _run_brief(
             return runner.PrincipalDelivery(True, "discord_dm → 1", "delivered", "discord_dm")
         return runner.PrincipalDelivery(False, "delivery failed", "send_failed")
 
-    monkeypatch.setattr(runner, "_deliver_to_principal", deliver or _deliver)
+    sends: list[tuple[int, str]] = []
+    per_person = deliver_person
+    by_text = deliver or _deliver
+
+    async def _recording(person, text: str, **kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        sends.append((person.id, text))
+        if per_person is not None:
+            return await per_person(person, text, **kw)  # type: ignore[operator]
+        return await by_text(text, **kw)  # type: ignore[operator]
+
+    monkeypatch.setattr(runner, "deliver_to_person", _recording)
     monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
 
     class _Store:
@@ -257,6 +288,7 @@ def _run_brief(
     action = episodic.get_scheduled_action(action_id)
     assert action is not None
     asyncio.run(runner._run_principal_brief(action, datetime.now(UTC)))
+    return sends
 
 
 def test_run_principal_brief_records_fingerprint_after_delivery(
@@ -401,9 +433,11 @@ def _with_gateway(monkeypatch: pytest.MonkeyPatch, sent: _Sent, **kw: str) -> No
 
 
 def _deliver(text: str = "BRIEF", label: str = "Morning Brief") -> tuple[bool, str]:
-    import asyncio
-
-    result = asyncio.run(runner._deliver_to_principal(text, label=label))
+    """The channel-order tests below seed exactly one principal, so the
+    fan-out's single result is that person's. Driving them through
+    ``deliver_to_each_principal`` rather than ``deliver_to_person`` keeps
+    them on the seam production actually uses."""
+    result = _deliver_result(text, label=label)
     return result.ok, result.detail
 
 
@@ -515,14 +549,22 @@ def test_email_is_the_backup_when_every_chat_send_fails(
     assert [name for name, _ in sent.calls] == ["slack", "gmail"]
 
 
-def _deliver_result() -> runner.PrincipalDelivery:
+def _deliver_result(text: str = "BRIEF", label: str = "Update") -> runner.PrincipalDelivery:
     import asyncio
 
-    return asyncio.run(runner._deliver_to_principal("BRIEF"))
+    results = asyncio.run(runner.deliver_to_each_principal(text, label=label))
+    assert len(results) == 1, f"expected one principal, got {len(results)}"
+    return results[0][1]
 
 
-def test_no_owner_is_its_own_reason(sent: _Sent) -> None:
-    assert _deliver_result().reason == "no_owner"
+def test_no_owner_sends_nothing_at_all(sent: _Sent) -> None:
+    """With no principal there is no per-recipient result to carry a reason;
+    the empty fan-out is the signal, which ``_run_principal_brief`` records
+    as ``no_owner`` (see test_no_principal_at_all_is_recorded_as_no_owner)."""
+    import asyncio
+
+    assert asyncio.run(runner.deliver_to_each_principal("BRIEF")) == []
+    assert sent.calls == []
 
 
 def test_nothing_connected_is_its_own_reason(sent: _Sent) -> None:
@@ -701,3 +743,175 @@ def test_a_private_brief_is_delivered_whole_but_kept_out_of_run_history(
     runs = wf_persistence.list_runs(workflow_name="morning_brief")
     stored = wf_persistence.get_run(runs[0]["run_id"])
     assert stored is not None and stored["artifact"] == wf_persistence.PRIVATE_RUN_ARTIFACT
+
+
+# ---------------------------------------------------------------------------
+# Co-principals: both founders get the brief, and the private-content flag
+# drops away as soon as there is more than one recipient
+# ---------------------------------------------------------------------------
+
+
+def test_each_principal_is_dmed_on_their_own_channel(sent: _Sent) -> None:
+    """The reason this fan-out exists: with two founders the brief used to
+    reach only the lowest-id row. Each result is reported separately, and each
+    send goes to that person's OWN id, never twice to the first one's."""
+    import asyncio
+
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Maarten", is_principal=True, slack_user_id="UMAARTEN")
+    people_store.upsert_person(full_name="Nick", is_principal=True, slack_user_id="UNICK")
+
+    results = asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
+
+    assert [p.full_name for p, _ in results] == ["Maarten", "Nick"]
+    assert all(d.ok and d.channel == "slack_dm" for _, d in results)
+    assert [args["user_id"] for name, args in sent.calls if name == "slack"] == [
+        "UMAARTEN", "UNICK",
+    ]
+
+
+def test_an_archived_principal_gets_no_brief(sent: _Sent) -> None:
+    """Off-boarding a founder has to stop the standing report too — otherwise
+    it keeps DMing someone who no longer runs the company."""
+    import asyncio
+
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Stays", is_principal=True, slack_user_id="USTAYS")
+    gone = people_store.upsert_person(full_name="Gone", is_principal=True, slack_user_id="UGONE")
+    people_store.archive_person(gone)
+
+    results = asyncio.run(runner.deliver_to_each_principal("BRIEF"))
+
+    assert [p.full_name for p, _ in results] == ["Stays"]
+    assert [args["user_id"] for _, args in sent.calls] == ["USTAYS"]
+
+
+def test_two_principals_make_the_brief_shared_not_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRINCIPAL_DELIVERY unlocks ONE person's mail, drafts and calendar (every
+    private reader resolves the owner through ``find_principal_person``), so
+    fanning a private run out would put Maarten's inbox in Nick's DM. With
+    co-principals the brief must be generated shared."""
+    from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+    seen: list[bool] = []
+    workflow = _flag_observing_workflow(seen)
+
+    _run_brief(tmp_path, monkeypatch, workflow=workflow, principals=2)
+    assert seen == [False]
+
+    seen.clear()
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _run_brief(solo, monkeypatch, workflow=workflow, principals=1)
+    assert seen == [True]
+    assert PRINCIPAL_DELIVERY.get() is False  # reset after the run
+
+
+def _flag_observing_workflow(seen: list[bool]):  # type: ignore[no-untyped-def]
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import (
+        PRINCIPAL_DELIVERY,
+        MorningBriefInput,
+        MorningBriefWorkflow,
+    )
+
+    class _Observes(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            seen.append(PRINCIPAL_DELIVERY.get())
+            yield WorkflowEvent(type="result", data={"brief_fingerprint": "fp-123"})
+            yield WorkflowEvent(type="artifact", content="BRIEF")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    return _Observes()
+
+
+def test_one_broken_channel_is_reported_while_the_other_founder_still_gets_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial delivery reports the FAILURE, not the success: the Briefing
+    notice and the Setup checks render one reason each, so collapsing to "ok
+    if any succeeded" would hide a founder whose channel is broken every day
+    behind the other's success. The window still advances — the recipient who
+    did get it must not be replayed yesterday's brief."""
+    from openexecutive.briefing import brief_state
+
+    rows: list[dict] = []  # type: ignore[type-arg]
+    monkeypatch.setattr(
+        "openexecutive.audit.log_event",
+        lambda *a, **k: rows.append(k.get("details") or {}),
+    )
+
+    async def _only_the_first_works(person, text: str, **_kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        if person.slack_user_id == "U0":
+            return runner.PrincipalDelivery(True, "slack_dm → U0", "delivered", "slack_dm")
+        return runner.PrincipalDelivery(False, "nothing connected", "no_channel")
+
+    sends = _run_brief(
+        tmp_path, monkeypatch, deliver_person=_only_the_first_works, principals=2
+    )
+
+    assert len(sends) == 2
+    last = brief_state.last_delivered("principal_brief_morning")
+    assert last is not None and last.input_hash == "fp-123"
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and (outcome.reason, outcome.channel) == ("no_channel", None)
+    # One audit row per recipient, so the broken one is visible on its own.
+    phases = [r["phase"] for r in rows if r.get("kind") == "principal_brief_morning"]
+    assert phases == ["delivered", "delivery_failed"]
+
+
+def test_a_founder_added_while_the_brief_runs_does_not_get_the_private_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audience is read ONCE, before the run, because it decides what the
+    brief may contain. Generation takes minutes; re-reading the roster at
+    delivery would hand a founder added inside that window a brief built as
+    private to the sitting principal."""
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import (
+        PRINCIPAL_DELIVERY,
+        MorningBriefInput,
+        MorningBriefWorkflow,
+    )
+
+    class _AddsAFounderMidRun(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            assert PRINCIPAL_DELIVERY.get() is True  # one principal: private
+            people_store.upsert_person(
+                full_name="Latecomer", is_principal=True, slack_user_id="ULATE"
+            )
+            yield WorkflowEvent(type="result", data={
+                "brief_fingerprint": "fp-123", "private_to_principal": True,
+            })
+            yield WorkflowEvent(type="artifact", content="PRIVATE BRIEF")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    sends = _run_brief(tmp_path, monkeypatch, workflow=_AddsAFounderMidRun(), principals=1)
+
+    principals = people_store.active_principals()
+    assert [p.full_name for p in principals] == ["Founder 0", "Latecomer"]  # write landed
+    assert sends == [(principals[0].id, "PRIVATE BRIEF")]  # only the original
+
+
+def test_no_principal_at_all_is_recorded_as_no_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh install with an empty roster: the brief is written and stored,
+    nothing is sent, and the reason stays the one the Setup page reads."""
+    from openexecutive.briefing import brief_state
+
+    sends = _run_brief(tmp_path, monkeypatch, principals=0)
+
+    assert sends == []
+    assert brief_state.last_delivered("principal_brief_morning") is None
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and (outcome.reason, outcome.channel) == ("no_owner", None)

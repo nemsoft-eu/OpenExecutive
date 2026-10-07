@@ -1375,14 +1375,16 @@ def test_scheduled_solo_brief_is_written_for_and_delivered_to_the_principal(
     calls = _capture_synth(monkeypatch)
     sent: list[str] = []
 
-    async def _deliver(text: str, **_kw: object) -> Any:
+    async def _deliver(person: Any, text: str, **_kw: object) -> Any:
         sent.append(text)
         return runner.PrincipalDelivery(True, "telegram → 555", "delivered", "telegram")
 
     async def _no_review(**_kw: object) -> None:
         return None
 
-    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    # The per-recipient seam the fan-out calls; a solo workspace has the one
+    # principal this test already seeded, so it is called once.
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver)
     monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
     monkeypatch.setattr("openexecutive.alerts.review.run_alert_review", _no_review)
 
