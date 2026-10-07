@@ -307,6 +307,27 @@ class Settings(BaseSettings):
     # this server instead (knowledge/pdf_reader.py).
     local_pdf_input: bool = Field(False, alias="LOCAL_PDF_INPUT")
     # Optional `reasoning_effort` sent on every local request (e.g. "low").
+    # Sampling for local calls. Unset means "not sent" — which on Ollama's
+    # /v1 is NOT neutral: it synthesises temperature=1.0 and top_p=1.0 and
+    # that override beats the Modelfile (openai/openai.go @ v0.34.0). For the
+    # qwen3.8 tag whose Modelfile ships Qwen's *thinking* preset
+    # (temp 1 / top_k 20 / top_p 0.95), the net effect of omitting them is
+    # top_p 0.95 -> 1.0. These defaults are Qwen's published *non-thinking*
+    # preset, which is the applicable one because we run reasoning_effort=none.
+    #
+    # Deliberately no LOCAL_TOP_K: top_k is not in the OpenAI schema and
+    # Ollama's /v1 silently drops it (verified — sending top_k:5 left the
+    # runner at top_k=20). The Modelfile's top_k 20 already matches the
+    # preset, so the setting would be inert and misleading.
+    #
+    # Deliberately no presence_penalty: Qwen's preset suggests 1.5, but it
+    # penalises already-emitted tokens and this model's tool calls are XML
+    # that repeats <parameter>/<function> by construction — the one knob with
+    # a plausible mechanism for CAUSING malformed tool calls.
+    # Bounded here rather than at the server: an out-of-range value comes
+    # back as an opaque 400 mid-turn, long after the typo.
+    local_temperature: float | None = Field(0.7, ge=0.0, le=2.0, alias="LOCAL_TEMPERATURE")
+    local_top_p: float | None = Field(0.8, gt=0.0, le=1.0, alias="LOCAL_TOP_P")
     # OpenAI-format `reasoning_effort` for local calls; the gate strips
     # Anthropic thinking, so this is the only reasoning control there.
     # Thinking-only models (GLM on Fireworks) otherwise spend the whole

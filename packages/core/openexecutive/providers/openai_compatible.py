@@ -104,6 +104,8 @@ class OpenAICompatibleProvider:
         model_resolver: Callable[[str], tuple[str, FeatureSpec] | None] | None = None,
         reasoning_effort: str | None = None,
         include_usage_accounting: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -132,6 +134,10 @@ class OpenAICompatibleProvider:
         # (LOCAL_REASONING_EFFORT). None = not sent. Only the local backend
         # sets it; OpenRouter uses the translator's nested `reasoning`.
         self._reasoning_effort = reasoning_effort
+        # LOCAL_TEMPERATURE / LOCAL_TOP_P. None = not sent, which on Ollama's
+        # /v1 means the server substitutes 1.0 for both (see config.py).
+        self._temperature = temperature
+        self._top_p = top_p
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -178,10 +184,24 @@ class OpenAICompatibleProvider:
         ``reasoning_effort`` is sent unconditionally when configured. Local
         slugs never carry a per-call ``reasoning`` object (their spec has
         ``supports_thinking=False``), so there is nothing for it to clash
-        with."""
+        with.
+
+        ``temperature``/``top_p`` use ``setdefault``, so a caller that set
+        one explicitly keeps it — today only ``integrations/response_gate.py``
+        (``temperature=0``), which must stay deterministic. They are set HERE
+        rather than at the call site on purpose: ``agents/base.py`` sends
+        ``thinking={"type": "adaptive"}``, and Anthropic rejects
+        ``temperature != 1`` alongside thinking, so a per-call temperature
+        kwarg would 400 the Claude path. This method is local-only —
+        OpenRouterProvider overrides it and never calls super(), and
+        Anthropic has its own provider."""
         if self._reasoning_effort:
             body["reasoning_effort"] = self._reasoning_effort
             _announce_effort(slug, self._reasoning_effort)
+        if self._temperature is not None:
+            body.setdefault("temperature", self._temperature)
+        if self._top_p is not None:
+            body.setdefault("top_p", self._top_p)
 
     def messages_create(self, **kwargs: Any) -> Awaitable[Any]:
         return self._messages_create(kwargs)

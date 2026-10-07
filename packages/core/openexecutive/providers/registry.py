@@ -415,6 +415,8 @@ def _local() -> OpenAICompatibleProvider:
             include_usage_accounting=getattr(
                 settings, "local_include_usage_accounting", False
             ),
+            temperature=getattr(settings, "local_temperature", None),
+            top_p=getattr(settings, "local_top_p", None),
         )
     return _local_provider
 

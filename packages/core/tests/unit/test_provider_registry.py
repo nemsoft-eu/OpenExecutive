@@ -168,6 +168,8 @@ def _settings_stub(
     local_timeout_s: float = 300.0,
     local_reasoning_effort: str | None = None,
     local_include_usage_accounting: bool = False,
+    local_temperature: float | None = None,
+    local_top_p: float | None = None,
 ) -> Any:
     return SimpleNamespace(
         anthropic_api_key=anthropic_key,
@@ -184,6 +186,8 @@ def _settings_stub(
         local_timeout_s=local_timeout_s,
         local_reasoning_effort=local_reasoning_effort,
         local_include_usage_accounting=local_include_usage_accounting,
+        local_temperature=local_temperature,
+        local_top_p=local_top_p,
     )
 
 
@@ -335,6 +339,33 @@ def test_local_provider_carries_configured_reasoning_effort(
     _local_stub(monkeypatch, enabled=False, local_reasoning_effort="none")
     provider = get_provider("llama3.3")
     assert provider._reasoning_effort == "none"  # type: ignore[attr-defined]
+
+
+def test_local_provider_carries_configured_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_stub(monkeypatch, enabled=False, local_temperature=0.7, local_top_p=0.8)
+    provider = get_provider("llama3.3")
+    assert provider._temperature == 0.7  # type: ignore[attr-defined]
+    assert provider._top_p == 0.8  # type: ignore[attr-defined]
+
+
+def test_openrouter_provider_never_receives_local_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control. LOCAL_TEMPERATURE/LOCAL_TOP_P must not reach a
+    hosted backend: Anthropic rejects temperature != 1 alongside thinking,
+    which agents/base.py enables. OpenRouterProvider overrides _extend_body
+    and never calls super(), so the fields are unreachable there — this
+    pins that, because a future refactor adding a super() call would send
+    them silently.
+    """
+    _local_stub(monkeypatch, enabled=True, local_temperature=0.7, local_top_p=0.8)
+    provider = get_provider("openai/gpt-6-astra")
+    body: dict[str, Any] = {}
+    provider._extend_body("openai/gpt-6-astra", body)  # type: ignore[attr-defined]
+    assert "temperature" not in body
+    assert "top_p" not in body
 
 
 def test_openrouter_provider_ignores_local_reasoning_effort(
