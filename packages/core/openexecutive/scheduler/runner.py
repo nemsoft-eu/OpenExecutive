@@ -749,11 +749,20 @@ async def _execute_action(
                 digest = result.get("digest") or ""
                 if digest:
                     try:
-                        # Client data, not principal-private: every owner
-                        # gets it.
-                        await deliver_to_each_principal(
-                            digest, label="Across your clients"
+                        # Client data rather than one owner's private data, so
+                        # every owner gets it — but the audience is still
+                        # owners only, so the egress is restricted the same way
+                        # the briefs are. Content privacy and audience
+                        # restriction are separate concerns; this fan-out needs
+                        # the second without the first.
+                        from openexecutive.orchestrator.people_tools import (
+                            restrict_to_principal,
                         )
+
+                        with restrict_to_principal():
+                            await deliver_to_each_principal(
+                                digest, label="Across your clients"
+                            )
                     except Exception:
                         logger.exception(
                             "scheduler: client_rotation digest delivery failed"

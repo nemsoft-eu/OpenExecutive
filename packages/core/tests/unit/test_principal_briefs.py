@@ -634,6 +634,47 @@ def test_client_digest_still_delivers(sent: _Sent, monkeypatch: pytest.MonkeyPat
     assert "<h1>Across your clients</h1>" in call["arguments"]["body"]
 
 
+def test_the_client_digest_fan_out_is_egress_restricted_too(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest is client data rather than one owner's private data, but its
+    audience is still owners only, so it needs the same egress restriction as
+    the briefs. It was left out when the briefs' gate was made unconditional —
+    the handlers would otherwise accept a founder demoted mid-send, exactly as
+    they would have for a shared brief."""
+    import asyncio
+
+    from openexecutive.clients import rotation
+    from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
+
+    restricted_at_send: list[bool] = []
+
+    async def _observe(person, text: str, **_kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        restricted_at_send.append(turn_is_private_to_principal())
+        return runner.PrincipalDelivery(True, "email → x", "delivered", "email")
+
+    _principal(preferred_channel="email", email="owner@example.com")
+    monkeypatch.setattr(runner, "deliver_to_person", _observe)
+
+    async def _rotate(_settings: object) -> dict:  # type: ignore[type-arg]
+        return {"ran": True, "rotated": ["acme"], "failed": {}, "digest": "# Across"}
+
+    monkeypatch.setattr(rotation, "run_client_rotation", _rotate)
+    monkeypatch.setattr(rotation, "seed_client_rotation", lambda: None)
+    action_id = episodic.insert_scheduled_action(
+        run_at=datetime.now(UTC).isoformat(), channel="__internal__",
+        channel_ref="client_rotation", intent_text="rotate", kind="client_rotation",
+    )
+    action = episodic.get_scheduled_action(action_id)
+    assert action is not None
+
+    asyncio.run(runner._execute_action(action, None))
+
+    assert restricted_at_send == [True]
+    # And it does not leak past the digest's own send.
+    assert turn_is_private_to_principal() is False
+
+
 def test_brief_with_no_deliverable_channel_is_still_generated_and_stored(
     sent: _Sent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
