@@ -185,8 +185,12 @@ skipping the check.
 can reach it unauthenticated. It returns:
 
 ```json
-{"status": "ok", "builtin_knowledge_chunks": 1234, "version": "0.1.0"}
+{"status": "ok", "builtin_knowledge_chunks": 1234, "version": "0.5.2"}
 ```
+
+That `version` is release-please-managed, so it moves with every release and is
+the cheapest signal that an upgrade actually took — see step 4 of
+[Upgrading](#upgrading), which compares it against the checkout.
 
 **Give it a startup grace period of about 5 minutes.** A cold container builds
 the MCP tool-discovery vector index and loads Chroma before it serves. The
@@ -335,34 +339,61 @@ host's Docker. Upgrade from the host instead.
 4. **Check it came back — and that it is actually the new code.**
 
    ```bash
-   python3 scripts/verify-deploy.py          # add --engine docker for Docker
+   python3 scripts/verify-deploy.py                      # localhost:8000
+   python3 scripts/verify-deploy.py --url https://exec.example.internal
+   python3 scripts/verify-deploy.py --expect X.Y.Z       # pinned-image install
    ```
 
-   This is the step to not skip. `curl -s http://localhost:8000/health`
-   returning 200 does **not** prove the upgrade took: it answers with the
-   configured company name whatever code is behind it, and the `version` it
-   reports is a static string that does not move between commits, so it reads
-   identically for a current deployment and a stale one. Settings → About
-   reads the same string.
+   This is the step to not skip. A 200 from `/health` on its own does **not**
+   prove the upgrade took — it answers with the configured company name
+   whatever code is behind it. What narrows it is the `version` in that
+   answer, which `verify-deploy.py` compares against
+   `packages/core/pyproject.toml` in this checkout: 0 when they match, 1 when
+   they do not, 2 when the check could not be completed (API unreachable,
+   non-200, a redirect, unparseable answer, unreadable checkout). An
+   inconclusive result must never read as a pass. `/health` is outside the
+   shared-secret gate, so no credential is needed; `--path /version` reads the
+   same number from the authenticated endpoint and takes the secret from
+   `$BACKEND_SHARED_SECRET` in the environment.
 
-   Two mirror-image failures both leave a healthy-looking stack and both exit
-   0 under `podman-compose`, which is why they need an explicit assertion:
+   Use `--expect X.Y.Z` on the published-image path above: there the operator
+   pins an image tag, so the *checkout's* version is unrelated to what was
+   deployed and the bare invocation would compare against the wrong number.
+   The remediation printed on exit 1 follows the flag — `compose pull` for a
+   pinned install, a rebuild for a checkout one. Only the API is checked; the
+   UI image carries the same version, so pull both and read the UI's from
+   Settings → About.
 
-   - **built but not recreated** — a new image exists while the container
-     still runs the old one;
-   - **recreated but not built** — the container runs the tagged image, but
-     that image predates the commit it is meant to contain. This happens when
-     step 3's `git pull` is skipped: the build then rebuilds the *same* old
-     source and succeeds.
+   On 2026-10-08 this install served an image built from source 17 days and
+   253 commits behind the checkout: the containers had been *recreated* the
+   evening before, which rebuilt nothing, because step 3's `git pull` was
+   skipped — the build rebuilt the *same* old source and succeeded. Health was
+   green the whole time while the standing briefs ran two-week-old code, and
+   because the briefs' delivery failure is itself silent, nothing surfaced it.
 
-   The second one went unnoticed on this install for 17 days and 253 commits.
-   Health was green the whole time while the standing briefs ran two-week-old
-   code — and because the briefs' delivery failure is itself silent, nothing
-   surfaced it. `verify-deploy.py` compares the container's image id against
-   the tag, and the image's build time against `HEAD`, and exits non-zero with
-   the reason. An engine or git error exits 2 rather than passing.
+   `/health` would have named that on day one: it reported `0.1.0` (the
+   pre-upstream-sync literal) while the checkout read `0.5.2`. An earlier
+   version of this step claimed the opposite — that the reported `version` is
+   "a static string that does not move between commits" — and that claim was
+   false. release-please writes the version into `pyproject.toml`, `uv.lock`,
+   `packages/ui/package.json`, `api/main.py` and `api/models.py` on every
+   release, so it moves with each one. Settings → About shows the same number
+   and is just as usable by eye.
 
-   Then confirm the behaviour you upgraded for, not just the process: for a
+   **What this does not catch.** The version moves per *release*, not per
+   commit, so every commit inside one release window reports the same number
+   and this check cannot tell them apart. Following unreleased `main` — as
+   this install does — it is therefore a weaker signal, blind to everything
+   merged since the last release; a passing run prints how many commits HEAD
+   is ahead of its version's tag so the size of that gap is visible. Read it
+   as a floor on staleness, not a proof of freshness.
+
+   Which is why you then confirm the behaviour you upgraded for, not just the
+   version. That part is not optional on an install between releases: it is
+   what distinguishes two commits sharing a version without reaching inside the
+   container. (The other way is exact and more intrusive — `exec` into the API
+   container and grep the changed code under
+   `/usr/local/lib/python3.11/site-packages/openexecutive/`.) For a
    scheduler change, `GET /scheduled?status=pending` should list the expected
    rows, and a route added by the release should return 200 where it
    previously 404'd.
