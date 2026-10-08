@@ -314,6 +314,11 @@ def test_slack_handler_suppresses_without_sending(monkeypatch: pytest.MonkeyPatc
         slack_bot_token = "xoxb-test"
 
     monkeypatch.setattr("openexecutive.config.get_settings", lambda: _S())
+    # Past the handler's roster gate, as the Telegram case below does: this
+    # test is about the suppression short-circuit, not about who is rostered.
+    monkeypatch.setattr(
+        "openexecutive.people.store.find_person_by_slack_id", lambda _ref: object()
+    )
     monkeypatch.setattr(
         "openexecutive.orchestrator.outbound_guard.check_outbound_allowed",
         lambda *_a, **_k: "duplicate suppressed",

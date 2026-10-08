@@ -777,8 +777,10 @@ def test_a_founder_offboarded_mid_fan_out_is_not_sent_to(
     """The fan-out awaits one network send per recipient, so the roster read
     before the loop is already stale by the time a later founder is reached.
     Archiving Nick while Maarten's Slack call is in flight must stop Nick's
-    send — `handle_send_slack_dm` has no unconditional roster check of its
-    own, so nothing downstream would catch it.
+    send. The Slack handler refuses an archived id of its own accord now, so
+    this is about the fan-out's own manners — Nick is dropped quietly here
+    rather than sent to and refused — and about a SHARED run, where no
+    private-egress gate applies at all.
 
     Nick is DROPPED from the results rather than carrying a reason, which is
     what the audience cap means: he is not a recipient of this run. See
@@ -944,6 +946,208 @@ def _flag_observing_workflow(seen: list[bool]):  # type: ignore[no-untyped-def]
             return MorningBriefInput
 
     return _Observes()
+
+
+# ---------------------------------------------------------------------------
+# The private brief's guarantee lives at the EGRESS
+#
+# Five review rounds found variants of "the recipient row went stale across an
+# await", each answered by moving the caller's snapshot closer to the send. A
+# snapshot cannot be await-safe at any granularity, so `_run_principal_brief`
+# now raises `people_tools.restrict_to_principal()` around the fan-out and
+# every channel leg re-reads `is_principal` immediately before its own call.
+# The fan-out's own revalidation (`runner._live_principal`) is a courtesy
+# pre-filter from here on, so these tests stub it out on purpose: what is
+# under test is what happens when it does NOT catch the recipient.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def slack_reached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Isolated people DB plus the REAL `handle_send_slack_dm`, Slack API
+    stubbed. Yields the list of user ids that reached `chat_postMessage` —
+    empty means the handler refused before the network call.
+
+    Deliberately NOT the `sent` fixture: that replaces the handler wholesale,
+    which is exactly the seam an egress test must not stub.
+    """
+    from openexecutive.orchestrator import mcp_gateway, schedule_tools
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    db = tmp_path / "people.db"
+    _setup_isolated_db(db, monkeypatch)
+    monkeypatch.setattr(people_store, "DB_PATH", db)
+    people_store.initialize_db(db)
+    people_registry.invalidate()
+    monkeypatch.setattr(mcp_gateway, "_active_gateway", None)  # email not ready
+
+    reached: list[str] = []
+
+    class _S:
+        slack_bot_token = "xoxb-test"
+
+    class _FakeClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        async def chat_postMessage(self, channel: str, text: str) -> dict:  # type: ignore[type-arg]
+            reached.append(channel)
+            return {"ok": True, "ts": "1.0"}
+
+    monkeypatch.setattr("openexecutive.config.get_settings", lambda: _S())
+    monkeypatch.setattr("slack_sdk.web.async_client.AsyncWebClient", _FakeClient)
+    # The anti-spam guard is a separate concern and needs settings this stub
+    # does not carry; the refusal under test happens before it either way.
+    monkeypatch.setattr(schedule_tools, "_guard_outbound", lambda **_kw: None)
+    return reached
+
+
+def test_a_demoted_team_member_is_refused_for_a_private_brief(
+    slack_reached: list[str],
+) -> None:
+    """The case `restrict_to_principal` closes and the roster gate cannot.
+
+    A founder DEMOTED rather than offboarded keeps a non-archived `kind =
+    'team'` row, so "is this id on the People roster?" says yes — which is all
+    the unconditional roster gate asks. Only the private-turn question
+    ("is this id the principal's?") refuses them, and that is the question a
+    brief carrying one person's mail, calendar, notes and drafts has to ask.
+    The control below is the point: the same call outside the block sends.
+    """
+    import asyncio
+    import json
+
+    from openexecutive.orchestrator import schedule_tools
+    from openexecutive.orchestrator.people_tools import (
+        PRIVATE_TURN_REFUSAL,
+        restrict_to_principal,
+    )
+    from openexecutive.people import store as people_store
+
+    reached = slack_reached
+    nick = people_store.upsert_person(
+        full_name="Nick", is_principal=True, slack_user_id="UNICK"
+    )
+    people_store.upsert_person(
+        full_name="Nick", is_principal=False, slack_user_id="UNICK", person_id=nick
+    )
+    row = people_store.get_person(nick)
+    assert row is not None and row.kind == "team" and not row.archived
+
+    args = {"user_id": "UNICK", "text": "PRIVATE BRIEF"}
+    with restrict_to_principal():
+        refused = json.loads(asyncio.run(schedule_tools.handle_send_slack_dm(args)))
+    assert refused == {"error": PRIVATE_TURN_REFUSAL}
+    assert reached == []
+
+    # Control: the roster gate alone waves this very recipient through.
+    allowed = json.loads(asyncio.run(schedule_tools.handle_send_slack_dm(args)))
+    assert allowed["status"] == "sent"
+    assert reached == ["UNICK"]
+
+
+def test_an_archived_recipient_is_refused_at_the_egress_not_by_the_pre_filter(
+    slack_reached: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the fan-out's revalidation stubbed to a passthrough — standing in
+    for any future caller that forgets it, or for a row that goes stale after
+    it ran — the Slack handler still refuses an archived recipient, and the
+    network call never happens."""
+    import asyncio
+
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
+    from openexecutive.people import store as people_store
+
+    reached = slack_reached
+    monkeypatch.setattr(runner, "_live_principal", lambda person: person)
+
+    gone = people_store.upsert_person(
+        full_name="Gone", is_principal=True, slack_user_id="UGONE"
+    )
+    pinned = people_store.active_principals()
+    people_store.archive_person(gone)
+
+    with restrict_to_principal():
+        results = asyncio.run(
+            runner.deliver_to_each_principal("PRIVATE BRIEF", recipients=pinned)
+        )
+
+    assert reached == []  # nothing reached Slack
+    assert [(p.full_name, d.ok, d.reason) for p, d in results] == [
+        ("Gone", False, "send_failed")
+    ]
+
+
+def test_the_shared_brief_is_not_gated_as_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`restrict_to_principal` is raised only for a single-recipient run. With
+    co-principals the artifact is generated SHARED, and gating the fan-out as
+    private would refuse each co-founder's own leg — every handler would ask
+    "is this id the principal's?" of a roster with two."""
+    from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
+
+    private_at_send: list[bool] = []
+
+    async def _observe(person, text: str, **_kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        private_at_send.append(turn_is_private_to_principal())
+        return runner.PrincipalDelivery(True, "slack_dm → U", "delivered", "slack_dm")
+
+    _run_brief(tmp_path, monkeypatch, deliver_person=_observe, principals=2)
+    assert private_at_send == [False, False]
+
+    private_at_send.clear()
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _run_brief(solo, monkeypatch, deliver_person=_observe, principals=1)
+    assert private_at_send == [True]
+    # And the flag does not outlive the send.
+    assert turn_is_private_to_principal() is False
+
+
+def test_restrict_to_principal_restores_the_prior_value() -> None:
+    """Save/restore, not `Token.reset`, so a nested block and an exception both
+    leave the flag as they found it — a leak would mark every later send on
+    this task private and refuse teammates nowhere near a brief."""
+    import pytest as _pytest
+
+    from openexecutive.orchestrator.people_tools import (
+        restrict_to_principal,
+        turn_is_private_to_principal,
+    )
+
+    assert turn_is_private_to_principal() is False
+    with restrict_to_principal():
+        assert turn_is_private_to_principal() is True
+        with restrict_to_principal():
+            assert turn_is_private_to_principal() is True
+        assert turn_is_private_to_principal() is True  # inner exit restores True
+    assert turn_is_private_to_principal() is False
+
+    with _pytest.raises(RuntimeError, match="brief blew up"), restrict_to_principal():
+        raise RuntimeError("brief blew up")
+    assert turn_is_private_to_principal() is False
+
+
+def test_the_private_brief_raises_the_flag_for_every_channel_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag is read at the SEND, not once per run: `deliver_to_person` is
+    reached inside the block, so each leg it tries — Slack, Discord, Telegram,
+    the email gateway's roster allow-set — sees it on a fresh read however
+    many awaits deep."""
+    from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
+
+    async def _assert_private(person, text: str, **_kw: object) -> runner.PrincipalDelivery:  # type: ignore[no-untyped-def]
+        import asyncio
+
+        await asyncio.sleep(0)  # an await between the gate and the read
+        assert turn_is_private_to_principal() is True
+        return runner.PrincipalDelivery(True, "email → x", "delivered", "email")
+
+    sends = _run_brief(tmp_path, monkeypatch, deliver_person=_assert_private, principals=1)
+    assert len(sends) == 1
 
 
 def test_one_broken_channel_is_reported_while_the_other_founder_still_gets_it(
@@ -1160,10 +1364,12 @@ def test_a_founder_offboarded_while_the_brief_runs_does_not_get_the_private_one(
 ) -> None:
     """The mirror of the test above, and the direction that leaks. Pinning the
     audience in BOTH directions meant a sole principal archived mid-run still
-    received a brief built as private to them — their mail, calendar, notes and
-    drafts — and `handle_send_slack_dm` has no unconditional roster gate to
-    catch it downstream (Discord and Telegram do). The pinned list is an upper
-    bound, so the audience may shrink but never grow."""
+    received a brief built as private to them — their mail, calendar, notes
+    and drafts. The pinned list is an upper bound, so the audience may shrink
+    but never grow. The send is also wrapped in `restrict_to_principal()`, so
+    an archived recipient is refused at the egress even with this pre-filter
+    out of the way — see
+    `test_an_archived_recipient_is_refused_at_the_egress_not_by_the_pre_filter`."""
     from openexecutive.briefing import brief_state
     from openexecutive.people import store as people_store
     from openexecutive.workflows.base import WorkflowEvent

@@ -414,8 +414,9 @@ def test_reflection_runs_only_tools_it_offered(
     mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A tool the pass does not offer never runs, in either mode. The raw
-    DM tools (send_slack_dm has no roster check), ack_alert and
-    close_open_loop used to run whenever the model emitted them."""
+    DM tools, ack_alert and close_open_loop used to run whenever the model
+    emitted them — the raw DM tools mattered most because the pass kept
+    passing the wrong identifier into them."""
     if mode == "solo":
         _solo()
     _principal()

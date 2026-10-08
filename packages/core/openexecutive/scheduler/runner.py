@@ -1940,22 +1940,31 @@ async def deliver_to_each_principal(
     send, and the live row's channel fields are the ones used. So the
     audience can only ever shrink between gating and sending: nobody is
     added (the content was gated on the pinned list), and anyone archived,
-    demoted or moved to contacts inside the window drops out. Pinning in
-    both directions was the wrong call — a brief generated as private to a
-    sole principal carries their mail, calendar, notes and drafts, and
-    ``handle_send_slack_dm`` has no unconditional roster gate (unlike the
-    Discord and Telegram handlers, which refuse a non-rostered id outright),
-    so an offboarded founder would still have received it on Slack. Taking
-    the live row also means a ``slack_user_id`` changed mid-run is not used
-    to DM whoever now holds the old id.
+    demoted or moved to contacts inside the window drops out. Taking the
+    live row also means a ``slack_user_id`` changed mid-run is not used to
+    DM whoever now holds the old id.
 
-    Revalidating PER RECIPIENT rather than once before the loop is the
-    point: each send is awaited, so a later founder is reached only after an
-    earlier one's channel call has returned, and a snapshot taken before the
-    loop is already stale by then. This check lives here rather than in
-    ``deliver_to_person`` because only this function knows what membership
-    its fan-out needs ("still an active principal") and what to do when it
-    fails (drop them). ``deliver_to_person`` is shared with
+    That revalidation is a PRE-FILTER, not the guarantee. Whether private
+    content may reach a given recipient is enforced at the egress: a caller
+    whose text is private to one principal sends inside
+    ``people_tools.restrict_to_principal()`` (``_run_principal_brief`` does,
+    for a single-recipient run), and every DM handler, the email gateway's
+    roster allow-set and the invite gate then read ``is_principal`` fresh
+    immediately before their own leg. Four review rounds found variants of
+    "the pinned row went stale across an await" precisely because a
+    caller-side snapshot cannot be await-safe at any granularity. What this
+    loop adds is manners: a recipient who stopped being an active principal
+    is dropped quietly here, with a log line, rather than sent to and
+    refused — and dropped from the results, so the aggregate is the
+    remaining recipients' (see below).
+
+    Revalidating PER RECIPIENT rather than once before the loop keeps the
+    pre-filter honest: each send is awaited, so a later founder is reached
+    only after an earlier one's channel call has returned, and a snapshot
+    taken before the loop is already stale by then. It lives here rather
+    than in ``deliver_to_person`` because only this function knows what
+    membership its fan-out needs ("still an active principal") and what to
+    do when it fails (drop them). ``deliver_to_person`` is shared with
     ``memory.history_reminders``, which sends to ordinary team members and
     needs a different question answered (``history.can_keep_notes``); one
     guard down there could not be both, and had to return a per-recipient
@@ -2043,16 +2052,23 @@ def _live_principal(person: Person) -> Person | None:
     """``person``'s row as the roster holds it NOW, or None when they are no
     longer an active principal.
 
+    A courtesy PRE-FILTER for ``deliver_to_each_principal``, not the privacy
+    guarantee. On a private run the egress refuses a non-principal anyway
+    (``people_tools.restrict_to_principal``, read fresh by each channel leg);
+    answering here lets the fan-out drop such a recipient quietly, with a log
+    line and no result row, instead of sending to them and being refused. It
+    is also what keeps a shared run — where no egress gate applies — from
+    delivering to someone offboarded mid-fan-out.
+
     Asks ``active_principals()`` and matches on id rather than re-reading the
     single row and re-testing its flags. That predicate is three conditions —
     ``archived = 0``, ``kind = 'team'`` and ``is_principal`` — and a
     hand-written copy of it is exactly what went wrong: the copy tested
     ``archived`` alone, so a founder DEMOTED rather than offboarded (an
     onboarding re-run rewrites the flag) passed it and still received the
-    standing brief, and nothing downstream catches that because the channel
-    roster checks accept any ordinary team member. Reusing the gate's own
-    query means the fan-out cannot disagree with it, and a fourth condition
-    added there needs no change here.
+    standing brief. Reusing the gate's own query means the fan-out cannot
+    disagree with it, and a fourth condition added there needs no change
+    here.
 
     One roster read per recipient, guarding one network DM each — on a roster
     with the one or two principals this fans out to, the read is not the cost.
@@ -2088,12 +2104,13 @@ async def deliver_to_person(person: Person, text: str, *, label: str = "Update")
     immediately before the send, and both have to: a loop that awaits a
     network send per person reaches a later one only after an earlier one's
     channel call has returned, so a roster read from before the loop is
-    already stale. Nothing downstream catches a stale row either —
-    ``handle_send_discord_dm`` and ``handle_send_telegram_message`` both run
-    ``_dm_recipient_on_roster``, but ``handle_send_slack_dm`` consults the
-    roster only when ``turn_is_private_to_principal()``, a per-TURN flag the
-    email poller sets and the scheduler never does. A new caller owes the
-    same read.
+    already stale. All three DM handlers now run ``_dm_recipient_on_roster``
+    unconditionally, so an archived or never-rostered id is refused
+    downstream as well — but that gate answers "on the roster at all", not
+    either caller's membership question, so a new caller still owes its own
+    read. A caller whose TEXT is private to the principal owes one more
+    thing: sending inside ``people_tools.restrict_to_principal()``, which is
+    what narrows every leg's gate to ``is_principal``.
     """
     return await _send_on_plan(person, delivery_order(person, email_ready=email_ready()), text, label=label)
 
@@ -2267,11 +2284,13 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     nor breaks the chain.
     """
     import uuid
+    from contextlib import nullcontext
 
     from openexecutive.audit import log_event as audit_log
     from openexecutive.briefing import brief_state
     from openexecutive.config import get_settings
     from openexecutive.knowledge.store import ChromaDBStore
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
     from openexecutive.workflows import WORKFLOW_REGISTRY
     from openexecutive.workflows.persistence import (
         complete_run,
@@ -2380,9 +2399,27 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             # out instead of being sent a brief built as private to them —
             # and drops out of `sends`, so the aggregate below is the
             # remaining recipients' and not `no_owner`.
-            sends = await deliver_to_each_principal(
-                artifact, label=workflow.title, recipients=recipients
-            )
+            #
+            # And the guarantee itself lives at the EGRESS, not here. A private
+            # brief is content private to one person, so the send is wrapped in
+            # `people_tools.restrict_to_principal()` — the same flag the email
+            # poller sets on a private turn — and every DM handler, the email
+            # gateway's roster allow-set and the invite gate then refuse a
+            # recipient who is not a principal on a read taken immediately
+            # before that leg's own call. Four rounds of review found variants
+            # of "the recipient row went stale across an await", because a
+            # caller-side snapshot cannot be await-safe at any granularity; the
+            # fan-out's revalidation is now a courtesy pre-filter that drops
+            # such a recipient quietly instead of letting the egress refuse
+            # them. Gated on `private_run` because that is exactly the
+            # condition that makes the artifact one person's private data: a
+            # SHARED brief must not be gated this way, or a co-founder's own
+            # leg would be refused.
+            gate = restrict_to_principal() if private_run else nullcontext()
+            with gate:
+                sends = await deliver_to_each_principal(
+                    artifact, label=workflow.title, recipients=recipients
+                )
             delivered = [(p, d) for p, d in sends if d.ok]
 
             # One recorded outcome per recipient. A single stored reason for a
