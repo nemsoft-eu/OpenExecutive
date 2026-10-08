@@ -161,6 +161,19 @@ PRIVATE_RUN_ARTIFACT = (
     "text is not kept in the shared run history.)"
 )
 
+# A private run that was WRITTEN but never sent, because the roster changed
+# during generation and the artifact's subject stopped being its recipient
+# (`scheduler.runner._run_principal_brief`). Distinct from
+# `PRIVATE_RUN_ARTIFACT`, which asserts a delivery, and from an empty
+# artifact, which asserts the brief could not be written: this run produced
+# one and then withheld it, and the history has to say so rather than claim
+# either of the other two.
+WITHHELD_RUN_ARTIFACT = (
+    "(Written but not delivered. The roster changed while it was being "
+    "written, so the brief was about someone other than the person it was "
+    "addressed to, and its text is not kept in the shared run history.)"
+)
+
 
 def stored_artifact(artifact: str, *, private_to_principal: bool) -> str:
     """What a run's history keeps for ``artifact``."""

@@ -2301,6 +2301,7 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     from openexecutive.orchestrator.people_tools import restrict_to_principal
     from openexecutive.workflows import WORKFLOW_REGISTRY
     from openexecutive.workflows.persistence import (
+        WITHHELD_RUN_ARTIFACT,
         complete_run,
         create_run,
         fail_run,
@@ -2384,11 +2385,6 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                     raise RuntimeError(event.message)
         finally:
             PRINCIPAL_DELIVERY.reset(delivery_token)
-        complete_run(
-            run_id,
-            stored_artifact(artifact, private_to_principal=private_to_principal)
-            or "(no artifact)",
-        )
 
         # A private artifact belongs to ONE person, and which person is decided
         # by `find_principal_person()` at each private reader's own read time —
@@ -2405,6 +2401,7 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         # while that recipient is still who the private readers resolve to.
         # Withheld rather than downgraded to a shared send — the artifact was
         # already generated with private content in it.
+        withheld = False
         if artifact and private_to_principal:
             owner = people_store.find_principal_person()
             pinned = [p.id for p in recipients]
@@ -2429,6 +2426,20 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                     kind, pinned, owner.id,
                 )
                 artifact = ""
+                withheld = True
+
+        # Completed AFTER the drift check, not before it. `PRIVATE_RUN_ARTIFACT`
+        # asserts "delivered to the principal" and an empty artifact asserts
+        # the brief could not be written; a withheld run is neither, and
+        # storing it before the check decided meant the Artifacts page and run
+        # history claimed a delivery that the outcome below records as
+        # `not_written`.
+        complete_run(
+            run_id,
+            WITHHELD_RUN_ARTIFACT if withheld
+            else stored_artifact(artifact, private_to_principal=private_to_principal)
+            or "(no artifact)",
+        )
 
         if not artifact:
             # `recipients=[]`, not omitted: this run is KNOWN to have reached

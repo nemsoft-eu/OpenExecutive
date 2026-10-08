@@ -1524,6 +1524,18 @@ def test_a_private_brief_is_withheld_when_its_subject_drifts_mid_run(
     assert outcome is not None and outcome.reason == "not_written"
     # The window must not advance on a brief nobody received.
     assert brief_state.last_delivered("principal_brief_morning") is None
+    # And the run history must not claim a delivery. `PRIVATE_RUN_ARTIFACT`
+    # reads "Delivered to the principal", so storing it here would have the
+    # Artifacts page assert the opposite of the outcome above; an empty
+    # artifact would claim the brief could not be written, which is also
+    # false. A withheld run is its own third state.
+    from openexecutive.workflows import persistence as wf_persistence
+
+    runs = wf_persistence.list_runs(workflow_name="morning_brief")
+    stored = wf_persistence.get_run(runs[0]["run_id"])
+    assert stored is not None
+    assert stored["artifact"] == wf_persistence.WITHHELD_RUN_ARTIFACT
+    assert "Delivered" not in stored["artifact"]
 
 
 def test_no_principal_at_all_is_recorded_as_no_owner(
