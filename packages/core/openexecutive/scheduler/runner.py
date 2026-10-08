@@ -1846,13 +1846,14 @@ def unreachable_principals(
     """Those of ``principals`` no channel can reach (``delivery_order`` empty).
 
     Whether a standing brief can be delivered is a question about EVERY
-    recipient, not about the lowest-id row. The fan-out records a partial
-    failure as ``no_channel``, but ``brief_state.current_problem`` judges that
-    reason from the present — so a surface that asks only about
-    ``find_principal_person()`` clears it the moment the oldest founder has a
-    channel, and the co-principal who receives nothing goes back behind a
-    green light. The Briefing notice and the Setup status light both pass the
-    whole active roster through here instead.
+    recipient, not about the lowest-id row. ``no_channel`` is the one delivery
+    problem that is a function of the present rather than of a past run, so
+    ``brief_state.outstanding_problems`` derives it from here and not from the
+    record: a surface that asked only about ``find_principal_person()``
+    cleared it the moment the oldest founder had a channel, putting the
+    co-principal who receives nothing back behind a green light. The Briefing
+    notice and the Setup status light pass the whole active roster through
+    ``outstanding_problems``, which calls this.
     """
     return [p for p in principals if not delivery_order(p, email_ready=email_ready)]
 
@@ -1914,6 +1915,12 @@ class PrincipalDelivery:
     reason: DeliveryReason
     # The delivery channel that sent it ("email", "slack_dm", ...), if one did.
     channel: str | None = None
+    # The first channel this person's plan offered, if they had one — what was
+    # actually tried, not what their plan would say later. The Setup light's
+    # backup-channel warning compares the two, and "email carried it while the
+    # plan starts at Slack" only means Slack failed if Slack was in the plan
+    # at the time (`brief_state.backup_channel_problem`).
+    first_tried: str | None = None
 
 
 async def deliver_to_each_principal(
@@ -1942,12 +1949,13 @@ async def deliver_to_each_principal(
     whoever now holds the old id.
 
     Returns one result PER RECIPIENT rather than a single verdict, on
-    purpose. ``brief_state.record_delivery_outcome`` stores one
-    reason/channel that the Briefing notice and Setup checks render, so
-    collapsing N results into "ok if any succeeded" would make a founder
-    whose channel is broken invisible on every surface — their brief would
-    fail silently every day behind the other founder's success. The caller
-    decides what a partial delivery means and audits each recipient.
+    purpose. ``brief_state.record_delivery_outcome`` stores the list as given
+    (one ``RecipientOutcome`` each) and both surfaces name the people a
+    problem is about, so collapsing N results into "ok if any succeeded" —
+    or into any one of them — would make a founder whose channel is broken
+    invisible on every surface, their brief failing silently every day behind
+    the other founder's success. The caller decides what a partial delivery
+    means and audits each recipient.
 
     Empty list when there is no principal at all, which the caller records
     as ``no_owner``. A not-ok result means no channel was configured or
@@ -1994,14 +2002,14 @@ async def _send_on_plan(
                     "user_id": principal.slack_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.slack_user_id)
+                    return _sent(channel, principal.slack_user_id, plan[0])
             elif channel == "discord_dm" and principal.discord_user_id:
                 from openexecutive.orchestrator.schedule_tools import handle_send_discord_dm
                 result = await handle_send_discord_dm({
                     "discord_user_id": principal.discord_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.discord_user_id)
+                    return _sent(channel, principal.discord_user_id, plan[0])
             elif channel == "telegram" and principal.telegram_chat_id:
                 from openexecutive.orchestrator.schedule_tools import (
                     handle_send_telegram_message,
@@ -2010,19 +2018,23 @@ async def _send_on_plan(
                     "chat_id": int(principal.telegram_chat_id), "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.telegram_chat_id)
+                    return _sent(channel, principal.telegram_chat_id, plan[0])
             elif channel == "email" and await _email_principal(principal, text, label):
-                return _sent(channel, principal.email)
+                return _sent(channel, principal.email, plan[0])
         except Exception:
             logger.exception("scheduler: delivery via %s failed", channel)
 
     return PrincipalDelivery(
-        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed"
+        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed",
+        first_tried=plan[0],
     )
 
 
-def _sent(channel: str, to: str | None) -> PrincipalDelivery:
-    return PrincipalDelivery(True, f"{channel} → {to}", "delivered", channel)
+def _sent(channel: str, to: str | None, first_tried: str | None = None) -> PrincipalDelivery:
+    """A delivered result. ``first_tried`` is the channel the plan started
+    with, which is only interesting when it is NOT ``channel`` — the plan
+    tried it, it did not send, and a later one did."""
+    return PrincipalDelivery(True, f"{channel} → {to}", "delivered", channel, first_tried)
 
 
 async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
@@ -2238,7 +2250,12 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         )
 
         if not artifact:
-            brief_state.record_delivery_outcome(kind, reason="not_written", channel=None)
+            # `recipients=[]`, not omitted: this run is KNOWN to have reached
+            # nobody, which is a different fact from a record that predates
+            # per-recipient outcomes and so cannot say.
+            brief_state.record_delivery_outcome(
+                kind, reason="not_written", channel=None, recipients=[]
+            )
             recorded = True
         else:
             sending = True
@@ -2250,12 +2267,42 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                 artifact, label=workflow.title, recipients=recipients
             )
             delivered = [(p, d) for p, d in sends if d.ok]
-            failed = [(p, d) for p, d in sends if not d.ok]
+
+            # One recorded outcome per recipient. A single stored reason for a
+            # run with several recipients made roster order decide which
+            # founder's problem any surface could show, and the other was
+            # rendered nowhere — so every recipient goes in, and `brief_state`
+            # derives the run's aggregate from them rather than from the first
+            # of a list.
+            #
+            # Written BEFORE the audit rows below, which is the opposite of
+            # the old order. `audit_log` writes to SQLite and can raise under
+            # contention; while it ran first, an exception on the second
+            # recipient left `recorded` False, so the handler recorded a
+            # run-level `send_failed` and discarded outcomes that already
+            # existed — reporting "every way of sending it failed" to a
+            # founder who had just received the brief. The outcome is what
+            # the Briefing notice and the Setup light read, so it goes first;
+            # the audit rows are the secondary artifact.
+            recipient_outcomes = [
+                brief_state.RecipientOutcome(
+                    person_id=person.id,
+                    name=person.full_name,
+                    reason=d.reason,
+                    channel=d.channel,
+                    first_tried=d.first_tried,
+                )
+                for person, d in sends
+            ]
+            reason, channel = brief_state.delivery_summary(recipient_outcomes)
+            brief_state.record_delivery_outcome(
+                kind, reason=reason, channel=channel, recipients=recipient_outcomes
+            )
+            recorded = True
 
             # One audit row per recipient: a founder whose channel is broken
             # has to be visible on its own, not folded into a sibling's
-            # success. Written before the outcome so the rows exist even if
-            # the summary below changes shape later.
+            # success.
             for person, d in sends:
                 audit_log(
                     "scheduled_action",
@@ -2269,26 +2316,6 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                         "channel_detail": d.detail, "suppressed": suppressed,
                     },
                 )
-
-            if not sends:
-                brief_state.record_delivery_outcome(
-                    kind, reason="no_owner", channel=None
-                )
-            elif failed:
-                # Any recipient missing is a problem worth surfacing — the
-                # Briefing notice and Setup checks render this single
-                # reason, so reporting the failure (not the success) is what
-                # keeps a permanently-broken channel visible.
-                first_failure = failed[0][1]
-                brief_state.record_delivery_outcome(
-                    kind, reason=first_failure.reason, channel=first_failure.channel
-                )
-            else:
-                first = delivered[0][1]
-                brief_state.record_delivery_outcome(
-                    kind, reason=first.reason, channel=first.channel
-                )
-            recorded = True
 
             ok = bool(delivered)
             detail = "; ".join(
@@ -2326,8 +2353,16 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         with contextlib.suppress(Exception):
             fail_run(run_id, str(exc))
         if not recorded:
+            # `recorded` is set the moment the per-recipient outcomes are
+            # written, so reaching here means the run raised before any
+            # recipient had one. The empty list says exactly that: the reason
+            # is the run's and is reported run-level, never attributed to a
+            # founder it was not about.
             brief_state.record_delivery_outcome(
-                kind, reason="send_failed" if sending else "not_written", channel=None
+                kind,
+                reason="send_failed" if sending else "not_written",
+                channel=None,
+                recipients=[],
             )
 
     # Always chain the next occurrence + mark this row done, so a single

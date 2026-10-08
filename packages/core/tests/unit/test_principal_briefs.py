@@ -861,9 +861,45 @@ def test_one_broken_channel_is_reported_while_the_other_founder_still_gets_it(
     assert last is not None and last.input_hash == "fp-123"
     outcome = brief_state.last_delivery_outcome()
     assert outcome is not None and (outcome.reason, outcome.channel) == ("no_channel", None)
+    # And the RECORD keeps it per recipient, so the surfaces can name the
+    # founder rather than inferring one reason for the run. Not a channel for
+    # the run either: one of the two sends never happened.
+    assert outcome.recipients is not None
+    assert [(r.name, r.reason, r.channel) for r in outcome.recipients] == [
+        ("Founder 0", "delivered", "slack_dm"),
+        ("Founder 1", "no_channel", None),
+    ]
     # One audit row per recipient, so the broken one is visible on its own.
     phases = [r["phase"] for r in rows if r.get("kind") == "principal_brief_morning"]
     assert phases == ["delivered", "delivery_failed"]
+
+
+def test_the_record_says_which_channel_was_tried_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Setup light's backup-channel warning needs the channel the run
+    ACTUALLY tried, not the one the plan would offer when the page is read: a
+    channel connected after the run would otherwise be announced as broken
+    without ever having been attempted. So the plan's first channel is
+    recorded per recipient at send time."""
+    from openexecutive.briefing import brief_state
+
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+
+    async def _slack_fails_email_carries(person, text: str, **_kw: object):  # type: ignore[no-untyped-def]
+        # The plan is Slack then email; Slack didn't send, email did.
+        return runner.PrincipalDelivery(
+            True, "email → f0@x.io", "delivered", "email", first_tried="slack_dm"
+        )
+
+    _run_brief(
+        tmp_path, monkeypatch, deliver_person=_slack_fails_email_carries, principals=1
+    )
+
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    [only] = outcome.recipients
+    assert (only.channel, only.first_tried) == ("email", "slack_dm")
 
 
 def test_a_founder_added_while_the_brief_runs_does_not_get_the_private_one(

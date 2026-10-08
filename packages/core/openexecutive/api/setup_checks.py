@@ -34,7 +34,7 @@ from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from openexecutive.audit import AuditEvent
-    from openexecutive.briefing.brief_state import DeliveryOutcome
+    from openexecutive.briefing.brief_state import DeliveryOutcome, DeliveryProblem
     from openexecutive.config import Settings
     from openexecutive.people.models import Person
 
@@ -979,18 +979,67 @@ _DELIVERY_CHANNEL_CHECKS: dict[str, str] = {
 }
 
 
+def _brief_problem_result(
+    problems: list[tuple[DeliveryProblem, tuple[str, ...]]],
+    *,
+    last: DeliveryOutcome | None,
+    unreachable: Sequence[Person],
+) -> SetupCheck:
+    """The "Daily brief" light for a non-empty ``outstanding_problems`` list.
+
+    EVERY clause is rendered, not just the worst one. Dropping the rest for
+    want of room is how a founder's recurring failure stayed invisible behind
+    the other's — the light's COLOUR still follows the worst reason, which is
+    all that was ever really competing for space.
+    """
+    from openexecutive.briefing.brief_state import brief_name, render_problems
+
+    problem, fix = render_problems(problems)
+    failed_run = [(r, names) for r, names in problems if r in ("send_failed", "not_written")]
+    # `last is not None` is what the type checker needs for `last.kind`; at
+    # runtime a non-empty `failed_run` already implies it, since both reasons
+    # come only from a record.
+    if last is not None and failed_run:
+        # A failed or unwritten run is red, and outranks an unreachable
+        # founder (amber) below. The lead follows the RED clauses only: "Your
+        # last brief wasn't sent" is honest when the run failed for everyone,
+        # and false for a founder who received it — so once the record says
+        # whose send failed, the line names them instead of the reader.
+        lead = (
+            f"The last {brief_name(last.kind)} didn't reach everyone"
+            if any(names for _, names in failed_run)
+            else f"Your last {brief_name(last.kind)} wasn't sent"
+        )
+        return _result("brief", "error", f"{lead}: {problem}.", fix)
+    # Ranked above the channel and time-zone warnings in `check_brief`: those
+    # are about how and when a brief that IS arriving goes out, while this
+    # founder gets none at all. Both of those are `warn` too, so the light's
+    # colour is the same either way, and this is the worse news.
+    #
+    # An unnamed problem here means it covers the whole roster, which
+    # `check_brief`'s own app-only branch normally returns on first; the
+    # wording is kept honest for the case it does not.
+    named = any(names for _, names in problems)
+    return _result(
+        "brief",
+        "warn",
+        f"{'Not reaching everyone' if named else 'Kept in the app only'}: {problem}.",
+        fix,
+        link=f"/people/{unreachable[0].id}" if unreachable and unreachable[0].id else "/people",
+    )
+
+
 def check_brief(snap: Snapshot) -> SetupCheck:
     """When the morning brief and end-of-day digest go out, and where."""
     from zoneinfo import ZoneInfo
 
     from openexecutive.briefing.brief_state import (
         BRIEF_KINDS,
-        CHANNEL_NAMES,
         DELIVERY_PROBLEMS,
+        backup_channel_problem,
         brief_name,
         channel_phrase,
-        current_problem,
-        partial_delivery_problem,
+        outstanding_problems,
     )
     from openexecutive.scheduler.runner import delivery_order, unreachable_principals
 
@@ -1005,7 +1054,17 @@ def check_brief(snap: Snapshot) -> SetupCheck:
     # about the whole roster, not `snap.principal`'s row. `snap.people` IS
     # what `active_principals()` reads — both are `list_people()` (team, not
     # archived) filtered on `is_principal`.
-    principals = [p for p in snap.people if p.is_principal]
+    # `snap.principal` stands in for a roster that does not contain it, so the
+    # problem list below cannot report "no owner" four lines after this
+    # function established there is one. The two reads really can disagree:
+    # `find_principal_person()` filters on `is_principal AND NOT archived`
+    # with no `kind` clause, while `list_people()` (hence `snap.people` and
+    # `active_principals()`) also requires `kind = 'team'`, so a contact row
+    # flagged `is_principal` is the owner here and no recipient at all to the
+    # fan-out. The light then describes a roster the briefs never reach —
+    # which it did before this too; it is not a state this branch creates, and
+    # fixing it belongs with whatever makes the two reads agree.
+    principals = [p for p in snap.people if p.is_principal] or [principal]
     missing = unreachable_principals(principals, email_ready=snap.brief_email_ready)
     if not plan and len(missing) >= len(principals):
         # Nobody can be reached, so the brief really is app-only. With some
@@ -1021,50 +1080,33 @@ def check_brief(snap: Snapshot) -> SetupCheck:
             link=f"/people/{principal.id}",
         )
     last = snap.brief_delivery
-    # `can_deliver` carries the roster-wide answer the function documents, so
-    # this surface and the Briefing notice mean the same thing by it. Only the
-    # run-scoped reasons are rendered here: `no_channel` is the partial state
-    # below, which says who is missing out instead of "your last brief wasn't
-    # sent" — it is not about one run, and the brief did reach someone.
-    reason = current_problem(last, has_owner=True, can_deliver=not missing)
-    if last is not None and reason in ("send_failed", "not_written"):
-        problem, fix = DELIVERY_PROBLEMS[reason]
-        return _result(
-            "brief", "error", f"Your last {brief_name(last.kind)} wasn't sent: {problem}.", fix
-        )
-    # Ranked above the channel and time-zone warnings below: those are about
-    # how and when a brief that IS arriving goes out, while this founder gets
-    # none at all. Both of those are `warn` too, so the light's colour is the
-    # same either way — only one summary fits, and this is the worse news.
-    if missing:
-        problem, fix = partial_delivery_problem([p.full_name for p in missing])
-        return _result(
-            "brief",
-            "warn",
-            f"Not reaching everyone: {problem}.",
-            fix,
-            link=f"/people/{missing[0].id}" if missing[0].id else "/people",
-        )
+    # Everything still outstanding, each clause naming who it is about unless
+    # it covers the whole roster. `outstanding_problems` asks
+    # `unreachable_principals` the same question `missing` above did — both
+    # are pure reads over rows already in hand, so asking twice costs nothing
+    # and the app-only branch keeps the list it needs for its link.
+    problems = outstanding_problems(last, principals, email_ready=snap.brief_email_ready)
+    if problems:
+        return _brief_problem_result(problems, last=last, unreachable=missing)
     # `plan` is non-empty from here: an empty one puts `principal` in
     # `missing`, which the branch above returns on.
     solo_roster = len(principals) <= 1
-    if solo_roster and last is not None and last.channel and last.channel != plan[0]:
-        # It got through, but not on the first channel it tried: that one is
-        # broken, and every brief is going by the backup.
-        #
-        # Only claimable on a one-principal roster. `record_delivery_outcome`
-        # stores ONE channel for a fan-out with several recipients (the first
-        # success), so with co-principals the recorded channel may be the
-        # other founder's — comparing it to this row's `plan[0]` would call a
-        # working channel broken. Attributing it needs a per-recipient record;
-        # until then the inference is unsound and is not made.
-        first = CHANNEL_NAMES[plan[0]]
+    # It got through, but not on the first channel that recipient's plan
+    # tried: that one is broken, and every brief is going by the backup.
+    # Judged per recipient against their own plan now that the record carries
+    # one — with one stored channel for a fan-out this could only be compared
+    # to the lowest-id row's plan, so it was withheld on a co-principal
+    # roster rather than calling a working channel broken.
+    backup = backup_channel_problem(
+        last, principals, email_ready=snap.brief_email_ready, owner=principal
+    )
+    if backup is not None:
+        summary, broken = backup
         return _result(
             "brief",
             "warn",
-            f"Your last {brief_name(last.kind)} went {channel_phrase(last.channel)}, "
-            f"because {first} didn't work.",
-            f'See the "{LABELS[_DELIVERY_CHANNEL_CHECKS[plan[0]]]}" light on this page.',
+            summary,
+            f'See the "{LABELS[_DELIVERY_CHANNEL_CHECKS[broken]]}" light on this page.',
         )
     zone = ZoneInfo(snap.brief_zone or "UTC")
     times = [

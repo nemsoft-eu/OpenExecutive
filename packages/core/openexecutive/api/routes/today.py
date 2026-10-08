@@ -1963,15 +1963,14 @@ class BriefDeliveryNotice(BaseModel):
 
 def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     from openexecutive.briefing.brief_state import (
-        DELIVERY_PROBLEMS,
         brief_name,
-        current_problem,
         last_delivery_outcome,
-        partial_delivery_problem,
+        outstanding_problems,
+        render_problems,
     )
     from openexecutive.config import get_settings
     from openexecutive.people.store import active_principals
-    from openexecutive.scheduler.runner import email_ready, unreachable_principals
+    from openexecutive.scheduler.runner import email_ready
 
     # With the scheduler off no brief is coming; the Setup status page says so.
     if not get_settings().scheduler_enabled:
@@ -1983,22 +1982,19 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     # DM per active principal, so a co-principal with no channel misses every
     # one of them, and asking only about the lowest-id row would let the
     # other founder's working channel clear the recorded failure.
-    principals = active_principals()
-    unreachable = unreachable_principals(principals, email_ready=email_ready())
-    reason = current_problem(
-        last, has_owner=bool(principals), can_deliver=bool(principals) and not unreachable
+    #
+    # Several problems can stand at once — one founder's sends failing while
+    # another has nothing connected — so they are joined into the one sentence
+    # this response shape carries, rather than one of them being picked and
+    # the rest going unreported. Each clause names who it is about unless it
+    # covers every principal there is, in which case the second person
+    # ("send it to you") is honest for whoever is reading.
+    problems = outstanding_problems(
+        last, active_principals(), email_ready=email_ready()
     )
-    if reason is None:
+    if not problems:
         return None
-    problem, fix = DELIVERY_PROBLEMS[reason]
-    if reason == "no_channel" and len(unreachable) < len(principals):
-        # Someone on the roster CAN be reached, so "nothing is set up to send
-        # it to you" may well be false for whoever is reading; name who is
-        # missing out instead. This is the roster as it stands now, not a
-        # claim about the recorded run — `current_problem` judges `no_channel`
-        # from the present for exactly that reason, so a founder added since
-        # the run counts, and the fix named is the one still outstanding.
-        problem, fix = partial_delivery_problem([p.full_name for p in unreachable])
+    problem, fix = render_problems(problems)
     return BriefDeliveryNotice(
         brief=brief_name(last.kind),
         at=last.at.isoformat(),

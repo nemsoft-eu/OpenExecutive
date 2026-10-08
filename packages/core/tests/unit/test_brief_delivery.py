@@ -1,14 +1,18 @@
 """Where the daily brief went, and telling the owner when it went nowhere.
 
-  * Each brief's latest run is recorded: the reason, and the channel that
-    sent it (a name, never an address).
+  * Each brief's latest run is recorded ONE ENTRY PER RECIPIENT: who it was
+    for, how it went for them, and the channel that reached them (a name,
+    never an address). A row written before that shape existed holds a single
+    reason and channel and reads back as a legacy row.
   * The Setup status page's "Daily brief" light says when the briefs go out
-    and where, and turns amber or red when they can't.
+    and where, and turns amber or red when they can't — naming whom a problem
+    is about whenever the roster has someone it does not apply to.
   * ``GET /today/brief-delivery`` gives the owner, and only the owner, the
-    latest brief that didn't reach them, until its cause is fixed.
+    latest brief that didn't reach a principal, until its cause is fixed.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,7 +23,7 @@ from fastapi.testclient import TestClient
 
 from openexecutive.api.setup_checks import Snapshot, check_brief
 from openexecutive.briefing import brief_state, narrative_cache
-from openexecutive.briefing.brief_state import DeliveryOutcome
+from openexecutive.briefing.brief_state import DeliveryOutcome, RecipientOutcome
 from openexecutive.config import Settings
 from openexecutive.people.models import Person
 
@@ -60,26 +64,387 @@ def test_an_unreadable_record_is_ignored() -> None:
     assert brief_state.last_delivery_outcome() is None
 
 
+# ---------------------------------------------------------------------------
+# The record, per recipient
+# ---------------------------------------------------------------------------
+
+
+def _store(text: str, *, reason: str = "send_failed", kind: str = MORNING) -> None:
+    """Put a raw `narrative_text` under the delivery scope, as a writer of
+    another version (or a hand edit) would have left it."""
+    narrative_cache.put(narrative_cache.BriefingNarrative(
+        scope=f"{brief_state.DELIVERY_SCOPE_PREFIX}{kind}",
+        input_hash=reason,
+        narrative_text=text,
+        generated_at=narrative_cache.utc_now_iso(),
+    ))
+
+
+def test_each_recipient_is_recorded_and_read_back() -> None:
+    brief_state.record_delivery_outcome(
+        MORNING,
+        reason="send_failed",
+        channel=None,
+        recipients=[
+            RecipientOutcome(person_id=3, name="Ada", reason="delivered", channel="email"),
+            RecipientOutcome(person_id=7, name="Grace", reason="send_failed", channel=None),
+        ],
+    )
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    assert [(r.person_id, r.name, r.reason, r.channel) for r in outcome.recipients] == [
+        (3, "Ada", "delivered", "email"),
+        (7, "Grace", "send_failed", None),
+    ]
+    # No address anywhere in the stored row: channel NAMES only.
+    stored = narrative_cache.get(f"{brief_state.DELIVERY_SCOPE_PREFIX}{MORNING}")
+    assert stored is not None and "@" not in stored.narrative_text
+
+
+def test_a_legacy_row_reads_back_as_one_with_no_recipients() -> None:
+    """`None` recipients is what tells every reader the record cannot say who
+    a problem was about — the one case left where a reason is run-level by
+    ignorance rather than by nature."""
+    _store("email", reason="delivered")
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None
+    assert (outcome.reason, outcome.channel, outcome.recipients) == ("delivered", "email", None)
+
+
+def test_a_run_that_reached_nobody_is_not_a_legacy_row() -> None:
+    """An EMPTY list is a positive fact — this run had no recipients — and
+    must not be confused with a row that predates per-recipient outcomes."""
+    brief_state.record_delivery_outcome(
+        MORNING, reason="not_written", channel=None, recipients=[]
+    )
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients == ()
+
+
 @pytest.mark.parametrize(
-    ("recorded", "has_owner", "can_deliver", "problem"),
+    "text",
     [
-        ("delivered", False, False, None),
-        ("send_failed", True, True, "send_failed"),  # stays until the next brief
-        ("not_written", True, True, "not_written"),
-        ("no_channel", True, False, "no_channel"),  # still nowhere to send it
-        ("no_channel", True, True, None),  # fixed since: the next one will go
-        ("no_owner", True, True, None),
-        # A partial fix reports what is left: an owner now, but still no channel.
-        ("no_owner", True, False, "no_channel"),
-        ("no_channel", False, False, "no_owner"),
+        "{not json at all",
+        '{"channel": "email"}',  # no recipients key
+        '{"channel": "email", "recipients": "Ada"}',  # not a list
+        '{"channel": ["email"], "recipients": []}',  # channel of the wrong type
     ],
 )
-def test_current_problem(
-    recorded: str, has_owner: bool, can_deliver: bool, problem: str | None
+def test_a_malformed_payload_reads_as_unreadable_rather_than_raising(text: str) -> None:
+    """The reason in `input_hash` still stands, so it is reported run-level,
+    exactly as a legacy row's is. A truncated write must not take the Briefing
+    notice and the Setup light down with it."""
+    _store(text)
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None
+    assert (outcome.reason, outcome.channel, outcome.recipients) == ("send_failed", None, None)
+
+
+def test_one_unreadable_entry_does_not_discard_the_others() -> None:
+    """Dropping the whole list would hide the founders it could still name."""
+    _store(json.dumps({
+        "channel": None,
+        "recipients": [
+            {"person_id": 3, "name": "Ada", "reason": "not-a-reason", "channel": None},
+            {"person_id": 7, "name": "Grace", "reason": "send_failed", "channel": None},
+            "not even an object",
+        ],
+    }))
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    assert [r.name for r in outcome.recipients] == ["Grace"]
+
+
+def test_a_channel_the_app_does_not_know_is_not_rendered_back() -> None:
+    """`channel_phrase` puts it in a sentence a founder reads ("went on …"),
+    so only one of `CHANNEL_NAMES` comes back out."""
+    _store(json.dumps({
+        "channel": None,
+        "recipients": [
+            {"person_id": 3, "name": "Ada", "reason": "delivered", "channel": "carrier pigeon"},
+            {"person_id": 7, "name": "Grace", "reason": "delivered", "channel": "slack_dm"},
+        ],
+    }), reason="delivered")
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    assert [r.channel for r in outcome.recipients] == [None, "slack_dm"]
+
+
+def test_a_json_true_person_id_is_not_read_as_person_one() -> None:
+    """`isinstance(True, int)`, so an unguarded read would attribute the
+    problem to whoever has id 1."""
+    _store(json.dumps({
+        "channel": None,
+        "recipients": [{"person_id": True, "name": "", "reason": "send_failed", "channel": None}],
+    }))
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    assert outcome.recipients[0].person_id is None
+
+
+@pytest.mark.parametrize(
+    ("reasons", "channels", "expected"),
+    [
+        ([], [], ("no_owner", None)),  # no principal at all
+        (["delivered"], ["email"], ("delivered", "email")),
+        (["delivered", "delivered"], ["email", "email"], ("delivered", "email")),
+        # Two founders on two channels: no one channel is the run's.
+        (["delivered", "delivered"], ["email", "slack_dm"], ("delivered", None)),
+        # A run that also failed somewhere names no channel either.
+        (["delivered", "no_channel"], ["slack_dm", None], ("no_channel", None)),
+        # Worst-first by a FIXED severity, so roster order cannot decide it.
+        (["no_channel", "send_failed"], [None, None], ("send_failed", None)),
+        (["send_failed", "no_channel"], [None, None], ("send_failed", None)),
+    ],
+)
+def test_the_aggregate_summarises_the_fan_out_without_indexing_it(
+    reasons: list[str], channels: list[str | None], expected: tuple[str, str | None]
+) -> None:
+    recipients = [
+        RecipientOutcome(person_id=i, name=f"P{i}", reason=r, channel=c)  # type: ignore[arg-type]
+        for i, (r, c) in enumerate(zip(reasons, channels, strict=True))
+    ]
+    assert brief_state.delivery_summary(recipients) == expected
+
+
+def _reachable(name: str = "Ada", person_id: int = 3) -> Person:
+    """A principal email can carry a brief to (with `email_ready=True`)."""
+    return Person(
+        id=person_id, full_name=name, is_principal=True, email=f"{name.lower()}@acme.io"
+    )
+
+
+def _unreachable(name: str = "Grace", person_id: int = 7) -> Person:
+    """A principal with nothing connected at all."""
+    return Person(id=person_id, full_name=name, is_principal=True)
+
+
+@pytest.mark.parametrize(
+    ("recorded", "roster", "email_ready", "expected"),
+    [
+        # A legacy row (no per-recipient list) reports its reason run-level.
+        ("delivered", [_reachable()], True, []),
+        ("send_failed", [_reachable()], True, [("send_failed", ())]),
+        ("not_written", [_reachable()], True, [("not_written", ())]),
+        # Nowhere to send it is judged from NOW, never from the record: still
+        # nowhere, then fixed since so the next one will go.
+        ("no_channel", [_unreachable()], True, [("no_channel", ())]),
+        ("no_channel", [_reachable()], True, []),
+        ("no_owner", [_reachable()], True, []),
+        # A partial fix reports what is left: an owner now, still no channel.
+        ("no_owner", [_unreachable()], True, [("no_channel", ())]),
+        ("no_channel", [], True, [("no_owner", ())]),
+        # Nobody left on the roster after a delivered run: that brief went
+        # out, and the next one records `no_owner` itself.
+        ("delivered", [], True, []),
+    ],
+)
+def test_outstanding_problems_from_a_legacy_record(
+    recorded: str,
+    roster: list[Person],
+    email_ready: bool,
+    expected: list[tuple[str, tuple[str, ...]]],
 ) -> None:
     outcome = DeliveryOutcome(MORNING, recorded, None, NOW)  # type: ignore[arg-type]
-    assert brief_state.current_problem(outcome, has_owner=has_owner, can_deliver=can_deliver) == problem
-    assert brief_state.current_problem(None, has_owner=has_owner, can_deliver=can_deliver) is None
+    assert outcome.recipients is None  # the pre-per-recipient shape
+    assert brief_state.outstanding_problems(
+        outcome, roster, email_ready=email_ready
+    ) == expected
+
+
+def test_outstanding_problems_with_no_record_still_asks_the_roster() -> None:
+    """`no_channel` needs no record — it is a fact about the present — so the
+    Setup light reports an unreachable founder before any brief has run."""
+    roster = [_reachable(), _unreachable()]
+    assert brief_state.outstanding_problems(None, roster, email_ready=True) == [
+        ("no_channel", ("Grace",))
+    ]
+    assert brief_state.outstanding_problems(None, [_reachable()], email_ready=True) == []
+
+
+def _recorded(
+    *entries: tuple[int, str, str, str | None] | tuple[int, str, str, str | None, str | None],
+    reason: str = "send_failed",
+) -> DeliveryOutcome:
+    """A per-recipient record from ``(person_id, name, reason, channel)``, with
+    an optional fifth element for the channel the run tried first."""
+    return DeliveryOutcome(
+        MORNING,
+        reason,  # type: ignore[arg-type]
+        None,
+        NOW,
+        recipients=tuple(
+            RecipientOutcome(
+                person_id=e[0], name=e[1], reason=e[2], channel=e[3],  # type: ignore[arg-type]
+                first_tried=e[4] if len(e) > 4 else None,  # type: ignore[misc]
+            )
+            for e in entries
+        ),
+    )
+
+
+def test_a_failed_send_names_the_founder_it_was_about() -> None:
+    """The failure this whole change is for. The owner's channel works and the
+    co-founder's Slack is broken, so the owner used to read "Your last morning
+    brief wasn't sent: every way of sending it failed" every day about a brief
+    she is holding. A daily false red on the surface two founders read is how
+    the real failure eventually gets ignored."""
+    roster = [_reachable("Ada", 3), _reachable("Grace", 7)]
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email"), (7, "Grace", "send_failed", None)
+    )
+    assert brief_state.outstanding_problems(outcome, roster, email_ready=True) == [
+        ("send_failed", ("Grace",))
+    ]
+    problem, fix = brief_state.render_problems(
+        brief_state.outstanding_problems(outcome, roster, email_ready=True)
+    )
+    assert problem == "every way of sending it to Grace failed"
+    assert fix == "The Setup status page shows which of their connections needs attention."
+
+
+def test_both_founders_failing_names_neither_because_it_is_about_everyone() -> None:
+    """An empty name tuple is what makes `DELIVERY_PROBLEMS`' second person
+    honest: with nobody left out, "every way of sending it failed" is true for
+    whoever is reading."""
+    roster = [_reachable("Ada", 3), _reachable("Grace", 7)]
+    outcome = _recorded(
+        (3, "Ada", "send_failed", None), (7, "Grace", "send_failed", None)
+    )
+    assert brief_state.outstanding_problems(outcome, roster, email_ready=True) == [
+        ("send_failed", ())
+    ]
+
+
+def test_two_different_failures_in_one_run_are_both_reported() -> None:
+    """`failed[0]` made person id decide which of these anyone could see, and
+    the other was rendered nowhere. Ada has no channel; Grace's sends all
+    fail."""
+    ada, grace = _unreachable("Ada", 3), _reachable("Grace", 7)
+    outcome = _recorded((3, "Ada", "no_channel", None), (7, "Grace", "send_failed", None))
+    assert brief_state.outstanding_problems(outcome, [ada, grace], email_ready=True) == [
+        ("send_failed", ("Grace",)),
+        ("no_channel", ("Ada",)),
+    ]
+    problem, fix = brief_state.render_problems(
+        brief_state.outstanding_problems(outcome, [ada, grace], email_ready=True)
+    )
+    assert problem == (
+        "every way of sending it to Grace failed; nothing is set up to send it to Ada"
+    )
+    # Both instructions, in order, neither swallowing the other.
+    assert fix.startswith("The Setup status page shows which of their connections")
+    assert "Connect Gmail" in fix
+
+
+def test_the_same_recipient_listed_twice_is_named_once() -> None:
+    """Not reachable through `record_delivery_outcome`, but a duplicate would
+    read as "Ada and Ada" and — worse — push the count to the roster's, which
+    `_names_unless_all` reads as "this is about everyone", putting the second
+    person back on a problem that is about one founder."""
+    ada, grace = _reachable("Ada", 3), _reachable("Grace", 7)
+    outcome = _recorded(
+        (3, "Ada", "send_failed", None),
+        (3, "Ada", "send_failed", None),
+        (7, "Grace", "delivered", "email"),
+    )
+    assert brief_state.outstanding_problems(
+        outcome, [ada, grace], email_ready=True
+    ) == [("send_failed", ("Ada",))]
+
+
+def test_a_failure_the_record_cannot_attribute_is_reported_run_level() -> None:
+    """The mirror of the test below, and the one that could have gone silent.
+    A recipient with no person id is a failure the record ASSERTS and cannot
+    attribute — unlike one whose id has left the roster, which is genuinely
+    nothing to report. Dropping it would have taken the whole problem with it:
+    the red light goes green on a run the record says failed."""
+    ada = _reachable("Ada", 3)
+    outcome = DeliveryOutcome(
+        MORNING, "send_failed", None, NOW,
+        recipients=(
+            RecipientOutcome(person_id=None, name="Grace", reason="send_failed", channel=None),
+        ),
+    )
+    # Run-level, not named: with nobody identified we cannot claim it is only
+    # some of them, so the conservative reading stands.
+    assert brief_state.outstanding_problems(outcome, [ada], email_ready=True) == [
+        ("send_failed", ())
+    ]
+
+
+def test_an_unattributable_failure_does_not_shrink_a_named_list() -> None:
+    """Naming Ada while an unidentified recipient also failed would tell the
+    reader everyone else is fine — the same silent shortening `_and_list`
+    exists to prevent, one layer up."""
+    ada, grace = _reachable("Ada", 3), _reachable("Grace", 7)
+    outcome = DeliveryOutcome(
+        MORNING, "send_failed", None, NOW,
+        recipients=(
+            RecipientOutcome(person_id=3, name="Ada", reason="send_failed", channel=None),
+            RecipientOutcome(person_id=None, name="?", reason="send_failed", channel=None),
+        ),
+    )
+    assert brief_state.outstanding_problems(
+        outcome, [ada, grace], email_ready=True
+    ) == [("send_failed", ())]
+
+
+def test_a_recipient_archived_since_the_run_is_dropped() -> None:
+    """The same intersection `deliver_to_each_principal` makes when it sends,
+    so the record and the fan-out cannot disagree about who a recipient is."""
+    ada = _reachable("Ada", 3)
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email"), (7, "Grace", "send_failed", None)
+    )
+    assert brief_state.outstanding_problems(outcome, [ada], email_ready=True) == []
+
+
+def test_a_founder_added_since_the_run_is_still_named_by_the_roster() -> None:
+    """Nothing is claimed about them from a run they were not in, but
+    `no_channel` is judged from NOW, so their missing channel counts."""
+    ada, lin = _reachable("Ada", 3), _unreachable("Lin", 9)
+    outcome = _recorded((3, "Ada", "delivered", "email"), reason="delivered")
+    assert brief_state.outstanding_problems(outcome, [ada, lin], email_ready=True) == [
+        ("no_channel", ("Lin",))
+    ]
+
+
+def test_a_nameless_recipient_is_described_in_place() -> None:
+    """Never dropped — telling a founder about one unreached co-principal when
+    there are two is the same silent omission this surface exists to prevent —
+    and never given its id, which is not something to show a reader."""
+    ada = _reachable("Ada", 3)
+    nameless = Person(id=7, full_name="", is_principal=True, email="g@acme.io")
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email"), (7, "", "send_failed", None)
+    )
+    problems = brief_state.outstanding_problems(outcome, [ada, nameless], email_ready=True)
+    assert problems == [("send_failed", ("",))]
+    problem, _ = brief_state.render_problems(problems)
+    assert problem == "every way of sending it to someone on the People list failed"
+
+
+def test_a_run_whose_delivery_raised_is_reported_run_level() -> None:
+    """The exception path records `send_failed` with an EMPTY recipient list:
+    it raised before any recipient had an outcome, so there is nobody to
+    attribute it to and the reason is the run's."""
+    roster = [_reachable("Ada", 3), _reachable("Grace", 7)]
+    outcome = DeliveryOutcome(MORNING, "send_failed", None, NOW, recipients=())
+    assert brief_state.outstanding_problems(outcome, roster, email_ready=True) == [
+        ("send_failed", ())
+    ]
+
+
+def test_not_written_stays_run_level_even_with_a_recipient_list() -> None:
+    """The artifact did not exist for anyone, so it is legitimately
+    single-valued."""
+    roster = [_reachable("Ada", 3), _unreachable("Grace", 7)]
+    outcome = DeliveryOutcome(MORNING, "not_written", None, NOW, recipients=())
+    assert brief_state.outstanding_problems(outcome, roster, email_ready=True) == [
+        ("not_written", ()),
+        ("no_channel", ("Grace",)),
+    ]
 
 
 def test_brief_names_come_from_the_scheduler_labels() -> None:
@@ -350,11 +715,20 @@ def test_the_light_names_every_unreached_co_principal() -> None:
 
 
 def test_a_failed_send_still_outranks_an_unreachable_co_principal() -> None:
+    """Red outranks amber for the light's COLOUR. It no longer outranks it for
+    the summary: both clauses are rendered, because dropping one for want of
+    room is how a founder's recurring problem stayed invisible behind the
+    other's."""
     people = _co_principals()
     failed = DeliveryOutcome(MORNING, "send_failed", None, NOW)
     check = check_brief(_snap(people=people, principal=people[0], brief_delivery=failed))
     assert check.state == "error"
-    assert check.summary == "Your last morning brief wasn't sent: every way of sending it failed."
+    # The record is a legacy one, so the failure is run-wide ("Your last") and
+    # only Grace's missing channel can be attributed.
+    assert check.summary == (
+        "Your last morning brief wasn't sent: every way of sending it failed; "
+        "nothing is set up to send it to Grace."
+    )
 
 
 def test_an_unreachable_first_founder_is_named_while_the_brief_still_goes_out() -> None:
@@ -440,6 +814,158 @@ def test_a_reachable_roster_leaves_the_light_green() -> None:
         Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7"),
     ]
     assert check_brief(_snap(people=people, principal=people[0])).state == "ok"
+
+
+def test_the_light_names_the_founder_whose_send_failed_and_not_the_reader() -> None:
+    """Red, because a send that failed is red — but about Grace, not "your
+    last brief". Ada is holding the brief it says wasn't sent."""
+    ada, grace = _reachable("Ada", 3), _reachable("Grace", 7)
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email"), (7, "Grace", "send_failed", None)
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "error"
+    assert check.summary == (
+        "The last morning brief didn't reach everyone: "
+        "every way of sending it to Grace failed."
+    )
+    # Not addressed to the reader at all. ("you" alone would also match
+    # "your", so it is no control; these are the phrasings that were wrong.)
+    assert "Your last" not in check.summary
+    assert "to you" not in check.summary
+
+
+def test_the_notice_names_the_founder_whose_send_failed(notice_client: Any) -> None:
+    client, state = notice_client
+    state["principals"] = [_reachable("Ada", 3), _reachable("Grace", 7)]
+    state["email_ready"] = True
+    brief_state.record_delivery_outcome(
+        MORNING,
+        reason="send_failed",
+        channel=None,
+        recipients=[
+            RecipientOutcome(person_id=3, name="Ada", reason="delivered", channel="email"),
+            RecipientOutcome(person_id=7, name="Grace", reason="send_failed", channel=None),
+        ],
+    )
+    body = client.get("/today/brief-delivery").json()
+    assert body["problem"] == "every way of sending it to Grace failed"
+    assert body["readable"] is True
+    assert "@" not in str(body)
+
+
+def test_the_light_reports_two_different_failures_at_once() -> None:
+    """Neither clause is dropped for want of room: that is how Grace's
+    recurring send failure stayed invisible behind Ada's missing channel."""
+    ada, grace = _unreachable("Ada", 3), _reachable("Grace", 7)
+    outcome = _recorded((3, "Ada", "no_channel", None), (7, "Grace", "send_failed", None))
+    check = check_brief(_snap(people=[ada, grace], principal=grace, brief_delivery=outcome))
+    assert check.state == "error"
+    assert check.summary == (
+        "The last morning brief didn't reach everyone: "
+        "every way of sending it to Grace failed; nothing is set up to send it to Ada."
+    )
+
+
+def test_a_backup_channel_is_named_per_recipient_on_a_co_principal_roster() -> None:
+    """Withheld until the record carried a recipient AND the channel that
+    recipient's run tried first: one stored channel could only be compared
+    against the lowest-id row's plan, which called a working channel broken
+    whenever the record was the other founder's."""
+    ada = Person(
+        id=3, full_name="Ada", is_principal=True, email="ada@acme.io",
+        preferred_channel="slack", slack_user_id="U3",
+    )
+    grace = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    # Ada's run tried Slack and email carried it; Grace's own Slack worked.
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email", "slack_dm"),
+        (7, "Grace", "delivered", "slack_dm", "slack_dm"),
+        reason="delivered",
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "warn"
+    assert check.summary == (
+        "Slack didn't work for Ada, so the last morning brief reached them "
+        "on a backup channel."
+    )
+    assert check.fix == 'See the "Slack" light on this page.'
+
+
+def test_a_working_channel_is_never_called_broken_on_a_co_principal_roster() -> None:
+    """The unsound inference the warning was withheld for. Grace was reached
+    on her own first channel; the fact that Ada's plan starts elsewhere says
+    nothing about it."""
+    ada = Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io")
+    grace = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email", "email"),
+        (7, "Grace", "delivered", "slack_dm", "slack_dm"),
+        reason="delivered",
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "ok"
+    assert "didn't work" not in check.summary
+
+
+def test_a_channel_connected_after_the_run_is_not_called_broken() -> None:
+    """Why the attempted channel is STORED rather than recomputed. Ada's plan
+    now starts at Slack, but the run that was recorded tried email and email
+    sent it — Slack was never offered. Comparing against the plan as it stands
+    would announce "Slack didn't work for Ada" about a channel nothing has
+    ever tried, and point the founder at a light that is working."""
+    ada = Person(
+        id=3, full_name="Ada", is_principal=True, email="ada@acme.io",
+        preferred_channel="slack", slack_user_id="U3",  # connected since the run
+    )
+    grace = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email", "email"),
+        (7, "Grace", "delivered", "slack_dm", "slack_dm"),
+        reason="delivered",
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "ok"
+    assert "didn't work" not in check.summary
+
+
+def test_a_record_with_no_attempted_channel_claims_nothing() -> None:
+    """Nothing to compare, so no claim — never a guess from the plan now."""
+    ada = Person(
+        id=3, full_name="Ada", is_principal=True, email="ada@acme.io",
+        preferred_channel="slack", slack_user_id="U3",
+    )
+    grace = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email"),  # no first_tried
+        (7, "Grace", "delivered", "slack_dm"),
+        reason="delivered",
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "ok"
+
+
+def test_two_different_broken_first_channels_make_no_single_claim() -> None:
+    """A known gap, pinned so it is a decision rather than a surprise: the
+    summary is one line and its fix points at ONE light, and there is no
+    honest way to name two broken channels in it. Both founders here were
+    reached on a backup, and the light is still green."""
+    ada = Person(
+        id=3, full_name="Ada", is_principal=True, email="ada@acme.io",
+        preferred_channel="slack", slack_user_id="U3",
+    )
+    grace = Person(
+        id=7, full_name="Grace", is_principal=True, email="grace@acme.io",
+        preferred_channel="telegram", telegram_chat_id="77",
+    )
+    outcome = _recorded(
+        (3, "Ada", "delivered", "email", "slack_dm"),
+        (7, "Grace", "delivered", "email", "telegram"),
+        reason="delivered",
+    )
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=outcome))
+    assert check.state == "ok"
+    assert "didn't work" not in check.summary
 
 
 @pytest.mark.parametrize(
