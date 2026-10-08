@@ -2390,6 +2390,46 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             or "(no artifact)",
         )
 
+        # A private artifact belongs to ONE person, and which person is decided
+        # by `find_principal_person()` at each private reader's own read time —
+        # not by the recipient pinned before the run. So the SUBJECT can drift
+        # during the minutes generation takes: restore or re-promote a
+        # lower-id principal mid-run and the notes, chat titles and calendar
+        # read into the brief become theirs, while the pinned recipient is
+        # still someone else. Both later gates pass that through, because each
+        # asks whether the RECIPIENT is a principal, and neither asks whether
+        # the CONTENT is still about them.
+        #
+        # So re-assert the premise rather than the audience: a private run may
+        # only be sent while the roster still holds exactly its recipient, and
+        # while that recipient is still who the private readers resolve to.
+        # Withheld rather than downgraded to a shared send — the artifact was
+        # already generated with private content in it.
+        if artifact and private_to_principal:
+            owner = people_store.find_principal_person()
+            pinned = [p.id for p in recipients]
+            # Only the OWNER is checked, not the whole roster. A principal
+            # ADDED mid-run has a higher id, so `find_principal_person()` still
+            # resolves to the pinned recipient and the content is still theirs
+            # — withholding there would refuse a correct brief (two existing
+            # tests cover exactly that case). A recipient who has gone away is
+            # a different concern, handled at the send by `_live_principal`.
+            #
+            # `not pinned` cannot arise from `private_run` (which requires
+            # exactly one), but `private_to_principal` comes off a workflow
+            # event, so it is not this function's invariant to trust.
+            # Only a DRIFT to a different person is withheld here. "No owner
+            # at all" is not drift: the recipient has gone away, the fan-out
+            # returns empty and the caller records `no_owner`, which describes
+            # it better than `not_written` would — the brief was written.
+            if pinned and owner is not None and owner.id != pinned[0]:
+                logger.warning(
+                    "scheduler: %s withheld — a private run's subject is no "
+                    "longer its recipient (pinned %s, owner now %s)",
+                    kind, pinned, owner.id,
+                )
+                artifact = ""
+
         if not artifact:
             # `recipients=[]`, not omitted: this run is KNOWN to have reached
             # nobody, which is a different fact from a record that predates

@@ -223,6 +223,7 @@ def _run_brief(
     deliver: object | None = None,
     deliver_person: object | None = None,
     principals: int = 1,
+    seed: object | None = None,
 ) -> list[tuple[int, str]]:
     """Run one morning brief against isolated DBs; returns the recorded sends
     as ``(person_id, text)``, in the order the fan-out made them.
@@ -252,6 +253,13 @@ def _run_brief(
         people_store.upsert_person(
             full_name=f"Founder {n}", is_principal=True, slack_user_id=f"U{n}"
         )
+    if seed is not None:
+        # Runs after the people DB is isolated and before the action is
+        # pinned, for a roster shape the sequential seeding above cannot make
+        # (e.g. an archived LOWER-id principal, so the sole active one is not
+        # the row `find_principal_person()` would pick once it is restored).
+        seed()
+        people_registry.invalidate()
     monkeypatch.setitem(
         WORKFLOW_REGISTRY, "morning_brief", workflow or _fake_brief_workflow("fp-123")
     )
@@ -1450,6 +1458,72 @@ def test_a_founder_added_while_the_brief_runs_does_not_get_the_private_one(
     principals = people_store.active_principals()
     assert [p.full_name for p in principals] == ["Founder 0", "Latecomer"]  # write landed
     assert sends == [(principals[0].id, "PRIVATE BRIEF")]  # only the original
+
+
+def test_a_private_brief_is_withheld_when_its_subject_drifts_mid_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The content-side twin of the stale-recipient bug, and the one the
+    egress gate cannot see.
+
+    A private artifact belongs to whoever `find_principal_person()` resolves
+    to at each private reader's own read time — not to the recipient pinned
+    before the run. Un-archive a LOWER-id principal during generation and the
+    notes, chat titles and calendar read into the brief become theirs, while
+    the pinned recipient is still someone else. Both later gates pass it:
+    each asks whether the recipient is a principal, never whether the content
+    is still about them. So the premise is re-asserted after generation and
+    the brief is withheld, not downgraded to a shared send — it already has
+    one person's private data in it."""
+    from openexecutive.briefing import brief_state
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import MorningBriefInput, MorningBriefWorkflow
+
+    def _seed() -> None:
+        # Drift needs the pinned recipient NOT to be the lowest id, since the
+        # owner is the lowest-id active principal. So: an ordinary team member
+        # at the lower id, and the sole principal above them.
+        people_store.upsert_person(full_name="Teammate", slack_user_id="UT")
+        people_store.upsert_person(
+            full_name="Sitting", is_principal=True, slack_user_id="USITTING"
+        )
+
+    class _SubjectDrifts(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            # The lower-id teammate is promoted mid-generation — the shape an
+            # onboarding re-run produces, which rewrites `is_principal` on a
+            # name-matched row. (There is no un-archive path in the store at
+            # all, so promotion is the reachable way to move the owner.)
+            mate = next(
+                p for p in people_store.list_people() if p.full_name == "Teammate"
+            )
+            people_store.upsert_person(
+                full_name="Teammate", is_principal=True, slack_user_id="UT",
+                person_id=mate.id,
+            )
+            # From here `find_principal_person()` resolves to Teammate, so the
+            # private readers would put THEIR notes, chats and calendar into a
+            # brief pinned to Sitting.
+            owner = people_store.find_principal_person()
+            assert owner is not None and owner.full_name == "Teammate"
+            yield WorkflowEvent(type="result", data={
+                "brief_fingerprint": "fp-123", "private_to_principal": True,
+            })
+            yield WorkflowEvent(type="artifact", content="PRIVATE BRIEF")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    sends = _run_brief(
+        tmp_path, monkeypatch, workflow=_SubjectDrifts(), principals=0, seed=_seed
+    )
+
+    assert sends == []  # nothing delivered at all
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.reason == "not_written"
+    # The window must not advance on a brief nobody received.
+    assert brief_state.last_delivered("principal_brief_morning") is None
 
 
 def test_no_principal_at_all_is_recorded_as_no_owner(
