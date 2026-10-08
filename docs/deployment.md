@@ -332,8 +332,40 @@ host's Docker. Upgrade from the host instead.
    ```
 
    Never run `docker compose down -v` to upgrade: `-v` deletes the volume.
-4. **Check it came back.** `curl -s http://localhost:8000/health` reports the
-   new `version`, and Settings → About shows it.
+4. **Check it came back — and that it is actually the new code.**
+
+   ```bash
+   python3 scripts/verify-deploy.py          # add --engine docker for Docker
+   ```
+
+   This is the step to not skip. `curl -s http://localhost:8000/health`
+   returning 200 does **not** prove the upgrade took: it answers with the
+   configured company name whatever code is behind it, and the `version` it
+   reports is a static string that does not move between commits, so it reads
+   identically for a current deployment and a stale one. Settings → About
+   reads the same string.
+
+   Two mirror-image failures both leave a healthy-looking stack and both exit
+   0 under `podman-compose`, which is why they need an explicit assertion:
+
+   - **built but not recreated** — a new image exists while the container
+     still runs the old one;
+   - **recreated but not built** — the container runs the tagged image, but
+     that image predates the commit it is meant to contain. This happens when
+     step 3's `git pull` is skipped: the build then rebuilds the *same* old
+     source and succeeds.
+
+   The second one went unnoticed on this install for 17 days and 253 commits.
+   Health was green the whole time while the standing briefs ran two-week-old
+   code — and because the briefs' delivery failure is itself silent, nothing
+   surfaced it. `verify-deploy.py` compares the container's image id against
+   the tag, and the image's build time against `HEAD`, and exits non-zero with
+   the reason. An engine or git error exits 2 rather than passing.
+
+   Then confirm the behaviour you upgraded for, not just the process: for a
+   scheduler change, `GET /scheduled?status=pending` should list the expected
+   rows, and a route added by the release should return 200 where it
+   previously 404'd.
 
 To go back, see **Rollback** under [Operations](#operations).
 
