@@ -403,8 +403,16 @@ def test_delivery_to_a_person_skips_a_group_telegram_chat(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(runner, "_send_on_plan", _send)
     monkeypatch.setattr(runner, "email_ready", lambda: False)
-    group = Person(id=5, full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5")
-    private = Person(id=6, full_name="Ann", telegram_chat_id="4242")
+    # Seeded rather than built in memory: `deliver_to_person` re-reads the row
+    # by id immediately before sending, so a Person with no row behind it is
+    # treated as offboarded and never sent to. Every production caller gets
+    # its Person from this store, so seeding is the realistic shape.
+    group_id = people_store.upsert_person(
+        full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5"
+    )
+    private_id = people_store.upsert_person(full_name="Ann", telegram_chat_id="4242")
+    group = Person(id=group_id, full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5")
+    private = Person(id=private_id, full_name="Ann", telegram_chat_id="4242")
     asyncio.run(runner.deliver_to_person(group, "hi"))
     asyncio.run(runner.deliver_to_person(private, "hi"))
     assert plans == [["slack_dm"], ["telegram"]]

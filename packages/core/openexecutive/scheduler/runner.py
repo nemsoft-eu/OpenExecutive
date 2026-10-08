@@ -1972,6 +1972,11 @@ async def deliver_to_each_principal(
         # Intersect on id and take the LIVE row: see the docstring. A pinned
         # row with no id cannot be revalidated, and cannot have come from
         # `active_principals()` either, so it is dropped rather than trusted.
+        #
+        # This is an early filter, not the guarantee: the loop below awaits a
+        # network send per recipient, so by the time a later one is reached
+        # this snapshot is already stale. `deliver_to_person` re-reads each
+        # row immediately before its own send, which is what actually holds.
         by_id = {p.id: p for p in live if p.id is not None}
         recipients = [by_id[p.id] for p in recipients if p.id is not None and p.id in by_id]
     return [(p, await deliver_to_person(p, text, label=label)) for p in recipients]
@@ -1980,7 +1985,31 @@ async def deliver_to_each_principal(
 async def deliver_to_person(person: Person, text: str, *, label: str = "Update") -> PrincipalDelivery:
     """Send ``text`` to ``person`` alone, the way the briefs reach the
     principal: their own Slack or Discord DM, their Telegram chat, or email
-    to their own address (``delivery_order``, which skips a Telegram group)."""
+    to their own address (``delivery_order``, which skips a Telegram group).
+
+    Re-reads the row here, immediately before sending, rather than trusting
+    the caller's. Every caller reads the roster and then awaits at least one
+    network send, so a fan-out sends to its second recipient only after the
+    first one's channel call has returned: a person archived or an id
+    reassigned inside that window would otherwise be DM'd from the stale
+    row. Doing it at the caller is what the two earlier fixes here tried;
+    this is the same guarantee one level down, where no caller can skip it.
+
+    Nothing downstream catches it either. ``handle_send_discord_dm`` and
+    ``handle_send_telegram_message`` both run ``_dm_recipient_on_roster``,
+    but ``handle_send_slack_dm`` consults the roster only when
+    ``turn_is_private_to_principal()``, a per-TURN flag the email poller
+    sets and the scheduler never does.
+    """
+    from openexecutive.people import store as people_store
+
+    if person.id is not None:
+        fresh = people_store.get_person(person.id)
+        if fresh is None or fresh.archived:
+            return PrincipalDelivery(
+                False, f"person {person.id} is no longer on the roster", "no_owner"
+            )
+        person = fresh
     return await _send_on_plan(person, delivery_order(person, email_ready=email_ready()), text, label=label)
 
 

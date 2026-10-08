@@ -771,6 +771,76 @@ def test_each_principal_is_dmed_on_their_own_channel(sent: _Sent) -> None:
     ]
 
 
+def test_a_founder_offboarded_mid_fan_out_is_not_sent_to(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fan-out awaits one network send per recipient, so the roster read
+    before the loop is already stale by the time a later founder is reached.
+    Archiving Nick while Maarten's Slack call is in flight must stop Nick's
+    send — `handle_send_slack_dm` has no unconditional roster check of its
+    own, so nothing downstream would catch it."""
+    import asyncio
+
+    from openexecutive.orchestrator import schedule_tools
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Maarten", is_principal=True, slack_user_id="UMAARTEN")
+    nick = people_store.upsert_person(
+        full_name="Nick", is_principal=True, slack_user_id="UNICK"
+    )
+
+    import json
+
+    async def _send_then_offboard_nick(args: dict) -> str:  # type: ignore[type-arg]
+        sent.calls.append(("slack", args))
+        # Nick is archived DURING Maarten's send, which is exactly the window
+        # the pre-loop snapshot cannot see.
+        if args["user_id"] == "UMAARTEN":
+            people_store.archive_person(nick)
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(schedule_tools, "handle_send_slack_dm", _send_then_offboard_nick)
+
+    results = asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
+
+    assert [args["user_id"] for _, args in sent.calls] == ["UMAARTEN"]  # never UNICK
+    by_name = {p.full_name: d for p, d in results}
+    assert by_name["Maarten"].ok
+    assert (by_name["Nick"].ok, by_name["Nick"].reason) == (False, "no_owner")
+
+
+def test_a_reassigned_slack_id_is_read_fresh_at_send_time(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the row survives but its channel id changed inside the
+    window. The send must use the id the roster holds now, not the snapshot's,
+    or the brief goes to whoever was given the old handle."""
+    import asyncio
+    import json
+
+    from openexecutive.orchestrator import schedule_tools
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Maarten", is_principal=True, slack_user_id="UMAARTEN")
+    nick = people_store.upsert_person(
+        full_name="Nick", is_principal=True, slack_user_id="UOLD"
+    )
+
+    async def _send_then_rotate_nicks_id(args: dict) -> str:  # type: ignore[type-arg]
+        sent.calls.append(("slack", args))
+        if args["user_id"] == "UMAARTEN":
+            people_store.upsert_person(
+                full_name="Nick", is_principal=True, slack_user_id="UNEW", person_id=nick
+            )
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(schedule_tools, "handle_send_slack_dm", _send_then_rotate_nicks_id)
+
+    asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
+
+    assert [args["user_id"] for _, args in sent.calls] == ["UMAARTEN", "UNEW"]
+
+
 def test_an_archived_principal_gets_no_brief(sent: _Sent) -> None:
     """Off-boarding a founder has to stop the standing report too — otherwise
     it keeps DMing someone who no longer runs the company."""
