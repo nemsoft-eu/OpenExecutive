@@ -201,8 +201,10 @@ class WeeklyReviewWorkflow(Workflow):
         # scheduler fans this review out to every active principal, so with
         # co-principals it would hand one founder the other's own commitments
         # and the asks their contacts made of them. Left out rather than
-        # mis-attributed; the morning brief gates its solo sections the same
-        # way (`morning_brief._private_ok`).
+        # mis-attributed; the morning brief gates every owner-keyed read the
+        # same way (`morning_brief.own_private_ok`, which is this roster check
+        # plus `_private_ok()` — this workflow has no PRINCIPAL_DELIVERY
+        # concept, so the roster check is the whole gate here).
         due = (
             principal_due_soon(within_days=7, limit=_MAX_LISTED, now=now)
             if len(active_principals()) <= 1

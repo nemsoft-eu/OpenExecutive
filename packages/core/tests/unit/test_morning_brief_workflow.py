@@ -601,3 +601,83 @@ async def test_a_co_principal_running_the_brief_sees_no_private_solo_sections(
         morning_brief.PRINCIPAL_DELIVERY.reset(token)
 
     assert due_calls == []  # not read at all, so it cannot be mis-attributed
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_reader_gets_no_owner_keyed_live_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same gate, three lines further down, for the reads the test above
+    does not cover.
+
+    `refresh_calendar` resolves `find_principal_person()` and asks for THAT
+    person's `calendar_id` (`top_three.read_todays_calendar`), and
+    `gather_live_signals(include_private=True)` hands back the same person's
+    chat titles (`live_signals._conversations`) plus an install-wide draft
+    count keyed to nobody (`live_signals._drafts`). Neither takes a recipient,
+    so both were gated on `_private_ok()` alone while the solo block above
+    them also asked the roster — and a co-principal running the brief from
+    their own DM therefore received the lowest-id founder's day.
+
+    The sibling test above stubs `build_top_three` and `principal_due_soon`;
+    the autouse fixture stubs `refresh_calendar` to None. So nothing asserted
+    on these reads, and the leak sat one gate away from the one that was
+    fixed.
+    """
+    from openexecutive.briefing import live_signals
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    conversation_reads: list[object] = []
+    monkeypatch.setattr(
+        live_signals,
+        "_conversations",
+        lambda since, tz: conversation_reads.append(since) or ([], []),
+    )
+    calendar_reads: list[object] = []
+
+    async def _calendar(now: object = None, **kw: object) -> None:
+        calendar_reads.append(now)
+        return None
+
+    monkeypatch.setattr(live_signals, "refresh_calendar", _calendar)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert conversation_reads == []
+    assert calendar_reads == []
+
+    # Control: a sole principal is the one reader these reads are about, and
+    # still gets them — otherwise this test would pass on a brief that simply
+    # never reads a calendar.
+    people_store.archive_person(
+        next(p.id for p in people_store.active_principals() if p.full_name == "Grace")
+    )
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert len(conversation_reads) == 1
+    assert len(calendar_reads) == 1

@@ -74,6 +74,14 @@ BRIEF_KIND = "principal_brief_morning"
 # (``memory.history_brief``).
 # A run anyone else starts (a teammate in chat, the workflow API) reads what
 # everyone may see, as before.
+# This flag answers "may this READER see principal-private data" and nothing
+# more. Whether the data is actually the reader's is a separate question, and
+# the roster is what answers it (`own_private_ok` in `run`): most of the
+# private reads resolve `find_principal_person()` rather than taking a
+# recipient, so on a co-founded roster the reader and the subject can differ.
+# The exception, deliberate and explained at that gate, is the private-alert
+# rows from `_build_today`, which `GET /today` already serves to any principal
+# under the same predicate.
 PRINCIPAL_DELIVERY: ContextVar[bool] = ContextVar("morning_brief_principal_delivery", default=False)
 
 
@@ -199,18 +207,36 @@ class MorningBriefWorkflow(Workflow):
             logger.exception("morning_brief: /today aggregation failed")
             today_data = {"departments": [], "people": [], "proposals": []}
         top_three_calendar = False
-        # Both reads below are keyed to `find_principal_person()` — the
-        # lowest-id row — and neither takes a recipient, so they are only safe
-        # when that row is the only principal there is. Two conditions, and
-        # neither implies the other: `private_ok` says this READER may see
-        # principal-private data (the scheduler's own delivery, or a principal
-        # on a verified private surface), while the roster check says the data
-        # is actually THEIRS. A co-principal running the brief from their own
-        # DM passes `private_ok` and would otherwise be handed the other
-        # founder's commitments and calendar titles; the scheduler's shared
-        # fan-out passes neither. Same predicate as the weekly review's
-        # commitments step.
-        if mode == "solo" and private_ok and len(active_principals()) <= 1:
+        # Reads whose SUBJECT is `find_principal_person()` — the lowest-id row
+        # — or, for `live_signals._drafts`, nothing at all, and which take no
+        # recipient, are only safe when that row is the only principal there
+        # is. Two conditions, and neither implies the other: `private_ok` says
+        # this READER may see principal-private data (the scheduler's own
+        # delivery, or a principal on a verified private surface), while the
+        # roster check says the data is actually THEIRS. A co-principal
+        # running the brief from their own DM passes `private_ok` and would
+        # otherwise be handed the other founder's commitments, calendar titles
+        # and chat titles; the scheduler's shared fan-out passes neither. Same
+        # predicate as the weekly review's commitments step.
+        #
+        # It gates the solo block, the fresh calendar read and
+        # `gather_live_signals` alike, computed once rather than restated per
+        # read: splitting them is how a co-principal kept receiving the
+        # lowest-id founder's calendar and chat titles while the solo block
+        # three lines down was already gated.
+        #
+        # `_build_today(include_private=private_ok)` above stays on the
+        # READER's answer on purpose, and is not an omission here. Its private
+        # rows are alerts tagged `private:principal` (mail from one of the
+        # principal's contacts, a meeting with one), and `GET /today` serves
+        # those to any non-archived principal under the very same predicate
+        # (`today._is_principal` → `people.store.is_principal_or_self(caller,
+        # None)`). So a co-principal reading them here can already read them
+        # on their own /today, and withholding them from the brief alone would
+        # not make them private — it would only make the two surfaces
+        # disagree. If that policy changes, both change together.
+        own_private_ok = private_ok and len(active_principals()) <= 1
+        if mode == "solo" and own_private_ok:
             # What the principal owns that is due this week or overdue — their
             # dated commitments. It lands here even when no channel reaches
             # them for a nudge. Never raises (reads as empty on failure).
@@ -232,12 +258,16 @@ class MorningBriefWorkflow(Workflow):
         # The principal's world since the last brief: who wrote, what got
         # stuck, their chats, and — unless the solo top three already listed
         # it — the day's calendar, read fresh (team mode never read one). The
-        # calendar is the principal's own, so only on a run for them.
+        # calendar is read for `find_principal_person()`'s own address
+        # (`top_three.read_todays_calendar`) and the chat titles are theirs
+        # (`live_signals._conversations`), so `own_private_ok`: a run for
+        # anyone else gets the shared read, even when that reader is a
+        # principal in their own DM.
         events = None
-        if private_ok and not top_three_calendar:
+        if own_private_ok and not top_three_calendar:
             events = await refresh_calendar(now, max_age=0)
         live = gather_live_signals(
-            since, now=now, include_private=private_ok,
+            since, now=now, include_private=own_private_ok,
             calendar=events, use_cached_calendar=False,
         )
         # The reflection's notes are written from what everyone may see (it
@@ -312,12 +342,13 @@ class MorningBriefWorkflow(Workflow):
         logger.info(
             "morning_brief: context since=%s proposals=%d activity=%d handled=%d "
             "inbound=%d stuck=%d drafts=%d conversations=%d calendar=%s "
-            "reflection_flags=%s notes=%d private=%s private_used=%s suppressed=%s",
+            "reflection_flags=%s notes=%d private=%s own=%s private_used=%s suppressed=%s",
             since.isoformat()[:16], len(today_data["proposals"]), len(activity),
             len(handled), live.inbound_total, len(live.stuck), live.drafts,
             len(live.conversations),
             "none" if live.calendar is None else len(live.calendar),
-            bool(reflection_flags), len(owner_notes.keys), private_ok, private_used, suppressed,
+            bool(reflection_flags), len(owner_notes.keys), private_ok, own_private_ok,
+            private_used, suppressed,
         )
 
         yield WorkflowEvent(
