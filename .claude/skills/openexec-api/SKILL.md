@@ -1,6 +1,6 @@
 ---
 name: openexec-api
-description: Interact with the Open Executive FastAPI backend via curl. Use this skill when the user asks to hit /chat, /today, /people, /scheduled_actions, /architecture/*, /health/*, /fixtures/*, /audit/*, or any HTTP endpoint on the Open Executive API, local or deployed. Authenticates via $BACKEND_SHARED_SECRET in the x-api-key header. Tiered safety: GET runs freely, mutating POSTs need explicit confirmation.
+description: Interact with the Open Executive FastAPI backend via curl. Use this skill when the user asks to hit /chat, /today, /people, /scheduled, /architecture/*, /health/*, /fixtures/*, /audit/*, or any HTTP endpoint on the Open Executive API, local or deployed. Authenticates via $BACKEND_SHARED_SECRET in the x-api-key header. Tiered safety: GET runs freely, mutating POSTs need explicit confirmation.
 ---
 
 # openexec-api
@@ -78,7 +78,12 @@ Replace `honcho` with any section id from `sections.py`: `overview`, `lifecycle`
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/today | jq
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/people | jq
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/people/by-scope/CEO | jq
-curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" "$OE_API/scheduled_actions?status=pending" | jq
+# The route is /scheduled, NOT /scheduled_actions (which this file claimed
+# until 2026-10-08 and which 404s). A 404 body is `{"detail":"Not Found"}`,
+# so a jq/python filter reaching for `.actions` turns it into an empty list
+# and the queue reads as empty when it is not. Check the status code, not
+# just the parsed length.
+curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" "$OE_API/scheduled?status=pending" | jq
 ```
 
 ## Green: audit log
@@ -139,6 +144,8 @@ If you need a route this skill doesn't list, the authoritative source is `packag
 
 ## Common gotchas
 
+- **A 404 parses as an empty result.** The body is `{"detail":"Not Found"}`, so any filter reaching for a list key (`.actions`, `.sections`, `.people`) with an `or []` fallback reports zero rows for a route that does not exist — indistinguishable from a genuinely empty one. A wrong path in this file once had a healthy 7-row scheduler queue reported as empty repeatedly. Capture `-w '%{http_code}'` (or `--fail`) on any GET whose emptiness you intend to act on, and treat a 404 as "wrong route", never as "no data".
+- A route that 404s against a deployed instance but exists in the source means the running image predates it — check `podman ps` for the API container's creation time before concluding the feature is missing.
 - `localhost:8000` requires `make dev` running. If curl returns "Connection refused," the dev server is down.
 - `x-api-key` middleware applies to nearly all routes. A bare `GET /health` works without it, but most others 401 without the header.
 - The UI proxies through `/api/backend/...` and re-stamps `x-caller-email` from the verified session. Hitting the API directly bypasses that — useful for testing, but means you control the caller identity (and have to set it accurately).
