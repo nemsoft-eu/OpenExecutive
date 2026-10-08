@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
@@ -748,7 +749,20 @@ async def _execute_action(
                 digest = result.get("digest") or ""
                 if digest:
                     try:
-                        await _deliver_to_principal(digest, label="Across your clients")
+                        # Client data rather than one owner's private data, so
+                        # every owner gets it — but the audience is still
+                        # owners only, so the egress is restricted the same way
+                        # the briefs are. Content privacy and audience
+                        # restriction are separate concerns; this fan-out needs
+                        # the second without the first.
+                        from openexecutive.orchestrator.people_tools import (
+                            restrict_to_principal,
+                        )
+
+                        with restrict_to_principal():
+                            await deliver_to_each_principal(
+                                digest, label="Across your clients"
+                            )
                     except Exception:
                         logger.exception(
                             "scheduler: client_rotation digest delivery failed"
@@ -1835,6 +1849,24 @@ def principal_delivery_plan() -> tuple[Person | None, list[str]]:
     return principal, delivery_order(principal, email_ready=email_ready())
 
 
+def unreachable_principals(
+    principals: Iterable[Person], *, email_ready: bool
+) -> list[Person]:
+    """Those of ``principals`` no channel can reach (``delivery_order`` empty).
+
+    Whether a standing brief can be delivered is a question about EVERY
+    recipient, not about the lowest-id row. ``no_channel`` is the one delivery
+    problem that is a function of the present rather than of a past run, so
+    ``brief_state.outstanding_problems`` derives it from here and not from the
+    record: a surface that asked only about ``find_principal_person()``
+    cleared it the moment the oldest founder had a channel, putting the
+    co-principal who receives nothing back behind a green light. The Briefing
+    notice and the Setup status light pass the whole active roster through
+    ``outstanding_problems``, which calls this.
+    """
+    return [p for p in principals if not delivery_order(p, email_ready=email_ready)]
+
+
 def next_brief_runs(after: datetime) -> dict[str, datetime]:
     """When each recurring brief next goes out after ``after``."""
     from openexecutive.briefing.brief_state import BRIEF_KINDS
@@ -1892,27 +1924,203 @@ class PrincipalDelivery:
     reason: DeliveryReason
     # The delivery channel that sent it ("email", "slack_dm", ...), if one did.
     channel: str | None = None
+    # The first channel this person's plan offered, if they had one — what was
+    # actually tried, not what their plan would say later. The Setup light's
+    # backup-channel warning compares the two, and "email carried it while the
+    # plan starts at Slack" only means Slack failed if Slack was in the plan
+    # at the time (`brief_state.backup_channel_problem`).
+    first_tried: str | None = None
 
 
-async def _deliver_to_principal(text: str, *, label: str = "Update") -> PrincipalDelivery:
-    """Send ``text`` to the principal on their preferred channel.
+async def deliver_to_each_principal(
+    text: str, *, label: str = "Update", recipients: list[Person] | None = None
+) -> list[tuple[Person, PrincipalDelivery]]:
+    """Send ``text`` to every active principal, one DM each.
 
-    Tries the channels from ``principal_delivery_plan`` in order until one
-    sends; ``label`` names the message in the email subject. Not ok when no
-    channel is configured or every send failed — the caller still marks the
-    action done (no point retrying the same misconfiguration) but audits the
-    failure.
+    ``recipients`` pins the audience instead of reading the roster now. A
+    caller whose CONTENT depends on who the recipients are must pass the
+    same list it gated on: the principal brief decides
+    ``PRINCIPAL_DELIVERY`` from the roster and then spends minutes
+    generating, so re-reading here would hand a founder added inside that
+    window a brief built as private to someone else.
+
+    It is an upper bound, not a licence. Each recipient is revalidated
+    against the roster inside the loop below, immediately before its OWN
+    send, and the live row's channel fields are the ones used. So the
+    audience can only ever shrink between gating and sending: nobody is
+    added (the content was gated on the pinned list), and anyone archived,
+    demoted or moved to contacts inside the window drops out. Taking the
+    live row also means a ``slack_user_id`` changed mid-run is not used to
+    DM whoever now holds the old id.
+
+    That revalidation is a PRE-FILTER, not the guarantee. Whether private
+    content may reach a given recipient is enforced at the egress: a caller
+    whose text is private to one principal sends inside
+    ``people_tools.restrict_to_principal()`` (``_run_principal_brief`` does,
+    for a single-recipient run), and every DM handler, the email gateway's
+    roster allow-set and the invite gate then read ``is_principal`` fresh
+    immediately before their own leg. Four review rounds found variants of
+    "the pinned row went stale across an await" precisely because a
+    caller-side snapshot cannot be await-safe at any granularity. What this
+    loop adds is manners: a recipient who stopped being an active principal
+    is dropped quietly here, with a log line, rather than sent to and
+    refused — and dropped from the results, so the aggregate is the
+    remaining recipients' (see below).
+
+    Revalidating PER RECIPIENT rather than once before the loop keeps the
+    pre-filter honest: each send is awaited, so a later founder is reached
+    only after an earlier one's channel call has returned, and a snapshot
+    taken before the loop is already stale by then. It lives here rather
+    than in ``deliver_to_person`` because only this function knows what
+    membership its fan-out needs ("still an active principal") and what to
+    do when it fails (drop them). ``deliver_to_person`` is shared with
+    ``memory.history_reminders``, which sends to ordinary team members and
+    needs a different question answered (``history.can_keep_notes``); one
+    guard down there could not be both, and had to return a per-recipient
+    reason where this needs the person dropped (logged, not silent).
+
+    Someone no longer an active principal is DROPPED from the results, not
+    returned with a reason. ``brief_state.delivery_summary`` takes the worst
+    reason any recipient got, and ``no_owner`` there already means "there was
+    no principal on the roster at all" — so reporting an offboarded founder
+    that way made a run that reached their co-founder aggregate to
+    ``no_owner``. Dropping matches what the audience cap means: they are not
+    a recipient of this run.
+
+    Returns one result PER RECIPIENT rather than a single verdict, on
+    purpose. ``brief_state.record_delivery_outcome`` stores the list as given
+    (one ``RecipientOutcome`` each) and both surfaces name the people a
+    problem is about, so collapsing N results into "ok if any succeeded" —
+    or into any one of them — would make a founder whose channel is broken
+    invisible on every surface, their brief failing silently every day behind
+    the other founder's success. The caller decides what a partial delivery
+    means and audits each recipient.
+
+    Empty list when there is no principal at all, which the caller records
+    as ``no_owner``. A not-ok result means no channel was configured or
+    every send failed: the caller still marks the action done — there is no
+    point retrying the same misconfiguration on the next tick — and audits
+    the failure instead.
     """
-    principal, plan = principal_delivery_plan()
-    if principal is None:
-        return PrincipalDelivery(False, "no principal Person row found", "no_owner")
-    return await _send_on_plan(principal, plan, text, label=label)
+    from openexecutive.people import store as people_store
+
+    # The audience, fixed on entry: the caller's pinned list when it has one,
+    # otherwise the roster as it stands now. Only ever an upper bound — the
+    # loop revalidates each id and can shrink it, never grow it.
+    candidates = people_store.active_principals() if recipients is None else recipients
+
+    results: list[tuple[Person, PrincipalDelivery]] = []
+    for pinned in candidates:
+        named = pinned  # who a result is reported against if the read fails
+        try:
+            live = _live_principal(pinned)
+            if live is None:
+                logger.info(
+                    "scheduler: person %s is no longer an active principal — "
+                    "dropped from the %s fan-out",
+                    pinned.id, label,
+                )
+                continue
+            named = live
+            delivery = await deliver_to_person(live, text, label=label)
+        except Exception:
+            # Per recipient, so one founder's failure cannot discard a
+            # sibling's. A roster read RAISES on a locked or corrupt DB
+            # (`people.store` swallows nothing on that path — it only degrades
+            # to an empty roster when the DB file is absent), and that used to
+            # abort the whole comprehension: the caller then recorded a
+            # run-level `send_failed` with no recipients and never advanced
+            # the window, replaying the same interval to the founder who
+            # already had the brief while every surface said the run had
+            # failed for everyone.
+            #
+            # Reported, not dropped: a read that failed says nothing about
+            # whether this person is still a principal, so claiming they are
+            # not a recipient would be a silent loss. `send_failed` is what
+            # happened, and it is the reason `delivery_summary` already
+            # carries for a partial failure.
+            #
+            # This also contains a crash in the send itself, which therefore
+            # no longer reaches `_run_principal_brief`'s outer handler: that
+            # recipient gets an outcome row and an audit row instead of the
+            # run getting a `send_failed` with none, and the run is no longer
+            # marked failed for one recipient's crash. `mark_action_done` and
+            # the chaining were already unconditional, so the action
+            # lifecycle is unchanged.
+            logger.exception(
+                "scheduler: delivering the %s to person %s failed", label, pinned.id
+            )
+            delivery = PrincipalDelivery(
+                False, f"delivering to person {pinned.id} raised", "send_failed"
+            )
+        results.append((named, delivery))
+    return results
+
+
+def _live_principal(person: Person) -> Person | None:
+    """``person``'s row as the roster holds it NOW, or None when they are no
+    longer an active principal.
+
+    A courtesy PRE-FILTER for ``deliver_to_each_principal``, not the privacy
+    guarantee. On a private run the egress refuses a non-principal anyway
+    (``people_tools.restrict_to_principal``, read fresh by each channel leg);
+    answering here lets the fan-out drop such a recipient quietly, with a log
+    line and no result row, instead of sending to them and being refused. It
+    is also what keeps a shared run — where no egress gate applies — from
+    delivering to someone offboarded mid-fan-out.
+
+    Asks ``active_principals()`` and matches on id rather than re-reading the
+    single row and re-testing its flags. That predicate is three conditions —
+    ``archived = 0``, ``kind = 'team'`` and ``is_principal`` — and a
+    hand-written copy of it is exactly what went wrong: the copy tested
+    ``archived`` alone, so a founder DEMOTED rather than offboarded (an
+    onboarding re-run rewrites the flag) passed it and still received the
+    standing brief. Reusing the gate's own query means the fan-out cannot
+    disagree with it, and a fourth condition added there needs no change
+    here.
+
+    One roster read per recipient, guarding one network DM each — on a roster
+    with the one or two principals this fans out to, the read is not the cost.
+
+    A pinned row with no id cannot be revalidated, and cannot have come from
+    ``active_principals()`` either, so it is not an active principal here.
+    """
+    if person.id is None:
+        return None
+    from openexecutive.people import store as people_store
+
+    return next((p for p in people_store.active_principals() if p.id == person.id), None)
 
 
 async def deliver_to_person(person: Person, text: str, *, label: str = "Update") -> PrincipalDelivery:
     """Send ``text`` to ``person`` alone, the way the briefs reach the
     principal: their own Slack or Discord DM, their Telegram chat, or email
-    to their own address (``delivery_order``, which skips a Telegram group)."""
+    to their own address (``delivery_order``, which skips a Telegram group).
+
+    Sends the row it is GIVEN, and does not ask whether that row is still on
+    the roster. The caller owns that, because only the caller knows which
+    membership it needs and what a lost one means. This briefly held a
+    membership check of its own and that was the wrong layer: it can only
+    test one notion of "still a recipient", while
+    ``deliver_to_each_principal`` needs "still an active principal" and the
+    person dropped from its results, and ``memory.history_reminders`` needs
+    "still a team member who may keep notes" (``history.can_keep_notes``,
+    which also covers a founder moved to contacts) and a logged skip. One
+    guard here could not be both, and the ``no_owner`` it returned collided
+    with the aggregate meaning "no principal on the roster at all".
+
+    Both callers do re-read, inside their own per-person loop and
+    immediately before the send, and both have to: a loop that awaits a
+    network send per person reaches a later one only after an earlier one's
+    channel call has returned, so a roster read from before the loop is
+    already stale. All three DM handlers now run ``_dm_recipient_on_roster``
+    unconditionally, so an archived or never-rostered id is refused
+    downstream as well — but that gate answers "on the roster at all", not
+    either caller's membership question, so a new caller still owes its own
+    read. A caller whose TEXT is private to the principal owes one more
+    thing: sending inside ``people_tools.restrict_to_principal()``, which is
+    what narrows every leg's gate to ``is_principal``.
+    """
     return await _send_on_plan(person, delivery_order(person, email_ready=email_ready()), text, label=label)
 
 
@@ -1934,14 +2142,14 @@ async def _send_on_plan(
                     "user_id": principal.slack_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.slack_user_id)
+                    return _sent(channel, principal.slack_user_id, plan[0])
             elif channel == "discord_dm" and principal.discord_user_id:
                 from openexecutive.orchestrator.schedule_tools import handle_send_discord_dm
                 result = await handle_send_discord_dm({
                     "discord_user_id": principal.discord_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.discord_user_id)
+                    return _sent(channel, principal.discord_user_id, plan[0])
             elif channel == "telegram" and principal.telegram_chat_id:
                 from openexecutive.orchestrator.schedule_tools import (
                     handle_send_telegram_message,
@@ -1950,19 +2158,23 @@ async def _send_on_plan(
                     "chat_id": int(principal.telegram_chat_id), "text": text,
                 })
                 if _delivered_ok(result):
-                    return _sent(channel, principal.telegram_chat_id)
+                    return _sent(channel, principal.telegram_chat_id, plan[0])
             elif channel == "email" and await _email_principal(principal, text, label):
-                return _sent(channel, principal.email)
+                return _sent(channel, principal.email, plan[0])
         except Exception:
             logger.exception("scheduler: delivery via %s failed", channel)
 
     return PrincipalDelivery(
-        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed"
+        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed",
+        first_tried=plan[0],
     )
 
 
-def _sent(channel: str, to: str | None) -> PrincipalDelivery:
-    return PrincipalDelivery(True, f"{channel} → {to}", "delivered", channel)
+def _sent(channel: str, to: str | None, first_tried: str | None = None) -> PrincipalDelivery:
+    """A delivered result. ``first_tried`` is the channel the plan started
+    with, which is only interesting when it is NOT ``channel`` — the plan
+    tried it, it did not send, and a later one did."""
+    return PrincipalDelivery(True, f"{channel} → {to}", "delivered", channel, first_tried)
 
 
 async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
@@ -2086,8 +2298,10 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     from openexecutive.briefing import brief_state
     from openexecutive.config import get_settings
     from openexecutive.knowledge.store import ChromaDBStore
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
     from openexecutive.workflows import WORKFLOW_REGISTRY
     from openexecutive.workflows.persistence import (
+        WITHHELD_RUN_ARTIFACT,
         complete_run,
         create_run,
         fail_run,
@@ -2131,11 +2345,33 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         fingerprint: str | None = None
         suppressed = False
         private_to_principal = False
-        # This run goes to the principal alone, so the brief may read what is
-        # private to them (morning_brief.PRINCIPAL_DELIVERY).
+        # Who this brief is for, resolved BEFORE the run because it decides
+        # what the brief may contain.
+        #
+        # PRINCIPAL_DELIVERY lets the brief read what is private to *the*
+        # principal — their contacts' mail, their chat titles, their
+        # calendar, their own notes, their Act-as-me drafts. None of those
+        # readers is keyed to a recipient: three resolve the owner through
+        # `find_principal_person()` (the lowest-id principal) —
+        # `live_signals._conversations`, `top_three`'s calendar block,
+        # `history_brief`'s notes — and `live_signals._drafts` is keyed to
+        # nothing at all, counting every `delegation_drafted` audit row the
+        # install has. So "private" here means one specific person's data
+        # (or worse, everyone's), never "each recipient's own".
+        #
+        # The flag is therefore only safe with exactly one recipient. With
+        # co-principals the brief goes out shared: fanning a private run out
+        # would put one founder's mail and calendar in the other's DM, and
+        # generating it per principal would not help — it would hand every
+        # recipient the SAME person's private data. Making the feature
+        # per-person means re-keying those readers, a larger change.
+        from openexecutive.people import store as people_store
+
+        recipients = people_store.active_principals()
+        private_run = len(recipients) == 1
         from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
 
-        delivery_token = PRINCIPAL_DELIVERY.set(True)
+        delivery_token = PRINCIPAL_DELIVERY.set(private_run)
         try:
             async for event in workflow.run(inputs=wf_inputs, store=store):
                 event = ensure_workflow_event(event, site="scheduler.principal_brief")
@@ -2149,54 +2385,223 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                     raise RuntimeError(event.message)
         finally:
             PRINCIPAL_DELIVERY.reset(delivery_token)
+
+        # A private artifact belongs to ONE person, and which person is decided
+        # by `find_principal_person()` at each private reader's own read time —
+        # not by the recipient pinned before the run. So the SUBJECT can drift
+        # during the minutes generation takes: restore or re-promote a
+        # lower-id principal mid-run and the notes, chat titles and calendar
+        # read into the brief become theirs, while the pinned recipient is
+        # still someone else. Both later gates pass that through, because each
+        # asks whether the RECIPIENT is a principal, and neither asks whether
+        # the CONTENT is still about them.
+        #
+        # So re-assert the premise rather than the audience: a private run may
+        # only be sent while the roster still holds exactly its recipient, and
+        # while that recipient is still who the private readers resolve to.
+        # Withheld rather than downgraded to a shared send — the artifact was
+        # already generated with private content in it.
+        withheld = False
+        if artifact and private_to_principal:
+            owner = people_store.find_principal_person()
+            pinned = [p.id for p in recipients]
+            # Only the OWNER is checked, not the whole roster. A principal
+            # ADDED mid-run has a higher id, so `find_principal_person()` still
+            # resolves to the pinned recipient and the content is still theirs
+            # — withholding there would refuse a correct brief (two existing
+            # tests cover exactly that case). A recipient who has gone away is
+            # a different concern, handled at the send by `_live_principal`.
+            #
+            # `not pinned` cannot arise from `private_run` (which requires
+            # exactly one), but `private_to_principal` comes off a workflow
+            # event, so it is not this function's invariant to trust.
+            # Only a DRIFT to a different person is withheld here. "No owner
+            # at all" is not drift: the recipient has gone away, the fan-out
+            # returns empty and the caller records `no_owner`, which describes
+            # it better than `not_written` would — the brief was written.
+            if pinned and owner is not None and owner.id != pinned[0]:
+                logger.warning(
+                    "scheduler: %s withheld — a private run's subject is no "
+                    "longer its recipient (pinned %s, owner now %s)",
+                    kind, pinned, owner.id,
+                )
+                artifact = ""
+                withheld = True
+
+        # Completed AFTER the drift check, not before it. `PRIVATE_RUN_ARTIFACT`
+        # asserts "delivered to the principal" and an empty artifact asserts
+        # the brief could not be written; a withheld run is neither, and
+        # storing it before the check decided meant the Artifacts page and run
+        # history claimed a delivery that the outcome below records as
+        # `not_written`.
         complete_run(
             run_id,
-            stored_artifact(artifact, private_to_principal=private_to_principal)
+            WITHHELD_RUN_ARTIFACT if withheld
+            else stored_artifact(artifact, private_to_principal=private_to_principal)
             or "(no artifact)",
         )
 
         if not artifact:
-            brief_state.record_delivery_outcome(kind, reason="not_written", channel=None)
+            # `recipients=[]`, not omitted: this run is KNOWN to have reached
+            # nobody, which is a different fact from a record that predates
+            # per-recipient outcomes and so cannot say.
+            brief_state.record_delivery_outcome(
+                kind, reason="not_written", channel=None, recipients=[]
+            )
             recorded = True
         else:
             sending = True
-            delivery = await _deliver_to_principal(artifact, label=workflow.title)
-            ok, detail = delivery.ok, delivery.detail
+            # `recipients`, not a fresh lookup: the audience that gated the
+            # content caps the audience that receives it. The fan-out
+            # revalidates each one against the roster before its own send, so
+            # a founder offboarded or demoted while this was generating drops
+            # out instead of being sent a brief built as private to them —
+            # and drops out of `sends`, so the aggregate below is the
+            # remaining recipients' and not `no_owner`.
+            #
+            # And the guarantee itself lives at the EGRESS, not here. A private
+            # brief is content private to one person, so the send is wrapped in
+            # `people_tools.restrict_to_principal()` — the same flag the email
+            # poller sets on a private turn — and every DM handler, the email
+            # gateway's roster allow-set and the invite gate then refuse a
+            # recipient who is not a principal on a read taken immediately
+            # before that leg's own call. Four rounds of review found variants
+            # of "the recipient row went stale across an await", because a
+            # caller-side snapshot cannot be await-safe at any granularity; the
+            # fan-out's revalidation is now a courtesy pre-filter that drops
+            # such a recipient quietly instead of letting the egress refuse
+            # them. Applied to EVERY brief fan-out, shared or private, because
+            # these are two different concerns: `PRINCIPAL_DELIVERY` decides
+            # what the artifact may CONTAIN, while this decides who it may
+            # REACH — and the fan-out addresses principals either way.
+            #
+            # An earlier revision conditioned this on `private_run`, reasoning
+            # that gating a shared brief would refuse a co-founder's own leg.
+            # That was false: `_dm_recipient_on_roster` requires
+            # `is_principal`, which every recipient out of
+            # `active_principals()` has by construction. The conditional
+            # bought nothing and left a demoted co-principal still receiving a
+            # shared brief from a fallback leg, because nothing else re-checks
+            # membership once `_live_principal` has run.
+            #
+            # Scope note: this block covers the SEND and nothing else. The
+            # per-recipient audit writes below sit outside it and so are
+            # marked private at their own call rather than inheriting it from
+            # here — an earlier revision of this comment claimed they
+            # inherited it, which was simply false and is the kind of thing
+            # the egress gate must not be reasoned about loosely.
+            with restrict_to_principal():
+                sends = await deliver_to_each_principal(
+                    artifact, label=workflow.title, recipients=recipients
+                )
+            delivered = [(p, d) for p, d in sends if d.ok]
+
+            # One recorded outcome per recipient. A single stored reason for a
+            # run with several recipients made roster order decide which
+            # founder's problem any surface could show, and the other was
+            # rendered nowhere — so every recipient goes in, and `brief_state`
+            # derives the run's aggregate from them rather than from the first
+            # of a list.
+            #
+            # Written BEFORE the audit rows below, which is the opposite of
+            # the old order. `audit_log` writes to SQLite and can raise under
+            # contention; while it ran first, an exception on the second
+            # recipient left `recorded` False, so the handler recorded a
+            # run-level `send_failed` and discarded outcomes that already
+            # existed — reporting "every way of sending it failed" to a
+            # founder who had just received the brief. The outcome is what
+            # the Briefing notice and the Setup light read, so it goes first;
+            # the audit rows are the secondary artifact.
+            recipient_outcomes = [
+                brief_state.RecipientOutcome(
+                    person_id=person.id,
+                    name=person.full_name,
+                    reason=d.reason,
+                    channel=d.channel,
+                    first_tried=d.first_tried,
+                )
+                for person, d in sends
+            ]
+            reason, channel = brief_state.delivery_summary(recipient_outcomes)
             brief_state.record_delivery_outcome(
-                kind, reason=delivery.reason, channel=delivery.channel
+                kind, reason=reason, channel=channel, recipients=recipient_outcomes
             )
             recorded = True
-            if ok:
-                logger.info("scheduler: %s delivered (%s)", kind, detail)
+
+            # One audit row per recipient: a founder whose channel is broken
+            # has to be visible on its own, not folded into a sibling's
+            # success.
+            #
+            # `private=True` explicitly, not inherited from the context. These
+            # writes run AFTER the `restrict_to_principal()` block above has
+            # exited, so `audit_row_private_to_principal` — which classifies
+            # from the context at write time — would file them as ordinary
+            # rows, and each one names a founder alongside the raw address or
+            # channel id the send used (`d.detail`). A teammate reading
+            # `/audit/logs` would get both. Marking them here keeps the
+            # classification true where the row is written rather than
+            # depending on a block it sits outside.
+            for person, d in sends:
                 audit_log(
                     "scheduled_action",
-                    f"{kind} delivered ({detail})",
+                    f"{kind} {'delivered' if d.ok else 'NOT delivered'} "
+                    f"to {person.full_name or person.id} ({d.detail})",
                     actor="scheduler",
+                    private=True,
                     details={
-                        "phase": "delivered", "kind": kind, "channel_detail": detail,
-                        "suppressed": suppressed,
+                        "phase": "delivered" if d.ok else "delivery_failed",
+                        "kind": kind, "person_id": person.id,
+                        "channel": d.channel, "reason": d.reason,
+                        "channel_detail": d.detail, "suppressed": suppressed,
                     },
                 )
+
+            ok = bool(delivered)
+            detail = "; ".join(
+                f"{p.full_name or p.id}: {d.detail}" for p, d in sends
+            ) or "no principal Person row found"
+            if ok:
+                logger.info(
+                    "scheduler: %s delivered to %d/%d principals (%s)",
+                    kind, len(delivered), len(sends), detail,
+                )
                 # Only a delivered brief advances the "since last brief"
-                # window and the unchanged-detection fingerprint.
+                # window and the unchanged-detection fingerprint. Keyed to
+                # the shared artifact, so ANY recipient receiving it is
+                # enough: not advancing would replay yesterday's window to
+                # the founder who did get it. A recipient who got nothing is
+                # surfaced by the outcome above, not by re-sending.
                 if fingerprint:
                     brief_state.record_delivered(kind, fingerprint, artifact)
             else:
                 logger.warning("scheduler: %s NOT delivered — %s", kind, detail)
-                audit_log(
-                    "scheduled_action",
-                    f"{kind} NOT delivered — {detail}",
-                    actor="scheduler",
-                    details={"phase": "delivery_failed", "kind": kind, "reason": detail},
-                )
+                if not sends:
+                    # No principal at all: there is no per-recipient row to
+                    # carry this, so the summary row is the only trace.
+                    audit_log(
+                        "scheduled_action",
+                        f"{kind} NOT delivered — {detail}",
+                        actor="scheduler",
+                        details={
+                            "phase": "delivery_failed", "kind": kind, "reason": detail,
+                        },
+                    )
     except Exception as exc:
         logger.exception("scheduler: %s (action %d) failed", kind, action.id)
         import contextlib
         with contextlib.suppress(Exception):
             fail_run(run_id, str(exc))
         if not recorded:
+            # `recorded` is set the moment the per-recipient outcomes are
+            # written, so reaching here means the run raised before any
+            # recipient had one. The empty list says exactly that: the reason
+            # is the run's and is reported run-level, never attributed to a
+            # founder it was not about.
             brief_state.record_delivery_outcome(
-                kind, reason="send_failed" if sending else "not_written", channel=None
+                kind,
+                reason="send_failed" if sending else "not_written",
+                channel=None,
+                recipients=[],
             )
 
     # Always chain the next occurrence + mark this row done, so a single

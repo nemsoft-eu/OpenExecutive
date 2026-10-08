@@ -385,10 +385,51 @@ def contacts_reachable_now() -> bool:
     return is_principal_on_verified_surface(current_session.get())
 
 
+# Set only around SENDING content that unattended code built as private to
+# the principal, where there is no session to carry
+# `Session.private_to_principal` — `scheduler.runner`'s private brief, whose
+# whole run has no session at all.
+#
+# A bare ContextVar, deliberately not a synthetic `Session` bound with
+# `set_session`: a session would switch on `_record_outbound_context`'s
+# linkage rows (which write only while one is live) and every other session
+# reader as side effects, where this reaches the egress predicate and nothing
+# else.
+_restricted_to_principal: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "restricted_to_principal", default=False
+)
+
+
+@contextlib.contextmanager
+def restrict_to_principal() -> Iterator[None]:
+    """Make every egress gate treat this block as private to the principal.
+
+    For a producer of principal-private content that has no session: the
+    standing brief, generated with ``morning_brief.PRINCIPAL_DELIVERY`` set
+    and so carrying one person's mail, calendar, notes and Act-as-me drafts.
+    Wrapping the SEND is the point — each channel leg then re-reads
+    ``is_principal`` from the roster immediately before its own call, so a
+    recipient archived, demoted or id-rotated inside the fan-out's awaits is
+    refused at the egress instead of needing to be caught by a snapshot in
+    the caller. Save/restore rather than ``Token.reset`` for the same reason
+    as ``set_session``.
+    """
+    prior = _restricted_to_principal.get()
+    _restricted_to_principal.set(True)
+    try:
+        yield
+    finally:
+        _restricted_to_principal.set(prior)
+
+
 def turn_is_private_to_principal() -> bool:
     """Whether the current turn is about something private to the principal
     (mail from one of their contacts, mail they forwarded — set by the email
-    poller). Such a turn may reach the principal and nobody else."""
+    poller), or is inside ``restrict_to_principal`` (unattended code sending
+    content it built as private — the standing brief). Such a turn may reach
+    the principal and nobody else."""
+    if _restricted_to_principal.get():
+        return True
     from openexecutive.orchestrator.schedule_tools import current_session
 
     return getattr(current_session.get(), "private_to_principal", False) is True

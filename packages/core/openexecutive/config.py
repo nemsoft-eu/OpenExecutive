@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Walk up from this file to find the repo root .env. If no .env exists
@@ -307,6 +307,37 @@ class Settings(BaseSettings):
     # this server instead (knowledge/pdf_reader.py).
     local_pdf_input: bool = Field(False, alias="LOCAL_PDF_INPUT")
     # Optional `reasoning_effort` sent on every local request (e.g. "low").
+    # Sampling for local calls. Unset means "not sent" — which on Ollama's
+    # /v1 is NOT neutral: it synthesises temperature=1.0 and top_p=1.0 and
+    # that override beats the Modelfile (openai/openai.go @ v0.34.0). For the
+    # qwen3.8 tag whose Modelfile ships Qwen's *thinking* preset
+    # (temp 1 / top_k 20 / top_p 0.95), the net effect of omitting them is
+    # top_p 0.95 -> 1.0. These defaults are Qwen's published *non-thinking*
+    # preset, which is the applicable one because we run reasoning_effort=none.
+    #
+    # Deliberately no LOCAL_TOP_K: top_k is not in the OpenAI schema and
+    # Ollama's /v1 silently drops it (verified — sending top_k:5 left the
+    # runner at top_k=20). The Modelfile's top_k 20 already matches the
+    # preset, so the setting would be inert and misleading.
+    #
+    # Deliberately no presence_penalty: Qwen's preset suggests 1.5, but it
+    # penalises already-emitted tokens and this model's tool calls are XML
+    # that repeats <parameter>/<function> by construction — the one knob with
+    # a plausible mechanism for CAUSING malformed tool calls.
+    # Bounded here rather than at the server: an out-of-range value comes
+    # back as an opaque 400 mid-turn, long after the typo.
+    #
+    # `off` (or `none`) is the opt-out, PER FIELD — suppressing sampling
+    # altogether means setting both, and `.env.example` says so. Coupling
+    # them would make a deliberately set LOCAL_TOP_P silently inert because
+    # of an unrelated key. It needs a WORD rather than a
+    # blank: `env_ignore_empty=True` above drops `LOCAL_TEMPERATURE=` before
+    # validation, so a blank falls back to this default and the `| None` in
+    # the annotation would be unreachable from a `.env` — which is the shape
+    # .env.example documents. A backend that rejects sampling fields outright
+    # needs some way to say so.
+    local_temperature: float | None = Field(0.7, ge=0.0, le=2.0, alias="LOCAL_TEMPERATURE")
+    local_top_p: float | None = Field(0.8, gt=0.0, le=1.0, alias="LOCAL_TOP_P")
     # OpenAI-format `reasoning_effort` for local calls; the gate strips
     # Anthropic thinking, so this is the only reasoning control there.
     # Thinking-only models (GLM on Fireworks) otherwise spend the whole
@@ -325,6 +356,21 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
         return _parse_csv_list(v)
+
+    @field_validator("local_temperature", "local_top_p", mode="before")
+    @classmethod
+    def _parse_local_sampling(cls, v: Any, info: ValidationInfo) -> Any:
+        # `off` / `none` means "do not send this field at all", for a backend
+        # that rejects it (a strict reasoning model). A blank cannot carry
+        # that meaning: `env_ignore_empty` drops it and the default wins.
+        if isinstance(v, str) and v.strip().lower() in ("off", "none"):
+            return None
+        # ...but `env_ignore_empty` only drops a TRULY empty string, so a
+        # stray space or an inline `# comment` reaches float parsing and
+        # takes the whole app down at startup. Treat those as unsupplied.
+        if _blank_or_comment(v) and info.field_name:
+            return cls.model_fields[info.field_name].default
+        return v
 
     @field_validator("local_reasoning_effort", mode="before")
     @classmethod

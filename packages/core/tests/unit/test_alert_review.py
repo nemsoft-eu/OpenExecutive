@@ -717,11 +717,14 @@ def test_pre_brief_review_runs_before_morning_brief_and_never_blocks_it(db: Path
 
     monkeypatch.setattr(kstore, "ChromaDBStore", _Store)
 
-    async def _deliver(text: str, **_kw: Any) -> runner.PrincipalDelivery:
+    async def _deliver(person: Any, text: str, **_kw: Any) -> runner.PrincipalDelivery:
         order.append("deliver")
         return runner.PrincipalDelivery(True, "ok", "delivered", "slack_dm")
 
-    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    # The per-recipient seam the brief's fan-out calls. A principal row has
+    # to exist or the fan-out has nobody to send to and never reaches it.
+    people_store.upsert_person(full_name="Owner", is_principal=True, slack_user_id="U1")
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver)
     monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
     action_id = episodic.insert_scheduled_action(
         run_at=NOW.isoformat(), channel="__internal__", channel_ref="principal",

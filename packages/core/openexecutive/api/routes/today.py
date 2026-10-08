@@ -1963,13 +1963,14 @@ class BriefDeliveryNotice(BaseModel):
 
 def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     from openexecutive.briefing.brief_state import (
-        DELIVERY_PROBLEMS,
         brief_name,
-        current_problem,
         last_delivery_outcome,
+        outstanding_problems,
+        render_problems,
     )
     from openexecutive.config import get_settings
-    from openexecutive.scheduler.runner import principal_delivery_plan
+    from openexecutive.people.store import active_principals
+    from openexecutive.scheduler.runner import email_ready
 
     # With the scheduler off no brief is coming; the Setup status page says so.
     if not get_settings().scheduler_enabled:
@@ -1977,11 +1978,23 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     last = last_delivery_outcome()
     if last is None:
         return None
-    principal, plan = principal_delivery_plan()
-    reason = current_problem(last, has_owner=principal is not None, can_deliver=bool(plan))
-    if reason is None:
+    # The whole roster, not `find_principal_person()`: the briefs go out one
+    # DM per active principal, so a co-principal with no channel misses every
+    # one of them, and asking only about the lowest-id row would let the
+    # other founder's working channel clear the recorded failure.
+    #
+    # Several problems can stand at once — one founder's sends failing while
+    # another has nothing connected — so they are joined into the one sentence
+    # this response shape carries, rather than one of them being picked and
+    # the rest going unreported. Each clause names who it is about unless it
+    # covers every principal there is, in which case the second person
+    # ("send it to you") is honest for whoever is reading.
+    problems = outstanding_problems(
+        last, active_principals(), email_ready=email_ready()
+    )
+    if not problems:
         return None
-    problem, fix = DELIVERY_PROBLEMS[reason]
+    problem, fix = render_problems(problems)
     return BriefDeliveryNotice(
         brief=brief_name(last.kind),
         at=last.at.isoformat(),
@@ -1997,9 +2010,11 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     tags=["today"],
 )
 async def get_brief_delivery(request: Request) -> BriefDeliveryNotice | None:
-    """The latest morning brief or end-of-day digest that didn't reach the
-    owner and still has a problem to fix, or null. Only the owner is told:
-    anyone else gets null, since it is about the owner's channels."""
+    """The latest morning brief or end-of-day digest that didn't reach every
+    principal and still has a problem to fix, or null. Only a principal is
+    told: anyone else gets null, since it is about the principals' channels.
+    With co-principals it may be about a founder other than the reader, and
+    says whose channel is missing rather than "you"."""
     from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
 
     if not await asyncio.to_thread(_caller_is_principal_or_unclaimed, request):

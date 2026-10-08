@@ -936,14 +936,20 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
         return json.dumps({"error": "user_id and text are required"})
 
     # A turn about the principal's private mail reaches the principal only.
+    # This block runs BEFORE the roster gate below and keeps its own refusal:
+    # on a private turn the two ask the same question (`is_principal` implies
+    # `kind = 'team'` — `people.store._check_kind`, the migration that repairs
+    # a hand-edited row, and `_row_to_person`), but collapsing them the way
+    # Discord and Telegram do — `_dm_recipient_on_roster` returns a bool —
+    # would answer a private-turn refusal with "not in the People roster" and
+    # lose a real distinction.
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
         turn_is_private_to_principal,
     )
+    from openexecutive.people.store import find_person_by_slack_id
 
     if turn_is_private_to_principal():
-        from openexecutive.people.store import find_person_by_slack_id
-
         recipient = find_person_by_slack_id(user_id)
         if recipient is None or not recipient.is_principal:
             return json.dumps({"error": PRIVATE_TURN_REFUSAL})
@@ -956,6 +962,27 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
         from slack_sdk.web.async_client import AsyncWebClient
     except ImportError:
         return json.dumps({"error": "slack_sdk is not installed"})
+
+    # Roster gate: refuse outbound to any Slack user id that doesn't match a
+    # non-archived Person row — the same unconditional gate the Discord and
+    # Telegram handlers have always had. Prevents prompt-injection from
+    # coaxing the Executive into DMing arbitrary Slack users, and makes this
+    # handler re-read the roster at the moment it sends, which is what a
+    # caller that awaits one send per recipient needs
+    # (`scheduler.runner.deliver_to_each_principal`) and could not get from a
+    # snapshot of its own.
+    #
+    # No person-id recovery branch, unlike Discord and Telegram: Slack user
+    # ids are `U…`, never a bare integer, and
+    # `_recover_channel_id_from_person_id` has no "slack" branch to route to.
+    if not _dm_recipient_on_roster(find_person_by_slack_id, user_id):
+        logger.warning(
+            "send_slack_dm: refused user_id=%s (not in People roster)", user_id
+        )
+        return json.dumps({"error": (
+            f"user_id {user_id!r} is not in the People roster. Pass the person's "
+            "slack_user_id from lookup_person — NOT their person_id."
+        )})
 
     # Anti-spam guard: suppress duplicates / rate-cap breaches / quiet-hours sends.
     suppressed = _guard_outbound(

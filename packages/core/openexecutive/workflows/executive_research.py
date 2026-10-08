@@ -1212,9 +1212,11 @@ _SYNTHESIS_EXCLUDED_TOOLS = frozenset({
     "remove_watchlist_entry",
     # Raw per-channel DM tools are withheld from synthesis: the model kept
     # passing the wrong identifier into them (a person_id, another channel's
-    # id, or an invented Slack-style handle), so DMs silently failed the roster
-    # gate. message_person(person_id, text) is the only DM path here — the
-    # server resolves the channel + real id, so there is nothing to fabricate.
+    # id, or an invented Slack-style handle), so DMs failed their handler's
+    # roster gate — and the Slack one, which had no such gate then, failed at
+    # the Slack API instead, which is no better. message_person(person_id,
+    # text) is the only DM path here — the server resolves the channel + real
+    # id, so there is nothing to fabricate.
     "send_slack_dm",
     "send_discord_dm",
     "send_telegram_message",

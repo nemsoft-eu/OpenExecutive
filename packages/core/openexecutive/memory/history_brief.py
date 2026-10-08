@@ -3,9 +3,14 @@
 today, for the end-of-day digest.
 
 Notes are their person's alone, so a brief reads them only on a run that goes
-to the owner alone (``workflows.morning_brief._private_ok``: the scheduler's
-delivery, or the owner's own verified turn in a conversation only they can
-read), only when the owner may keep notes and has "Keep track of what
+to the owner alone: ``workflows.morning_brief.PRINCIPAL_DELIVERY`` directly,
+which the scheduler sets only when the fan-out has exactly ONE recipient —
+never ``_private_ok()``, which is about the reader and is true for any
+principal on a verified private surface. ``owner_keeping_notes`` resolves
+``find_principal_person()``, so on a co-founded roster the reader and the
+owner can differ; the stricter gate is what keeps these out of a chat run
+too, whose tool result reaches the turn's shared audit row and peer memory.
+Then only when the owner may keep notes and has "Keep track of what
 happens" on, and only the owner's own. A brief that used any is marked
 private to the owner (``private_to_principal``), so its text stays out of the
 shared run history.

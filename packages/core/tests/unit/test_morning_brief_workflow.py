@@ -21,7 +21,7 @@ from openexecutive.workflows.morning_brief import (
 
 
 @pytest.fixture(autouse=True)
-def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
     # The "handled overnight" block reads the audit log; keep it empty and
     # deterministic here regardless of what other modules audited.
@@ -38,10 +38,24 @@ def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(episodic, "DB_PATH", tmp_path / "episodic.db")
     episodic.initialize_db()
 
+    # The solo sections are gated on the size of the roster, so the tests
+    # below seed principals. Without this the writes land in the default
+    # ./episodic_memory.db and change what OTHER modules' tests see — a
+    # failure that only shows in a full run. (test_weekly_review.py and
+    # test_top_three.py isolate the same store for the same reason.)
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    monkeypatch.setattr(people_store, "DB_PATH", tmp_path / "people.db")
+    people_store.initialize_db(tmp_path / "people.db")
+    people_registry.invalidate()
+
     async def _no_calendar(*_a: object, **_k: object) -> None:
         return None
 
     monkeypatch.setattr(live_signals, "refresh_calendar", _no_calendar)
+    yield
+    people_registry.invalidate()
 
 
 @pytest.mark.asyncio
@@ -488,3 +502,182 @@ async def test_eod_digest_keeps_a_repair_that_grounds_it(monkeypatch: pytest.Mon
     [row] = rows
     assert row["details"]["repaired"] is True  # type: ignore[index]
     assert row["details"]["held_back"] == []  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_solo_sections_are_left_out_of_a_shared_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`principal_due_soon` and `build_top_three` both resolve the lowest-id
+    principal and take no recipient, so on a solo workspace with
+    co-principals — where the brief is generated SHARED and fanned out to all
+    of them — they would put one founder's own commitments and their calendar
+    event titles in the other's DM. Gated on `_private_ok`, like the
+    calendar read directly below them."""
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+
+    due_calls: list[object] = []
+    top_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        top_calls.append(_due)
+        return [], None
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    # Shared run (no PRINCIPAL_DELIVERY): neither principal-keyed read fires.
+    [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert (due_calls, top_calls) == ([], [])
+
+    # The sole-principal run still gets them — that is the whole solo brief.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+    assert len(due_calls) == 1 and len(top_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_running_the_brief_sees_no_private_solo_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_private_ok` answers "may this READER see principal-private data" —
+    true for any principal on a verified private surface — not "is this data
+    theirs". `principal_due_soon` and `build_top_three` resolve the lowest-id
+    row, so a co-principal running the brief from their own DM would be handed
+    the other founder's commitments and calendar titles. Both conditions are
+    needed and neither implies the other."""
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+    due_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        raise AssertionError("top three built for a co-principal reader")
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    # A reader who passes `_private_ok` — as the scheduler's own run does, and
+    # as a principal on their own verified surface does.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert due_calls == []  # not read at all, so it cannot be mis-attributed
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_reader_gets_no_owner_keyed_live_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same gate, three lines further down, for the reads the test above
+    does not cover.
+
+    `refresh_calendar` resolves `find_principal_person()` and asks for THAT
+    person's `calendar_id` (`top_three.read_todays_calendar`), and
+    `gather_live_signals(include_private=True)` hands back the same person's
+    chat titles (`live_signals._conversations`) plus an install-wide draft
+    count keyed to nobody (`live_signals._drafts`). Neither takes a recipient,
+    so both were gated on `_private_ok()` alone while the solo block above
+    them also asked the roster — and a co-principal running the brief from
+    their own DM therefore received the lowest-id founder's day.
+
+    The sibling test above stubs `build_top_three` and `principal_due_soon`;
+    the autouse fixture stubs `refresh_calendar` to None. So nothing asserted
+    on these reads, and the leak sat one gate away from the one that was
+    fixed.
+    """
+    from openexecutive.briefing import live_signals
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    conversation_reads: list[object] = []
+    monkeypatch.setattr(
+        live_signals,
+        "_conversations",
+        lambda since, tz: conversation_reads.append(since) or ([], []),
+    )
+    calendar_reads: list[object] = []
+
+    async def _calendar(now: object = None, **kw: object) -> None:
+        calendar_reads.append(now)
+        return None
+
+    monkeypatch.setattr(live_signals, "refresh_calendar", _calendar)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert conversation_reads == []
+    assert calendar_reads == []
+
+    # Control: a sole principal is the one reader these reads are about, and
+    # still gets them — otherwise this test would pass on a brief that simply
+    # never reads a calendar.
+    people_store.archive_person(
+        next(p.id for p in people_store.active_principals() if p.full_name == "Grace")
+    )
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert len(conversation_reads) == 1
+    assert len(calendar_reads) == 1

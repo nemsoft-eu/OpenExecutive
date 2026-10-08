@@ -414,8 +414,9 @@ def test_reflection_runs_only_tools_it_offered(
     mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A tool the pass does not offer never runs, in either mode. The raw
-    DM tools (send_slack_dm has no roster check), ack_alert and
-    close_open_loop used to run whenever the model emitted them."""
+    DM tools, ack_alert and close_open_loop used to run whenever the model
+    emitted them — the raw DM tools mattered most because the pass kept
+    passing the wrong identifier into them."""
     if mode == "solo":
         _solo()
     _principal()
@@ -1375,14 +1376,16 @@ def test_scheduled_solo_brief_is_written_for_and_delivered_to_the_principal(
     calls = _capture_synth(monkeypatch)
     sent: list[str] = []
 
-    async def _deliver(text: str, **_kw: object) -> Any:
+    async def _deliver(person: Any, text: str, **_kw: object) -> Any:
         sent.append(text)
         return runner.PrincipalDelivery(True, "telegram → 555", "delivered", "telegram")
 
     async def _no_review(**_kw: object) -> None:
         return None
 
-    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    # The per-recipient seam the fan-out calls; a solo workspace has the one
+    # principal this test already seeded, so it is called once.
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver)
     monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
     monkeypatch.setattr("openexecutive.alerts.review.run_alert_review", _no_review)
 

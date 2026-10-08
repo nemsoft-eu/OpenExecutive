@@ -278,11 +278,11 @@ async def test_synthesis_stops_when_iteration_makes_no_progress(
 async def test_synthesis_skips_a_tool_it_did_not_offer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tool the pass withholds (here the raw `send_slack_dm`, which has no
-    roster check; likewise the watchlist writes, `ack_alert`, `run_workflow`)
-    must not run when the model emits it anyway — e.g. from injected text in
-    a finding. The handler map is built from the offered list, so it is
-    skipped as unknown."""
+    """A tool the pass withholds (here the raw `send_slack_dm`, which the pass
+    kept calling with the wrong identifier; likewise the watchlist writes,
+    `ack_alert`, `run_workflow`) must not run when the model emits it anyway —
+    e.g. from injected text in a finding. The handler map is built from the
+    offered list, so it is skipped as unknown."""
     ran: list[str] = []
 
     async def _dm(_inp: dict[str, Any]) -> str:
