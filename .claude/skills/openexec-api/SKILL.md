@@ -86,11 +86,14 @@ curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/today | jq
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/people | jq
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/people/by-scope/CEO | jq
 # The route is /scheduled, NOT /scheduled_actions (which this file claimed
-# until 2026-10-08 and which 404s). A 404 body is `{"detail":"Not Found"}`,
-# so a jq/python filter reaching for `.actions` turns it into an empty list
-# and the queue reads as empty when it is not. Check the status code, not
-# just the parsed length.
-curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" "$OE_API/scheduled?status=pending" | jq
+# until 2026-10-08 and which 404s). Read the status code: a 404 does not
+# announce itself downstream, and `| jq` cannot carry the failure — `curl -f`
+# exits 22, but jq exits 0 on empty input and a pipeline reports the LAST
+# command's status unless `set -o pipefail` is on.
+code=$(curl -s -o /tmp/scheduled.json -w '%{http_code}' \
+  -H "x-api-key: $BACKEND_SHARED_SECRET" "$OE_API/scheduled?status=pending")
+if [ "$code" = 200 ]; then jq . /tmp/scheduled.json
+else echo "HTTP $code - wrong route, auth or host; NOT an empty queue"; fi
 ```
 
 ## Green: audit log
@@ -151,8 +154,8 @@ If you need a route this skill doesn't list, the authoritative source is `packag
 
 ## Common gotchas
 
-- **A 404 parses as an empty result.** The body is `{"detail":"Not Found"}`, so any filter reaching for a list key (`.actions`, `.sections`, `.people`) with an `or []` fallback reports zero rows for a route that does not exist — indistinguishable from a genuinely empty one. A wrong path in this file once had a healthy 7-row scheduler queue reported as empty repeatedly. Capture `-w '%{http_code}'` (or `--fail`) on any GET whose emptiness you intend to act on, and treat a 404 as "wrong route", never as "no data".
-- A route that 404s against a deployed instance but exists in the source means the running image predates it — check `podman ps` for the API container's creation time before concluding the feature is missing.
+- **A 404 never reads as a 404 downstream.** `/scheduled` and `/people` answer with a bare JSON array; the 404 body is an object, `{"detail":"Not Found"}`. So `jq 'length'` on a 404 returns 1 (one key, not one row), a per-element filter dies with `Cannot index string`, and a key-based fallback written for a wrapper object (`(.actions // []) | length`) returns 0 — which is the one that silently lies, and it returns 0 for a *healthy* queue too, because the real answer is an array with no `.actions` at all. A wrong path in this file once had a healthy 7-row scheduler queue reported as empty repeatedly. Capture `-w '%{http_code}'` on any GET whose emptiness you intend to act on and require 200 before reading the body; `--fail` alone is not enough through a pipe (see the scheduler recipe above).
+- **A route that 404s against a deployed instance but exists in the source means the running image predates it — do not diagnose that from container age.** A Docker host may have no `podman` at all, and a container's creation time records when the *instance* was created, not when its image was built: recreating from a stale cached image looks minutes old while serving month-old code. That is the exact trap this file fell into. Compare versions instead — `GET /health` reports a release-please-managed `version` (`/version` returns the same number as `current`) and `packages/core/pyproject.toml` holds the checkout's, so a mismatch means the image is not this code. It is release-granular, so two commits inside one release window are indistinguishable and a match does not prove an unreleased route is present; for that, call the route. `scripts/verify-deploy.py` (added in #44) automates the comparison with exit 0/1/2.
 - `localhost:8000` requires `make dev` running. If curl returns "Connection refused," the dev server is down.
 - `x-api-key` middleware applies to nearly all routes. A bare `GET /health` works without it, but most others 401 without the header.
 - The UI proxies through `/api/backend/...` and re-stamps `x-caller-email` from the verified session. Hitting the API directly bypasses that — useful for testing, but means you control the caller identity (and have to set it accurately).
