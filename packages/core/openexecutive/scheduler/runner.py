@@ -2433,11 +2433,12 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             # shared brief from a fallback leg, because nothing else re-checks
             # membership once `_live_principal` has run.
             #
-            # Consequence worth knowing: the delivery audit rows for a shared
-            # brief are now classified `private_to_principal` too
-            # (`audit_row_private_to_principal`). They carry delivery metadata
-            # about a report that only principals ever receive, so principal-
-            # only visibility is the honest classification rather than a loss.
+            # Scope note: this block covers the SEND and nothing else. The
+            # per-recipient audit writes below sit outside it and so are
+            # marked private at their own call rather than inheriting it from
+            # here — an earlier revision of this comment claimed they
+            # inherited it, which was simply false and is the kind of thing
+            # the egress gate must not be reasoned about loosely.
             with restrict_to_principal():
                 sends = await deliver_to_each_principal(
                     artifact, label=workflow.title, recipients=recipients
@@ -2479,12 +2480,23 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             # One audit row per recipient: a founder whose channel is broken
             # has to be visible on its own, not folded into a sibling's
             # success.
+            #
+            # `private=True` explicitly, not inherited from the context. These
+            # writes run AFTER the `restrict_to_principal()` block above has
+            # exited, so `audit_row_private_to_principal` — which classifies
+            # from the context at write time — would file them as ordinary
+            # rows, and each one names a founder alongside the raw address or
+            # channel id the send used (`d.detail`). A teammate reading
+            # `/audit/logs` would get both. Marking them here keeps the
+            # classification true where the row is written rather than
+            # depending on a block it sits outside.
             for person, d in sends:
                 audit_log(
                     "scheduled_action",
                     f"{kind} {'delivered' if d.ok else 'NOT delivered'} "
                     f"to {person.full_name or person.id} ({d.detail})",
                     actor="scheduler",
+                    private=True,
                     details={
                         "phase": "delivered" if d.ok else "delivery_failed",
                         "kind": kind, "person_id": person.id,

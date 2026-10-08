@@ -1239,6 +1239,25 @@ def test_the_private_brief_raises_the_flag_for_every_channel_leg(
     assert len(sends) == 1
 
 
+def test_the_per_recipient_delivery_audit_rows_are_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each row names a founder next to the raw address or channel id the send
+    used, so a teammate reading /audit/logs must not get them. They are written
+    after the `restrict_to_principal()` block exits, so the context classifier
+    would file them as ordinary rows — they carry `private=True` of their own
+    instead. Asserted on the kwarg because that is what the logger stores."""
+    flags: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.audit.log_event",
+        lambda *a, **k: flags.append(k.get("private")) if k.get("details") else None,
+    )
+
+    _run_brief(tmp_path, monkeypatch, principals=2)
+
+    assert flags == [True, True]  # one per recipient, both private
+
+
 def test_one_broken_channel_is_reported_while_the_other_founder_still_gets_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
