@@ -2284,7 +2284,6 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     nor breaks the chain.
     """
     import uuid
-    from contextlib import nullcontext
 
     from openexecutive.audit import log_event as audit_log
     from openexecutive.briefing import brief_state
@@ -2411,12 +2410,26 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             # caller-side snapshot cannot be await-safe at any granularity; the
             # fan-out's revalidation is now a courtesy pre-filter that drops
             # such a recipient quietly instead of letting the egress refuse
-            # them. Gated on `private_run` because that is exactly the
-            # condition that makes the artifact one person's private data: a
-            # SHARED brief must not be gated this way, or a co-founder's own
-            # leg would be refused.
-            gate = restrict_to_principal() if private_run else nullcontext()
-            with gate:
+            # them. Applied to EVERY brief fan-out, shared or private, because
+            # these are two different concerns: `PRINCIPAL_DELIVERY` decides
+            # what the artifact may CONTAIN, while this decides who it may
+            # REACH — and the fan-out addresses principals either way.
+            #
+            # An earlier revision conditioned this on `private_run`, reasoning
+            # that gating a shared brief would refuse a co-founder's own leg.
+            # That was false: `_dm_recipient_on_roster` requires
+            # `is_principal`, which every recipient out of
+            # `active_principals()` has by construction. The conditional
+            # bought nothing and left a demoted co-principal still receiving a
+            # shared brief from a fallback leg, because nothing else re-checks
+            # membership once `_live_principal` has run.
+            #
+            # Consequence worth knowing: the delivery audit rows for a shared
+            # brief are now classified `private_to_principal` too
+            # (`audit_row_private_to_principal`). They carry delivery metadata
+            # about a report that only principals ever receive, so principal-
+            # only visibility is the honest classification rather than a loss.
+            with restrict_to_principal():
                 sends = await deliver_to_each_principal(
                     artifact, label=workflow.title, recipients=recipients
                 )

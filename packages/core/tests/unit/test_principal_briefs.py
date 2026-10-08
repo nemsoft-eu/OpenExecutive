@@ -1079,13 +1079,20 @@ def test_an_archived_recipient_is_refused_at_the_egress_not_by_the_pre_filter(
     ]
 
 
-def test_the_shared_brief_is_not_gated_as_private(
+def test_every_brief_fan_out_is_gated_at_the_egress_shared_or_private(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`restrict_to_principal` is raised only for a single-recipient run. With
-    co-principals the artifact is generated SHARED, and gating the fan-out as
-    private would refuse each co-founder's own leg — every handler would ask
-    "is this id the principal's?" of a roster with two."""
+    """Audience and content are different concerns. `PRINCIPAL_DELIVERY`
+    decides what the artifact may CONTAIN; `restrict_to_principal` decides who
+    it may REACH, and a brief fan-out addresses principals either way.
+
+    An earlier revision raised the gate only for a single-recipient run, on the
+    reasoning that gating a shared brief would refuse each co-founder's own leg
+    because the handlers would ask "is this id *the* principal's" of a roster
+    with two. That reasoning was wrong: `_dm_recipient_on_roster` asks
+    `is_principal`, which every recipient out of `active_principals()` has. The
+    conditional bought nothing and left a co-principal demoted mid-send still
+    receiving a shared brief off a fallback leg."""
     from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
 
     private_at_send: list[bool] = []
@@ -1095,7 +1102,7 @@ def test_the_shared_brief_is_not_gated_as_private(
         return runner.PrincipalDelivery(True, "slack_dm → U", "delivered", "slack_dm")
 
     _run_brief(tmp_path, monkeypatch, deliver_person=_observe, principals=2)
-    assert private_at_send == [False, False]
+    assert private_at_send == [True, True]  # shared artifact, still principal-only egress
 
     private_at_send.clear()
     solo = tmp_path / "solo"
@@ -1104,6 +1111,47 @@ def test_the_shared_brief_is_not_gated_as_private(
     assert private_at_send == [True]
     # And the flag does not outlive the send.
     assert turn_is_private_to_principal() is False
+
+
+def test_a_demoted_co_principal_is_refused_by_the_shared_briefs_egress(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap that closing the `private_run` conditional fixes, asserted at
+    the handler because that is the only place it is observable.
+
+    Going through `deliver_to_each_principal` would prove nothing: both
+    `active_principals()` and the pinned-list intersect already drop a demoted
+    row, so such a test passes with the egress gate entirely removed (verified
+    by mutation). The gate earns its keep only in the window those filters
+    cannot see — demotion between the intersect and a later channel leg — so
+    the behaviour under test is the handler's own fresh read: a demoted but
+    still-active team member must be refused when the turn is restricted,
+    and accepted when it is not."""
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
+    from openexecutive.orchestrator.schedule_tools import _dm_recipient_on_roster
+    from openexecutive.people import store as people_store
+    from openexecutive.people.store import find_person_by_slack_id
+
+    people_store.upsert_person(full_name="Maarten", is_principal=True, slack_user_id="UM")
+    nick = people_store.upsert_person(
+        full_name="Nick", is_principal=True, slack_user_id="UN"
+    )
+    # Demoted, NOT archived: still an active team member, so an archived-only
+    # check lets him through and only `is_principal` refuses him.
+    people_store.upsert_person(
+        full_name="Nick", is_principal=False, slack_user_id="UN", person_id=nick
+    )
+
+    with restrict_to_principal():
+        assert _dm_recipient_on_roster(find_person_by_slack_id, "UN") is False
+        # The sitting principal is unaffected — the gate narrows the audience
+        # to principals, it does not refuse the fan-out's own recipients.
+        assert _dm_recipient_on_roster(find_person_by_slack_id, "UM") is True
+
+    # Negative control: outside the restriction the demoted member is an
+    # ordinary allowed DM recipient, so the refusal above is the gate rather
+    # than a roster lookup or an archived row.
+    assert _dm_recipient_on_roster(find_person_by_slack_id, "UN") is True
 
 
 def test_restrict_to_principal_restores_the_prior_value() -> None:
