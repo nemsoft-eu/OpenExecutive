@@ -68,6 +68,14 @@ async def remind_due(now: datetime) -> int:
     sent = 0
     for person_id in history.people_keeping_notes():
         try:
+            # Read inside the loop, so the row is this person's as it stands
+            # after the previous iteration's send returned, not from a
+            # snapshot taken before any of them. `deliver_to_person` sends
+            # the row it is handed and deliberately does not check the
+            # roster itself — a membership check down there can only ask one
+            # question, and the one this needs is `can_keep_notes` (on the
+            # People list, works here, not archived, never a contact), not
+            # the principal membership the brief fan-out needs.
             person = get_person(person_id)
             if person is None or not history.can_keep_notes(person) or history.reminded(person_id, day):
                 continue

@@ -306,6 +306,38 @@ def test_a_reminder_says_how_many_never_what(
     assert asyncio.run(hr.remind_due(NOW)) == 0 and len(sends) == 2
 
 
+def test_someone_offboarded_mid_pass_gets_no_reminder(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`remind_due` sends one reminder per person and awaits each, so a person
+    reached later is reached only after an earlier send has returned. Its row
+    is therefore read inside the loop and checked with `can_keep_notes` —
+    `deliver_to_person` sends whatever Person it is handed and asks the roster
+    nothing, so this is the only thing standing between an offboarded
+    teammate and a DM."""
+    from openexecutive.scheduler import runner
+
+    out: list[int] = []
+
+    async def _deliver_then_offboard_ben(person: Any, text: str, *, label: str = "") -> Any:
+        out.append(person.id)
+        # Ben is archived while Olivia's send is in flight — the window a
+        # roster read from before the loop could not see.
+        if person.id == roster.owner:
+            people_store.archive_person(roster.teammate)
+            people_registry.invalidate()
+        return runner.PrincipalDelivery(True, "slack_dm → U1", "delivered", "slack_dm")
+
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver_then_offboard_ben)
+    _keep(roster.owner)
+    _keep(roster.teammate)
+    _note(roster.owner, "the price list goes to Dana", due=TODAY)
+    _note(roster.teammate, "the venue deposit goes in", due=TODAY)
+
+    assert asyncio.run(hr.remind_due(NOW)) == 1
+    assert out == [roster.owner]  # never Ben
+
+
 def test_no_reminder_for_chat_promises_other_days_or_the_switch_off(
     roster: SimpleNamespace, sends: list[tuple[int, str]],
 ) -> None:
@@ -403,16 +435,14 @@ def test_delivery_to_a_person_skips_a_group_telegram_chat(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(runner, "_send_on_plan", _send)
     monkeypatch.setattr(runner, "email_ready", lambda: False)
-    # Seeded rather than built in memory: `deliver_to_person` re-reads the row
-    # by id immediately before sending, so a Person with no row behind it is
-    # treated as offboarded and never sent to. Every production caller gets
-    # its Person from this store, so seeding is the realistic shape.
-    group_id = people_store.upsert_person(
-        full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5"
-    )
-    private_id = people_store.upsert_person(full_name="Ann", telegram_chat_id="4242")
-    group = Person(id=group_id, full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5")
-    private = Person(id=private_id, full_name="Ann", telegram_chat_id="4242")
+    # Built in memory, with no row behind them: `deliver_to_person` sends the
+    # Person it is given and asks the roster nothing, so the plan is all this
+    # needs. It briefly re-read the row by id, which made these two read as
+    # offboarded and forced a seed here; that check now lives in the callers
+    # that actually have a membership question (`deliver_to_each_principal`,
+    # `memory.history_reminders`).
+    group = Person(id=5, full_name="Ben", telegram_chat_id="-100123", slack_user_id="U5")
+    private = Person(id=6, full_name="Ann", telegram_chat_id="4242")
     asyncio.run(runner.deliver_to_person(group, "hi"))
     asyncio.run(runner.deliver_to_person(private, "hi"))
     assert plans == [["slack_dm"], ["telegram"]]

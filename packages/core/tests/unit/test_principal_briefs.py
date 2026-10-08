@@ -778,7 +778,12 @@ def test_a_founder_offboarded_mid_fan_out_is_not_sent_to(
     before the loop is already stale by the time a later founder is reached.
     Archiving Nick while Maarten's Slack call is in flight must stop Nick's
     send — `handle_send_slack_dm` has no unconditional roster check of its
-    own, so nothing downstream would catch it."""
+    own, so nothing downstream would catch it.
+
+    Nick is DROPPED from the results rather than carrying a reason, which is
+    what the audience cap means: he is not a recipient of this run. See
+    `test_an_offboarded_founder_does_not_poison_the_runs_aggregate` for why
+    a per-recipient reason here cannot work."""
     import asyncio
 
     from openexecutive.orchestrator import schedule_tools
@@ -804,9 +809,7 @@ def test_a_founder_offboarded_mid_fan_out_is_not_sent_to(
     results = asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
 
     assert [args["user_id"] for _, args in sent.calls] == ["UMAARTEN"]  # never UNICK
-    by_name = {p.full_name: d for p, d in results}
-    assert by_name["Maarten"].ok
-    assert (by_name["Nick"].ok, by_name["Nick"].reason) == (False, "no_owner")
+    assert [(p.full_name, d.reason) for p, d in results] == [("Maarten", "delivered")]
 
 
 def test_a_reassigned_slack_id_is_read_fresh_at_send_time(
@@ -839,6 +842,48 @@ def test_a_reassigned_slack_id_is_read_fresh_at_send_time(
     asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
 
     assert [args["user_id"] for _, args in sent.calls] == ["UMAARTEN", "UNEW"]
+
+
+def test_a_founder_demoted_mid_fan_out_is_not_sent_to(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Being archived is not the only way to stop being a recipient. An
+    onboarding re-run rewrites `is_principal`, and a DEMOTED founder's row
+    stays right there, unarchived — so a revalidation that tests `archived`
+    alone sends them the standing brief, and the channel handlers' roster
+    checks wave it through because an ordinary team member is on the roster.
+
+    `active_principals()` filters on `is_principal` as well as `archived` (and
+    on `kind = 'team'`), so the fix is to ask it rather than to restate it."""
+    import asyncio
+    import json
+
+    from openexecutive.orchestrator import schedule_tools
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Maarten", is_principal=True, slack_user_id="UMAARTEN")
+    nick = people_store.upsert_person(
+        full_name="Nick", is_principal=True, slack_user_id="UNICK"
+    )
+
+    async def _send_then_demote_nick(args: dict) -> str:  # type: ignore[type-arg]
+        sent.calls.append(("slack", args))
+        if args["user_id"] == "UMAARTEN":
+            people_store.upsert_person(
+                full_name="Nick", is_principal=False, slack_user_id="UNICK", person_id=nick
+            )
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(schedule_tools, "handle_send_slack_dm", _send_then_demote_nick)
+
+    results = asyncio.run(runner.deliver_to_each_principal("BRIEF", label="Morning Brief"))
+
+    assert [args["user_id"] for _, args in sent.calls] == ["UMAARTEN"]  # never UNICK
+    assert [(p.full_name, d.reason) for p, d in results] == [("Maarten", "delivered")]
+    # Demoted, not offboarded: the row is still on the roster and unarchived,
+    # which is exactly what an `archived`-only check cannot see.
+    fresh = people_store.get_person(nick)
+    assert fresh is not None and not fresh.archived and not fresh.is_principal
 
 
 def test_an_archived_principal_gets_no_brief(sent: _Sent) -> None:
@@ -942,6 +987,93 @@ def test_one_broken_channel_is_reported_while_the_other_founder_still_gets_it(
     # One audit row per recipient, so the broken one is visible on its own.
     phases = [r["phase"] for r in rows if r.get("kind") == "principal_brief_morning"]
     assert phases == ["delivered", "delivery_failed"]
+
+
+def test_an_offboarded_founder_does_not_poison_the_runs_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why the fan-out DROPS a founder who stopped being a principal instead
+    of returning a reason for them. `delivery_summary` takes the worst reason
+    any recipient got, and `no_owner` there already means "there was no
+    principal on the roster at all" — so a per-recipient `no_owner` made a run
+    that did reach the other founder store as `no_owner`, indistinguishable
+    from a run with nobody to send to."""
+    from openexecutive.briefing import brief_state
+    from openexecutive.people import store as people_store
+
+    archived: list[int] = []
+
+    async def _archive_the_other_founder(person, text: str, **_kw: object):  # type: ignore[no-untyped-def]
+        # Founder 1 is offboarded while Founder 0's send is in flight.
+        if not archived:
+            for other in people_store.active_principals():
+                if other.id is not None and other.id != person.id:
+                    people_store.archive_person(other.id)
+                    archived.append(other.id)
+        return runner.PrincipalDelivery(True, "slack_dm → U0", "delivered", "slack_dm")
+
+    sends = _run_brief(
+        tmp_path, monkeypatch, deliver_person=_archive_the_other_founder, principals=2
+    )
+
+    assert len(archived) == 1
+    assert len(sends) == 1  # Founder 1 is never sent to
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    # The aggregate is the remaining recipient's, not `no_owner`.
+    assert (outcome.reason, outcome.channel) == ("delivered", "slack_dm")
+    assert [(r.name, r.reason) for r in outcome.recipients] == [("Founder 0", "delivered")]
+    # And the window advanced, so the founder who got it is not replayed it.
+    last = brief_state.last_delivered("principal_brief_morning")
+    assert last is not None and last.input_hash == "fp-123"
+
+
+def test_a_failed_roster_read_for_a_later_founder_keeps_the_earlier_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`people.store` is not exception-swallowing. A roster read that raises
+    for a LATER recipient — an SQLite error under contention, say — must not
+    discard the recipients already delivered to: that recorded a run-level
+    `send_failed` with no recipients at all, never advanced the window, and so
+    replayed the same interval to the founder who already had the brief while
+    every surface said the run had failed for everyone."""
+    import sqlite3
+
+    from openexecutive.briefing import brief_state
+    from openexecutive.people import store as people_store
+
+    real_active_principals = people_store.active_principals
+    armed: list[bool] = []
+
+    def _raises_once_armed(*args: object, **kw: object) -> list[object]:
+        if armed:
+            raise sqlite3.OperationalError("database is locked")
+        return real_active_principals(*args, **kw)  # type: ignore[arg-type]
+
+    # Armed by the first send rather than by a call count, so the test does
+    # not depend on how many times the roster is read before the loop.
+    monkeypatch.setattr(people_store, "active_principals", _raises_once_armed)
+
+    async def _deliver_then_break_the_roster(person, text: str, **_kw: object):  # type: ignore[no-untyped-def]
+        armed.append(True)
+        return runner.PrincipalDelivery(True, "slack_dm → U0", "delivered", "slack_dm")
+
+    sends = _run_brief(
+        tmp_path, monkeypatch, deliver_person=_deliver_then_break_the_roster, principals=2
+    )
+
+    assert len(sends) == 1  # Founder 1's revalidation raised before its send
+    outcome = brief_state.last_delivery_outcome()
+    assert outcome is not None and outcome.recipients is not None
+    # Founder 0's success survives, and Founder 1's failure is still visible
+    # as its own recipient row rather than as a run-level verdict.
+    assert [(r.name, r.reason) for r in outcome.recipients] == [
+        ("Founder 0", "delivered"), ("Founder 1", "send_failed"),
+    ]
+    assert (outcome.reason, outcome.channel) == ("send_failed", None)
+    # The window advanced for the founder who did receive it.
+    last = brief_state.last_delivered("principal_brief_morning")
+    assert last is not None and last.input_hash == "fp-123"
 
 
 def test_the_record_says_which_channel_was_tried_first(
