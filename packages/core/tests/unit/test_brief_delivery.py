@@ -403,10 +403,35 @@ def test_an_unreached_founder_outranks_the_channel_and_zone_warnings() -> None:
     check = check_brief(snap)
     assert check.state == "warn"
     assert check.summary == "Not reaching everyone: nothing is set up to send it to Grace."
-    # Both masked warnings still show once Grace can be reached.
-    people[1] = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
-    solo = check_brief(_snap(people=people, principal=ada, brief_delivery=backup, brief_zone=None))
+    # Control: the backup-channel warning it masked does show on a roster
+    # where it can be claimed at all — one principal, so the recorded channel
+    # is unambiguously theirs. (With co-principals it stays suppressed even
+    # when everyone is reachable: one record cannot be attributed to a
+    # person. See `test_a_co_principal_roster_claims_no_single_channel`.)
+    solo = check_brief(
+        _snap(people=[ada], principal=ada, brief_delivery=backup, brief_zone=None)
+    )
     assert solo.summary.startswith("Your last morning brief went by email")
+
+
+def test_a_co_principal_roster_claims_no_single_channel() -> None:
+    """Ada by email, Grace on Slack: both reachable, so the light is green —
+    but "Sent to you by email" would be false for Grace, and the recorded
+    channel (the FIRST successful recipient's) cannot be attributed to either,
+    so the backup-channel warning is not claimable either."""
+    ada = Person(id=3, full_name="Ada", is_principal=True, email="ada@acme.io")
+    grace = Person(id=7, full_name="Grace", is_principal=True, slack_user_id="U7")
+    # Recorded channel is Grace's Slack; Ada's plan starts at email. On one
+    # roster that reads as "email didn't work" — here it means nothing.
+    carried = DeliveryOutcome(MORNING, "delivered", "slack_dm", NOW)
+    check = check_brief(_snap(people=[ada, grace], principal=ada, brief_delivery=carried))
+    assert check.state == "ok"
+    assert check.summary == (
+        "Sent to each of you on your own channel: the morning brief at 08:00 "
+        "and the end-of-day digest at 18:00 (America/Los_Angeles)."
+    )
+    assert "by email" not in check.summary
+    assert "didn't work" not in check.summary
 
 
 def test_a_reachable_roster_leaves_the_light_green() -> None:

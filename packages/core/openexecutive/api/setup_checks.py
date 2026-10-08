@@ -1047,9 +1047,17 @@ def check_brief(snap: Snapshot) -> SetupCheck:
         )
     # `plan` is non-empty from here: an empty one puts `principal` in
     # `missing`, which the branch above returns on.
-    if last is not None and last.channel and last.channel != plan[0]:
+    solo_roster = len(principals) <= 1
+    if solo_roster and last is not None and last.channel and last.channel != plan[0]:
         # It got through, but not on the first channel it tried: that one is
         # broken, and every brief is going by the backup.
+        #
+        # Only claimable on a one-principal roster. `record_delivery_outcome`
+        # stores ONE channel for a fan-out with several recipients (the first
+        # success), so with co-principals the recorded channel may be the
+        # other founder's — comparing it to this row's `plan[0]` would call a
+        # working channel broken. Attributing it needs a per-recipient record;
+        # until then the inference is unsound and is not made.
         first = CHANNEL_NAMES[plan[0]]
         return _result(
             "brief",
@@ -1065,15 +1073,20 @@ def check_brief(snap: Snapshot) -> SetupCheck:
         if kind in snap.brief_next_runs
     ]
     when = f": {' and '.join(times)}" if times else ""
+    # `plan` is this row's. Co-principals each get their own DM on their own
+    # channel, so naming one would tell a founder reached on Slack that the
+    # briefs go by email. Every principal is reachable by here (an unreachable
+    # one returns above), so the only honest summary is the plural one.
+    sent = f"Sent to you {channel_phrase(plan[0])}" if solo_roster else "Sent to each of you on your own channel"
     if snap.brief_zone is None:
         return _result(
             "brief",
             "warn",
-            f"Sent to you {channel_phrase(plan[0])}{when}, in UTC because no time zone is set.",
+            f"{sent}{when}, in UTC because no time zone is set.",
             "Set your time zone in Settings.",
             link="/settings",
         )
-    return _result("brief", "ok", f"Sent to you {channel_phrase(plan[0])}{when} ({snap.brief_zone}).")
+    return _result("brief", "ok", f"{sent}{when} ({snap.brief_zone}).")
 
 
 async def check_memory(snap: Snapshot) -> SetupCheck:

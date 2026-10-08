@@ -21,7 +21,7 @@ from openexecutive.workflows.morning_brief import (
 
 
 @pytest.fixture(autouse=True)
-def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
     # The "handled overnight" block reads the audit log; keep it empty and
     # deterministic here regardless of what other modules audited.
@@ -38,10 +38,24 @@ def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(episodic, "DB_PATH", tmp_path / "episodic.db")
     episodic.initialize_db()
 
+    # The solo sections are gated on the size of the roster, so the tests
+    # below seed principals. Without this the writes land in the default
+    # ./episodic_memory.db and change what OTHER modules' tests see — a
+    # failure that only shows in a full run. (test_weekly_review.py and
+    # test_top_three.py isolate the same store for the same reason.)
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    monkeypatch.setattr(people_store, "DB_PATH", tmp_path / "people.db")
+    people_store.initialize_db(tmp_path / "people.db")
+    people_registry.invalidate()
+
     async def _no_calendar(*_a: object, **_k: object) -> None:
         return None
 
     monkeypatch.setattr(live_signals, "refresh_calendar", _no_calendar)
+    yield
+    people_registry.invalidate()
 
 
 @pytest.mark.asyncio
@@ -538,3 +552,52 @@ async def test_solo_sections_are_left_out_of_a_shared_brief(
     finally:
         morning_brief.PRINCIPAL_DELIVERY.reset(token)
     assert len(due_calls) == 1 and len(top_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_running_the_brief_sees_no_private_solo_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_private_ok` answers "may this READER see principal-private data" —
+    true for any principal on a verified private surface — not "is this data
+    theirs". `principal_due_soon` and `build_top_three` resolve the lowest-id
+    row, so a co-principal running the brief from their own DM would be handed
+    the other founder's commitments and calendar titles. Both conditions are
+    needed and neither implies the other."""
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+    due_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        raise AssertionError("top three built for a co-principal reader")
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    # A reader who passes `_private_ok` — as the scheduler's own run does, and
+    # as a principal on their own verified surface does.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert due_calls == []  # not read at all, so it cannot be mis-attributed

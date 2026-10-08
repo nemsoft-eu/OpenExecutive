@@ -175,6 +175,7 @@ class MorningBriefWorkflow(Workflow):
         from openexecutive.briefing.live_signals import gather_live_signals, refresh_calendar
         from openexecutive.memory.workspace_settings import effective_workspace_mode
         from openexecutive.orchestrator.schedule_tools import current_session
+        from openexecutive.people.store import active_principals
 
         # The window is "since the last brief I actually delivered" (24 h on
         # a cold store), so "what changed" is a real delta, not the latest N.
@@ -198,13 +199,18 @@ class MorningBriefWorkflow(Workflow):
             logger.exception("morning_brief: /today aggregation failed")
             today_data = {"departments": [], "people": [], "proposals": []}
         top_three_calendar = False
-        # `private_ok`, not just `mode`: both reads below are keyed to
-        # `find_principal_person()` — the lowest-id row — and neither takes a
-        # recipient. On a solo workspace with co-principals the brief is
-        # generated SHARED and fanned out to all of them, so including these
-        # would put one founder's own commitments, the asks their contacts
-        # made of them, and their calendar event titles in the other's DM.
-        if mode == "solo" and private_ok:
+        # Both reads below are keyed to `find_principal_person()` — the
+        # lowest-id row — and neither takes a recipient, so they are only safe
+        # when that row is the only principal there is. Two conditions, and
+        # neither implies the other: `private_ok` says this READER may see
+        # principal-private data (the scheduler's own delivery, or a principal
+        # on a verified private surface), while the roster check says the data
+        # is actually THEIRS. A co-principal running the brief from their own
+        # DM passes `private_ok` and would otherwise be handed the other
+        # founder's commitments and calendar titles; the scheduler's shared
+        # fan-out passes neither. Same predicate as the weekly review's
+        # commitments step.
+        if mode == "solo" and private_ok and len(active_principals()) <= 1:
             # What the principal owns that is due this week or overdue — their
             # dated commitments. It lands here even when no channel reaches
             # them for a nudge. Never raises (reads as empty on failure).
