@@ -14,6 +14,7 @@ must not behave like the fixture loader.
 """
 from __future__ import annotations
 
+import sqlite3
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,9 @@ from openexecutive.api.models import ONBOARD_MESSAGE_MAX_CHARS
 from openexecutive.api.routes import onboarding as route
 from openexecutive.memory.company_profile import CompanyProfile
 from openexecutive.onboarding import interview as iv
+from openexecutive.onboarding.commit import (
+    save_onboarding_people as _real_save_onboarding_people,
+)
 
 
 def _draft(**overrides: Any) -> iv.CompanyDraft:
@@ -79,9 +83,14 @@ def seeded(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
 @pytest.fixture()
 def client(
-    monkeypatch: pytest.MonkeyPatch, profile_path: Path
+    monkeypatch: pytest.MonkeyPatch, profile_path: Path, tmp_path: Path
 ) -> TestClient:
     fired: list[str] = []
+    # An empty roster unless a test seeds one: the commit reads it to decide
+    # who owns the workspace, and must never see the developer's real DB.
+    from openexecutive.people import store as people_store
+
+    monkeypatch.setattr(people_store, "DB_PATH", tmp_path / "no-people.db")
 
     async def _no_research(session_id: str) -> None:
         fired.append(session_id)
@@ -695,3 +704,399 @@ def test_a_full_legal_start_does_not_lock_the_conversation(
         "/onboard/interview/message", json={"session_id": sid, "message": "Series A."}
     )
     assert follow_up.status_code == 200, follow_up.text
+
+
+# ── the owner's sign-in email ────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def people_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real roster, and the real save_onboarding_people the client fixture stubs."""
+    from openexecutive.people import store as people_store
+
+    path = tmp_path / "people.db"
+    monkeypatch.setattr(people_store, "DB_PATH", path)
+    people_store.initialize_db(path)
+    monkeypatch.setattr(
+        "openexecutive.onboarding.commit.save_onboarding_people", _real_save_onboarding_people
+    )
+    return path
+
+
+def test_commit_links_the_owner_email_to_the_principal(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    seeded.append(_draft())
+    sid = _start(client)
+    body = _commit_body(sid)
+    body["owner_email"] = " Dana@Example.com "
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+
+    owner = people_store.find_person_by_email("dana@example.com", db_path=people_db)
+    assert owner is not None
+    assert owner.full_name == "Dana Reyes" and owner.is_principal
+    assert owner.email == "dana@example.com"
+
+
+def test_commit_without_an_owner_email_leaves_the_principal_without_one(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    seeded.append(_draft())
+    sid = _start(client)
+    assert client.post("/onboard/interview/commit", json=_commit_body(sid)).status_code == 200
+    principal = people_store.find_principal_person(db_path=people_db)
+    assert principal is not None and principal.email is None
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_a_rejected_owner_email_writes_nothing_and_stays_retryable(
+    client: TestClient,
+    seeded: list[Any],
+    people_db: Path,
+    profile_path: Path,
+    taken: bool,
+) -> None:
+    from openexecutive.people import store as people_store
+
+    if taken:
+        people_store.upsert_person(full_name="Sam Okafor", email="secret-owner@example.com")
+        bad = "secret-owner@example.com"
+    else:
+        bad = "secret-owner-at-example"
+    seeded.append(_draft())
+    sid = _start(client)
+    body = _commit_body(sid)
+    body["owner_email"] = bad
+
+    resp = client.post("/onboard/interview/commit", json=body)
+    assert resp.status_code == 422
+    assert "secret-owner" not in resp.text
+    assert not profile_path.exists()
+    assert people_store.find_principal_person(db_path=people_db) is None
+
+    # Fixed and resent, the same session saves.
+    body["owner_email"] = "dana@example.com"
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert profile_path.exists()
+
+
+def test_a_rerun_never_replaces_the_owners_existing_email(
+    client: TestClient, seeded: list[Any], people_db: Path, profile_path: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    seeded.append(_draft())
+    sid = _start(client)
+    body = _commit_body(sid)
+    body["owner_email"] = "ops@example.com"
+
+    resp = client.post("/onboard/interview/commit", json=body)
+    assert resp.status_code == 422
+    assert not profile_path.exists()
+    dana = people_store.find_principal_person(db_path=people_db)
+    assert dana is not None and dana.email == "dana@example.com"
+
+    # Kept as it was (what the review screen now pre-fills on a re-run), it saves.
+    body["owner_email"] = "dana@example.com"
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    dana = people_store.find_principal_person(db_path=people_db)
+    assert dana is not None and dana.email == "dana@example.com"
+
+
+# ── who may change the owner ─────────────────────────────────────────────────
+# Setup demotes the current owner when it drafts someone else as principal,
+# and any signed-in user can open /onboard.
+
+
+def _seed_owner_and_teammate() -> None:
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    people_store.upsert_person(full_name="Bob Lin", email="bob@example.com")
+
+
+def _bob_as_owner(sid: str) -> dict[str, Any]:
+    body = _commit_body(sid)
+    body["people"] = [{"full_name": "Bob Lin", "role": "COO", "is_principal": True}]
+    body["departments"] = [{"title": "Operations"}]
+    return body
+
+
+def test_a_teammate_cannot_take_the_owner_role_by_rerunning_setup(
+    client: TestClient, seeded: list[Any], people_db: Path, profile_path: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    _seed_owner_and_teammate()
+    seeded.append(_draft())
+    sid = _start(client)
+    resp = client.post(
+        "/onboard/interview/commit",
+        json=_bob_as_owner(sid),
+        headers={"x-caller-email": "bob@example.com"},
+    )
+    assert resp.status_code == 403
+    assert not profile_path.exists()
+    owner = people_store.find_principal_person(db_path=people_db)
+    assert owner is not None and owner.full_name == "Dana Reyes"
+
+
+def test_the_owner_can_hand_the_role_on(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    _seed_owner_and_teammate()
+    seeded.append(_draft())
+    sid = _start(client)
+    resp = client.post(
+        "/onboard/interview/commit",
+        json=_bob_as_owner(sid),
+        headers={"x-caller-email": "dana@example.com"},
+    )
+    assert resp.status_code == 200, resp.text
+    owner = people_store.find_principal_person(db_path=people_db)
+    assert owner is not None and owner.full_name == "Bob Lin"
+
+
+def test_anyone_may_rerun_setup_that_keeps_the_owner(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    _seed_owner_and_teammate()
+    seeded.append(_draft())
+    sid = _start(client)
+    resp = client.post(
+        "/onboard/interview/commit",
+        json=_commit_body(sid),
+        headers={"x-caller-email": "bob@example.com"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_local_login_and_the_cli_count_as_the_owner(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    """No x-caller-email resolves to the principal, as everywhere else."""
+    from openexecutive.people import store as people_store
+
+    _seed_owner_and_teammate()
+    seeded.append(_draft())
+    sid = _start(client)
+    assert client.post("/onboard/interview/commit", json=_bob_as_owner(sid)).status_code == 200
+    owner = people_store.find_principal_person(db_path=people_db)
+    assert owner is not None and owner.full_name == "Bob Lin"
+
+
+def test_a_service_cannot_save_a_first_setup(
+    client: TestClient, seeded: list[Any], profile_path: Path
+) -> None:
+    """With signed callers on, a request holding only the shared secret names
+    no one, so it can't choose the owner (and their sign-in email) on an
+    install that has none yet."""
+    import json as _json
+
+    from openexecutive.api import caller as api_caller
+
+    vectors = _json.loads((Path(__file__).parent / "caller_assertion_vectors.json").read_text())
+    client.app.middleware("http")(  # type: ignore[attr-defined]
+        api_caller.caller_gate(api_caller.parse_public_keys(vectors["public_keys"]))
+    )
+    seeded.append(_draft())
+    sid = _start(client)
+    resp = client.post("/onboard/interview/commit", json=_commit_body(sid))
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Sign in to save setup."
+    assert not profile_path.exists()
+
+
+# ── who may fill in the owner's missing email ────────────────────────────────
+# The roster is the web sign-in allow-list, so an address put on an owner entry
+# that has none becomes a way to sign in as the owner.
+
+
+OWNER_EMAIL_REFUSAL = "Only the owner can put another address on the owner's entry."
+
+
+def _seed_owner_without_email_and_teammate() -> None:
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Dana Reyes", is_principal=True)
+    people_store.upsert_person(full_name="Bob Lin", email="bob@example.com")
+
+
+def _commit_with_owner_email(
+    client: TestClient, email: str, caller: str | None
+) -> Any:
+    sid = _start(client)
+    body = _commit_body(sid)
+    body["owner_email"] = email
+    headers = {"x-caller-email": caller} if caller else {}
+    return client.post("/onboard/interview/commit", json=body, headers=headers)
+
+
+def test_a_teammate_cannot_put_an_address_of_their_own_on_the_owners_entry(
+    client: TestClient, seeded: list[Any], people_db: Path, profile_path: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    # An address Bob controls that is on nobody's entry yet.
+    resp = _commit_with_owner_email(client, "bob.private@example.com", caller="bob@example.com")
+    assert resp.status_code == 403
+    assert resp.json()["detail"].startswith(OWNER_EMAIL_REFUSAL)
+    assert not profile_path.exists()
+    dana = people_store.find_principal_person(db_path=people_db)
+    assert dana is not None and dana.email is None
+    assert people_store.find_person_by_email("bob.private@example.com", db_path=people_db) is None
+
+
+def test_someone_signed_in_elsewhere_cannot_link_another_address(
+    client: TestClient, seeded: list[Any], people_db: Path, profile_path: Path
+) -> None:
+    # Let in by ALLOWED_EMAILS, on no entry: only their own address may go on.
+    from openexecutive.people import store as people_store
+
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    resp = _commit_with_owner_email(client, "someone@example.com", caller="dana@example.com")
+    assert resp.status_code == 403
+    assert resp.json()["detail"].startswith(OWNER_EMAIL_REFUSAL)
+    assert not profile_path.exists()
+    dana = people_store.find_principal_person(db_path=people_db)
+    assert dana is not None and dana.email is None
+
+
+def test_a_teammates_own_address_is_refused_too(
+    client: TestClient, seeded: list[Any], people_db: Path, profile_path: Path
+) -> None:
+    # What makes allowing the caller's own address safe: a rostered teammate's
+    # is already on their own entry. What the review screen pre-fills for Bob
+    # when the owner has none — and the message says what works.
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    resp = _commit_with_owner_email(client, "bob@example.com", caller="bob@example.com")
+    assert resp.status_code == 422
+    assert "leave it blank" in resp.json()["detail"]
+    assert not profile_path.exists()
+
+
+def test_an_unreadable_roster_refuses_to_link_the_owner_email(
+    client: TestClient,
+    seeded: list[Any],
+    people_db: Path,
+    profile_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def locked(*_args: Any, **_kwargs: Any) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    monkeypatch.setattr("openexecutive.onboarding.commit.owner_email_blocked", locked)
+    resp = _commit_with_owner_email(client, "dana@example.com", caller="dana@example.com")
+    assert resp.status_code == 503
+    assert not profile_path.exists()
+
+
+def test_the_owner_can_still_link_the_email_they_signed_in_with(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    # Dana's entry has no email, so the app can't tell her login is hers yet;
+    # the review screen pre-fills the address she signed in with.
+    from openexecutive.people import store as people_store
+
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    resp = _commit_with_owner_email(client, "Dana@Example.com", caller="dana@example.com")
+    assert resp.status_code == 200, resp.text
+    dana = people_store.find_person_by_email("dana@example.com", db_path=people_db)
+    assert dana is not None and dana.is_principal
+
+
+def test_local_login_and_the_cli_can_link_any_owner_email(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    from openexecutive.people import store as people_store
+
+    _seed_owner_without_email_and_teammate()
+    seeded.append(_draft())
+    assert _commit_with_owner_email(client, "dana@example.com", caller=None).status_code == 200
+    dana = people_store.find_principal_person(db_path=people_db)
+    assert dana is not None and dana.email == "dana@example.com"
+
+
+def test_a_teammate_rerun_that_keeps_the_owners_email_still_saves(
+    client: TestClient, seeded: list[Any], people_db: Path
+) -> None:
+    # What the review screen pre-fills on a re-run: the owner's current email.
+    _seed_owner_and_teammate()
+    seeded.append(_draft())
+    resp = _commit_with_owner_email(client, "dana@example.com", caller="bob@example.com")
+    assert resp.status_code == 200, resp.text
+
+
+# ── solo: one person, no new departments, workspace settings untouched ───────
+
+
+def test_solo_commit_keeps_workspace_settings_and_saves_one_person(
+    client: TestClient,
+    seeded: list[Any],
+    profile_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the solo review screen sends — the principal alone and no
+    departments — creates exactly one Person and leaves the seeded areas
+    as they were. The workspace settings live in their own table, so the
+    commit (which rebuilds the profile from scratch) cannot wipe them."""
+    from openexecutive.departments import store as dept_store
+    from openexecutive.memory import episodic
+    from openexecutive.memory import workspace_settings as ws
+    from openexecutive.onboarding.commit import (
+        reconcile_onboarding_departments as real_reconcile,
+    )
+    from openexecutive.people import store as people_store
+
+    db = tmp_path / "episodic.db"
+    for module in (episodic, dept_store, people_store):
+        monkeypatch.setattr(module, "DB_PATH", db)
+    people_store.initialize_db(db)
+    dept_store.initialize_db(db)
+    dept_store.seed_default_departments(db)
+    monkeypatch.setattr("openexecutive.departments.registry.invalidate", lambda: None)
+    monkeypatch.setattr(
+        "openexecutive.onboarding.commit.save_onboarding_people", _real_save_onboarding_people
+    )
+    monkeypatch.setattr(
+        "openexecutive.onboarding.commit.reconcile_onboarding_departments", real_reconcile
+    )
+    ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo", timezone="Europe/Berlin"))
+    areas_before = sorted(d.config.slug for d in dept_store.list_departments(db))
+    assert areas_before, "fixture assumption: the default areas are seeded"
+
+    seeded.append(
+        _draft(
+            people=[{"full_name": "Dana Reyes", "role": "Founder", "is_principal": True}],
+            departments=[],
+        )
+    )
+    sid = _start(client)
+    body = _commit_body(sid)
+    body["departments"] = []
+    body["people"] = [{"full_name": "Dana Reyes", "role": "Founder", "is_principal": True}]
+    resp = client.post("/onboard/interview/commit", json=body)
+    assert resp.status_code == 200, resp.text
+
+    assert ws.get_workspace() == ws.WorkspaceSettings(mode="solo", timezone="Europe/Berlin")
+    people = people_store.list_people(db_path=db)
+    assert [(p.full_name, p.is_principal) for p in people] == [("Dana Reyes", True)]
+    assert sorted(d.config.slug for d in dept_store.list_departments(db)) == areas_before
+    saved = CompanyProfile.load_from_yaml(profile_path)
+    assert saved.org_structure.departments == []
+    assert saved.org_structure.leadership_team == ["Dana Reyes, Founder"]

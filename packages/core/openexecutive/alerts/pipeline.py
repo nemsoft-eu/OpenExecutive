@@ -10,6 +10,7 @@ from typing import Any
 
 from openexecutive.alerts import dispatcher, preferences, store
 from openexecutive.alerts.models import (
+    AlertChannel,
     AlertEvent,
     TriageDecision,
 )
@@ -71,6 +72,67 @@ def _rate_limited() -> bool:
         return False
 
 
+def _make_private(
+    topic_tags: list[str], dedup_key: str
+) -> tuple[list[str], int | None, str, list[AlertChannel]]:
+    """An alert only the principal may see: tagged, routed to the principal,
+    stored but never pushed live or broadcast, and deduplicated only against
+    other private alerts (coalescing into a shared card would copy its body
+    there)."""
+    from openexecutive.alerts.models import PRIVATE_ALERT_TAG
+
+    principal_id: int | None = None
+    try:
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        principal_id = principal.id if principal is not None else None
+    except Exception:
+        logger.exception("alerts.pipeline: principal lookup failed for a private alert")
+    tags = [t for t in topic_tags if t != PRIVATE_ALERT_TAG] + [PRIVATE_ALERT_TAG]
+    # Stored for the principal's /today only: no live push to every open
+    # browser (dispatch_web), no email, no team-room broadcast.
+    persisted_only: list[AlertChannel] = [AlertChannel.PERSISTED]
+    return tags, principal_id, f"private:{dedup_key}", persisted_only
+
+
+def _ground_decision(
+    decision: TriageDecision, event: AlertEvent, initiatives: list[Any],
+) -> TriageDecision:
+    """``decision`` with any headline / body sentence / suggested action that
+    names a person or figure absent from the event dropped (see
+    ``briefing.grounding``). Unchanged when grounded, and on any error."""
+    from openexecutive.briefing.grounding import (
+        ground_alert_text,
+        profile_sources,
+        sources_from_text,
+    )
+
+    event_text = "\n".join(
+        part for part in (
+            event.subject, event.from_ or "", event.title or "", event.body,
+        ) if part
+    )
+    sources = (
+        sources_from_text(event_text, "Event", "event")
+        + sources_from_text("\n".join(str(i) for i in initiatives), "Initiatives", "init")
+        + profile_sources()
+    )
+    headline, body, action, changed = ground_alert_text(
+        decision.headline, decision.body, decision.suggested_action,
+        sources=sources,
+        fallback_headline=event.subject or event.title or "",
+        fallback_body=event.body,
+        surface="alert triage",
+        private=event.private,
+    )
+    if not changed:
+        return decision
+    return decision.model_copy(
+        update={"headline": headline, "body": body, "suggested_action": action}
+    )
+
+
 async def evaluate_and_dispatch(
     event: AlertEvent,
     db_path: Path | None = None,
@@ -110,7 +172,8 @@ async def evaluate_and_dispatch(
             "dedup_key": a.dedup_key,
             "topic_tags": a.topic_tags,
         }
-        for a in store.recent_alerts(limit=20, db_path=path)
+        # Never anyone's drafted documents: they are their owners' alone.
+        for a in store.recent_alerts(limit=20, db_path=path, exclude_source="artifact")
     ]
     try:
         initiatives = get_active_initiatives()
@@ -143,6 +206,11 @@ async def evaluate_and_dispatch(
         # only persist when the decision says alert=true.
         return decision, None
 
+    # Triage rewrote the event into a headline and body nobody reads before
+    # dispatch: keep only what the event itself (or the profile, or the
+    # initiatives triage was shown) supports.
+    decision = _ground_decision(decision, event, initiatives)
+
     effective_channels = preferences.resolve_channels(
         decision.channels, decision.severity, prefs
     )
@@ -154,6 +222,10 @@ async def evaluate_and_dispatch(
         decision.topic_tags, event.department or event.channel,
     )
     routed_to = _person_id_from_event(event)
+    if event.private:
+        topic_tags, routed_to, dedup_key, effective_channels = _make_private(
+            topic_tags, dedup_key
+        )
 
     # A replay of the SAME upstream event (webhook retry, re-poll) is a
     # no-op, exactly as before: the (source, external_id) row already exists.

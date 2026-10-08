@@ -147,6 +147,27 @@ def test_chip_suppressed_on_not_found() -> None:
     assert chip is None
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("upsert_person", {"full_name": "Mallory"}),
+        ("archive_person", {"person_id": 3}),
+        ("set_department_head", {"department_slug": "legal", "person_id": 3}),
+    ],
+)
+def test_chip_suppressed_when_roster_change_is_refused(
+    tool_name: str, tool_input: dict
+) -> None:
+    # A roster change asked for by someone other than the principal is refused
+    # (people_tools returns `status: refused`), so no "Updated …" ✓ chip.
+    chip = summarize_action(
+        tool_name=tool_name,
+        tool_input=tool_input,
+        tool_result=json.dumps({"status": "refused", "detail": "owner only"}),
+    )
+    assert chip is None
+
+
 def test_run_workflow_chip_with_link() -> None:
     chip = summarize_action(
         tool_name="run_workflow",
@@ -288,9 +309,15 @@ def test_non_json_result_still_surfaces() -> None:
 _KNOWN_READ_ONLY_TOOLS: frozenset[str] = frozenset({
     # schedule_tools
     "lookup_person",
+    "find_alerts",
     # people_tools
     "list_people",
     "ask_about_person",
+    # open_loop_tools
+    "list_open_loops",
+    # artifact_tools
+    "list_artifacts",
+    "get_artifact",
     # department_tools
     "list_department_goals",
     # skills_tools
@@ -311,8 +338,12 @@ def _all_registered_tool_names() -> set[str]:
     """
     from openexecutive.orchestrator.artifact_tools import DRAFT_ARTIFACT_TOOL_HANDLERS
     from openexecutive.orchestrator.broadcast_tools import BROADCAST_TOOL_HANDLERS
+    from openexecutive.orchestrator.decision_tools import DECISION_TOOL_HANDLERS
+    from openexecutive.orchestrator.delegation_tools import DELEGATION_TOOL_HANDLERS
     from openexecutive.orchestrator.department_tools import DEPARTMENT_TOOL_HANDLERS
+    from openexecutive.orchestrator.fact_tools import FACT_TOOL_HANDLERS
     from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES
+    from openexecutive.orchestrator.open_loop_tools import OPEN_LOOP_TOOL_HANDLERS
     from openexecutive.orchestrator.people_tools import PEOPLE_TOOL_HANDLERS
     from openexecutive.orchestrator.schedule_tools import SCHEDULE_TOOL_HANDLERS
     from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS
@@ -321,12 +352,17 @@ def _all_registered_tool_names() -> set[str]:
     return (
         set(SCHEDULE_TOOL_HANDLERS)
         | set(PEOPLE_TOOL_HANDLERS)
+        | set(OPEN_LOOP_TOOL_HANDLERS)
         | set(DEPARTMENT_TOOL_HANDLERS)
+        | set(DECISION_TOOL_HANDLERS)
+        | set(FACT_TOOL_HANDLERS)
         | set(SKILL_TOOL_HANDLERS)
         | set(BROADCAST_TOOL_HANDLERS)
         | set(DRAFT_ARTIFACT_TOOL_HANDLERS)
         | set(MCP_TOOL_NAMES)
         | set(WORKFLOW_RUN_TOOL_HANDLERS)
+        # Act as me: its own registry, offered per turn (never _ALL_SKILL_TOOLS).
+        | set(DELEGATION_TOOL_HANDLERS)
         # `create_alert` is in chat module rather than a HANDLERS dict.
         | {"create_alert"}
     )
@@ -358,3 +394,24 @@ def test_no_silent_omission_from_side_effecting_tools() -> None:
         f"(to emit a chip) or _KNOWN_READ_ONLY_TOOLS (to deliberately skip): "
         f"{sorted(unclassified)}"
     )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "result", "summary"),
+    [
+        ("create_skill", {"drafted": True}, "Drafted playbook: p"),
+        ("update_skill", {"drafted": True}, "Drafted a change to playbook: p"),
+        ("delete_skill", {"drafted": True}, "Proposed deleting playbook: p"),
+    ],
+)
+def test_skill_chips_say_playbook_and_link_to_tab(
+    tool_name: str, result: dict[str, object], summary: str
+) -> None:
+    payload = summarize_action(
+        tool_name=tool_name,
+        tool_input={"name": "p"},
+        tool_result=json.dumps(result),
+    )
+    assert payload is not None
+    assert payload["summary"] == summary
+    assert payload["link"] == "/jobs?tab=playbooks&draft=p"

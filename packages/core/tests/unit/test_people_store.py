@@ -256,21 +256,47 @@ def test_find_principal_skips_archived(db: Path) -> None:
     assert principal is not None and principal.id == new
 
 
-def test_archive_last_principal_refused(db: Path) -> None:
+def test_active_principals_returns_every_principal_oldest_first(db: Path) -> None:
+    """``find_principal_person`` answers "whose peer card is this turn", which
+    stays one row. This answers "who owns the business", which in a co-founded
+    company is both founders — the standing reports fan out on it."""
+    first = people_store.upsert_person(full_name="Maarten", is_principal=True)
+    second = people_store.upsert_person(full_name="Nick", is_principal=True)
+    people_store.upsert_person(full_name="Staff", is_principal=False)
+
+    assert [p.id for p in people_store.active_principals()] == [first, second]
+
+
+def test_active_principals_excludes_archived_and_contacts(db: Path) -> None:
+    """Archiving a founder has to stop their standing reports; a *contact* can
+    never be a principal at all (``upsert_person`` raises), so the kind filter
+    `list_people` applies is belt-and-braces rather than reachable here."""
+    stays = people_store.upsert_person(full_name="Stays", is_principal=True)
+    gone = people_store.upsert_person(full_name="Gone", is_principal=True)
+    people_store.archive_person(gone)
+
+    assert [p.id for p in people_store.active_principals()] == [stays]
+
+    with pytest.raises(people_store.PrincipalContactError):
+        people_store.upsert_person(full_name="Contact", is_principal=True, kind="contact")
+
+
+def test_active_principals_is_empty_on_an_unclaimed_install(db: Path) -> None:
+    people_store.upsert_person(full_name="Staff", is_principal=False)
+    assert people_store.active_principals() == []
+
+
+def test_archive_last_principal_is_allowed(db: Path) -> None:
+    """A zero-principal roster is reachable on purpose — it is how you re-run
+    onboarding, and the install then reads as "unclaimed" until someone
+    claims it. The fork briefly refused this (PR #29); the guard was dropped
+    in the 2026-10-07 upstream sync once upstream's `_require_roster_owner`
+    made the principal the only caller who can reach the route at all.
+    """
     pid = people_store.upsert_person(full_name="The Boss", is_principal=True)
     people_store.upsert_person(full_name="Staff")
-    with pytest.raises(people_store.LastPrincipalError):
-        people_store.archive_person(pid)
-    principal = people_store.find_principal_person()
-    assert principal is not None and principal.id == pid
-
-
-def test_archive_co_principal_allowed_until_one_remains(db: Path) -> None:
-    first = people_store.upsert_person(full_name="Founder A", is_principal=True)
-    second = people_store.upsert_person(full_name="Founder B", is_principal=True)
-    assert people_store.archive_person(first) is True
-    with pytest.raises(people_store.LastPrincipalError):
-        people_store.archive_person(second)
+    assert people_store.archive_person(pid) is True
+    assert people_store.find_principal_person() is None
 
 
 def test_archive_non_principal_unaffected_by_guard(db: Path) -> None:

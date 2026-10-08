@@ -19,6 +19,8 @@ _PROVIDER_VARS = (
     "LOCAL_MODELS",
     "LOCAL_API_KEY",
     "LOCAL_REASONING_EFFORT",
+    "LOCAL_TEMPERATURE",
+    "LOCAL_TOP_P",
 )
 
 
@@ -99,3 +101,71 @@ def test_no_provider_configured_is_rejected(monkeypatch: pytest.MonkeyPatch) -> 
 def test_anthropic_key_alone_still_boots(monkeypatch: pytest.MonkeyPatch) -> None:
     s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
     assert s.anthropic_api_key == "sk-test"
+
+
+def test_local_reasoning_effort_unset_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
+    assert s.local_reasoning_effort is None
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "# e.g. low"])
+def test_local_reasoning_effort_blank_means_unset(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT=raw)
+    assert s.local_reasoning_effort is None
+
+
+def test_local_reasoning_effort_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT=" Low ")
+    assert s.local_reasoning_effort == "low"
+
+
+def test_local_reasoning_effort_typo_fails_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo would otherwise 400 every local call at request time."""
+    with pytest.raises(ValueError, match="LOCAL_REASONING_EFFORT"):
+        _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_REASONING_EFFORT="lwo")
+
+
+def test_local_sampling_defaults_are_sent_not_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = _build(monkeypatch, ANTHROPIC_API_KEY="sk-test")
+    assert (s.local_temperature, s.local_top_p) == (0.7, 0.8)
+
+
+@pytest.mark.parametrize("raw", ["off", "none", " OFF ", "None"])
+def test_local_sampling_opts_out_on_a_word(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    """A backend that rejects the fields outright needs a way to say so, and
+    `env_ignore_empty=True` means a blank cannot carry it."""
+    s = _build(
+        monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_TEMPERATURE=raw, LOCAL_TOP_P=raw
+    )
+    assert (s.local_temperature, s.local_top_p) == (None, None)
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "# e.g. 0.7"])
+def test_a_blank_still_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Pinned because it is the trap: `.env.example` ships optional keys as
+    `KEY=`, `env_ignore_empty` drops those before validation, so a blank is
+    the DEFAULT and not an opt-out. Anyone reading `float | None` and writing
+    `LOCAL_TEMPERATURE=` gets 0.7.
+
+    The whitespace and comment cases matter on their own: `env_ignore_empty`
+    only drops a TRULY empty string, so before this validator a stray space
+    reached float parsing and took startup down with it."""
+    s = _build(
+        monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_TEMPERATURE=raw, LOCAL_TOP_P=raw
+    )
+    assert (s.local_temperature, s.local_top_p) == (0.7, 0.8)
+
+
+def test_an_out_of_range_sampling_value_fails_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="LOCAL_TOP_P"):
+        _build(monkeypatch, ANTHROPIC_API_KEY="sk-test", LOCAL_TOP_P="1.5")

@@ -186,8 +186,10 @@ cd .. && toolbox run -c rust-dev npm --prefix packages/ui run build
   set → the app raises at **import**, so it looks like a collection error.
 - `npm run lint` has no ESLint config and opens an interactive prompt — `npm run
   build` is the UI's gate. `npm`/`node` exist only inside `toolbox run -c rust-dev`.
-- Known-red on main and excluded from comparison:
-  `tests/integration/test_chat_committee.py::test_chat_with_committee_streams_phases_and_revised_text`.
+- ~~Known-red on main and excluded from comparison:
+  `tests/integration/test_chat_committee.py::test_chat_with_committee_streams_phases_and_revised_text`.~~
+  **Fixed upstream — verified passing in the 2026-10-07 sync** (`1 passed`, not
+  skipped). Stop deselecting it; the whole integration suite should be green.
 
 **Expect failures here even when the merge was conflict-free** — they are the
 semantic conflicts the textual merge could not see. The 2026-09-21 sync had 13,

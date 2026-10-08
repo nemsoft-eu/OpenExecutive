@@ -114,7 +114,13 @@ def test_send_discord_dm_roster_gate_does_not_persist(monkeypatch: pytest.Monkey
 # Slack
 # --------------------------------------------------------------------------- #
 
-def test_send_slack_dm_persists_done_row() -> None:
+def test_send_slack_dm_persists_done_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Roster gate: simulate a registered Slack person.
+    monkeypatch.setattr(
+        "openexecutive.people.store.find_person_by_slack_id",
+        lambda _id: object(),
+    )
+
     class _FakeClient:
         def __init__(self, token: str) -> None:
             self.token = token
@@ -137,6 +143,23 @@ def test_send_slack_dm_persists_done_row() -> None:
     assert rows[0].channel == "slack_dm"
     assert rows[0].channel_ref == "U123"
     assert rows[0].status == "done"
+
+
+def test_send_slack_dm_roster_gate_does_not_persist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unrostered recipient: the roster gate refuses BEFORE the send, with no
+    row written — the Discord and Telegram behaviour, which Slack lacked. It
+    is unconditional, so this holds on an ordinary turn with no private flag
+    anywhere; the network client is deliberately left unpatched, so a send
+    would blow up rather than pass."""
+    monkeypatch.setattr(
+        "openexecutive.people.store.find_person_by_slack_id",
+        lambda _id, **_kw: None,
+    )
+    result = asyncio.run(
+        schedule_tools.handle_send_slack_dm({"user_id": "U_STRANGER", "text": "hi"})
+    )
+    assert "not in the People roster" in json.loads(result)["error"]
+    assert _done_rows() == []
 
 
 # --------------------------------------------------------------------------- #

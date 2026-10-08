@@ -29,8 +29,6 @@ from openexecutive.people import store as people_store
 @pytest.fixture(autouse=True)
 def _reset_route_state() -> None:
     chat_route._sessions.clear()
-    chat_route._last_turn_events.clear()
-    chat_route._last_turn_meta.clear()
 
 
 @pytest.fixture()
@@ -160,3 +158,132 @@ def test_turn_start_clears_a_stale_trusted_set(env: Path, monkeypatch: pytest.Mo
     _ = resp.text
 
     assert _only_session().trusted_alert_ids == set()
+
+
+# --------------------------------------------------------------------- #
+# What `ack_alert` actually reads
+#
+# Every test above asserts `session.trusted_alert_ids` — the attribute. That
+# attribute was correct all along. `ack_alert` does not read it directly; it
+# reads `current_session.get()`, and on the SSE path that returned None for
+# every step after the first, so the tool fell back to an empty set and
+# refused every ack. Asserting the attribute cannot see that gap. These drive
+# the real route and assert what the tool resolves, from a LATER stream step.
+# --------------------------------------------------------------------- #
+
+
+def _post_with_tool_call_on_step(
+    step: int, tool_input: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """Drive the real route with a stub that calls `ack_alert` mid-stream.
+
+    `step` is the 0-based yield index the tool call is made from. Step 0 is
+    the only one a `current_session.set()` inside the executive's own
+    generator survives to, so `step >= 1` is what reproduces production.
+    """
+    from openexecutive.orchestrator import executive as exec_mod
+    from openexecutive.orchestrator.schedule_tools import (
+        current_session,
+        handle_ack_alert,
+    )
+
+    results: list[str] = []
+
+    class _ToolCallingExecutive:
+        _THINKING = exec_mod.Executive._THINKING
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def stream_chat(self, **kwargs: Any) -> AsyncIterator[str]:
+            # Faithful to the real `Executive.stream_chat`, which binds the
+            # session with a bare `set()` at its top. That is what makes the
+            # bug step-dependent: this binding survives into step 0 and is
+            # discarded with the per-step Task that made it, so step 1 onward
+            # sees None unless the ROUTE bound it from outside.
+            current_session.set(kwargs.get("session"))
+            for i in range(step + 2):
+                if i == step:
+                    results.append(await handle_ack_alert(tool_input))
+                yield f"chunk-{i}"
+
+        async def stream_chat_with_committee(self, **kwargs: Any) -> AsyncIterator[str]:
+            async for chunk in self.stream_chat(**kwargs):
+                yield chunk
+
+    monkeypatch.setattr(exec_mod, "Executive", _ToolCallingExecutive)
+    _post()
+    return results
+
+
+@pytest.mark.parametrize("step", [0, 1, 3])
+def test_ack_alert_resolves_the_session_on_every_stream_step(
+    step: int, env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression. `_sse_body` drives the executive with
+    `asyncio.wait_for(stream.__anext__())`, which runs each step in a fresh
+    Task holding a *copy* of the context — so a bare `current_session.set()`
+    inside the executive's generator is gone by step 1. The tool-call loop
+    runs on those later steps, so on the live tenant every ack the principal
+    asked for was refused with "not among the open items you were shown this
+    turn", on a card that was open the whole time.
+
+    Parametrized over the step deliberately: a test that only ever acked on
+    step 0 passes against the bug.
+    """
+    people_store.upsert_person(full_name="Alex", is_principal=True)
+    live = alert_store.insert_alert(
+        source="email", external_id="live-1", severity="high",
+        headline="Approve the Q3 budget", body="Needs a decision.",
+        db_path=env / "alerts.db",
+    )
+    assert live is not None
+
+    results = _post_with_tool_call_on_step(
+        step, {"alert_id": live, "status": "dismissed"}, monkeypatch
+    )
+
+    assert len(results) == 1
+    assert "error" not in results[0], (
+        f"ack on stream step {step} was refused: {results[0]}"
+    )
+    refreshed = alert_store.get_alert(live, db_path=env / "alerts.db")
+    assert refreshed is not None and refreshed.status == "dismissed"
+
+
+def test_a_closed_alert_is_still_refused_from_a_later_step(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix restores reach, it must not widen it: binding the session for
+    the whole stream makes the trusted set visible, not permissive."""
+    people_store.upsert_person(full_name="Alex", is_principal=True)
+    closed = alert_store.insert_alert(
+        source="email", external_id="closed-1", severity="high",
+        headline="Already handled", body="b", db_path=env / "alerts.db",
+    )
+    assert closed is not None
+    alert_store.set_status(closed, "dismissed", db_path=env / "alerts.db")
+
+    results = _post_with_tool_call_on_step(
+        2, {"alert_id": closed, "status": "ack"}, monkeypatch
+    )
+
+    assert len(results) == 1
+    assert "error" in results[0]
+
+
+def test_an_invented_id_is_still_refused_from_a_later_step(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    people_store.upsert_person(full_name="Alex", is_principal=True)
+    alert_store.insert_alert(
+        source="email", external_id="live-1", severity="high",
+        headline="Approve the Q3 budget", body="b", db_path=env / "alerts.db",
+    )
+
+    results = _post_with_tool_call_on_step(
+        2, {"alert_id": 9999, "status": "dismissed"}, monkeypatch
+    )
+
+    assert len(results) == 1
+    assert "error" in results[0]

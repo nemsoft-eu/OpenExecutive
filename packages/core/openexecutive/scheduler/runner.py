@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, tzinfo
+from typing import TYPE_CHECKING
 
+from openexecutive.audit.context import unscoped_audit_rows
 from openexecutive.memory.episodic import (
     ScheduledAction,
     claim_due_actions,
@@ -22,13 +26,36 @@ from openexecutive.memory.episodic import (
     reschedule_action,
 )
 from openexecutive.orchestrator.mcp_gateway import MCPGateway
+from openexecutive.scheduler.pause import is_paused
 from openexecutive.workflows.gate import ensure_workflow_event
+
+if TYPE_CHECKING:
+    from openexecutive.briefing.brief_state import DeliveryReason
+    from openexecutive.people.models import Person
 
 logger = logging.getLogger(__name__)
 
 
 # Strong refs so GC cannot cancel in-flight tasks mid-execution.
 _inflight: set[asyncio.Task[None]] = set()
+
+# Liveness for the Setup status page (api/setup_checks.py): when this
+# loop started, and when its last tick finished and how. Every tick ends by
+# recording itself, so an old value means the loop has stopped or is stuck.
+_started_at: datetime | None = None
+_last_tick: tuple[datetime, str] | None = None
+
+
+def scheduler_heartbeat() -> tuple[datetime | None, tuple[datetime, str] | None]:
+    """``(started_at, (finished_at, outcome))`` — ``None`` for what hasn't
+    happened yet. Outcomes: ``ran``, ``paused``, ``waiting_for_company``,
+    ``rotating``, ``failed``."""
+    return _started_at, _last_tick
+
+
+def _beat(outcome: str) -> None:
+    global _last_tick
+    _last_tick = (datetime.now(UTC), outcome)
 
 
 def _company_profile_active() -> bool:
@@ -55,6 +82,78 @@ def _company_profile_active() -> bool:
 # before onboarding completes).
 _ALERT_SWEEP_INTERVAL = timedelta(minutes=15)
 _last_alert_sweep_at: datetime | None = None
+
+
+# The /today header's precompute (api.routes.today.refresh_principal_
+# narrative). Throttled inside the tick loop like the sweep; the regeneration
+# itself runs as its own task so a slow model call never holds the tick.
+_last_narrative_refresh_at: datetime | None = None
+_narrative_task: asyncio.Task[bool] | None = None
+
+
+def _maybe_refresh_narrative(now: datetime) -> bool:
+    """Start a principal-header refresh when the interval has elapsed and it
+    is daytime locally. True when one was started. Never raises."""
+    global _last_narrative_refresh_at, _narrative_task
+    try:
+        from openexecutive.config import get_settings
+        from openexecutive.memory.workspace_settings import get_user_timezone
+
+        s = get_settings()
+        minutes = int(s.briefing_narrative_refresh_minutes)
+        if minutes <= 0:
+            return False
+        if (
+            _last_narrative_refresh_at is not None
+            and now - _last_narrative_refresh_at < timedelta(minutes=minutes)
+        ):
+            return False
+        if _narrative_task is not None and not _narrative_task.done():
+            return False
+        local_hour = now.astimezone(get_user_timezone()).hour
+        if not (
+            int(s.briefing_narrative_refresh_start_hour)
+            <= local_hour
+            < int(s.briefing_narrative_refresh_end_hour)
+        ):
+            return False
+        _last_narrative_refresh_at = now
+        from openexecutive.api.routes.today import refresh_principal_narrative
+
+        with unscoped_audit_rows():
+            _narrative_task = asyncio.create_task(refresh_principal_narrative())
+        return True
+    except Exception:
+        logger.exception("scheduler: narrative refresh failed to start")
+        return False
+
+
+def _maybe_scan_inbox(now: datetime) -> bool:
+    """Act as me's inbox watcher (delegation/inbox.py): start the scans that
+    are due, throttled per person by DELEGATION_INBOX_POLL_MINUTES. A hook
+    here rather than a scheduled_actions row, which /scheduled would show to
+    everyone. Its own task, one at a time, so a slow scan never holds the
+    tick. Never raises."""
+    try:
+        from openexecutive.delegation.inbox import maybe_scan
+
+        return maybe_scan(now)
+    except Exception:
+        logger.exception("scheduler: inbox scan failed to start")
+        return False
+
+
+def _maybe_remind_notes(now: datetime) -> bool:
+    """Always in the loop's due-today reminders (memory/history_reminders.py),
+    throttled there. A hook here, like the inbox watcher, rather than a
+    scheduled_actions row everyone could see. Never raises."""
+    try:
+        from openexecutive.memory.history_reminders import maybe_remind
+
+        return maybe_remind(now)
+    except Exception:
+        logger.exception("scheduler: note reminders failed to start")
+        return False
 
 
 def _maybe_sweep_alerts(now: datetime) -> int:
@@ -89,6 +188,16 @@ def _maybe_sweep_alerts(now: datetime) -> int:
             logger.info("scheduler: watchlist sweep %s", counts)
     except Exception:
         logger.exception("scheduler: watchlist sweep failed")
+    # Always in the loop: delete notes past their expiry (reads already skip
+    # them).
+    try:
+        from openexecutive.memory.history import sweep_expired
+
+        removed = sweep_expired(now=now)
+        if removed:
+            logger.info("scheduler: removed %d expired note(s)", removed)
+    except Exception:
+        logger.exception("scheduler: note expiry sweep failed")
     return expired
 
 
@@ -98,6 +207,9 @@ async def run_scheduler(
     poll_interval_seconds: int = 30,
 ) -> None:
     """Poll for due scheduled actions and dispatch them through the Executive."""
+    global _started_at, _last_tick
+    _started_at = datetime.now(UTC)
+    _last_tick = None
     # Sweep any rows left in 'running' by a previous crash back to 'pending'
     # so they can be re-tried. Without this they would stay stuck forever.
     try:
@@ -152,11 +264,28 @@ async def run_scheduler(
     logger.info(
         "scheduler started (poll_interval=%ds)", poll_interval_seconds
     )
-    # Throttle the "no profile" log so it fires once per gap, not every poll.
+    # Throttle the "no profile" / "paused" logs so each fires once per gap,
+    # not every poll.
     holding_for_profile = False
+    holding_for_pause = False
     while True:
         try:
             now = datetime.now(UTC)
+            # Operator pause (scheduler/pause.py) comes first: paused means
+            # idle — no sweeps, no claims. Due rows stay 'pending' and fire
+            # on the first tick after resume; in-flight actions finish.
+            if is_paused():
+                if not holding_for_pause:
+                    logger.warning(
+                        "scheduler: executive paused — holding all scheduled work"
+                    )
+                    holding_for_pause = True
+                _beat("paused")
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            if holding_for_pause:
+                logger.info("scheduler: executive resumed — releasing held work")
+                holding_for_pause = False
             # Alert expiry is pure DB hygiene and must not wait for
             # onboarding or a client rotation — it runs before both gates.
             _maybe_sweep_alerts(now)
@@ -169,6 +298,7 @@ async def run_scheduler(
                         "scheduled actions until one is configured"
                     )
                     holding_for_profile = True
+                _beat("waiting_for_company")
                 await asyncio.sleep(poll_interval_seconds)
                 continue
             if holding_for_profile:
@@ -181,19 +311,29 @@ async def run_scheduler(
                 # context — claiming now would fire the just-activated
                 # client's overdue outbound backlog at 3am. Everything due
                 # fires on the first tick after the original client is back.
+                _beat("rotating")
                 await asyncio.sleep(poll_interval_seconds)
                 continue
+            _maybe_refresh_narrative(now)
+            _maybe_scan_inbox(now)
+            _maybe_remind_notes(now)
             due = claim_due_actions(now)
             if due:
                 logger.info("scheduler: %d due action(s)", len(due))
             for row in due:
-                task = asyncio.create_task(_execute_action(row, gateway))
+                # A scheduled action is unattended, never part of a turn: its
+                # task starts with no audit scope (create_task copies the
+                # context as it is here).
+                with unscoped_audit_rows():
+                    task = asyncio.create_task(_execute_action(row, gateway))
                 _inflight.add(task)
                 task.add_done_callback(_inflight.discard)
+            _beat("ran")
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("scheduler tick failed")
+            _beat("failed")
         try:
             await asyncio.sleep(poll_interval_seconds)
         except asyncio.CancelledError:
@@ -212,10 +352,47 @@ async def _execute_action(
     now = datetime.now(UTC)
 
     # ------------------------------------------------------------------
-    # Authority gate — only applies to department-scoped actions.
+    # Solo mode runs no department check-ins. A dept_cadence row still
+    # pending from before the switch (or seeded by a fixture) is retired
+    # here WITHOUT running and WITHOUT chaining its next occurrence. It is
+    # marked `cancelled`, not `done`: the nudge engine reads a done
+    # check-in as a recent department pulse, and the Pulse history would
+    # show one that never ran. It sits ahead of the authority gate, which
+    # would otherwise turn a propose_only department's check-in into an
+    # approval card.
     # ------------------------------------------------------------------
-    if action.department:
-        from openexecutive.departments.authority import gate_action, propose_via_alert
+    if action.kind == "dept_cadence":
+        from openexecutive.memory.episodic import mark_action_cancelled
+        from openexecutive.memory.workspace_settings import get_workspace
+
+        if get_workspace().mode == "solo":
+            mark_action_cancelled(
+                action.id, "solo workspace: department check-ins are off"
+            )
+            logger.info(
+                "scheduler: dept_cadence action %d retired — solo workspace",
+                action.id,
+            )
+            return
+
+    # ------------------------------------------------------------------
+    # Authority gate — only applies to department-scoped actions.
+    #
+    # A `dept_cadence` row always carries its department, and the seeded
+    # departments are propose_only, so gating it turned every check-in into
+    # a one-shot proposal card, marked the row done and never chained the
+    # next occurrence. The check-in itself sends nothing: it grades Goals
+    # and runs each action it proposes through `gate_action` as an
+    # annotation (see `department_check_in._gate_proposed_actions`), so the
+    # authority level still governs what it proposes — the fire does not
+    # need gating.
+    # ------------------------------------------------------------------
+    if action.department and action.kind != "dept_cadence":
+        from openexecutive.departments.authority import (
+            escalate_via_alert,
+            gate_action,
+            propose_via_alert,
+        )
         from openexecutive.people.models import AuthorityScope
         from openexecutive.people.registry import get_person
         from openexecutive.scheduler.action_phrasing import describe_executive_action
@@ -317,22 +494,54 @@ async def _execute_action(
             return
 
         if decision.action == "escalate":
-            # Create alert AND fall through to dispatch.
-            if decision.assignee_person_id is not None:
-                propose_via_alert(
-                    department_slug=action.department,
-                    person_id=decision.assignee_person_id,
+            # Hold for a human, flagged urgent; do NOT dispatch. The setting
+            # promises "the specialist will not act — it forwards everything
+            # to a human", and the card's "If you approve: … right away" line
+            # is what sends it — dispatching here as well acted before anyone
+            # agreed, then acted again on approval. Unlike `propose`, an
+            # escalation is never deferred to the approver's window. The card
+            # is the action's only trace (see `escalate_via_alert` for how it
+            # is kept from being lost); if it cannot be written the row is
+            # retried with backoff and finally marked failed — never done.
+            try:
+                escalate_via_alert(
+                    action.department,
+                    decision.assignee_person_id,
                     summary=f"[ESCALATION] {action.intent_text[:140]}",
                     body=action.intent_text,
                     suggested_action=_proposed_action_phrase(urgent=True),
+                    action_key="|".join((
+                        action.kind, action.channel, action.channel_ref,
+                        str(action.assigned_to_person_id), action.intent_text,
+                    )),
+                    occurrence_id=str(action.id),
                 )
-            else:
+            except Exception as exc:
+                logger.exception(
+                    "scheduler: escalation card for action %d could not be filed",
+                    action.id,
+                )
+                if mark_action_failed_or_retry(
+                    action.id, f"escalation card could not be filed: {exc}"
+                ) == "failed":
+                    logger.error(
+                        "scheduler: escalated action %d dept=%r gave up — no "
+                        "card was filed and nothing was sent",
+                        action.id, action.department,
+                    )
+                return
+            if decision.assignee_person_id is None:
                 logger.warning(
-                    "scheduler: escalate for dept=%r has no assignee — "
-                    "alert skipped, dispatch continues",
-                    action.department,
+                    "scheduler: escalate for dept=%r has no approver — "
+                    "action %d filed as an unrouted card",
+                    action.department, action.id,
                 )
-            # fall through → dispatch proceeds below
+            mark_action_done(action.id)
+            logger.info(
+                "scheduler: action %d escalated to person %s — not dispatched",
+                action.id, decision.assignee_person_id,
+            )
+            return
 
     # ------------------------------------------------------------------
     # Department cadence — run the check-in workflow, then chain the next
@@ -342,15 +551,35 @@ async def _execute_action(
     if action.kind == "dept_cadence":
         slug = action.channel_ref  # set by cadence.enqueue_next / bootstrap_cadences
         logger.info("scheduler: dept_cadence firing for dept=%r (action %d)", slug, action.id)
+        # Skip rule first, BEFORE create_run: a department with nothing to
+        # review costs no specialist calls and leaves no empty run in the
+        # activity rail. A skipped occurrence still chains the next one, and
+        # is recorded `cancelled` (reason in last_error), not `done`: a done
+        # cadence row reads as "the check-in ran", which the nudge engine
+        # takes as covering the department's idle initiatives.
+        skip_reason = _dept_check_in_skip_reason(slug, now)
+        if skip_reason is not None:
+            logger.info("scheduler: dept_cadence %r skipped — %s", slug, skip_reason)
+            _chain_dept_cadence(slug)
+            try:
+                _mark_check_in_skipped(action.id, skip_reason)
+            except Exception:
+                # The row stays `running` until the boot sweep requeues it;
+                # the chain is idempotent, so that re-fire adds no duplicate.
+                logger.exception(
+                    "scheduler: dept_cadence %r (action %d) — could not record the skip",
+                    slug, action.id,
+                )
+            return
         # Assign run_id before the try block so the except handler can always
         # reference it.  An empty string means create_run never ran, so fail_run
         # will be guarded below.
         run_id = ""
+        chained = False
         try:
             import uuid as _uuid
 
             from openexecutive.config import get_settings as _get_settings
-            from openexecutive.departments.cadence import enqueue_next
             from openexecutive.knowledge.store import ChromaDBStore as _ChromaDBStore
             from openexecutive.workflows.department_check_in import (
                 DepartmentCheckInInput,
@@ -387,10 +616,10 @@ async def _execute_action(
                     raise RuntimeError(event.message)
 
             complete_run(run_id, artifact or "(no artifact)")
-            # Capture wall-clock time AFTER the workflow completes so that
-            # enqueue_next always schedules strictly in the future, even when
-            # the workflow took longer than (target_time − tick_time).
-            enqueue_next(slug, after=datetime.now(UTC))
+            # Chained AFTER the workflow completes (at wall-clock time) so the
+            # next occurrence is always strictly in the future, even when the
+            # workflow took longer than (target_time − tick_time).
+            chained = _chain_dept_cadence(slug)
             mark_action_done(action.id)
             logger.info(
                 "scheduler: dept_cadence %r done — run_id=%s artifact=%d chars",
@@ -402,6 +631,10 @@ async def _execute_action(
             )
             new_status = mark_action_failed_or_retry(action.id, str(exc))
             logger.info("scheduler: action %d → %s", action.id, new_status)
+            if new_status == "failed" and not chained:
+                # Retries are spent. Chain anyway so one broken department
+                # does not fall out of the daily cycle until the next boot.
+                _chain_dept_cadence(slug)
             if run_id:
                 try:
                     from openexecutive.workflows.persistence import fail_run
@@ -516,7 +749,20 @@ async def _execute_action(
                 digest = result.get("digest") or ""
                 if digest:
                     try:
-                        await _deliver_to_principal(digest)
+                        # Client data rather than one owner's private data, so
+                        # every owner gets it — but the audience is still
+                        # owners only, so the egress is restricted the same way
+                        # the briefs are. Content privacy and audience
+                        # restriction are separate concerns; this fan-out needs
+                        # the second without the first.
+                        from openexecutive.orchestrator.people_tools import (
+                            restrict_to_principal,
+                        )
+
+                        with restrict_to_principal():
+                            await deliver_to_each_principal(
+                                digest, label="Across your clients"
+                            )
                     except Exception:
                         logger.exception(
                             "scheduler: client_rotation digest delivery failed"
@@ -661,6 +907,92 @@ async def _execute_action(
         return
 
     # ------------------------------------------------------------------
+    # Google Drive folder sync — same shape as the Notion sync above: files
+    # in the shared folders go into the isolated DRIVE collection.
+    # ------------------------------------------------------------------
+    if action.kind == "drive_sync_scan":
+        from openexecutive.knowledge.drive_sync import (
+            enqueue_next_drive_sync_scan,
+            run_drive_sync,
+        )
+        try:
+            stats = await run_drive_sync(now=now)
+            logger.info("scheduler: drive_sync_scan %s", stats)
+        except Exception:
+            logger.exception("scheduler: drive_sync_scan (action %d) crashed", action.id)
+        try:
+            mark_action_done(action.id)
+        except Exception:
+            logger.exception(
+                "scheduler: drive_sync_scan (action %d) — mark_done failed", action.id
+            )
+        try:
+            enqueue_next_drive_sync_scan(after=datetime.now(UTC))
+        except Exception:
+            logger.exception(
+                "scheduler: failed to chain next drive_sync_scan "
+                "heartbeat — sync will stall until next bootstrap"
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # OneDrive folder sync — the Microsoft twin of the Drive sync above.
+    # ------------------------------------------------------------------
+    if action.kind == "onedrive_sync_scan":
+        from openexecutive.knowledge.onedrive_sync import (
+            enqueue_next_onedrive_sync_scan,
+            run_onedrive_sync,
+        )
+        try:
+            stats = await run_onedrive_sync(now=now)
+            logger.info("scheduler: onedrive_sync_scan %s", stats)
+        except Exception:
+            logger.exception("scheduler: onedrive_sync_scan (action %d) crashed", action.id)
+        try:
+            mark_action_done(action.id)
+        except Exception:
+            logger.exception(
+                "scheduler: onedrive_sync_scan (action %d) — mark_done failed", action.id
+            )
+        try:
+            enqueue_next_onedrive_sync_scan(after=datetime.now(UTC))
+        except Exception:
+            logger.exception(
+                "scheduler: failed to chain next onedrive_sync_scan "
+                "heartbeat — sync will stall until next bootstrap"
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # Confluence space sync — same shape as the Drive sync above: pages in
+    # the configured spaces go into the isolated CONFLUENCE collection.
+    # ------------------------------------------------------------------
+    if action.kind == "confluence_sync_scan":
+        from openexecutive.knowledge.confluence_sync import (
+            enqueue_next_confluence_sync_scan,
+            run_confluence_sync,
+        )
+        try:
+            stats = await run_confluence_sync(now=now)
+            logger.info("scheduler: confluence_sync_scan %s", stats)
+        except Exception:
+            logger.exception("scheduler: confluence_sync_scan (action %d) crashed", action.id)
+        try:
+            mark_action_done(action.id)
+        except Exception:
+            logger.exception(
+                "scheduler: confluence_sync_scan (action %d) — mark_done failed", action.id
+            )
+        try:
+            enqueue_next_confluence_sync_scan(after=datetime.now(UTC))
+        except Exception:
+            logger.exception(
+                "scheduler: failed to chain next confluence_sync_scan "
+                "heartbeat — sync will stall until next bootstrap"
+            )
+        return
+
+    # ------------------------------------------------------------------
     # Proactive nudge — re-check reachability at dispatch time before
     # falling through to the ad-hoc dispatch path. The person may have
     # gone on leave between schedule and fire; if so, defer rather than
@@ -729,11 +1061,12 @@ async def _execute_action(
 
     # ------------------------------------------------------------------
     # Principal briefs (Shift 3) — run the morning_brief / end_of_day_digest
-    # workflow, then deliver the artifact via DM to the principal on their
-    # preferred channel. Must come BEFORE the generic __internal__ short-
-    # circuit because the brief rows use channel="__internal__" too.
+    # workflow (and, in solo mode, the weekly_review), then deliver the
+    # artifact via DM to the principal on their preferred channel. Must come
+    # BEFORE the generic __internal__ short-circuit because the brief rows
+    # use channel="__internal__" too.
     # ------------------------------------------------------------------
-    if action.kind in ("principal_brief_morning", "principal_brief_eod"):
+    if action.kind in _PRINCIPAL_WORKFLOWS:
         await _run_principal_brief(action, now)
         return
 
@@ -747,6 +1080,10 @@ async def _execute_action(
     # ------------------------------------------------------------------
     if action.kind == "executive_reflection":
         await _run_executive_reflection(action, now)
+        return
+
+    if action.kind == TAKE_THE_LEAD_WAKE_KIND:
+        await _run_take_the_lead_wake(action, now)
         return
 
     # ------------------------------------------------------------------
@@ -764,9 +1101,10 @@ async def _execute_action(
         logger.info("scheduler: action %d (__internal__) completed without dispatch", action.id)
         return
 
-    # Email channel requires MCP (Gmail send tool is an MCP tool). Without
-    # a gateway, the Executive cannot deliver — short-circuit with a clear
-    # error rather than burning attempts on silent failures.
+    # Email channel requires MCP (the mail send tool is an MCP tool, whichever
+    # backend EMAIL_PROVIDER names). Without a gateway, the Executive cannot
+    # deliver — short-circuit with a clear error rather than burning attempts
+    # on silent failures.
     if action.channel == "email" and gateway is None:
         mark_action_failed_or_retry(
             action.id,
@@ -792,17 +1130,28 @@ async def _execute_action(
         session = Session(
             company_profile=profile if not profile.is_empty() else None,
             seen_channel_refs={(action.channel, action.channel_ref)},
+            # Nobody is watching this run and its prompt quotes stored intent
+            # text: the loop withholds the principal-only tools
+            # (schedule_tools.UNATTENDED_WITHHELD_TOOLS, e.g. create_goal).
+            unattended=True,
         )
 
         retrieved_context = retrieve(query=action.intent_text)
         episodic_context = format_for_prompt()
 
-        send_tool_hint = {
-            "telegram": "send_telegram_message",
-            "slack_dm": "send_slack_dm",
-            "discord_dm": "send_discord_dm",
-            "email": "google_workspace__send_gmail_message (via MCP)",
-        }.get(action.channel, "the appropriate send tool")
+        if action.channel == "email":
+            # Names the configured mail backend's send tool (EMAIL_PROVIDER);
+            # resolved only here so a provider lookup can never affect the
+            # DM channels.
+            from openexecutive.integrations.workspace.registry import get_mail_provider
+
+            send_tool_hint = get_mail_provider().send_tool_hint()
+        else:
+            send_tool_hint = {
+                "telegram": "send_telegram_message",
+                "slack_dm": "send_slack_dm",
+                "discord_dm": "send_discord_dm",
+            }.get(action.channel, "the appropriate send tool")
 
         # Wrap stored intent in delimiters to make prompt-injection harder.
         # The framing tells the Executive that everything inside the tag is
@@ -824,12 +1173,16 @@ async def _execute_action(
         )
 
         executive = Executive(mcp_gateway=gateway)
-        await executive.chat(
-            user_message=synthetic_message,
-            session=session,
-            retrieved_context=retrieved_context,
-            episodic_context=episodic_context,
-        )
+        from openexecutive.attunement.outcomes import tag_proactive
+
+        source, ref = _outreach_source(action)
+        with tag_proactive(source, ref):
+            await executive.chat(
+                user_message=synthetic_message,
+                session=session,
+                retrieved_context=retrieved_context,
+                episodic_context=episodic_context,
+            )
 
     except Exception as exc:
         logger.exception("scheduler: action %d failed", action.id)
@@ -870,20 +1223,100 @@ async def _execute_action(
 
 
 # --------------------------------------------------------------------------- #
+# Department cadence helpers
+# --------------------------------------------------------------------------- #
+
+def _dept_check_in_skip_reason(slug: str, now: datetime) -> str | None:
+    """Why this department's scheduled check-in can be skipped, or None.
+
+    Delegates to ``department_check_in.needs_check_in``. Fails open: if the
+    check itself breaks, the check-in runs as before.
+    """
+    try:
+        from openexecutive.departments import registry as dept_registry
+        from openexecutive.workflows.department_check_in import needs_check_in
+
+        state = dept_registry.get_state(slug)
+        if state is None:
+            return f"department {slug!r} not found"
+        return needs_check_in(state, now)
+    except Exception:
+        logger.exception(
+            "scheduler: dept_cadence %r skip check failed — running the check-in", slug
+        )
+        return None
+
+
+def _pending_dept_cadence_exists(slug: str) -> bool:
+    """True when a `pending` dept_cadence row for ``slug`` is already queued.
+
+    Only `pending`: the row being handled is `running` (or `failed`), so it
+    never counts itself.
+    """
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+
+    with _get_conn(_resolve_db_path(None)) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM scheduled_actions WHERE kind = 'dept_cadence' "
+            "AND department = ? AND status = 'pending' LIMIT 1",
+            (slug,),
+        ).fetchone()
+    return row is not None
+
+
+def _chain_dept_cadence(slug: str) -> bool:
+    """Enqueue the department's next check-in. Never raises.
+
+    Idempotent: when a next occurrence is already pending (an earlier attempt
+    chained, then failed to mark its row, and the row fired again) nothing is
+    added. True when a next occurrence is queued afterwards.
+    """
+    try:
+        from openexecutive.departments.cadence import enqueue_next
+
+        if _pending_dept_cadence_exists(slug):
+            return True
+        return enqueue_next(slug, after=datetime.now(UTC)) is not None
+    except Exception:
+        logger.exception(
+            "scheduler: failed to chain the next dept_cadence for %r — it "
+            "resumes at the next boot (bootstrap_cadences)", slug,
+        )
+        return False
+
+
+def _mark_check_in_skipped(action_id: int, reason: str) -> None:
+    """Record a skipped check-in as `cancelled`, with the reason in last_error.
+
+    Not `done`: `nudge_engine._dept_cadence_recent` counts a done cadence row
+    as a check-in that covered the department's initiatives.
+    """
+    from openexecutive.memory.episodic import mark_action_cancelled
+
+    mark_action_cancelled(action_id, f"skipped: {reason}")
+
+
+# --------------------------------------------------------------------------- #
 # Principal briefs (Shift 3)
 # --------------------------------------------------------------------------- #
 
-# Default times of day for the principal brief and EoD digest, in HH:MM
-# UTC. Override via env vars. Single-timezone for v1 — when company
-# timezone awareness lands, this should consult company_profile.
-# TODO(v2): treat these times as local-to-company once timezone is on
-# the profile; today, a SF team with default 08:00 UTC sees the morning
-# brief at midnight PT.
+# Default times of day for the principal brief and EoD digest, as HH:MM
+# wall-clock times in the user's zone (memory.workspace_settings
+# .get_user_timezone: the workspace's zone, else USER_TIMEZONE, else UTC).
+# An operator who pinned a time with one of the env vars in
+# `_RECURRING_KIND_ENV` keeps it read as UTC, as before zones existed, so a
+# pinned time never moves. (An install that set USER_TIMEZONE but no pinned
+# times does move to that zone, from each brief's first fire after upgrade.)
 _DEFAULT_MORNING_TIME = "08:00"
 _DEFAULT_EOD_TIME = "18:00"
 # Executive reflection runs ~30 minutes before the morning brief so OE
 # has acted on whatever it could before the principal opens the brief.
 _DEFAULT_REFLECTION_TIME = "07:30"
+# Solo mode's weekly review: Friday afternoon in the user's zone. Its env
+# var takes a whole weekly spec (`weekly@DOW@HH:MM`), read as UTC like the
+# other pinned times.
+WEEKLY_REVIEW_KIND = "principal_weekly_review"
+_DEFAULT_WEEKLY_REVIEW_SPEC = "weekly@fri@16:00"
 
 
 def _rotation_pause_active() -> bool:
@@ -902,17 +1335,23 @@ def _rotation_pause_active() -> bool:
         return False
 
 
+def _strict_hhmm(spec: str) -> tuple[int, int] | None:
+    """Parse an HH:MM time of day, or None if it is not one."""
+    try:
+        hh_str, mm_str = spec.strip().split(":", 1)
+        hh, mm = int(hh_str), int(mm_str)
+    except (ValueError, AttributeError):
+        return None
+    return (hh, mm) if 0 <= hh < 24 and 0 <= mm < 60 else None
+
+
 def _parse_hhmm(spec: str, default: str) -> tuple[int, int]:
     """Parse an HH:MM time-of-day string. Falls back to ``default`` on any
     parse error so a malformed env var can't crash the scheduler."""
     raw = (spec or default).strip()
-    try:
-        hh_str, mm_str = raw.split(":", 1)
-        hh, mm = int(hh_str), int(mm_str)
-        if 0 <= hh < 24 and 0 <= mm < 60:
-            return hh, mm
-    except (ValueError, AttributeError):
-        pass
+    parsed = _strict_hhmm(raw)
+    if parsed is not None:
+        return parsed
     logger.warning("scheduler: invalid time-of-day %r, falling back to %s", raw, default)
     dh, dm = default.split(":", 1)
     return int(dh), int(dm)
@@ -947,96 +1386,354 @@ def _has_pending_brief(kind: str) -> bool:
     return row is not None
 
 
-def seed_principal_briefs() -> int:
-    """Idempotently enqueue the next morning_brief and EoD_digest occurrences.
-
-    Called at scheduler startup. Returns the number of rows newly
-    inserted (0–2). When a brief row is already pending or running, no
-    new row is added — the existing one will fire and chain its
-    successor via ``_run_principal_brief``.
-
-    Times of day are read from env vars (`PRINCIPAL_BRIEF_MORNING_TIME`,
-    `PRINCIPAL_BRIEF_EOD_TIME`) in HH:MM UTC format, defaulting to
-    08:00 and 18:00 respectively. The principal's company timezone is
-    not yet supported — a v2 task.
-    """
-    import os
-
-    from openexecutive.memory.episodic import insert_scheduled_action
-
-    now = datetime.now(UTC)
-    inserted = 0
-
-    for kind, env_name, default_time in (
-        ("principal_brief_morning", "PRINCIPAL_BRIEF_MORNING_TIME", _DEFAULT_MORNING_TIME),
-        ("principal_brief_eod", "PRINCIPAL_BRIEF_EOD_TIME", _DEFAULT_EOD_TIME),
-        # Reflection runs alongside the briefs — same seed-once-per-DB
-        # pattern, just on its own cadence. Shares this loop because
-        # the chain-next mechanism is identical.
-        ("executive_reflection", "PRINCIPAL_REFLECTION_TIME", _DEFAULT_REFLECTION_TIME),
-    ):
-        if _has_pending_brief(kind):
-            logger.info("scheduler: %s already pending, not re-seeding", kind)
-            continue
-        hh, mm = _parse_hhmm(os.environ.get(env_name, ""), default_time)
-        run_at = _next_occurrence(now, hh, mm)
-        try:
-            action_id = insert_scheduled_action(
-                run_at=run_at.isoformat(),
-                channel="__internal__",
-                channel_ref="principal",
-                intent_text=(
-                    f"Generate the {kind.replace('_', ' ')} via the matching "
-                    f"workflow and DM the artifact to the principal."
-                ),
-                kind=kind,
-            )
-            inserted += 1
-            logger.info(
-                "scheduler: seeded %s at %s (id=%d)", kind, run_at.isoformat(), action_id
-            )
-        except Exception:
-            logger.exception("scheduler: failed to seed %s", kind)
-
-    return inserted
-
-
+# Recurring principal kinds → (env var overriding the time, default). The
+# default is a time of day (HH:MM, daily) or, for a weekly kind, a weekly spec.
 _RECURRING_KIND_ENV: dict[str, tuple[str, str]] = {
     "principal_brief_morning": ("PRINCIPAL_BRIEF_MORNING_TIME", _DEFAULT_MORNING_TIME),
     "principal_brief_eod": ("PRINCIPAL_BRIEF_EOD_TIME", _DEFAULT_EOD_TIME),
+    # Reflection runs alongside the briefs — same seed-once-per-DB pattern
+    # and chain-next mechanism, just on its own time of day.
     "executive_reflection": ("PRINCIPAL_REFLECTION_TIME", _DEFAULT_REFLECTION_TIME),
+    # Solo only (see _SOLO_ONLY_KINDS): seeded in solo, cancelled on a switch
+    # to team, retired without running if one fires in team anyway.
+    WEEKLY_REVIEW_KIND: ("PRINCIPAL_WEEKLY_REVIEW_TIME", _DEFAULT_WEEKLY_REVIEW_SPEC),
+}
+# Kinds that recur weekly (the rest are daily).
+_WEEKLY_KINDS: frozenset[str] = frozenset({WEEKLY_REVIEW_KIND})
+# Kinds that exist only in a solo workspace.
+_SOLO_ONLY_KINDS: frozenset[str] = frozenset({WEEKLY_REVIEW_KIND})
+# The recurring principal kinds that run a workflow and deliver its artifact
+# to the principal (see _run_principal_brief).
+_PRINCIPAL_WORKFLOWS: dict[str, str] = {
+    "principal_brief_morning": "morning_brief",
+    "principal_brief_eod": "end_of_day_digest",
+    WEEKLY_REVIEW_KIND: "weekly_review",
 }
 
 
+def _strict_weekly(spec: str) -> str | None:
+    """A valid ``weekly@DOW@HH:MM`` spec, normalised to lower case, or None."""
+    from openexecutive.departments.cadence import _DOW_MAP, _WEEKLY_RE
+
+    raw = spec.strip().lower()
+    m = _WEEKLY_RE.match(raw)
+    if m is None or m.group(1) not in _DOW_MAP:
+        return None
+    return raw if _strict_hhmm(f"{m.group(2)}:{m.group(3)}") is not None else None
+
+
+def _kind_runs_in(kind: str, mode: str) -> bool:
+    """Whether ``kind`` belongs in a workspace in ``mode``."""
+    return mode == "solo" or kind not in _SOLO_ONLY_KINDS
+
+
+def _workspace_mode() -> str:
+    from openexecutive.memory.workspace_settings import get_workspace
+
+    return get_workspace().mode
+
+
+def _team_for_sure(kind: str) -> bool:
+    """Whether a solo-only ``kind`` must stop because the workspace really is
+    in team mode. Fails open: a mode that could not be read
+    (``read_stored_mode`` → None — a locked DB, say) is not team, so one bad
+    read never retires the weekly review or breaks its chain; the next run
+    checks again. Always False for a kind that runs in both modes."""
+    if kind not in _SOLO_ONLY_KINDS:
+        return False
+    from openexecutive.memory.workspace_settings import read_stored_mode
+
+    return read_stored_mode() == "team"
+
+
+def _pinned_spec(kind: str, raw: str) -> str | None:
+    """The cadence spec an operator's env value pins, or None if it is not
+    a valid one: ``HH:MM`` for a daily kind, ``weekly@DOW@HH:MM`` for a
+    weekly one."""
+    if kind in _WEEKLY_KINDS:
+        return _strict_weekly(raw)
+    pinned = _strict_hhmm(raw)
+    return f"daily@{pinned[0]:02d}:{pinned[1]:02d}" if pinned is not None else None
+
+
+def _next_principal_run_at(kind: str, after: datetime) -> datetime | None:
+    """Next fire time of a recurring principal kind, strictly after ``after``.
+
+    The default time is local to the user's zone (DST-safe, via the cadence
+    parser): a time of day for the daily kinds, Friday 16:00 for the weekly
+    review. A valid value the operator set in the kind's env var is read as
+    UTC, exactly as before zones existed; a malformed one is logged and
+    ignored, like an unset one. None for an unknown kind.
+    """
+    import os
+
+    from openexecutive.departments.cadence import _parse_cadence_spec
+    from openexecutive.memory.workspace_settings import get_user_timezone
+
+    env_pair = _RECURRING_KIND_ENV.get(kind)
+    if env_pair is None:
+        return None
+    env_name, default = env_pair
+    raw = os.environ.get(env_name, "").strip()
+    pinned = _pinned_spec(kind, raw) if raw else None
+    if pinned is not None:
+        spec = pinned
+        zone: tzinfo = UTC
+    else:
+        if raw:
+            logger.warning(
+                "scheduler: invalid %s=%r — using %s in the user's zone",
+                env_name, raw, default,
+            )
+        if kind in _WEEKLY_KINDS:
+            spec = default
+        else:
+            hh, mm = _parse_hhmm(default, default)
+            spec = f"daily@{hh:02d}:{mm:02d}"
+        zone = get_user_timezone()
+    return _parse_cadence_spec(spec, after, zone)
+
+
+def _brief_intent(kind: str) -> str:
+    return (
+        f"Generate the {kind.replace('_', ' ')} via the matching "
+        f"workflow and DM the artifact to the principal."
+    )
+
+
+def _seed_kind(kind: str, now: datetime) -> bool:
+    """Enqueue the next row of ``kind`` unless one is pending or running.
+    True when a row was inserted. Never raises."""
+    from openexecutive.memory.episodic import insert_scheduled_action
+
+    try:
+        if _has_pending_brief(kind):
+            logger.info("scheduler: %s already pending, not re-seeding", kind)
+            return False
+        run_at = _next_principal_run_at(kind, now)
+        if run_at is None:
+            return False
+        action_id = insert_scheduled_action(
+            run_at=run_at.isoformat(),
+            channel="__internal__",
+            channel_ref="principal",
+            intent_text=_brief_intent(kind),
+            kind=kind,
+        )
+    except Exception:
+        logger.exception("scheduler: failed to seed %s", kind)
+        return False
+    logger.info("scheduler: seeded %s at %s (id=%d)", kind, run_at.isoformat(), action_id)
+    return True
+
+
+def seed_principal_briefs() -> int:
+    """Idempotently enqueue the next morning brief, EoD digest and reflection
+    — and, in a solo workspace, the weekly review.
+
+    Called at scheduler startup (and after a reset, a blank client slot or a
+    change of the user's zone). Returns the number of rows newly inserted
+    (0–4). When a row of a kind is already pending or running, no new row is
+    added — the existing one will fire and chain its successor via
+    ``_run_principal_brief`` / ``_run_executive_reflection``.
+
+    Times default to 08:00 / 18:00 / 07:30 daily and Friday 16:00 weekly, in
+    the user's zone; see ``_next_principal_run_at`` for the env-var overrides.
+    """
+    now = datetime.now(UTC)
+    mode = _workspace_mode()
+    return sum(
+        1 for kind in _RECURRING_KIND_ENV
+        if _kind_runs_in(kind, mode) and _seed_kind(kind, now)
+    )
+
+
+def seed_weekly_review() -> int:
+    """Enqueue the next weekly review if none is pending (a switch to solo).
+    Returns 0 or 1. Never raises."""
+    return int(_seed_kind(WEEKLY_REVIEW_KIND, datetime.now(UTC)))
+
+
+def cancel_weekly_reviews() -> int:
+    """Cancel every pending weekly review (a switch to team). A running one
+    finishes and does not chain another in team. Returns the count
+    cancelled; never raises."""
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+
+    try:
+        resolved = _resolve_db_path(None)
+        if not resolved.exists():
+            return 0
+        with _get_conn(resolved) as conn:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduled_actions'"
+            ).fetchone() is None:
+                return 0
+            cancelled = int(conn.execute(
+                "UPDATE scheduled_actions SET status = 'cancelled', "
+                "last_error = 'team workspace: the weekly review runs in solo mode' "
+                "WHERE kind = ? AND status = 'pending'",
+                (WEEKLY_REVIEW_KIND,),
+            ).rowcount)
+    except Exception:
+        logger.exception("scheduler: cancelling the weekly review failed")
+        return 0
+    if cancelled:
+        logger.info("scheduler: cancelled %d pending weekly review(s)", cancelled)
+    return cancelled
+
+
+# Two runs of one recurring principal kind are never closer than this, even
+# across a change of zone — so a zone change can neither send a second brief
+# the same local day nor, by moving a row more than this far, skip one.
+_PRINCIPAL_MIN_GAP = timedelta(hours=12)
+# The same for a weekly kind: half its period.
+_WEEKLY_MIN_GAP = timedelta(days=3, hours=12)
+
+
+def _min_gap(kind: str) -> timedelta:
+    return _WEEKLY_MIN_GAP if kind in _WEEKLY_KINDS else _PRINCIPAL_MIN_GAP
+
+
+def _parse_run_at(raw: object) -> datetime | None:
+    """A stored ``run_at`` as an aware UTC datetime (naive → UTC), or None."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
+
+
+def _chain_after(action: ScheduledAction) -> datetime:
+    """The ``after`` a recurring principal row chains from: now, but never
+    within the kind's minimum gap (``_min_gap``: 12h daily, 3.5 days weekly)
+    of the occurrence that just fired. In a steady zone this changes nothing
+    (the next occurrence is a full period out); it matters when the zone
+    changed while the row ran — without it the next local time could land a
+    few hours later, a second brief the same day."""
+    now = datetime.now(UTC)
+    fired = _parse_run_at(action.run_at)
+    return max(now, fired + _min_gap(action.kind)) if fired is not None else now
+
+
+def reschedule_principal_rhythm(now: datetime | None = None) -> int:
+    """Re-time the principal's briefs and reflection in place after the
+    user's zone changed. Returns the number of rows moved.
+
+    Only a kind's PENDING, not-yet-due row is touched, and only its
+    ``run_at`` — nothing is inserted or cancelled, so this cannot race the
+    chain into a duplicate. A kind with no such row (one is running, one
+    just fired and is between ``mark_action_done`` and its chain insert, or
+    a due row is held by a pause or a missing company profile) is left
+    alone: that run chains its successor in the new zone itself.
+
+    The new time is the kind's next occurrence in the new zone after
+    ``max(now, last fired run + gap)`` — never a second run the same day (or,
+    for the weekly review, the same half-week). ``gap`` is ``_min_gap``: 12h
+    for a daily kind, 3.5 days for a weekly one. If the new time is more than
+    ``gap`` later than the row's current time, moving it would skip a run, so
+    the row keeps its time for this one occurrence and the chain picks up
+    the new zone.
+    """
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+
+    resolved = _resolve_db_path(None)
+    if not resolved.exists():
+        return 0
+    now = now or datetime.now(UTC)
+    kinds = list(_RECURRING_KIND_ENV)
+    placeholders = ",".join("?" for _ in kinds)
+    with _get_conn(resolved) as conn:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduled_actions'"
+        ).fetchone() is None:
+            return 0
+        rows = conn.execute(
+            "SELECT id, kind, run_at, status FROM scheduled_actions "
+            f"WHERE kind IN ({placeholders}) "  # noqa: S608 — placeholders only
+            "AND status IN ('pending', 'running', 'done')",
+            kinds,
+        ).fetchall()
+
+    # Plan with the DB closed: `_next_principal_run_at` reads the zone
+    # through its own connection.
+    moves: list[tuple[int, str, str]] = []
+    for kind in kinds:
+        gap = _min_gap(kind)
+        fired = [
+            t for r in rows
+            if r["kind"] == kind and r["status"] in ("running", "done")
+            and (t := _parse_run_at(r["run_at"])) is not None
+        ]
+        floor = max(now, max(fired) + gap) if fired else now
+        for r in rows:
+            if r["kind"] != kind or r["status"] != "pending":
+                continue
+            old = _parse_run_at(r["run_at"])
+            if old is None or old <= now:
+                continue  # due (or unreadable): it fires as it is
+            new = _next_principal_run_at(kind, floor)
+            if new is None or new == old:
+                continue
+            if new - old > gap:
+                logger.info(
+                    "scheduler: keeping %s at %s once (the new zone's %s would skip a day)",
+                    kind, old.isoformat(), new.isoformat(),
+                )
+                continue
+            moves.append((int(r["id"]), str(r["run_at"]), new.isoformat()))
+
+    moved = 0
+    if moves:
+        with _get_conn(resolved) as conn:
+            for action_id, old_raw, new_raw in moves:
+                # Guarded on the row being untouched since it was read: a
+                # claim (→ running) or any other write in between wins.
+                moved += conn.execute(
+                    "UPDATE scheduled_actions SET run_at = ? "
+                    "WHERE id = ? AND status = 'pending' AND run_at = ?",
+                    (new_raw, action_id, old_raw),
+                ).rowcount
+    logger.info("scheduler: re-timed %d principal rhythm row(s) to the new zone", moved)
+    return moved
+
+
 def _enqueue_next_principal_brief(kind: str, after: datetime) -> int | None:
-    """Insert the next occurrence of a principal brief / reflection 24h
-    after ``after``.
+    """Insert the next occurrence of a principal brief / reflection / weekly
+    review after ``after``.
 
     Returns the new action id, or None on failure. Mirrors
     ``departments.cadence.enqueue_next`` for the daily-recurring case.
     Despite the name, this also handles the ``executive_reflection``
-    kind — the chain logic is identical, just the env var differs.
+    kind — the chain logic is identical, just the env var differs. The
+    zone is read fresh, so a change of zone applies from the next link.
     """
-    import os
-
     from openexecutive.memory.episodic import insert_scheduled_action
 
-    env_pair = _RECURRING_KIND_ENV.get(kind)
-    if env_pair is None:
+    if kind in _WEEKLY_KINDS:
+        # A switch to solo while this run finished already seeded the next
+        # one (seed_weekly_review); a second would send two reviews. A check
+        # that fails chains anyway — a missed review is worse than a double.
+        try:
+            already = _has_pending_brief(kind)
+        except Exception:
+            logger.exception("scheduler: pending check for %s failed — chaining", kind)
+            already = False
+        if already:
+            logger.info("scheduler: %s already pending — not chaining another", kind)
+            return None
+    run_at = _next_principal_run_at(kind, after)
+    if run_at is None:
         logger.warning("scheduler: unknown recurring kind %r — no chain", kind)
         return None
-    env_name, default_time = env_pair
-    hh, mm = _parse_hhmm(os.environ.get(env_name, ""), default_time)
-    run_at = _next_occurrence(after, hh, mm)
     try:
         action_id = insert_scheduled_action(
             run_at=run_at.isoformat(),
             channel="__internal__",
             channel_ref="principal",
-            intent_text=(
-                f"Generate the {kind.replace('_', ' ')} via the matching "
-                f"workflow and DM the artifact to the principal."
-            ),
+            intent_text=_brief_intent(kind),
             kind=kind,
         )
         logger.info(
@@ -1064,37 +1761,380 @@ def _delivered_ok(result_json: str) -> bool:
     return isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") == "sent"
 
 
-async def _deliver_to_principal(text: str) -> tuple[bool, str]:
-    """Send ``text`` to the principal on their preferred channel.
+# `Person.preferred_channel` values (people/models.py PreferredChannel) mapped
+# to the delivery channels below. "any" has no entry: it keeps the fallback
+# order.
+_PREFERRED_TO_DELIVERY: dict[str, str] = {
+    "slack": "slack_dm",
+    "discord": "discord_dm",
+    "telegram": "telegram",
+    "email": "email",
+}
+# Chat fallback order after the preferred channel. Email comes after all of
+# them unless it is the preference — see `delivery_order`.
+_CHAT_DELIVERY_ORDER: tuple[str, ...] = ("slack_dm", "discord_dm", "telegram")
 
-    Returns (ok, detail). Picks the channel from the principal Person
-    row's preferred_channel + matching channel id. Falls back to other
-    channels in fixed order if the preferred is unconfigured (e.g. the
-    principal prefers Slack but has no slack_user_id set). Returns
-    (False, ...) when no deliverable channel is configured at all —
-    caller still marks the action done (no point retrying the same
-    misconfiguration) but audits the failure.
+
+def delivery_order(principal: Person | None, *, email_ready: bool) -> list[str]:
+    """The channels a message can reach ``principal`` on, in the order to try.
+
+    Chat channels the principal has an id for come first — the preferred one
+    ahead of the rest (slack, discord, telegram). Email (it needs the MCP
+    gateway, ``email_ready``) is tried first when it is the preference, and
+    otherwise last, as the backup: delivery stops at the first channel that
+    sends, so an owner linked by email at setup (preference ``any``) with a
+    working Slack still never gets the briefs by email too — only when every
+    chat channel is missing or fails.
+    Empty when nothing can deliver — e.g. a principal who only uses the web UI.
     """
+    if principal is None:
+        return []
+    ids = {
+        "slack_dm": principal.slack_user_id,
+        "discord_dm": principal.discord_user_id,
+        # Only a private chat: a group's id is negative, and everyone in it
+        # would read the message.
+        "telegram": principal.telegram_chat_id if str(principal.telegram_chat_id or "").isdigit() else None,
+    }
+    chat = [c for c in _CHAT_DELIVERY_ORDER if ids[c]]
+    pref = (principal.preferred_channel or "any").lower()
+    preferred = _PREFERRED_TO_DELIVERY.get(pref)
+    order = ([preferred] if preferred in chat else []) + [c for c in chat if c != preferred]
+    if email_ready and principal.email:
+        if pref == "email":
+            order.insert(0, "email")
+        else:
+            order.append("email")
+    return order
+
+
+def google_workspace_ready() -> bool:
+    """Whether the Executive can reach Google Workspace tools (Gmail,
+    Calendar): the MCP gateway is up and the Google Workspace server is one
+    it runs. Another MCP server alone does not count."""
+    from openexecutive.config import get_settings
+    from openexecutive.orchestrator.mcp_gateway import (
+        configured_server_names,
+        get_active_gateway,
+    )
+
+    if get_active_gateway() is None:
+        return False
+    return "google_workspace" in configured_server_names(get_settings().mcp_servers_config_path)
+
+
+def email_ready() -> bool:
+    """Whether the Executive can send email: the MCP gateway is up and runs
+    the server of the configured mail backend (``EMAIL_PROVIDER``: the Google
+    Workspace server for Gmail, the Microsoft 365 one for Outlook)."""
+    from openexecutive.config import get_settings
+    from openexecutive.integrations.workspace.registry import get_mail_provider
+    from openexecutive.orchestrator.mcp_gateway import (
+        configured_server_names,
+        get_active_gateway,
+    )
+
+    if get_active_gateway() is None:
+        return False
+    settings = get_settings()
+    server = get_mail_provider(settings).server_name
+    return server in configured_server_names(settings.mcp_servers_config_path)
+
+
+def principal_delivery_plan() -> tuple[Person | None, list[str]]:
+    """The principal Person row and the channels to try, in order."""
     from openexecutive.people.store import find_principal_person
 
     principal = find_principal_person()
-    if principal is None:
-        return False, "no principal Person row found"
+    return principal, delivery_order(principal, email_ready=email_ready())
 
-    # Try preferred channel first, then ranked fallbacks.
-    pref = (principal.preferred_channel or "").lower()
-    ordered_channels = [pref] + [
-        c for c in ("slack_dm", "discord_dm", "telegram", "email") if c != pref
-    ]
-    for channel in ordered_channels:
-        if not channel:
-            continue
-        # Email requires the MCP gateway (Gmail send tool is an MCP tool)
-        # and isn't wired up for the brief path yet — explicit skip so
-        # this branch reads as intentional rather than an oversight.
-        # TODO(v2): wire email delivery via the existing MCP gateway.
-        if channel == "email":
-            continue
+
+def unreachable_principals(
+    principals: Iterable[Person], *, email_ready: bool
+) -> list[Person]:
+    """Those of ``principals`` no channel can reach (``delivery_order`` empty).
+
+    Whether a standing brief can be delivered is a question about EVERY
+    recipient, not about the lowest-id row. ``no_channel`` is the one delivery
+    problem that is a function of the present rather than of a past run, so
+    ``brief_state.outstanding_problems`` derives it from here and not from the
+    record: a surface that asked only about ``find_principal_person()``
+    cleared it the moment the oldest founder had a channel, putting the
+    co-principal who receives nothing back behind a green light. The Briefing
+    notice and the Setup status light pass the whole active roster through
+    ``outstanding_problems``, which calls this.
+    """
+    return [p for p in principals if not delivery_order(p, email_ready=email_ready)]
+
+
+def next_brief_runs(after: datetime) -> dict[str, datetime]:
+    """When each recurring brief next goes out after ``after``."""
+    from openexecutive.briefing.brief_state import BRIEF_KINDS
+
+    runs = {kind: _next_principal_run_at(kind, after) for kind in BRIEF_KINDS}
+    return {kind: at for kind, at in runs.items() if at is not None}
+
+
+def _email_subject(label: str, now: datetime | None = None) -> str:
+    """``label`` and today's date where the user is ("Morning Brief — Fri 25
+    Sep"): an evening digest sent from UTC would otherwise carry tomorrow's
+    date for anyone west of it."""
+    from openexecutive.memory.workspace_settings import get_user_timezone
+
+    local = (now or datetime.now(UTC)).astimezone(get_user_timezone())
+    return f"{label} — {local:%a} {local.day} {local:%b}"
+
+
+async def _email_principal(principal: Person, text: str, label: str) -> bool:
+    """Send ``text`` (Markdown) to the principal's address through the active
+    MCP gateway, formatted as HTML (``utils.markdown_email``).
+
+    Sent as the Executive's own mailbox (the principal is on the roster, so
+    the gateway's egress gate allows it). False when there is no gateway or
+    the tool reports an error in-band.
+    """
+    from openexecutive.integrations.workspace.registry import send_from_executive
+    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+    from openexecutive.utils.markdown_email import markdown_to_email_html
+    from openexecutive.workflows.action_step import looks_like_error
+
+    gateway = get_active_gateway()
+    if gateway is None or not principal.email:
+        return False
+    result = await send_from_executive(
+        gateway,
+        to=principal.email,
+        subject=_email_subject(label),
+        body=markdown_to_email_html(text),
+        html=True,
+    )
+    if looks_like_error(result):
+        logger.warning("scheduler: email to the principal failed: %s", result[:300])
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class PrincipalDelivery:
+    """How one message to the principal went."""
+
+    ok: bool
+    # For the log and the audit row; carries the address or id it went to.
+    detail: str
+    reason: DeliveryReason
+    # The delivery channel that sent it ("email", "slack_dm", ...), if one did.
+    channel: str | None = None
+    # The first channel this person's plan offered, if they had one — what was
+    # actually tried, not what their plan would say later. The Setup light's
+    # backup-channel warning compares the two, and "email carried it while the
+    # plan starts at Slack" only means Slack failed if Slack was in the plan
+    # at the time (`brief_state.backup_channel_problem`).
+    first_tried: str | None = None
+
+
+async def deliver_to_each_principal(
+    text: str, *, label: str = "Update", recipients: list[Person] | None = None
+) -> list[tuple[Person, PrincipalDelivery]]:
+    """Send ``text`` to every active principal, one DM each.
+
+    ``recipients`` pins the audience instead of reading the roster now. A
+    caller whose CONTENT depends on who the recipients are must pass the
+    same list it gated on: the principal brief decides
+    ``PRINCIPAL_DELIVERY`` from the roster and then spends minutes
+    generating, so re-reading here would hand a founder added inside that
+    window a brief built as private to someone else.
+
+    It is an upper bound, not a licence. Each recipient is revalidated
+    against the roster inside the loop below, immediately before its OWN
+    send, and the live row's channel fields are the ones used. So the
+    audience can only ever shrink between gating and sending: nobody is
+    added (the content was gated on the pinned list), and anyone archived,
+    demoted or moved to contacts inside the window drops out. Taking the
+    live row also means a ``slack_user_id`` changed mid-run is not used to
+    DM whoever now holds the old id.
+
+    That revalidation is a PRE-FILTER, not the guarantee. Whether private
+    content may reach a given recipient is enforced at the egress: a caller
+    whose text is private to one principal sends inside
+    ``people_tools.restrict_to_principal()`` (``_run_principal_brief`` does,
+    for a single-recipient run), and every DM handler, the email gateway's
+    roster allow-set and the invite gate then read ``is_principal`` fresh
+    immediately before their own leg. Four review rounds found variants of
+    "the pinned row went stale across an await" precisely because a
+    caller-side snapshot cannot be await-safe at any granularity. What this
+    loop adds is manners: a recipient who stopped being an active principal
+    is dropped quietly here, with a log line, rather than sent to and
+    refused — and dropped from the results, so the aggregate is the
+    remaining recipients' (see below).
+
+    Revalidating PER RECIPIENT rather than once before the loop keeps the
+    pre-filter honest: each send is awaited, so a later founder is reached
+    only after an earlier one's channel call has returned, and a snapshot
+    taken before the loop is already stale by then. It lives here rather
+    than in ``deliver_to_person`` because only this function knows what
+    membership its fan-out needs ("still an active principal") and what to
+    do when it fails (drop them). ``deliver_to_person`` is shared with
+    ``memory.history_reminders``, which sends to ordinary team members and
+    needs a different question answered (``history.can_keep_notes``); one
+    guard down there could not be both, and had to return a per-recipient
+    reason where this needs the person dropped (logged, not silent).
+
+    Someone no longer an active principal is DROPPED from the results, not
+    returned with a reason. ``brief_state.delivery_summary`` takes the worst
+    reason any recipient got, and ``no_owner`` there already means "there was
+    no principal on the roster at all" — so reporting an offboarded founder
+    that way made a run that reached their co-founder aggregate to
+    ``no_owner``. Dropping matches what the audience cap means: they are not
+    a recipient of this run.
+
+    Returns one result PER RECIPIENT rather than a single verdict, on
+    purpose. ``brief_state.record_delivery_outcome`` stores the list as given
+    (one ``RecipientOutcome`` each) and both surfaces name the people a
+    problem is about, so collapsing N results into "ok if any succeeded" —
+    or into any one of them — would make a founder whose channel is broken
+    invisible on every surface, their brief failing silently every day behind
+    the other founder's success. The caller decides what a partial delivery
+    means and audits each recipient.
+
+    Empty list when there is no principal at all, which the caller records
+    as ``no_owner``. A not-ok result means no channel was configured or
+    every send failed: the caller still marks the action done — there is no
+    point retrying the same misconfiguration on the next tick — and audits
+    the failure instead.
+    """
+    from openexecutive.people import store as people_store
+
+    # The audience, fixed on entry: the caller's pinned list when it has one,
+    # otherwise the roster as it stands now. Only ever an upper bound — the
+    # loop revalidates each id and can shrink it, never grow it.
+    candidates = people_store.active_principals() if recipients is None else recipients
+
+    results: list[tuple[Person, PrincipalDelivery]] = []
+    for pinned in candidates:
+        named = pinned  # who a result is reported against if the read fails
+        try:
+            live = _live_principal(pinned)
+            if live is None:
+                logger.info(
+                    "scheduler: person %s is no longer an active principal — "
+                    "dropped from the %s fan-out",
+                    pinned.id, label,
+                )
+                continue
+            named = live
+            delivery = await deliver_to_person(live, text, label=label)
+        except Exception:
+            # Per recipient, so one founder's failure cannot discard a
+            # sibling's. A roster read RAISES on a locked or corrupt DB
+            # (`people.store` swallows nothing on that path — it only degrades
+            # to an empty roster when the DB file is absent), and that used to
+            # abort the whole comprehension: the caller then recorded a
+            # run-level `send_failed` with no recipients and never advanced
+            # the window, replaying the same interval to the founder who
+            # already had the brief while every surface said the run had
+            # failed for everyone.
+            #
+            # Reported, not dropped: a read that failed says nothing about
+            # whether this person is still a principal, so claiming they are
+            # not a recipient would be a silent loss. `send_failed` is what
+            # happened, and it is the reason `delivery_summary` already
+            # carries for a partial failure.
+            #
+            # This also contains a crash in the send itself, which therefore
+            # no longer reaches `_run_principal_brief`'s outer handler: that
+            # recipient gets an outcome row and an audit row instead of the
+            # run getting a `send_failed` with none, and the run is no longer
+            # marked failed for one recipient's crash. `mark_action_done` and
+            # the chaining were already unconditional, so the action
+            # lifecycle is unchanged.
+            logger.exception(
+                "scheduler: delivering the %s to person %s failed", label, pinned.id
+            )
+            delivery = PrincipalDelivery(
+                False, f"delivering to person {pinned.id} raised", "send_failed"
+            )
+        results.append((named, delivery))
+    return results
+
+
+def _live_principal(person: Person) -> Person | None:
+    """``person``'s row as the roster holds it NOW, or None when they are no
+    longer an active principal.
+
+    A courtesy PRE-FILTER for ``deliver_to_each_principal``, not the privacy
+    guarantee. On a private run the egress refuses a non-principal anyway
+    (``people_tools.restrict_to_principal``, read fresh by each channel leg);
+    answering here lets the fan-out drop such a recipient quietly, with a log
+    line and no result row, instead of sending to them and being refused. It
+    is also what keeps a shared run — where no egress gate applies — from
+    delivering to someone offboarded mid-fan-out.
+
+    Asks ``active_principals()`` and matches on id rather than re-reading the
+    single row and re-testing its flags. That predicate is three conditions —
+    ``archived = 0``, ``kind = 'team'`` and ``is_principal`` — and a
+    hand-written copy of it is exactly what went wrong: the copy tested
+    ``archived`` alone, so a founder DEMOTED rather than offboarded (an
+    onboarding re-run rewrites the flag) passed it and still received the
+    standing brief. Reusing the gate's own query means the fan-out cannot
+    disagree with it, and a fourth condition added there needs no change
+    here.
+
+    One roster read per recipient, guarding one network DM each — on a roster
+    with the one or two principals this fans out to, the read is not the cost.
+
+    A pinned row with no id cannot be revalidated, and cannot have come from
+    ``active_principals()`` either, so it is not an active principal here.
+    """
+    if person.id is None:
+        return None
+    from openexecutive.people import store as people_store
+
+    return next((p for p in people_store.active_principals() if p.id == person.id), None)
+
+
+async def deliver_to_person(person: Person, text: str, *, label: str = "Update") -> PrincipalDelivery:
+    """Send ``text`` to ``person`` alone, the way the briefs reach the
+    principal: their own Slack or Discord DM, their Telegram chat, or email
+    to their own address (``delivery_order``, which skips a Telegram group).
+
+    Sends the row it is GIVEN, and does not ask whether that row is still on
+    the roster. The caller owns that, because only the caller knows which
+    membership it needs and what a lost one means. This briefly held a
+    membership check of its own and that was the wrong layer: it can only
+    test one notion of "still a recipient", while
+    ``deliver_to_each_principal`` needs "still an active principal" and the
+    person dropped from its results, and ``memory.history_reminders`` needs
+    "still a team member who may keep notes" (``history.can_keep_notes``,
+    which also covers a founder moved to contacts) and a logged skip. One
+    guard here could not be both, and the ``no_owner`` it returned collided
+    with the aggregate meaning "no principal on the roster at all".
+
+    Both callers do re-read, inside their own per-person loop and
+    immediately before the send, and both have to: a loop that awaits a
+    network send per person reaches a later one only after an earlier one's
+    channel call has returned, so a roster read from before the loop is
+    already stale. All three DM handlers now run ``_dm_recipient_on_roster``
+    unconditionally, so an archived or never-rostered id is refused
+    downstream as well — but that gate answers "on the roster at all", not
+    either caller's membership question, so a new caller still owes its own
+    read. A caller whose TEXT is private to the principal owes one more
+    thing: sending inside ``people_tools.restrict_to_principal()``, which is
+    what narrows every leg's gate to ``is_principal``.
+    """
+    return await _send_on_plan(person, delivery_order(person, email_ready=email_ready()), text, label=label)
+
+
+async def _send_on_plan(
+    principal: Person, plan: list[str], text: str, *, label: str
+) -> PrincipalDelivery:
+    """Try ``plan``'s channels for ``principal`` (any Person) in order until
+    one sends."""
+    if not plan:
+        return PrincipalDelivery(
+            False, "no deliverable channel configured for principal", "no_channel"
+        )
+
+    for channel in plan:
         try:
             if channel == "slack_dm" and principal.slack_user_id:
                 from openexecutive.orchestrator.schedule_tools import handle_send_slack_dm
@@ -1102,14 +2142,14 @@ async def _deliver_to_principal(text: str) -> tuple[bool, str]:
                     "user_id": principal.slack_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return True, f"slack_dm → {principal.slack_user_id}"
+                    return _sent(channel, principal.slack_user_id, plan[0])
             elif channel == "discord_dm" and principal.discord_user_id:
                 from openexecutive.orchestrator.schedule_tools import handle_send_discord_dm
                 result = await handle_send_discord_dm({
                     "discord_user_id": principal.discord_user_id, "text": text,
                 })
                 if _delivered_ok(result):
-                    return True, f"discord_dm → {principal.discord_user_id}"
+                    return _sent(channel, principal.discord_user_id, plan[0])
             elif channel == "telegram" and principal.telegram_chat_id:
                 from openexecutive.orchestrator.schedule_tools import (
                     handle_send_telegram_message,
@@ -1118,11 +2158,23 @@ async def _deliver_to_principal(text: str) -> tuple[bool, str]:
                     "chat_id": int(principal.telegram_chat_id), "text": text,
                 })
                 if _delivered_ok(result):
-                    return True, f"telegram → {principal.telegram_chat_id}"
+                    return _sent(channel, principal.telegram_chat_id, plan[0])
+            elif channel == "email" and await _email_principal(principal, text, label):
+                return _sent(channel, principal.email, plan[0])
         except Exception:
             logger.exception("scheduler: delivery via %s failed", channel)
 
-    return False, "no deliverable channel configured for principal"
+    return PrincipalDelivery(
+        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed",
+        first_tried=plan[0],
+    )
+
+
+def _sent(channel: str, to: str | None, first_tried: str | None = None) -> PrincipalDelivery:
+    """A delivered result. ``first_tried`` is the channel the plan started
+    with, which is only interesting when it is NOT ``channel`` — the plan
+    tried it, it did not send, and a later one did."""
+    return PrincipalDelivery(True, f"{channel} → {to}", "delivered", channel, first_tried)
 
 
 async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
@@ -1143,7 +2195,9 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
         schedule_dynamic_workflow_cadence,
     )
     from openexecutive.workflows.dynamic_store import get_definition
+    from openexecutive.workflows.gate import checkpoint_gate
     from openexecutive.workflows.persistence import complete_run, create_run, fail_run
+    from openexecutive.workflows.wait_for_human import WaitForHumanEvent
 
     assert action.id is not None
     name = action.channel_ref
@@ -1164,7 +2218,21 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
         )
         store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
         artifact = ""
+        paused = False
         async for event in workflow.run(inputs=wf_inputs, store=store):
+            # The one pause a scheduled run CAN take: an action step held
+            # writes to new targets. Nothing waits in-process — the run is
+            # checkpointed, its owner is asked, and the resumer finishes it
+            # (and DMs the artifact to this cadence's recipient) later.
+            if (
+                isinstance(event, WaitForHumanEvent)
+                and event.resume_state is not None
+                and event.resume_state.kind == "held_writes"
+            ):
+                event.resume_state.deliver_to_person_id = action.assigned_to_person_id
+                await checkpoint_gate(run_id=run_id, event=event, workflow_title=workflow.title)
+                paused = True
+                break
             # The only scheduler branch that can receive a DYNAMIC workflow, so
             # the only one that can be handed an approval gate. A cadence fire
             # has no human in the loop, and `validate_definition` forbids gates
@@ -1179,7 +2247,10 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
                 artifact = event.content
             elif event.type == "error" and event.message:
                 raise RuntimeError(event.message)
-        complete_run(run_id, artifact or "(no artifact)")
+        if paused:
+            artifact = ""  # the resumer delivers it once the owner answers
+        else:
+            complete_run(run_id, artifact or "(no artifact)")
     except Exception as exc:
         logger.exception("scheduler: dynamic_workflow %r (action %d) failed", name, action.id)
         with contextlib.suppress(Exception):
@@ -1208,31 +2279,44 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
 
 
 async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
-    """Run the matching brief workflow and dispatch the artifact to the principal.
+    """Run the kind's workflow (``_PRINCIPAL_WORKFLOWS``: the morning brief,
+    the end-of-day digest, the weekly review) and dispatch the artifact to
+    the principal.
 
-    Chains the next occurrence 24h forward regardless of delivery outcome
-    — a single failed brief shouldn't break the recurring rhythm. Mirrors
-    the dept_cadence handler's pattern.
+    Chains the next occurrence regardless of delivery outcome — a single
+    failed brief shouldn't break the recurring rhythm. Mirrors the
+    dept_cadence handler's pattern. A solo-only kind (the weekly review)
+    that fires in a workspace whose stored mode is team is retired without
+    running and without chaining — the backstop for a row the switch to
+    team did not cancel. A mode that cannot be read counts as not team
+    (``_team_for_sure``), so a transient read error neither retires the row
+    nor breaks the chain.
     """
     import uuid
 
     from openexecutive.audit import log_event as audit_log
+    from openexecutive.briefing import brief_state
     from openexecutive.config import get_settings
     from openexecutive.knowledge.store import ChromaDBStore
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
     from openexecutive.workflows import WORKFLOW_REGISTRY
     from openexecutive.workflows.persistence import (
+        WITHHELD_RUN_ARTIFACT,
         complete_run,
         create_run,
         fail_run,
+        stored_artifact,
     )
 
     assert action.id is not None
     kind = action.kind
-    workflow_name = (
-        "morning_brief"
-        if kind == "principal_brief_morning"
-        else "end_of_day_digest"
-    )
+    if _team_for_sure(kind):
+        from openexecutive.memory.episodic import mark_action_cancelled
+
+        mark_action_cancelled(action.id, "team workspace: the weekly review runs in solo mode")
+        logger.info("scheduler: %s action %d retired — team workspace", kind, action.id)
+        return
+    workflow_name = _PRINCIPAL_WORKFLOWS[kind]
     workflow = WORKFLOW_REGISTRY[workflow_name]
     input_cls = workflow.input_model()
     wf_inputs = input_cls()
@@ -1248,6 +2332,9 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         except Exception:
             logger.exception("scheduler: pre-brief alert review failed")
 
+    # Every run ends with its outcome recorded — sent, not sent, or not
+    # written — for the Briefing's notice and the Setup status page.
+    sending = recorded = False
     try:
         create_run(
             run_id, workflow_name, f"{workflow.title} {now.strftime('%Y-%m-%d')}",
@@ -1257,55 +2344,306 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         artifact = ""
         fingerprint: str | None = None
         suppressed = False
-        async for event in workflow.run(inputs=wf_inputs, store=store):
-            event = ensure_workflow_event(event, site="scheduler.principal_brief")
-            if event.type == "artifact" and event.content:
-                artifact = event.content
-            elif event.type == "result" and event.data and event.data.get("brief_fingerprint"):
-                fingerprint = str(event.data["brief_fingerprint"])
-                suppressed = bool(event.data.get("suppressed"))
-            elif event.type == "error" and event.message:
-                raise RuntimeError(event.message)
-        complete_run(run_id, artifact or "(no artifact)")
+        private_to_principal = False
+        # Who this brief is for, resolved BEFORE the run because it decides
+        # what the brief may contain.
+        #
+        # PRINCIPAL_DELIVERY lets the brief read what is private to *the*
+        # principal — their contacts' mail, their chat titles, their
+        # calendar, their own notes, their Act-as-me drafts. None of those
+        # readers is keyed to a recipient: three resolve the owner through
+        # `find_principal_person()` (the lowest-id principal) —
+        # `live_signals._conversations`, `top_three`'s calendar block,
+        # `history_brief`'s notes — and `live_signals._drafts` is keyed to
+        # nothing at all, counting every `delegation_drafted` audit row the
+        # install has. So "private" here means one specific person's data
+        # (or worse, everyone's), never "each recipient's own".
+        #
+        # The flag is therefore only safe with exactly one recipient. With
+        # co-principals the brief goes out shared: fanning a private run out
+        # would put one founder's mail and calendar in the other's DM, and
+        # generating it per principal would not help — it would hand every
+        # recipient the SAME person's private data. Making the feature
+        # per-person means re-keying those readers, a larger change.
+        from openexecutive.people import store as people_store
 
-        if artifact:
-            ok, detail = await _deliver_to_principal(artifact)
-            if ok:
-                logger.info("scheduler: %s delivered (%s)", kind, detail)
+        recipients = people_store.active_principals()
+        private_run = len(recipients) == 1
+        from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+        delivery_token = PRINCIPAL_DELIVERY.set(private_run)
+        try:
+            async for event in workflow.run(inputs=wf_inputs, store=store):
+                event = ensure_workflow_event(event, site="scheduler.principal_brief")
+                if event.type == "artifact" and event.content:
+                    artifact = event.content
+                elif event.type == "result" and event.data and event.data.get("brief_fingerprint"):
+                    fingerprint = str(event.data["brief_fingerprint"])
+                    suppressed = bool(event.data.get("suppressed"))
+                    private_to_principal = bool(event.data.get("private_to_principal"))
+                elif event.type == "error" and event.message:
+                    raise RuntimeError(event.message)
+        finally:
+            PRINCIPAL_DELIVERY.reset(delivery_token)
+
+        # A private artifact belongs to ONE person, and which person is decided
+        # by `find_principal_person()` at each private reader's own read time —
+        # not by the recipient pinned before the run. So the SUBJECT can drift
+        # during the minutes generation takes: restore or re-promote a
+        # lower-id principal mid-run and the notes, chat titles and calendar
+        # read into the brief become theirs, while the pinned recipient is
+        # still someone else. Both later gates pass that through, because each
+        # asks whether the RECIPIENT is a principal, and neither asks whether
+        # the CONTENT is still about them.
+        #
+        # So re-assert the premise rather than the audience: a private run may
+        # only be sent while the roster still holds exactly its recipient, and
+        # while that recipient is still who the private readers resolve to.
+        # Withheld rather than downgraded to a shared send — the artifact was
+        # already generated with private content in it.
+        withheld = False
+        if artifact and private_to_principal:
+            owner = people_store.find_principal_person()
+            pinned = [p.id for p in recipients]
+            # Only the OWNER is checked, not the whole roster. A principal
+            # ADDED mid-run has a higher id, so `find_principal_person()` still
+            # resolves to the pinned recipient and the content is still theirs
+            # — withholding there would refuse a correct brief (two existing
+            # tests cover exactly that case). A recipient who has gone away is
+            # a different concern, handled at the send by `_live_principal`.
+            #
+            # `not pinned` cannot arise from `private_run` (which requires
+            # exactly one), but `private_to_principal` comes off a workflow
+            # event, so it is not this function's invariant to trust.
+            # Only a DRIFT to a different person is withheld here. "No owner
+            # at all" is not drift: the recipient has gone away, the fan-out
+            # returns empty and the caller records `no_owner`, which describes
+            # it better than `not_written` would — the brief was written.
+            if pinned and owner is not None and owner.id != pinned[0]:
+                logger.warning(
+                    "scheduler: %s withheld — a private run's subject is no "
+                    "longer its recipient (pinned %s, owner now %s)",
+                    kind, pinned, owner.id,
+                )
+                artifact = ""
+                withheld = True
+
+        # Completed AFTER the drift check, not before it. `PRIVATE_RUN_ARTIFACT`
+        # asserts "delivered to the principal" and an empty artifact asserts
+        # the brief could not be written; a withheld run is neither, and
+        # storing it before the check decided meant the Artifacts page and run
+        # history claimed a delivery that the outcome below records as
+        # `not_written`.
+        complete_run(
+            run_id,
+            WITHHELD_RUN_ARTIFACT if withheld
+            else stored_artifact(artifact, private_to_principal=private_to_principal)
+            or "(no artifact)",
+        )
+
+        if not artifact:
+            # `recipients=[]`, not omitted: this run is KNOWN to have reached
+            # nobody, which is a different fact from a record that predates
+            # per-recipient outcomes and so cannot say.
+            brief_state.record_delivery_outcome(
+                kind, reason="not_written", channel=None, recipients=[]
+            )
+            recorded = True
+        else:
+            sending = True
+            # `recipients`, not a fresh lookup: the audience that gated the
+            # content caps the audience that receives it. The fan-out
+            # revalidates each one against the roster before its own send, so
+            # a founder offboarded or demoted while this was generating drops
+            # out instead of being sent a brief built as private to them —
+            # and drops out of `sends`, so the aggregate below is the
+            # remaining recipients' and not `no_owner`.
+            #
+            # And the guarantee itself lives at the EGRESS, not here. A private
+            # brief is content private to one person, so the send is wrapped in
+            # `people_tools.restrict_to_principal()` — the same flag the email
+            # poller sets on a private turn — and every DM handler, the email
+            # gateway's roster allow-set and the invite gate then refuse a
+            # recipient who is not a principal on a read taken immediately
+            # before that leg's own call. Four rounds of review found variants
+            # of "the recipient row went stale across an await", because a
+            # caller-side snapshot cannot be await-safe at any granularity; the
+            # fan-out's revalidation is now a courtesy pre-filter that drops
+            # such a recipient quietly instead of letting the egress refuse
+            # them. Applied to EVERY brief fan-out, shared or private, because
+            # these are two different concerns: `PRINCIPAL_DELIVERY` decides
+            # what the artifact may CONTAIN, while this decides who it may
+            # REACH — and the fan-out addresses principals either way.
+            #
+            # An earlier revision conditioned this on `private_run`, reasoning
+            # that gating a shared brief would refuse a co-founder's own leg.
+            # That was false: `_dm_recipient_on_roster` requires
+            # `is_principal`, which every recipient out of
+            # `active_principals()` has by construction. The conditional
+            # bought nothing and left a demoted co-principal still receiving a
+            # shared brief from a fallback leg, because nothing else re-checks
+            # membership once `_live_principal` has run.
+            #
+            # Scope note: this block covers the SEND and nothing else. The
+            # per-recipient audit writes below sit outside it and so are
+            # marked private at their own call rather than inheriting it from
+            # here — an earlier revision of this comment claimed they
+            # inherited it, which was simply false and is the kind of thing
+            # the egress gate must not be reasoned about loosely.
+            with restrict_to_principal():
+                sends = await deliver_to_each_principal(
+                    artifact, label=workflow.title, recipients=recipients
+                )
+            delivered = [(p, d) for p, d in sends if d.ok]
+
+            # One recorded outcome per recipient. A single stored reason for a
+            # run with several recipients made roster order decide which
+            # founder's problem any surface could show, and the other was
+            # rendered nowhere — so every recipient goes in, and `brief_state`
+            # derives the run's aggregate from them rather than from the first
+            # of a list.
+            #
+            # Written BEFORE the audit rows below, which is the opposite of
+            # the old order. `audit_log` writes to SQLite and can raise under
+            # contention; while it ran first, an exception on the second
+            # recipient left `recorded` False, so the handler recorded a
+            # run-level `send_failed` and discarded outcomes that already
+            # existed — reporting "every way of sending it failed" to a
+            # founder who had just received the brief. The outcome is what
+            # the Briefing notice and the Setup light read, so it goes first;
+            # the audit rows are the secondary artifact.
+            recipient_outcomes = [
+                brief_state.RecipientOutcome(
+                    person_id=person.id,
+                    name=person.full_name,
+                    reason=d.reason,
+                    channel=d.channel,
+                    first_tried=d.first_tried,
+                )
+                for person, d in sends
+            ]
+            reason, channel = brief_state.delivery_summary(recipient_outcomes)
+            brief_state.record_delivery_outcome(
+                kind, reason=reason, channel=channel, recipients=recipient_outcomes
+            )
+            recorded = True
+
+            # One audit row per recipient: a founder whose channel is broken
+            # has to be visible on its own, not folded into a sibling's
+            # success.
+            #
+            # `private=True` explicitly, not inherited from the context. These
+            # writes run AFTER the `restrict_to_principal()` block above has
+            # exited, so `audit_row_private_to_principal` — which classifies
+            # from the context at write time — would file them as ordinary
+            # rows, and each one names a founder alongside the raw address or
+            # channel id the send used (`d.detail`). A teammate reading
+            # `/audit/logs` would get both. Marking them here keeps the
+            # classification true where the row is written rather than
+            # depending on a block it sits outside.
+            for person, d in sends:
                 audit_log(
                     "scheduled_action",
-                    f"{kind} delivered ({detail})",
+                    f"{kind} {'delivered' if d.ok else 'NOT delivered'} "
+                    f"to {person.full_name or person.id} ({d.detail})",
                     actor="scheduler",
+                    private=True,
                     details={
-                        "phase": "delivered", "kind": kind, "channel_detail": detail,
-                        "suppressed": suppressed,
+                        "phase": "delivered" if d.ok else "delivery_failed",
+                        "kind": kind, "person_id": person.id,
+                        "channel": d.channel, "reason": d.reason,
+                        "channel_detail": d.detail, "suppressed": suppressed,
                     },
                 )
-                # Only a delivered brief advances the "since last brief"
-                # window and the unchanged-detection fingerprint.
-                if fingerprint:
-                    from openexecutive.briefing import brief_state
 
+            ok = bool(delivered)
+            detail = "; ".join(
+                f"{p.full_name or p.id}: {d.detail}" for p, d in sends
+            ) or "no principal Person row found"
+            if ok:
+                logger.info(
+                    "scheduler: %s delivered to %d/%d principals (%s)",
+                    kind, len(delivered), len(sends), detail,
+                )
+                # Only a delivered brief advances the "since last brief"
+                # window and the unchanged-detection fingerprint. Keyed to
+                # the shared artifact, so ANY recipient receiving it is
+                # enough: not advancing would replay yesterday's window to
+                # the founder who did get it. A recipient who got nothing is
+                # surfaced by the outcome above, not by re-sending.
+                if fingerprint:
                     brief_state.record_delivered(kind, fingerprint, artifact)
             else:
                 logger.warning("scheduler: %s NOT delivered — %s", kind, detail)
-                audit_log(
-                    "scheduled_action",
-                    f"{kind} NOT delivered — {detail}",
-                    actor="scheduler",
-                    details={"phase": "delivery_failed", "kind": kind, "reason": detail},
-                )
+                if not sends:
+                    # No principal at all: there is no per-recipient row to
+                    # carry this, so the summary row is the only trace.
+                    audit_log(
+                        "scheduled_action",
+                        f"{kind} NOT delivered — {detail}",
+                        actor="scheduler",
+                        details={
+                            "phase": "delivery_failed", "kind": kind, "reason": detail,
+                        },
+                    )
     except Exception as exc:
         logger.exception("scheduler: %s (action %d) failed", kind, action.id)
         import contextlib
         with contextlib.suppress(Exception):
             fail_run(run_id, str(exc))
+        if not recorded:
+            # `recorded` is set the moment the per-recipient outcomes are
+            # written, so reaching here means the run raised before any
+            # recipient had one. The empty list says exactly that: the reason
+            # is the run's and is reported run-level, never attributed to a
+            # founder it was not about.
+            brief_state.record_delivery_outcome(
+                kind,
+                reason="send_failed" if sending else "not_written",
+                channel=None,
+                recipients=[],
+            )
 
     # Always chain the next occurrence + mark this row done, so a single
     # bad brief doesn't kill the recurring rhythm. Worst case the next
-    # tick re-attempts on the same shape of input.
+    # tick re-attempts on the same shape of input. A solo-only kind whose
+    # workspace switched to team while it ran does not chain.
     mark_action_done(action.id)
-    _enqueue_next_principal_brief(kind, after=datetime.now(UTC))
+    if _team_for_sure(kind):
+        logger.info("scheduler: %s not chained — the workspace is now in team mode", kind)
+    else:
+        _enqueue_next_principal_brief(kind, after=_chain_after(action))
+
+
+def _outreach_source(action: ScheduledAction) -> tuple[str, str]:
+    """``(source, ref)`` for the outcome ledger of one dispatched action.
+
+    A nudge is keyed by its scope key (``nudge:<source>:<id>``) so closing the
+    thing it chased resolves it; a commitment nudge whose target is an open
+    loop is reported as an open-loop chase. Anything else is a scheduled
+    follow-up."""
+    from openexecutive.attunement import outcomes
+
+    if action.kind != "proactive_nudge" or not action.scope_key:
+        return outcomes.SOURCE_FOLLOWUP, f"action:{action.id}"
+    scope = action.scope_key
+    parts = scope.split(":")
+    kind = parts[1] if len(parts) > 2 else ""
+    if kind == "commitment":
+        from openexecutive.memory.episodic import get_scheduled_action
+
+        try:
+            target = get_scheduled_action(int(parts[2]))
+        except Exception:
+            # A malformed id or a lookup failure just means "not a loop".
+            target = None
+        if target is not None and target.kind == "open_loop":
+            return outcomes.SOURCE_OPEN_LOOP, scope
+        return outcomes.SOURCE_NUDGE_COMMITMENT, scope
+    return {
+        "stalled": outcomes.SOURCE_NUDGE_STALLED,
+        "initiative": outcomes.SOURCE_NUDGE_INITIATIVE,
+    }.get(kind, outcomes.SOURCE_FOLLOWUP), scope
 
 
 # --------------------------------------------------------------------------- #
@@ -1325,6 +2663,36 @@ async def _run_executive_reflection(
     the next occurrence + mark done even when the workflow itself
     fails, so a single bad reflection can't kill the daily cadence.
     """
+    assert action.id is not None
+    await _reflect(now, kind="executive_reflection")
+    # Always chain + mark done so a single failed reflection doesn't
+    # kill the recurring rhythm.
+    mark_action_done(action.id)
+    _enqueue_next_principal_brief("executive_reflection", after=_chain_after(action))
+
+
+# Take the lead as the Executive: new mail or chat wakes the reflection early
+# (orchestrator.take_the_lead.wake), batched; one-off, never chained.
+TAKE_THE_LEAD_WAKE_KIND = "take_the_lead_wake"
+
+
+async def _run_take_the_lead_wake(action: ScheduledAction, now: datetime) -> None:
+    """Run the reflection now, if Take the lead as the Executive is still on."""
+    from openexecutive.orchestrator import take_the_lead
+
+    assert action.id is not None
+    try:
+        if take_the_lead.executive_on():
+            await _reflect(now, kind=TAKE_THE_LEAD_WAKE_KIND)
+        else:
+            logger.info("scheduler: Take the lead is off — skipping the wake")
+    finally:
+        mark_action_done(action.id)
+
+
+async def _reflect(now: datetime, *, kind: str) -> None:
+    """One executive_reflection run, stored and audited under ``kind``.
+    Never raises."""
     import contextlib
     import uuid
 
@@ -1338,7 +2706,6 @@ async def _run_executive_reflection(
         fail_run,
     )
 
-    assert action.id is not None
     workflow = WORKFLOW_REGISTRY["executive_reflection"]
     input_cls = workflow.input_model()
     wf_inputs = input_cls()
@@ -1362,34 +2729,27 @@ async def _run_executive_reflection(
         complete_run(run_id, artifact or "(no artifact)")
         audit_log(
             "scheduled_action",
-            f"executive_reflection completed (run_id={run_id})",
+            f"{kind} completed (run_id={run_id})",
             actor="scheduler",
             details={
                 "phase": "completed",
-                "kind": "executive_reflection",
+                "kind": kind,
                 "run_id": run_id,
                 "artifact_chars": len(artifact),
             },
         )
     except Exception as exc:
-        logger.exception(
-            "scheduler: executive_reflection (action %d) failed", action.id
-        )
+        logger.exception("scheduler: %s failed", kind)
         with contextlib.suppress(Exception):
             fail_run(run_id, str(exc))
         audit_log(
             "scheduled_action",
-            f"executive_reflection FAILED: {exc}",
+            f"{kind} FAILED: {exc}",
             actor="scheduler",
             details={
                 "phase": "failed",
-                "kind": "executive_reflection",
+                "kind": kind,
                 "run_id": run_id,
                 "error": str(exc)[:300],
             },
         )
-
-    # Always chain + mark done so a single failed reflection doesn't
-    # kill the recurring rhythm.
-    mark_action_done(action.id)
-    _enqueue_next_principal_brief("executive_reflection", after=datetime.now(UTC))

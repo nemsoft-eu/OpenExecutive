@@ -168,6 +168,8 @@ def _settings_stub(
     local_timeout_s: float = 300.0,
     local_reasoning_effort: str | None = None,
     local_include_usage_accounting: bool = False,
+    local_temperature: float | None = None,
+    local_top_p: float | None = None,
 ) -> Any:
     return SimpleNamespace(
         anthropic_api_key=anthropic_key,
@@ -184,6 +186,8 @@ def _settings_stub(
         local_timeout_s=local_timeout_s,
         local_reasoning_effort=local_reasoning_effort,
         local_include_usage_accounting=local_include_usage_accounting,
+        local_temperature=local_temperature,
+        local_top_p=local_top_p,
     )
 
 
@@ -337,6 +341,33 @@ def test_local_provider_carries_configured_reasoning_effort(
     assert provider._reasoning_effort == "none"  # type: ignore[attr-defined]
 
 
+def test_local_provider_carries_configured_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_stub(monkeypatch, enabled=False, local_temperature=0.7, local_top_p=0.8)
+    provider = get_provider("llama3.3")
+    assert provider._temperature == 0.7  # type: ignore[attr-defined]
+    assert provider._top_p == 0.8  # type: ignore[attr-defined]
+
+
+def test_openrouter_provider_never_receives_local_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control. LOCAL_TEMPERATURE/LOCAL_TOP_P must not reach a
+    hosted backend: Anthropic rejects temperature != 1 alongside thinking,
+    which agents/base.py enables. OpenRouterProvider overrides _extend_body
+    and never calls super(), so the fields are unreachable there — this
+    pins that, because a future refactor adding a super() call would send
+    them silently.
+    """
+    _local_stub(monkeypatch, enabled=True, local_temperature=0.7, local_top_p=0.8)
+    provider = get_provider("openai/gpt-6-astra")
+    body: dict[str, Any] = {}
+    provider._extend_body("openai/gpt-6-astra", body)  # type: ignore[attr-defined]
+    assert "temperature" not in body
+    assert "top_p" not in body
+
+
 def test_openrouter_provider_ignores_local_reasoning_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -364,6 +395,23 @@ def test_local_provider_respects_usage_accounting_opt_in(
     _local_stub(monkeypatch, enabled=False, local_include_usage_accounting=True)
     provider = get_provider("llama3.3")
     assert provider._include_usage_accounting is True  # type: ignore[attr-defined]
+
+
+def test_local_provider_reasoning_effort_unset_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_stub(monkeypatch, enabled=False)
+    provider = get_provider("llama3.3")
+    assert provider._reasoning_effort is None  # type: ignore[attr-defined]
+
+
+def test_local_provider_passes_configured_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOCAL_REASONING_EFFORT reaches the local provider."""
+    _local_stub(monkeypatch, enabled=False, local_reasoning_effort="low")
+    provider = get_provider("llama3.3")
+    assert provider._reasoning_effort == "low"  # type: ignore[attr-defined]
 
 
 def test_local_provider_distinct_from_openrouter_singleton(
@@ -458,3 +506,120 @@ def test_feature_spec_for_matches_the_routed_providers_gate(
         assert isinstance(provider, AnthropicProvider)
         enforced = registry_mod._CLAUDE_FEATURE_SPEC
     assert registry_mod.feature_spec_for(model) == enforced
+
+
+# --------------------------------------------------------------------------
+# model_options_for — Council Provider → Model picker grouping
+# --------------------------------------------------------------------------
+
+
+def test_model_options_match_allowlist_ids_and_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grouped view must never drift from the PATCH validator's list."""
+    from openexecutive.providers import allowed_models_for, model_options_for
+    from openexecutive.providers import openrouter_catalog as catalog
+
+    monkeypatch.setattr(catalog, "_loaded_models", None)
+    for stub in (
+        _settings_stub(enabled=False),
+        _settings_stub(enabled=True),
+        _settings_stub(
+            enabled=True,
+            local_enabled=True,
+            local_base_url="http://localhost:11434/v1",
+            local_models=["qwen/qwen3-8b"],
+        ),
+    ):
+        monkeypatch.setattr(
+            "openexecutive.providers.registry.get_settings", lambda s=stub: s
+        )
+        ids = [o["id"] for o in model_options_for("cso")]
+        assert ids == allowed_models_for("cso")
+
+
+def test_model_options_group_claude_direct_under_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.providers import model_options_for
+
+    monkeypatch.setattr(
+        "openexecutive.providers.registry.get_settings",
+        lambda: _settings_stub(enabled=False),
+    )
+    by_id = {o["id"]: o for o in model_options_for(None)}
+    assert by_id["claude-opus-5-5"] == {
+        "id": "claude-opus-5-5",
+        "provider": "anthropic",
+        "provider_label": "Anthropic",
+        "route": "direct",
+        "label": "Claude Opus 5.5",
+    }
+    assert by_id["claude-fable-5-1"]["label"] == "Claude Fable 5.1"
+    assert by_id["claude-haiku-4-5"]["label"] == "Claude Haiku 4.5"
+    assert by_id["claude-sonnet-5"]["label"] == "Claude Sonnet 5"
+
+
+def test_model_options_route_and_merge_with_openrouter_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With OpenRouter on, Claude ids route via OpenRouter (mirrors
+    get_provider), OpenRouter-only Claude slugs join the same Anthropic group,
+    and a catalog duplicate of a direct id is not listed twice."""
+    from openexecutive.providers import model_options_for
+    from openexecutive.providers import openrouter_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "_loaded_models",
+        [
+            "anthropic/claude-fable-5.1",  # duplicate of claude-fable-5-1
+            "anthropic/claude-opus-4.8",  # OpenRouter-only generation
+            "openai/gpt-6",
+            "x-ai/grok-4.6",
+            "newvendor/model-1",
+        ],
+    )
+    monkeypatch.setattr(
+        "openexecutive.providers.registry.get_settings",
+        lambda: _settings_stub(enabled=True),
+    )
+    opts = model_options_for(None)
+    ids = [o["id"] for o in opts]
+    by_id = {o["id"]: o for o in opts}
+    assert "anthropic/claude-fable-5.1" not in ids
+    assert by_id["claude-fable-5-1"]["route"] == "openrouter"
+    assert by_id["anthropic/claude-opus-4.8"] == {
+        "id": "anthropic/claude-opus-4.8",
+        "provider": "anthropic",
+        "provider_label": "Anthropic",
+        "route": "openrouter",
+        "label": "Claude Opus 4.8",
+    }
+    assert by_id["openai/gpt-6"]["provider_label"] == "OpenAI"
+    assert by_id["openai/gpt-6"]["label"] == "gpt-6"
+    assert by_id["x-ai/grok-4.6"]["provider_label"] == "xAI"
+    # Unknown vendor: grouped under its raw prefix rather than dropped.
+    assert by_id["newvendor/model-1"]["provider"] == "newvendor"
+    assert by_id["newvendor/model-1"]["provider_label"] == "newvendor"
+
+
+def test_model_options_local_wins_over_vendor_shaped_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.providers import model_options_for
+
+    monkeypatch.setattr(
+        "openexecutive.providers.registry.get_settings",
+        lambda: _settings_stub(
+            enabled=False,
+            local_enabled=True,
+            local_base_url="http://localhost:11434/v1",
+            local_models=["qwen/qwen3-8b", "claude-proxy-1"],
+        ),
+    )
+    by_id = {o["id"]: o for o in model_options_for(None)}
+    for slug in ("qwen/qwen3-8b", "claude-proxy-1"):
+        assert by_id[slug]["provider"] == "local"
+        assert by_id[slug]["route"] == "local"
+        assert by_id[slug]["label"] == slug

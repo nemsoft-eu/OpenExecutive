@@ -133,6 +133,14 @@ SECTIONS: list[SectionSpec] = [
         diagram_kind="flowchart",
     ),
     SectionSpec(
+        id="attunement",
+        title="Attunement (Open Loops)",
+        sub="How the Executive keeps track of what each person owes: sender attribution, 👍/👎 feedback, and open loops from anyone on the roster that the nudge engine chases once due and closes when done.",
+        kb_query="attunement open loops commitments asks sender attribution feedback nudge chase close",
+        wants_mermaid=True,
+        diagram_kind="flowchart",
+    ),
+    SectionSpec(
         id="org",
         title="Org Structure (Departments & People)",
         sub="Departments, goals, checklists, cadences; people registry; authority gates and channel resolution (Discord/Telegram/email).",
@@ -240,6 +248,17 @@ SECTIONS: list[SectionSpec] = [
         title="Client Companies (Slots)",
         sub="Multi-client mode for fractional executives: named save files of the full company context, one active at a time, with save-back switching and per-client MCP tool configs.",
         kb_query="client slots fractional multi-client switch save restore activate company context",
+        wants_mermaid=True,
+        diagram_kind="flowchart",
+    ),
+    # `delegation` — Act as me: the Executive writing as a person, as a
+    # draft in their own Gmail. New top-level module; see `delegation:` in
+    # architecture-facts.yaml.
+    SectionSpec(
+        id="delegation",
+        title="Act as Me (Delegation)",
+        sub="The one place the Executive writes as a person instead of itself: drafts in the principal's own Gmail, in their voice, offered only on their own verified turn, and sent only when they tap Send on a reply card.",
+        kb_query="act as me delegation ghostwrite draft own gmail voice profile how I write principal verified turn",
         wants_mermaid=True,
         diagram_kind="flowchart",
     ),

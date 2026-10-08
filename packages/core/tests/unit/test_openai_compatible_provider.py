@@ -12,6 +12,9 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from openexecutive.providers import openai_compatible
 from openexecutive.providers.feature_gate import FeatureSpec
 from openexecutive.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -24,13 +27,18 @@ _LOCAL_SPEC = FeatureSpec(
 
 
 def _local_provider(
-    api_key: str | None = None, reasoning_effort: str | None = None
+    api_key: str | None = None,
+    reasoning_effort: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(
         base_url="http://localhost:11434/v1",
         api_key=api_key,
         spec_lookup={"llama3.3": _LOCAL_SPEC},
         reasoning_effort=reasoning_effort,
+        temperature=temperature,
+        top_p=top_p,
     )
 
 
@@ -113,6 +121,95 @@ def test_anthropic_only_fields_stripped_for_local_model() -> None:
     assert isinstance(body["messages"][0]["content"], str)
 
 
+def test_sampling_not_sent_when_unset() -> None:
+    """Unset means the field is absent. Worth pinning because absent is NOT
+    neutral on Ollama's /v1 — it substitutes temperature=1.0 and top_p=1.0,
+    overriding the Modelfile — so "we send nothing" must be a deliberate
+    state, not an accident."""
+    captured = _run_create(_local_provider())
+    assert "temperature" not in captured["json"]
+    assert "top_p" not in captured["json"]
+
+
+def test_sampling_sent_when_configured() -> None:
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8))
+    assert captured["json"]["temperature"] == 0.7
+    assert captured["json"]["top_p"] == 0.8
+
+
+def test_explicit_caller_temperature_wins_over_the_configured_default() -> None:
+    """`_extend_body` uses setdefault. integrations/response_gate.py passes
+    temperature=0 and must stay deterministic even with LOCAL_TEMPERATURE set
+    — a plain assignment here would silently make the gate stochastic."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8), temperature=0)
+    assert captured["json"]["temperature"] == 0
+    # top_p, which the caller did not set, still takes the configured default.
+    assert captured["json"]["top_p"] == 0.8
+
+
+def test_sampling_sent_on_stream() -> None:
+    """The Executive streams, so the streaming body must carry them too."""
+    stream = _local_provider(temperature=0.7, top_p=0.8).messages_stream(
+        model="llama3.3",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert stream._body["temperature"] == 0.7  # type: ignore[attr-defined]
+    assert stream._body["top_p"] == 0.8  # type: ignore[attr-defined]
+
+
+def test_sampling_suppressed_once_reasoning_is_turned_on() -> None:
+    """A strict reasoning backend (OpenAI's o-series, and hosted gateways are
+    documented as reachable through LOCAL_BASE_URL) requires temperature and
+    top_p to be ABSENT, so sending them 400s every call. They are also the
+    wrong numbers there: the defaults are Qwen's non-thinking preset."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8, reasoning_effort="high"))
+    assert captured["json"]["reasoning_effort"] == "high"
+    assert "temperature" not in captured["json"]
+    assert "top_p" not in captured["json"]
+
+
+def test_sampling_still_sent_with_reasoning_explicitly_off() -> None:
+    """`none` is the deployment's own setting and the condition the preset was
+    chosen for, so it must NOT suppress them — that is the Ollama Modelfile
+    override this pair exists to stop."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8, reasoning_effort="none"))
+    assert captured["json"]["temperature"] == 0.7
+    assert captured["json"]["top_p"] == 0.8
+
+
+def test_sampling_suppressed_on_stream_too_when_reasoning_is_on() -> None:
+    stream = _local_provider(temperature=0.7, top_p=0.8, reasoning_effort="low").messages_stream(
+        model="llama3.3",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert "temperature" not in stream._body  # type: ignore[attr-defined]
+    assert "top_p" not in stream._body  # type: ignore[attr-defined]
+
+
+def test_an_explicit_caller_temperature_survives_reasoning_being_on() -> None:
+    """Only the CONFIGURED defaults are suppressed, never a value the caller
+    asked for. integrations/response_gate.py passes temperature=0 because the
+    outbound gate must be deterministic; stripping it on a reasoning backend
+    would make the gate stochastic silently, which is worse than the 400 that
+    backend will raise and which an operator can actually diagnose."""
+    captured = _run_create(
+        _local_provider(temperature=0.7, top_p=0.8, reasoning_effort="high"), temperature=0
+    )
+    assert captured["json"]["temperature"] == 0
+    assert "top_p" not in captured["json"]
+
+
+def test_no_top_k_is_sent() -> None:
+    """Negative control for a setting we deliberately did NOT add: top_k is
+    not in the OpenAI schema and Ollama's /v1 silently drops it (verified
+    against the live runner), so a LOCAL_TOP_K would be inert and
+    misleading. If someone adds one, this fails and sends them to read why."""
+    captured = _run_create(_local_provider(temperature=0.7, top_p=0.8))
+    assert "top_k" not in captured["json"]
+
+
 def test_reasoning_effort_sent_flat_on_create() -> None:
     """Ollama's /v1 endpoint reads the flat OpenAI field, not a nested object."""
     captured = _run_create(_local_provider(reasoning_effort="none"))
@@ -120,9 +217,30 @@ def test_reasoning_effort_sent_flat_on_create() -> None:
     assert "reasoning" not in captured["json"]
 
 
+def _effort_provider(effort: str | None) -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        base_url="https://api.fireworks.ai/inference/v1",
+        spec_lookup={"llama3.3": _LOCAL_SPEC},
+        reasoning_effort=effort,
+    )
+
+
+def test_reasoning_effort_omitted_by_default() -> None:
+    """Most OpenAI-compatible servers don't know the field; unset = not sent."""
+    captured = _run_create(_local_provider())
+    assert "reasoning_effort" not in captured["json"]
+
+
+def test_reasoning_effort_sent_when_configured() -> None:
+    """Thinking-only models (GLM on Fireworks) otherwise burn the whole
+    max_tokens budget reasoning and return no tool call."""
+    captured = _run_create(_effort_provider("low"))
+    assert captured["json"]["reasoning_effort"] == "low"
+
+
 def test_reasoning_effort_sent_on_stream() -> None:
-    """The Executive streams — the streaming body must carry the field too."""
-    stream = _local_provider(reasoning_effort="low").messages_stream(
+    provider = _effort_provider("low")
+    stream = provider.messages_stream(
         model="llama3.3",
         max_tokens=8,
         messages=[{"role": "user", "content": "hi"}],
@@ -149,3 +267,33 @@ def test_stream_options_absent_on_non_streaming_call() -> None:
     ``messages_stream`` and keeps it out of the shared body builder."""
     captured = _run_create(_local_provider())
     assert "stream_options" not in captured["json"]
+
+
+def test_reasoning_effort_logged_once_per_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The effort in play is what decides whether a thinking-only model
+    answers at all, so it's logged, but once per model, not per call."""
+    monkeypatch.setattr(openai_compatible, "_effort_announced", set())
+    fake_logger = MagicMock()
+    monkeypatch.setattr(openai_compatible, "logger", fake_logger)
+    provider = _effort_provider("low")
+    _run_create(provider)
+    _run_create(provider)
+    assert fake_logger.info.call_count == 1
+    assert fake_logger.info.call_args.args[1:] == ("low", "llama3.3")
+
+
+def test_the_sampling_opt_out_is_per_field() -> None:
+    """`LOCAL_TEMPERATURE=off` alone still sends top_p, and a backend that
+    rejects sampling rejects whichever field is left — so .env.example tells
+    operators to set both. Pinned as a contract rather than coupled: making
+    one key suppress the other would render a deliberately set LOCAL_TOP_P
+    silently inert."""
+    captured = _run_create(_local_provider(temperature=None, top_p=0.8))
+    assert "temperature" not in captured["json"]
+    assert captured["json"]["top_p"] == 0.8
+
+    both_off = _run_create(_local_provider(temperature=None, top_p=None))
+    assert "temperature" not in both_off["json"]
+    assert "top_p" not in both_off["json"]

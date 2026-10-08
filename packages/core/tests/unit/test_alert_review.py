@@ -61,7 +61,12 @@ def audit_events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict]]
 def dms(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
     sent: list[tuple[int, str]] = []
 
-    async def fake_dm(person_id: int, text: str, *, headline: str = "") -> tuple[bool, str]:
+    async def fake_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    ) -> tuple[bool, str]:
+        # Every review DM must say which alert it is about, so acking or
+        # dismissing that alert can resolve it in the outcome ledger.
+        assert alert_id is not None
         sent.append((person_id, text))
         return True, "sent"
 
@@ -198,7 +203,7 @@ def test_gather_evidence_collects_watch_signals_related_alerts_roster_and_workfl
     from openexecutive.api.routes import today as today_route
     from openexecutive.api.routes.today import ActivityItem, ActivityResponse
 
-    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None: ActivityResponse(items=[
+    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[
         ActivityItem(kind="decision_logged", summary="Switched checkout to backup PSP", actor="Executive",
                      target=None, department="finance", at=(NOW - timedelta(hours=2)).isoformat()),
     ]))
@@ -412,7 +417,7 @@ def test_draft_calls_draft_artifact_and_marks_source(db: Path, audit_events, mon
 
     async def fake_draft(tool_input: dict) -> str:
         drafted.append(tool_input)
-        return '{"status": "drafted"}'
+        return '{"ok": true, "artifact_id": "alert:999"}'
 
     import openexecutive.orchestrator.artifact_tools as artifact_tools
 
@@ -429,6 +434,22 @@ def test_draft_calls_draft_artifact_and_marks_source(db: Path, audit_events, mon
     assert row is not None and row.review_verdict == "drafted" and row.status == "unread"
     assert summary.drafted == 1 and summary.moves_used == 1
     assert any(e[0] == review.EVENT_DRAFTED for e in audit_events)
+
+
+def test_rejected_draft_is_not_labelled_drafted(db: Path, audit_events, monkeypatch) -> None:
+    async def fake_draft(tool_input: dict) -> str:
+        return '{"error": "document is 60001 chars; the limit is 60000"}'
+
+    import openexecutive.orchestrator.artifact_tools as artifact_tools
+
+    monkeypatch.setattr(artifact_tools, "handle_draft_artifact", fake_draft)
+    aid = _insert(db, "Write the Q3 pricing memo")
+    summary = review.ReviewSummary()
+    label = _apply(db, aid, _verdict(aid, recommended_move="draft", draft_title="Memo",
+                                     draft_document="x"), summary=summary)
+    assert label != "drafted"
+    assert summary.drafted == 0
+    assert not any(e[0] == review.EVENT_DRAFTED for e in audit_events)
 
 
 def test_suggest_workflow_only_from_offered_list_and_never_runs(db: Path, audit_events) -> None:
@@ -536,7 +557,7 @@ def test_run_alert_review_end_to_end_with_stubbed_agent(db: Path, audit_events, 
     from openexecutive.api.routes import today as today_route
     from openexecutive.api.routes.today import ActivityItem, ActivityResponse
 
-    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None: ActivityResponse(items=[
+    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[
         # Mentions the alert's subject ("resolved one"), so it is citable as A1.
         ActivityItem(kind="decision_logged", summary="Closed out 'resolved one' — vendor chosen", actor="Executive",
                      target=None, department=None, at=(NOW - timedelta(hours=2)).isoformat()),
@@ -563,6 +584,33 @@ def test_run_alert_review_end_to_end_with_stubbed_agent(db: Path, audit_events, 
         reason="manual", ignore_interval=True, now=NOW, db_path=db, settings=_settings(),
     ))
     assert summary3.reviewed == 1 and seen_batches
+
+
+def test_run_alert_review_reads_standing_facts_from_its_own_db(
+    db: Path, monkeypatch, tmp_path: Path,
+) -> None:
+    """The batch carries the facts of the DB the review runs against, not the
+    default one."""
+    from openexecutive.agents import alert_review as agent_module
+    from openexecutive.api.routes import today as today_route
+    from openexecutive.api.routes.today import ActivityResponse
+    from openexecutive.memory import episodic, facts
+
+    monkeypatch.setattr(episodic, "DB_PATH", tmp_path / "some_other.db")
+    facts.record_fact(subject="Units", statement="Maple House has 48 units.", source_quote="q", db_path=db)
+    _insert(db, "Maple House rent roll", hours_ago=10)
+    seen: list[str] = []
+
+    async def fake_review(self, batch_context: str) -> list[AlertVerdict]:
+        seen.append(batch_context)
+        return []
+
+    monkeypatch.setattr(agent_module.AlertReviewAgent, "review", fake_review)
+    monkeypatch.setattr(review, "_seed_outbound_session", lambda: None)
+    monkeypatch.setattr(today_route, "_build_activity",
+                        lambda limit, since=None, **_kw: ActivityResponse(items=[]))
+    asyncio.run(review.run_alert_review(now=NOW, db_path=db, settings=_settings()))
+    assert seen and "Maple House has 48 units." in seen[0]
 
 
 def test_run_alert_review_provider_failure_changes_nothing(db: Path, monkeypatch) -> None:
@@ -669,11 +717,14 @@ def test_pre_brief_review_runs_before_morning_brief_and_never_blocks_it(db: Path
 
     monkeypatch.setattr(kstore, "ChromaDBStore", _Store)
 
-    async def _deliver(text: str) -> tuple[bool, str]:
+    async def _deliver(person: Any, text: str, **_kw: Any) -> runner.PrincipalDelivery:
         order.append("deliver")
-        return True, "ok"
+        return runner.PrincipalDelivery(True, "ok", "delivered", "slack_dm")
 
-    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    # The per-recipient seam the brief's fan-out calls. A principal row has
+    # to exist or the fan-out has nobody to send to and never reaches it.
+    people_store.upsert_person(full_name="Owner", is_principal=True, slack_user_id="U1")
+    monkeypatch.setattr(runner, "deliver_to_person", _deliver)
     monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
     action_id = episodic.insert_scheduled_action(
         run_at=NOW.isoformat(), channel="__internal__", channel_ref="principal",
@@ -822,7 +873,7 @@ def test_draft_is_idempotent_across_passes(db: Path, monkeypatch) -> None:
 
     async def fake_draft(tool_input: dict) -> str:
         drafted.append(tool_input)
-        return '{"status": "drafted"}'
+        return '{"ok": true, "artifact_id": "alert:999"}'
 
     import openexecutive.orchestrator.artifact_tools as artifact_tools
 
@@ -839,7 +890,9 @@ def test_draft_is_idempotent_across_passes(db: Path, monkeypatch) -> None:
 def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_events, monkeypatch) -> None:
     attempts: list[int] = []
 
-    async def flaky_dm(person_id: int, text: str, *, headline: str = "") -> tuple[bool, str]:
+    async def flaky_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    ) -> tuple[bool, str]:
         attempts.append(person_id)
         return (len(attempts) > 1), "ok" if len(attempts) > 1 else "no channel"
 
@@ -886,7 +939,7 @@ def test_activity_refs_only_for_items_about_this_alert(db: Path, monkeypatch) ->
     from openexecutive.api.routes import today as today_route
     from openexecutive.api.routes.today import ActivityItem, ActivityResponse
 
-    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None: ActivityResponse(items=[
+    monkeypatch.setattr(today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[
         ActivityItem(kind="decision_logged", summary="Renewed the Acme contract", actor="Executive",
                      target=None, department=None, at=(NOW - timedelta(hours=1)).isoformat()),
         ActivityItem(kind="dm_sent", summary="DM'd Sam about hiring", actor="Executive",
@@ -926,3 +979,72 @@ def test_review_endpoint_runs_the_review_on_demand(monkeypatch: pytest.MonkeyPat
     assert body["reviewed"] == 3 and body["closed"] == 1 and body["annotated"] == 2
     assert body["routed"] == 0
     assert calls == {"reason": "manual", "ignore_interval": True}
+
+
+def test_changed_rewrite_naming_what_the_evidence_lacks_keeps_the_old_text(
+    db: Path, audit_events, monkeypatch,
+) -> None:
+    """The fabricated colleague the review once affirmed: a rewrite may not
+    bring in a person or figure neither the alert nor its evidence holds."""
+    from openexecutive.briefing import grounding
+
+    monkeypatch.setattr(grounding, "grounding_mode", lambda: "enforce")
+    aid = _insert(db, "Payments degraded", severity="high")
+    label = _apply(db, aid, _verdict(
+        aid, verdict="changed", note="rewritten",
+        headline="Marcus Lee says payments are 40% down",
+        body="Escalated by Marcus Lee.", severity="medium",
+    ))
+    assert label == "changed"
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None
+    assert row.headline == "Payments degraded" and row.body == "body of Payments degraded"
+    assert row.severity == "medium"  # severity still moves
+    ev = next(e for e in audit_events if e[0] == review.EVENT_CHANGED)
+    assert ev[2]["text_ungrounded"] == ["Marcus Lee", "40%"]
+    assert ev[2]["new_headline"] is None
+
+
+def test_a_rewrite_applying_a_standing_fact_is_grounded_by_it(
+    db: Path, audit_events, monkeypatch,
+) -> None:
+    """The review is shown the principal's standing facts so it can correct a
+    card to them; the grounding check must accept a figure they hold."""
+    from openexecutive.briefing import grounding
+
+    monkeypatch.setattr(grounding, "grounding_mode", lambda: "enforce")
+    aid = _insert(db, "Maple House rent roll due", severity="medium")
+    alert = alert_store.get_alert(aid, db_path=db)
+    assert alert is not None
+    verdict = _verdict(aid, verdict="changed", note="rewritten",
+                       headline="Maple House rent roll due for all 48 units")
+    facts_block = "STANDING FACTS\n- [fact 1] Maple House unit count: Maple House has 48 units."
+    label = asyncio.run(review.apply_verdict(
+        alert, verdict, review.gather_evidence(alert, NOW, db_path=db), now=NOW,
+        settings=_settings(), summary=review.ReviewSummary(), db_path=db,
+        standing_facts=facts_block,
+    ))
+    assert label == "changed"
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.headline == "Maple House rent roll due for all 48 units"
+    # Without the facts, the same figure is not grounded.
+    aid2 = _insert(db, "Cedar Court rent roll due", severity="medium")
+    _apply(db, aid2, _verdict(aid2, verdict="changed", note="rewritten",
+                              headline="Cedar Court rent roll due for all 48 units"))
+    row2 = alert_store.get_alert(aid2, db_path=db)
+    assert row2 is not None and row2.headline == "Cedar Court rent roll due"
+
+
+def test_ungrounded_rewrite_without_a_severity_change_changes_nothing(
+    db: Path, audit_events, monkeypatch,
+) -> None:
+    from openexecutive.briefing import grounding
+
+    monkeypatch.setattr(grounding, "grounding_mode", lambda: "enforce")
+    aid = _insert(db, "Payments degraded", severity="high")
+    _apply(db, aid, _verdict(aid, verdict="changed", headline="Marcus Lee flagged payments"))
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.headline == "Payments degraded" and row.severity == "high"
+    assert not any(e[0] == review.EVENT_CHANGED for e in audit_events)
+    refused = [e for e in audit_events if e[2].get("text_ungrounded")]
+    assert refused and refused[0][2]["text_ungrounded"] == ["Marcus Lee"]

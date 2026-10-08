@@ -21,11 +21,41 @@ from openexecutive.workflows.morning_brief import (
 
 
 @pytest.fixture(autouse=True)
-def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_brief_state(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
     # The "handled overnight" block reads the audit log; keep it empty and
     # deterministic here regardless of what other modules audited.
     monkeypatch.setattr(brief_state, "handled_since", lambda since, limit=20: [])
+    # The live blocks read the audit log, the principal's chats and the
+    # calendar; point them at empty, isolated stores.
+    from openexecutive.audit import logger as audit_logger
+    from openexecutive.briefing import live_signals
+    from openexecutive.memory import episodic
+
+    monkeypatch.setattr(
+        audit_logger, "_default_logger", audit_logger.AuditLogger(db_path=tmp_path / "audit.db")
+    )
+    monkeypatch.setattr(episodic, "DB_PATH", tmp_path / "episodic.db")
+    episodic.initialize_db()
+
+    # The solo sections are gated on the size of the roster, so the tests
+    # below seed principals. Without this the writes land in the default
+    # ./episodic_memory.db and change what OTHER modules' tests see — a
+    # failure that only shows in a full run. (test_weekly_review.py and
+    # test_top_three.py isolate the same store for the same reason.)
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    monkeypatch.setattr(people_store, "DB_PATH", tmp_path / "people.db")
+    people_store.initialize_db(tmp_path / "people.db")
+    people_registry.invalidate()
+
+    async def _no_calendar(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(live_signals, "refresh_calendar", _no_calendar)
+    yield
+    people_registry.invalidate()
 
 
 @pytest.mark.asyncio
@@ -42,10 +72,10 @@ async def test_morning_brief_uses_standalone_prompt(
     # Avoid touching the DB — stub the aggregators.
     monkeypatch.setattr(
         today_route, "_build_today",
-        lambda: TodayResponse(departments=[], people=[], proposals=[]),
+        lambda **_kw: TodayResponse(departments=[], people=[], proposals=[]),
     )
     monkeypatch.setattr(
-        today_route, "_build_activity", lambda limit, since=None: ActivityResponse(items=[])
+        today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[])
     )
 
     wf = MorningBriefWorkflow()
@@ -66,7 +96,7 @@ def _stub_aggregators(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         today_route, "_build_today",
-        lambda: TodayResponse(departments=[], people=[], proposals=[
+        lambda **_kw: TodayResponse(departments=[], people=[], proposals=[
             ProposalItem(
                 alert_id=1, headline="Renew Acme", body="b", routed_to_person_id=None,
                 suggested_action="", created_at="2026-01-01T00:00:00+00:00", topic_tags=[],
@@ -74,7 +104,7 @@ def _stub_aggregators(monkeypatch: pytest.MonkeyPatch) -> None:
         ]),
     )
     monkeypatch.setattr(
-        today_route, "_build_activity", lambda limit, since=None: ActivityResponse(items=[])
+        today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[])
     )
 
 
@@ -132,3 +162,522 @@ async def test_morning_brief_suppressed_when_fingerprint_unchanged(
     ]
     assert next(e for e in third if e.type == "result").data["suppressed"] is False
     assert calls["n"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# The principal's live world (briefing.live_signals) and what stays private
+# --------------------------------------------------------------------------- #
+
+def _log_inbound(subject: str, *, private: bool = False) -> None:
+    from openexecutive.audit import logger as audit_logger
+
+    audit_logger.get_audit_logger().log(
+        "integration_inbound", f"Inbound email from sam@x.com: {subject}", actor="email",
+        details={"channel": "email", "from": "sam@x.com", "subject": subject},
+        private=private,
+    )
+
+
+def _capture(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+
+    async def _synth(**kw: object) -> str:
+        calls.append(kw)
+        return "FULL BRIEF"
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_inbound_since_the_last_brief_reaches_the_brief_and_unsuppresses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    first = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    fp = next(e for e in first if e.type == "result").data["brief_fingerprint"]
+    brief_state.record_delivered("principal_brief_morning", fp, "FULL BRIEF")
+    _log_inbound("vendor renewal terms")
+
+    second = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert next(e for e in second if e.type == "result").data["suppressed"] is False
+    live = calls[-1]["live"]
+    assert "vendor renewal terms" in "\n".join(live.inbound)  # type: ignore[attr-defined]
+    assert calls[-1]["live_window"] == "since the last brief"
+
+
+@pytest.mark.asyncio
+async def test_a_teammates_correction_reaches_the_brief_and_unsuppresses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.memory import facts
+
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    first = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    fp = next(e for e in first if e.type == "result").data["brief_fingerprint"]
+    brief_state.record_delivered("principal_brief_morning", fp, "FULL BRIEF")
+    facts.set_needs_approval(7, False)  # a trusted teammate: theirs apply at once
+    facts.record_fact(subject="Cedar Court unit count", statement="Cedar Court has 38 units.",
+                      source_quote="q", recorded_by_role="teammate", recorded_by_name="Sam Lee",
+                      recorded_by_person_id=7)
+
+    second = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert next(e for e in second if e.type == "result").data["suppressed"] is False
+    rendered = str(calls[-1]["rendered_context"])
+    assert "TEAMMATE CORRECTIONS SINCE LAST BRIEF" in rendered
+    assert "Sam Lee recorded Cedar Court unit count: Cedar Court has 38 units." in rendered
+    # Once delivered, the same correction is not news the next time.
+    fp2 = next(e for e in second if e.type == "result").data["brief_fingerprint"]
+    brief_state.record_delivered("principal_brief_morning", fp2, "FULL BRIEF")
+    n_calls = len(calls)
+    _ = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert all("TEAMMATE CORRECTIONS" not in str(c["rendered_context"]) for c in calls[n_calls:])
+
+
+@pytest.mark.asyncio
+async def test_a_teammates_proposal_is_only_in_the_principals_private_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.memory import facts
+    from openexecutive.workflows import morning_brief
+
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    facts.record_fact(subject="Oak Row", statement="Oak Row has 12 units.", source_quote="q",
+                      recorded_by_role="teammate", recorded_by_name="Sam Lee", proposed=True)
+    # Anyone may run the brief from chat; its run history is shared.
+    shared = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert "Oak Row" not in str(calls[-1]["rendered_context"])
+    assert next(e for e in shared if e.type == "result").data["private_to_principal"] is False
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        delivered = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(force_full=True), MagicMock())]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+    assert "Sam Lee proposed Oak Row" in str(calls[-1]["rendered_context"])
+    assert next(e for e in delivered if e.type == "result").data["private_to_principal"] is True
+
+
+def test_teammate_changes_count_against_a_quiet_day() -> None:
+    block = "TEAMMATE CORRECTIONS SINCE LAST BRIEF (…):\n- Sam Lee recorded X: Y."
+    quiet = briefing_narrative.render_briefing_context(
+        period_label="Today", today_data={}, activity=[], standing_facts="",
+    )
+    news = briefing_narrative.render_briefing_context(
+        period_label="Today", today_data={}, activity=[], standing_facts="", teammate_changes=block,
+    )
+    assert "No org activity" in quiet and "No org activity" not in news and block in news
+    base = {"today_data": {}, "activity": [], "handled": [], "since": None}
+    assert brief_state.build_brief_fingerprint(**base) != brief_state.build_brief_fingerprint(
+        **base, teammate_changes=block,
+    )
+    assert brief_state.build_brief_fingerprint(**base) == brief_state.build_brief_fingerprint(
+        **base, teammate_changes="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_rows_only_on_a_run_for_the_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+    calls = _capture(monkeypatch)
+    seen: list[bool] = []
+
+    def _build_today(*, include_private: bool = False, **_kw: object) -> TodayResponse:
+        seen.append(include_private)
+        return TodayResponse(departments=[], people=[], proposals=[])
+
+    monkeypatch.setattr(today_route, "_build_today", _build_today)
+    monkeypatch.setattr(
+        today_route, "_build_activity",
+        lambda limit, since=None, **_kw: ActivityResponse(items=[]),
+    )
+    _log_inbound("a private matter", private=True)
+
+    anyone = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    token = PRINCIPAL_DELIVERY.set(True)
+    try:
+        own = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    finally:
+        PRINCIPAL_DELIVERY.reset(token)
+
+    assert seen == [False, True]
+    assert calls[0]["live"].inbound == ()  # type: ignore[attr-defined]
+    assert "a private matter" in "\n".join(calls[1]["live"].inbound)  # type: ignore[attr-defined]
+    # The run that used a private row says so, so its text stays out of the
+    # shared run history; the one that did not keeps it.
+    assert next(e for e in anyone if e.type == "result").data["private_to_principal"] is False
+    assert next(e for e in own if e.type == "result").data["private_to_principal"] is True
+
+
+@pytest.mark.asyncio
+async def test_reflection_flags_reach_the_brief(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.workflows import persistence
+
+    monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "runs.db")
+    persistence.initialize_runs_db()
+    persistence.create_run("r1", "executive_reflection", "Executive Reflection", {})
+    persistence.complete_run(
+        "r1",
+        "**Acted on:**\n- DM'd Sam\n\n**Flagged for the brief:**\n- Audit deadline "
+        "is Friday\n\n**Quiet:** nothing else.",
+    )
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    _ = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert calls[0]["reflection_flags"] == "- Audit deadline is Friday"
+
+
+def test_stored_artifact_withholds_a_private_brief() -> None:
+    from openexecutive.workflows.persistence import PRIVATE_RUN_ARTIFACT, stored_artifact
+
+    assert stored_artifact("text", private_to_principal=False) == "text"
+    assert stored_artifact("text", private_to_principal=True) == PRIVATE_RUN_ARTIFACT
+    assert stored_artifact("", private_to_principal=True) == ""
+
+
+@pytest.mark.parametrize(
+    ("session_id", "expected"),
+    [("slack:dm:U1", True), ("slack:channel:C1:U1", False), ("discord:guild:1:2", False)],
+)
+def test_a_chat_run_reads_private_rows_only_in_a_private_conversation(
+    monkeypatch: pytest.MonkeyPatch, session_id: str, expected: bool,
+) -> None:
+    """The principal asking in a shared channel gets the reply posted there,
+    so their private rows stay out of it."""
+    from types import SimpleNamespace
+
+    from openexecutive.orchestrator import people_tools
+    from openexecutive.orchestrator.schedule_tools import current_session
+    from openexecutive.workflows import morning_brief
+
+    monkeypatch.setattr(people_tools, "is_principal_on_verified_surface", lambda s: True)
+    session = SimpleNamespace(
+        session_id=session_id, origin_channel=session_id.split(":", 1)[0], from_web_chat=False,
+    )
+    token = current_session.set(session)  # type: ignore[arg-type]
+    try:
+        assert morning_brief._private_ok() is expected
+    finally:
+        current_session.reset(token)
+
+
+def test_a_private_row_past_the_top_groups_still_counts() -> None:
+    from openexecutive.briefing.live_signals import LiveSignals
+    from openexecutive.workflows.morning_brief import _differs
+
+    keys = {"inbound": ["a|b|1"], "stuck": [], "drafts": 0, "conversations": [], "calendar": ""}
+    own = LiveSignals(inbound_total=12, keys=keys)
+    shared = LiveSignals(inbound_total=11, keys=dict(keys))
+    assert _differs(own, shared) is True
+    assert _differs(shared, LiveSignals(inbound_total=11, keys=dict(keys))) is False
+
+
+# --------------------------------------------------------------------------- #
+# Grounding (briefing/grounding.py): what ships names only what the context holds
+# --------------------------------------------------------------------------- #
+
+
+def _ground_in_isolation(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    from openexecutive.briefing import grounding
+
+    monkeypatch.setattr(grounding, "profile_sources", lambda: [])
+    monkeypatch.setattr(grounding, "org_sources", lambda: [])
+    monkeypatch.setattr(grounding, "roster", lambda: [])
+    monkeypatch.setattr(grounding, "grounding_mode", lambda: "enforce")
+    monkeypatch.setattr(grounding, "citations_enabled", lambda: True)
+    rows: list[dict[str, object]] = []
+
+    def _log(event_type: str, summary: str, **kw: object) -> None:
+        if event_type == "grounding":
+            rows.append({"summary": summary, **kw})
+
+    monkeypatch.setattr("openexecutive.audit.log_event", _log)
+    return rows
+
+
+def _stub_lease_board(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.api.routes.today import ProposalItem
+
+    monkeypatch.setattr(
+        today_route, "_build_today",
+        lambda **_kw: TodayResponse(departments=[], people=[], proposals=[
+            ProposalItem(
+                alert_id=1, headline="Renew Acme lease for 48 units", body="b",
+                routed_to_person_id=None, suggested_action="",
+                created_at="2099-01-01T00:00:00+00:00", topic_tags=[],
+            ),
+        ]),
+    )
+    monkeypatch.setattr(
+        today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[])
+    )
+
+
+class _SeqProvider:
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = list(texts)
+        self.calls: list[dict[str, object]] = []
+
+    async def messages_create(self, **kw: object) -> object:
+        from types import SimpleNamespace
+
+        self.calls.append(kw)
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.texts.pop(0))])
+
+
+@pytest.mark.asyncio
+async def test_morning_brief_holds_back_a_fabricated_colleague_and_cites_figures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive import providers
+
+    rows = _ground_in_isolation(monkeypatch)
+    _stub_lease_board(monkeypatch)
+    captured: dict[str, object] = {}
+    draft = (
+        "**Needs you**\n- Renew Acme lease for 48 units\n"
+        "- Marcus Lee wants a call about 52 units"
+    )
+
+    async def _synth(**kw: object) -> str:
+        captured.update(kw)
+        return draft
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+    # The one repair attempt changes nothing, so the line is dropped.
+    repair = _SeqProvider([draft])
+    monkeypatch.setattr(providers, "get_provider", lambda _m: repair)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    events = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    artifact = next(e for e in events if e.type == "artifact").content
+
+    # The synthesizer got the context the grounding pass checked against.
+    assert "Renew Acme lease for 48 units" in str(captured["rendered_context"])
+    assert "'Marcus Lee', '52'" in repair.calls[0]["messages"][0]["content"]  # type: ignore[index]
+    assert "Marcus" not in artifact
+    assert "- Renew Acme lease for 48 [1] units" in artifact
+    assert "_Held back 1 line " in artifact
+    assert "- [1] Needs you — Renew Acme lease for 48 units" in artifact
+    step = next(e for e in events if e.type == "step_done" and e.step_id == "synthesize")
+    assert "1 line(s) held back" in step.summary
+    [row] = rows
+    assert row["private"] is False
+    assert row["details"]["names_bad"] == ["Marcus Lee"]  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_eod_digest_keeps_a_repair_that_grounds_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive import providers
+    from openexecutive.workflows.end_of_day_digest import (
+        EndOfDayDigestInput,
+        EndOfDayDigestWorkflow,
+    )
+
+    rows = _ground_in_isolation(monkeypatch)
+    _stub_lease_board(monkeypatch)
+    provider = _SeqProvider([
+        "**Still pending**\n- Acme lease, 48 units — Marcus Lee is blocking",
+        "**Still pending**\n- Acme lease, 48 units",
+    ])
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    events = [e async for e in EndOfDayDigestWorkflow().run(EndOfDayDigestInput(), MagicMock())]
+    artifact = next(e for e in events if e.type == "artifact").content
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["system"] == provider.calls[0]["system"]
+    assert artifact.startswith("**Still pending**\n- Acme lease, 48 [1] units")
+    assert "Marcus" not in artifact and "Held back" not in artifact
+    [row] = rows
+    assert row["details"]["repaired"] is True  # type: ignore[index]
+    assert row["details"]["held_back"] == []  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_solo_sections_are_left_out_of_a_shared_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`principal_due_soon` and `build_top_three` both resolve the lowest-id
+    principal and take no recipient, so on a solo workspace with
+    co-principals — where the brief is generated SHARED and fanned out to all
+    of them — they would put one founder's own commitments and their calendar
+    event titles in the other's DM. Gated on `_private_ok`, like the
+    calendar read directly below them."""
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+
+    due_calls: list[object] = []
+    top_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        top_calls.append(_due)
+        return [], None
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    # Shared run (no PRINCIPAL_DELIVERY): neither principal-keyed read fires.
+    [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert (due_calls, top_calls) == ([], [])
+
+    # The sole-principal run still gets them — that is the whole solo brief.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+    assert len(due_calls) == 1 and len(top_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_running_the_brief_sees_no_private_solo_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_private_ok` answers "may this READER see principal-private data" —
+    true for any principal on a verified private surface — not "is this data
+    theirs". `principal_due_soon` and `build_top_three` resolve the lowest-id
+    row, so a co-principal running the brief from their own DM would be handed
+    the other founder's commitments and calendar titles. Both conditions are
+    needed and neither implies the other."""
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    monkeypatch.setattr(
+        "openexecutive.memory.workspace_settings.effective_workspace_mode",
+        lambda _session=None: "solo",
+    )
+    due_calls: list[object] = []
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.principal_due_soon",
+        lambda **kw: due_calls.append(kw) or [],
+    )
+
+    async def _top_three(_due: object) -> tuple[list[object], object]:
+        raise AssertionError("top three built for a co-principal reader")
+
+    monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    # A reader who passes `_private_ok` — as the scheduler's own run does, and
+    # as a principal on their own verified surface does.
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert due_calls == []  # not read at all, so it cannot be mis-attributed
+
+
+@pytest.mark.asyncio
+async def test_a_co_principal_reader_gets_no_owner_keyed_live_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same gate, three lines further down, for the reads the test above
+    does not cover.
+
+    `refresh_calendar` resolves `find_principal_person()` and asks for THAT
+    person's `calendar_id` (`top_three.read_todays_calendar`), and
+    `gather_live_signals(include_private=True)` hands back the same person's
+    chat titles (`live_signals._conversations`) plus an install-wide draft
+    count keyed to nobody (`live_signals._drafts`). Neither takes a recipient,
+    so both were gated on `_private_ok()` alone while the solo block above
+    them also asked the roster — and a co-principal running the brief from
+    their own DM therefore received the lowest-id founder's day.
+
+    The sibling test above stubs `build_top_three` and `principal_due_soon`;
+    the autouse fixture stubs `refresh_calendar` to None. So nothing asserted
+    on these reads, and the leak sat one gate away from the one that was
+    fixed.
+    """
+    from openexecutive.briefing import live_signals
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows import morning_brief
+
+    _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    conversation_reads: list[object] = []
+    monkeypatch.setattr(
+        live_signals,
+        "_conversations",
+        lambda since, tz: conversation_reads.append(since) or ([], []),
+    )
+    calendar_reads: list[object] = []
+
+    async def _calendar(now: object = None, **kw: object) -> None:
+        calendar_reads.append(now)
+        return None
+
+    monkeypatch.setattr(live_signals, "refresh_calendar", _calendar)
+
+    people_store.upsert_person(full_name="Ada", is_principal=True)
+    people_store.upsert_person(full_name="Grace", is_principal=True)
+
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert conversation_reads == []
+    assert calendar_reads == []
+
+    # Control: a sole principal is the one reader these reads are about, and
+    # still gets them — otherwise this test would pass on a brief that simply
+    # never reads a calendar.
+    people_store.archive_person(
+        next(p.id for p in people_store.active_principals() if p.full_name == "Grace")
+    )
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        [
+            e
+            async for e in MorningBriefWorkflow().run(
+                MorningBriefInput(force_full=True), MagicMock()
+            )
+        ]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+
+    assert len(conversation_reads) == 1
+    assert len(calendar_reads) == 1
