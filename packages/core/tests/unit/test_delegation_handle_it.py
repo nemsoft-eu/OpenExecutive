@@ -555,6 +555,7 @@ def test_get_shows_the_switch(client: TestClient, owner: Any) -> None:
         "available": True, "sent_today": 0,
         "lead": False, "lead_available": True,
     }
+    assert body["training"] == {"replies": False, "follow_ups": False, "actions": False, "drafts": False, "learned": []}
 
 
 def test_turning_it_on_needs_the_inbox_watcher(client: TestClient, owner: Any) -> None:

@@ -41,6 +41,7 @@ no body, so nothing here can change what goes or to whom. Only
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -70,6 +71,7 @@ from openexecutive.delegation.gmail import (
     GmailNotConfigured,
     GmailNotFound,
     GmailRateLimited,
+    MailAttachment,
     MailMessage,
     MailThread,
     SentMessage,
@@ -100,7 +102,7 @@ _PREFER = 'outlook.body-content-type="text", IdType="ImmutableId"'
 _SELECT = (
     "id,conversationId,changeKey,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,"
     "sentDateTime,receivedDateTime,internetMessageId,internetMessageHeaders,body,isDraft,"
-    "inferenceClassification,parentFolderId"
+    "inferenceClassification,parentFolderId,hasAttachments"
 )
 _EXPAND = f"singleValueExtendedProperties($filter=id eq '{GHOSTWRITTEN_PROPERTY}')"
 
@@ -357,6 +359,7 @@ def parse_message(raw: dict[str, Any], sent_folder: str = "", own: str = "") -> 
         delivery_report="multipart/report" in content_type or local_part in _REPORT_SENDERS,
         calendar_invite="eventmessage" in kind,
         sender_authenticated=(not draft) and exchange_authenticated(message, from_addr),
+        has_attachments=raw.get("hasAttachments") is True,
     )
 
 
@@ -683,6 +686,56 @@ class DelegateOutlook:
             )
         return self._parse(data)
 
+    async def _attachment_list(self, client: httpx.AsyncClient, message_id: str) -> list[dict[str, Any]]:
+        """The message's attached files as Graph lists them, but an inline one
+        (an image the body shows in place, such as a signature's logo)."""
+        if not valid_id(message_id):
+            raise GmailError("invalid message id")
+        data = await self._get(
+            client,
+            f"/messages/{quote(message_id, safe='')}/attachments",
+            {"$select": "id,name,contentType,size,isInline"},
+        )
+        return [
+            a for a in data.get("value") or []
+            if isinstance(a, dict) and a.get("isInline") is not True and valid_id(a.get("id"))
+        ]
+
+    @staticmethod
+    def _attachment(index: int, raw: dict[str, Any]) -> MailAttachment:
+        size = raw.get("size")
+        return MailAttachment(
+            index=index,
+            name=str(raw.get("name") or "").strip(),
+            mime_type=str(raw.get("contentType") or "").lower(),
+            size=size if isinstance(size, int) else 0,
+        )
+
+    async def list_attachments(self, message_id: str) -> list[MailAttachment]:
+        async with self._client() as client:
+            listed = await self._attachment_list(client, message_id)
+        return [self._attachment(i, a) for i, a in enumerate(listed, 1)]
+
+    async def attachment_bytes(self, message_id: str, index: int) -> tuple[MailAttachment, bytes]:
+        """The ``index``-th attached file of the message (1-based) and its
+        bytes. Only a file attachment has bytes; an attached Outlook item or
+        cloud link does not."""
+        async with self._client() as client:
+            listed = await self._attachment_list(client, message_id)
+            if not 1 <= index <= len(listed):
+                raise GmailNotFound("no such attachment")
+            raw = await self._get(
+                client,
+                f"/messages/{quote(message_id, safe='')}/attachments/{quote(str(listed[index - 1]['id']), safe='')}",
+            )
+        data = raw.get("contentBytes")
+        if not isinstance(data, str):
+            raise GmailError("graph returned no file for that attachment")
+        try:
+            return self._attachment(index, listed[index - 1]), base64.b64decode(data)
+        except (ValueError, TypeError) as exc:
+            raise GmailError("graph returned unreadable attachment data") from exc
+
     async def get_draft(self, draft_id: str) -> DraftInfo | None:
         """The draft as it is now, or None when it is gone (sent or deleted).
         Its message id is a version (``draft_version``): it changes on each edit."""
@@ -749,7 +802,9 @@ class DelegateOutlook:
             "singleValueExtendedProperties": [{"id": GHOSTWRITTEN_PROPERTY, "value": "1"}],
         }
         async with self._client() as client:
-            if not spec.thread_id:
+            if spec.forward is not None:
+                data = await self._forward_draft(client, spec, fields)
+            elif not spec.thread_id:
                 data = await self._request(client, "POST", "/messages", json_body=fields)
             else:
                 data = await self._reply_draft(client, spec, fields)
@@ -758,6 +813,19 @@ class DelegateOutlook:
             draft_id=draft_id,
             message_id=draft_version(draft_id, str(data.get("changeKey") or "")),
             thread_id=str(data.get("conversationId") or spec.thread_id or ""),
+        )
+
+    async def _forward_draft(self, client: httpx.AsyncClient, spec: DraftSpec, fields: dict[str, Any]) -> dict[str, Any]:
+        """A forward made with Graph's ``createForward``, which keeps the
+        original, its forward header and its files. The note goes in as the
+        comment; the body is never patched, or the original would be lost."""
+        assert spec.forward is not None
+        if not valid_id(spec.forward.message_id):
+            raise GmailError("invalid message id")
+        message = {k: fields[k] for k in ("toRecipients", "ccRecipients", "singleValueExtendedProperties")}
+        return await self._request(
+            client, "POST", f"/messages/{quote(spec.forward.message_id, safe='')}/createForward",
+            json_body={"comment": spec.body, "message": message},
         )
 
     async def _reply_draft(self, client: httpx.AsyncClient, spec: DraftSpec, fields: dict[str, Any]) -> dict[str, Any]:

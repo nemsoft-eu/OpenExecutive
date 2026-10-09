@@ -30,6 +30,7 @@ from openexecutive.departments import store as dept_store
 from openexecutive.memory import episodic
 from openexecutive.orchestrator.schedule_tools import current_session
 from openexecutive.orchestrator.session import Session
+from tests.unit.offered_tools import capture_offered
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 
@@ -951,6 +952,8 @@ class _ScriptedStreams:
     def __init__(self, finals: list[Any]) -> None:
         self._finals = list(finals)
         self.calls: list[dict[str, Any]] = []
+        # Per call, every tool the turn offered (tests.unit.offered_tools).
+        self.offered: list[list[str]] = []
 
     def messages_stream(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
@@ -997,6 +1000,7 @@ def _run_loop(
 
     async def _go() -> None:
         with (
+            capture_offered() as offered,
             patch("openexecutive.orchestrator.executive.get_provider", return_value=provider),
             # The loop's module-level alias, bound when executive was first
             # imported: another module's test that imports it lazily while
@@ -1011,25 +1015,30 @@ def _run_loop(
                 turn_id="t-loop",
             ):
                 pass
+            provider.offered = offered
 
     asyncio.run(_go())
     return provider
 
 
 def _offered(provider: _ScriptedStreams) -> list[str]:
-    """The client tools offered on the first call (server tools have no
-    input_schema)."""
-    return [t["name"] for t in provider.calls[0]["tools"] if "input_schema" in t]
+    """Every client tool the first call offered, the ones behind open_tools
+    included (sorted names)."""
+    return provider.offered[0]
 
 
 def test_every_withheld_name_is_a_real_tool() -> None:
     from openexecutive.orchestrator.executive import _ALL_SKILL_HANDLERS, _ALL_SKILL_TOOLS
     from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES
     from openexecutive.orchestrator.schedule_tools import PRIVATE_TURN_WITHHELD_TOOLS
+    from openexecutive.workflows.step_script import LIST_SAVED_TOOLS_TOOL, RUN_SCRIPT_TOOL
 
-    names = {t["name"] for t in _ALL_SKILL_TOOLS} | MCP_TOOL_NAMES
+    # run_script and list_saved_tools are dispatched beside the gateway's
+    # meta-tools (step_script).
+    gateway_side = MCP_TOOL_NAMES | {RUN_SCRIPT_TOOL, LIST_SAVED_TOOLS_TOOL}
+    names = {t["name"] for t in _ALL_SKILL_TOOLS} | gateway_side
     assert names >= PRIVATE_TURN_WITHHELD_TOOLS
-    assert set(_ALL_SKILL_HANDLERS) | MCP_TOOL_NAMES >= PRIVATE_TURN_WITHHELD_TOOLS
+    assert set(_ALL_SKILL_HANDLERS) | gateway_side >= PRIVATE_TURN_WITHHELD_TOOLS
 
 
 @pytest.mark.parametrize("mode", ["team", "solo"])
@@ -1081,6 +1090,32 @@ def test_a_private_turn_refuses_a_withheld_tool_the_model_emits_anyway(
     assert refusals[0].details["refused"] == "private_turn"
     # Every row of the private turn is private, the model-call rows included.
     assert all(e.private for e in _audit().query(limit=1000))
+
+
+def test_a_private_turn_refuses_a_withheld_tool_through_use_tool(roster: SimpleNamespace) -> None:
+    """The less common tools are reached through open_tools / use_tool
+    (tool_groups). A use_tool call meets the same guard as a direct call, and
+    the private turn's open_tools never lists a withheld tool."""
+    from openexecutive.orchestrator import executive as executive_module
+    from openexecutive.orchestrator.people_tools import PRIVATE_TURN_REFUSAL
+
+    handler = AsyncMock(return_value=json.dumps({"status": "sent"}))
+    uses = [
+        SimpleNamespace(type="tool_use", id="tu-1", name="use_tool",
+                        input={"name": "send_company_broadcast", "input": {"text": "Jordan"}}),
+        SimpleNamespace(type="tool_use", id="tu-2", name="open_tools", input={"group": "messaging"}),
+    ]
+    with patch.dict(executive_module._ALL_SKILL_HANDLERS, {"send_company_broadcast": handler}):
+        provider = _run_loop(_private_turn(roster), uses)
+    handler.assert_not_awaited()
+    results = {b["tool_use_id"]: b["content"] for b in provider.calls[1]["messages"][-1]["content"]}
+    assert PRIVATE_TURN_REFUSAL in json.loads(results["tu-1"])["error"]
+    listed = {t["name"] for t in json.loads(results["tu-2"])["tools"]}
+    assert "send_slack_dm" in listed
+    assert not listed & {"send_company_broadcast", "send_department_message"}
+    # Nor does the open_tools definition name them.
+    open_tools = next(t for t in provider.calls[0]["tools"] if t["name"] == "open_tools")
+    assert "send_company_broadcast" not in open_tools["description"]
 
 
 def test_a_private_turn_refuses_load_mcp_server(roster: SimpleNamespace) -> None:
@@ -1329,6 +1364,11 @@ def test_the_private_turn_allow_list_is_reads_and_gated_gmail_only() -> None:
     ("google_workspace__list_calendars", True),
     ("google_workspace__query_freebusy", True),
     ("google_workspace__search_drive_files", True),
+    ("google_workspace__get_drive_file_content", True),
+    ("google_workspace__get_doc_content", True),
+    ("google_workspace__read_sheet_values", True),
+    ("microsoft_365__list-folder-files", True),
+    ("microsoft_365__download-bytes", False),  # only with a OneDrive file's target
     *((tool, False) for tool, _ in _REFUSED_CALLS),
     ("google_workspace__modify_gmail_message_labels", False),
     ("google_workspace__manage_drive_access", False),
@@ -1352,6 +1392,23 @@ def test_which_mcp_tools_a_private_turn_may_call(name: Any, allowed: bool) -> No
     assert private_turn_withholds("load_mcp_server", {"name": name}) is True
 
 
+@pytest.mark.parametrize(("target", "allowed"), [
+    ("/drives/d1/items/i1/content", True),
+    ("/drives/d1/items/i1/content?format=pdf", True),
+    ("/me/messages/m1/attachments/a1/$value", False),
+    ("/drives/%2e%2e/items/i1/content", False),
+    ("/me/messages/m1/$value", False),
+    (None, False),
+])
+def test_a_private_turn_opens_a_onedrive_file_and_nothing_else_with_download_bytes(
+    target: Any, allowed: bool
+) -> None:
+    from openexecutive.orchestrator.schedule_tools import private_turn_withholds
+
+    call = {"name": "microsoft_365__download-bytes", "arguments": {"target": target}}
+    assert private_turn_withholds("call_tool", call) is not allowed
+
+
 def test_a_normal_turn_offers_and_runs_them_unchanged(roster: SimpleNamespace) -> None:
     from openexecutive.orchestrator import executive as executive_module
     from openexecutive.orchestrator.content_trust import PRINCIPAL_ONLY_TOOLS
@@ -1368,8 +1425,16 @@ def test_a_normal_turn_offers_and_runs_them_unchanged(roster: SimpleNamespace) -
     offered = _offered(provider)
     # A teammate's turn: everything but the principal-only tools.
     assert set(offered) >= PRIVATE_TURN_WITHHELD_TOOLS - PRINCIPAL_ONLY_TOOLS
+    from openexecutive.workflows.step_script import (
+        CHAT_TOOL_DEFINITION,
+        LIST_SAVED_TOOLS_DEFINITION,
+    )
+
     assert offered == sorted(
-        t["name"] for t in [*SPECIALIST_TOOLS, *_ALL_SKILL_TOOLS, *MCP_TOOLS]
+        t["name"] for t in [
+            *SPECIALIST_TOOLS, *_ALL_SKILL_TOOLS, *MCP_TOOLS, CHAT_TOOL_DEFINITION,
+            LIST_SAVED_TOOLS_DEFINITION,
+        ]
         if t["name"] not in PRINCIPAL_ONLY_TOOLS
     )
     assert not any(e.private for e in _audit().query(limit=1000))

@@ -44,7 +44,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.message import EmailMessage, Message
 from email.utils import formataddr, getaddresses
@@ -116,6 +116,11 @@ STATUS_MESSAGES: dict[str, str] = {
 
 # Gmail ids are short hex strings; anything else never reaches a URL path.
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# A forward's attached files, at most (Gmail's own message limit is 25 MB).
+FORWARD_MAX_FILES = 10
+FORWARD_MAX_BYTES = 20 * 1024 * 1024
+# Gmail's attachment ids are far longer than its message ids.
+_ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,4096}")
 _EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 _TOKEN_URI_RE = re.compile(r"^https://oauth2\.googleapis\.com/")
 _MAX_HEADER = 900
@@ -164,6 +169,18 @@ class GmailCredential:
 
 
 @dataclass
+class MailAttachment:
+    """A file attached to a message: its place among the message's
+    attachments (1-based), and what the mailbox says it is. The provider's
+    own id is looked up afresh when it is read (Gmail's changes per fetch)."""
+
+    index: int
+    name: str
+    mime_type: str = ""
+    size: int = 0
+
+
+@dataclass
 class MailMessage:
     id: str
     thread_id: str
@@ -193,6 +210,11 @@ class MailMessage:
     # Gmail's own Authentication-Results found From's domain authenticated
     # (dmarc=pass): who it says it is from is who it is from.
     sender_authenticated: bool = False
+    # Files attached to it. Gmail lists them with the message; Outlook only
+    # says whether there are any (``has_attachments``) until asked
+    # (``list_attachments``).
+    attachments: list[MailAttachment] = field(default_factory=list)
+    has_attachments: bool = False
 
 
 @dataclass
@@ -210,6 +232,19 @@ class ThreadSummary:
 
 
 @dataclass
+class ForwardOf:
+    """The message a draft forwards (``DraftSpec.forward``): the provider's
+    id for it, and the header block and text Gmail quotes under the note.
+    Outlook forwards by id (``createForward``), original and files included;
+    Gmail's draft quotes ``header`` and ``text`` and attaches the message's
+    files itself (``DelegateGmail.create_draft``)."""
+
+    message_id: str
+    header: str
+    text: str
+
+
+@dataclass
 class DraftSpec:
     to: list[str]
     subject: str
@@ -222,6 +257,10 @@ class DraftSpec:
     # One of the person's own send-as addresses to write from (the one the
     # mail being answered went to); None is their primary address.
     from_addr: str | None = None
+    # A forward instead of a reply or a new email: the body is the note above it.
+    forward: ForwardOf | None = None
+    # Files to attach (name, MIME type, bytes): a forward's, on Gmail.
+    attachments: list[tuple[str, str, bytes]] = field(default_factory=list)
 
 
 @dataclass
@@ -229,6 +268,8 @@ class CreatedDraft:
     draft_id: str
     message_id: str
     thread_id: str
+    # A forward's files that were left off (too many or too large).
+    skipped_attachments: int = 0
 
 
 @dataclass
@@ -480,6 +521,34 @@ def _part_types(payload: dict[str, Any]) -> set[str]:
     return types
 
 
+def _attachment_parts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """The message's attached files, in the order Gmail lists its parts: any
+    part that names a file, but an image the HTML body shows in place (one
+    with a Content-ID, such as a signature's logo)."""
+    out: list[dict[str, Any]] = []
+    stack = [payload]
+    while stack:
+        part = stack.pop(0)
+        embedded = str(part.get("mimeType") or "").lower().startswith("image/") and "content-id" in _headers(part)
+        if str(part.get("filename") or "").strip() and not embedded:
+            out.append(part)
+        stack.extend(p for p in part.get("parts") or [] if isinstance(p, dict))
+    return out
+
+
+def _attachments(payload: dict[str, Any]) -> list[MailAttachment]:
+    out = []
+    for i, part in enumerate(_attachment_parts(payload), 1):
+        size = (part.get("body") or {}).get("size")
+        out.append(MailAttachment(
+            index=i,
+            name=str(part.get("filename") or "").strip(),
+            mime_type=str(part.get("mimeType") or "").lower(),
+            size=size if isinstance(size, int) else 0,
+        ))
+    return out
+
+
 def _received_at(raw: dict[str, Any]) -> str:
     try:
         ms = int(str(raw.get("internalDate") or ""))
@@ -502,6 +571,7 @@ def parse_message(raw: dict[str, Any]) -> MailMessage:
     auto = headers.get("auto-submitted", "no").strip().lower() not in ("", "no")
     types = _part_types(payload)
     local_part = normalize_email(from_addr).partition("@")[0]
+    attachments = _attachments(payload)
     return MailMessage(
         id=str(raw.get("id") or ""),
         thread_id=str(raw.get("threadId") or ""),
@@ -526,6 +596,8 @@ def parse_message(raw: dict[str, Any]) -> MailMessage:
         delivery_report="multipart/report" in types or local_part in _REPORT_SENDERS,
         calendar_invite=bool(types & _CALENDAR_TYPES),
         sender_authenticated=headers_authenticated(header_msg, normalize_email(from_addr)),
+        attachments=attachments,
+        has_attachments=bool(attachments),
     )
 
 
@@ -576,7 +648,16 @@ def build_raw(sender: str, spec: DraftSpec) -> str:
     if spec.references:
         msg["References"] = clean_header(spec.references)
     msg[GHOSTWRITTEN_HEADER] = "1"
-    msg.set_content(spec.body)
+    body = spec.body
+    if spec.forward is not None:
+        body = f"{spec.body}\n\n{spec.forward.header}\n\n{spec.forward.text}"
+    msg.set_content(body)
+    for name, mime, data in spec.attachments:
+        maintype, _, subtype = (mime or "application/octet-stream").partition("/")
+        msg.add_attachment(
+            data, maintype=maintype or "application", subtype=subtype or "octet-stream",
+            filename=clean_header(name) or "attachment",
+        )
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
 
@@ -881,6 +962,54 @@ class DelegateGmail:
             data = await self._get(client, f"/messages/{message_id}", {"format": "full"})
         return parse_message(data)
 
+    async def list_attachments(self, message_id: str) -> list[MailAttachment]:
+        return (await self.get_message(message_id)).attachments
+
+    async def _with_forwarded_files(self, spec: DraftSpec) -> tuple[DraftSpec, int]:
+        """``spec`` with its forwarded message's files attached, and how
+        many were left off for the caps."""
+        assert spec.forward is not None
+        files: list[tuple[str, str, bytes]] = []
+        total = skipped = 0
+        for meta in await self.list_attachments(spec.forward.message_id):
+            if len(files) >= FORWARD_MAX_FILES or total + meta.size > FORWARD_MAX_BYTES:
+                skipped += 1
+                continue
+            meta, data = await self.attachment_bytes(spec.forward.message_id, meta.index)
+            if total + len(data) > FORWARD_MAX_BYTES:
+                skipped += 1
+                continue
+            total += len(data)
+            files.append((meta.name, meta.mime_type, data))
+        return replace(spec, attachments=files), skipped
+
+    async def attachment_bytes(self, message_id: str, index: int) -> tuple[MailAttachment, bytes]:
+        """The ``index``-th attached file of the message (1-based) and its
+        bytes, read with the attachment id Gmail gives on this fetch."""
+        if not valid_id(message_id):
+            raise GmailError("invalid message id")
+        async with self._client() as client:
+            raw = await self._get(client, f"/messages/{message_id}", {"format": "full"})
+            raw_payload = raw.get("payload")
+            payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+            parts = _attachment_parts(payload)
+            if not 1 <= index <= len(parts):
+                raise GmailNotFound("no such attachment")
+            meta = _attachments(payload)[index - 1]
+            body = parts[index - 1].get("body") or {}
+            attachment_id = body.get("attachmentId")
+            if isinstance(attachment_id, str) and attachment_id:
+                if not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
+                    raise GmailError("gmail returned an unusable attachment id")
+                body = await self._get(client, f"/messages/{message_id}/attachments/{attachment_id}")
+        data = body.get("data")
+        if not isinstance(data, str):
+            raise GmailError("gmail returned no attachment data")
+        try:
+            return meta, _b64decode(data)
+        except (ValueError, TypeError) as exc:
+            raise GmailError("gmail returned unreadable attachment data") from exc
+
     async def send_as_addresses(self) -> list[str]:
         """Every address the person can send as (their primary and aliases)."""
         async with self._client() as client:
@@ -925,9 +1054,14 @@ class DelegateGmail:
         return SentMessage(id=str(data.get("id") or ""), thread_id=str(data.get("threadId") or ""))
 
     async def create_draft(self, spec: DraftSpec) -> CreatedDraft:
-        """Save ``spec`` as a draft in the person's Gmail. Nothing is sent."""
+        """Save ``spec`` as a draft in the person's Gmail. Nothing is sent.
+        A forward attaches the forwarded message's files, as many as fit
+        ``FORWARD_MAX_FILES`` and ``FORWARD_MAX_BYTES``."""
         if spec.thread_id is not None and not valid_id(spec.thread_id):
             raise GmailError("invalid thread id")
+        skipped = 0
+        if spec.forward is not None and not spec.attachments:
+            spec, skipped = await self._with_forwarded_files(spec)
         message: dict[str, Any] = {"raw": build_raw(self.email, spec)}
         if spec.thread_id:
             message["threadId"] = spec.thread_id
@@ -939,6 +1073,7 @@ class DelegateGmail:
             draft_id=str(data.get("id") or ""),
             message_id=str(created.get("id") or ""),
             thread_id=str(created.get("threadId") or spec.thread_id or ""),
+            skipped_attachments=skipped,
         )
 
 

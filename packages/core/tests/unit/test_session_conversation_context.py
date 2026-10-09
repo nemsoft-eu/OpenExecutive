@@ -104,6 +104,43 @@ def test_window_keeps_two_exchanges_and_drops_older_ones() -> None:
     assert "ANCIENT_TURN" not in rendered
 
 
+def test_the_window_stays_two_exchanges_at_the_stepped_window_s_worst_case() -> None:
+    """The window is exact, not stepped.
+
+    `get_recent_history` moves its start in steps of `step_turns` (default 10)
+    so the Executive's own history reads back from the prompt cache. Applied
+    to this two-turn tail the stepping overshoots instead: at 23 messages the
+    start rounds down to 0 and every turn is rendered — 11 exchanges where two
+    were asked for, each specialist paying the prefill. So the call pins
+    `step_turns=1`.
+
+    23 is the peak of that sawtooth for a two-turn window, and the only size
+    worth pinning: at 24 the start steps forward again and the bug hides.
+    """
+    session = Session()
+    session.add_user_message("OLDEST_TURN")
+    session.add_assistant_message("oldest reply")
+    for i in range(10):
+        session.add_user_message(f"turn {i}")
+        session.add_assistant_message(f"reply {i}")
+    assert len(session.conversation_history) == 22
+    session.add_user_message("ODD_TRAILING_TURN")
+    assert len(session.conversation_history) == 23
+
+    rendered = session.render_conversation_context("now")
+
+    assert "OLDEST_TURN" not in rendered
+    assert "ODD_TRAILING_TURN" in rendered
+    assert "turn 7" not in rendered
+    # The window is `max_turns * 2` messages back from a start that steps by
+    # one TURN (two messages), so an odd-length history keeps one extra
+    # message: turn 8, reply 8, turn 9, reply 9, ODD_TRAILING_TURN. Three
+    # history user turns plus the current message. The figure that matters is
+    # that it is bounded at all — a stepped start renders all eleven.
+    assert rendered.count("User:") == 4
+    assert "turn 8" in rendered
+
+
 def test_assistant_block_list_content_is_flattened() -> None:
     """A cached penultimate assistant turn is a block list, not a str.
 

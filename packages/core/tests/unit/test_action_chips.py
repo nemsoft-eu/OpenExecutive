@@ -208,6 +208,16 @@ def test_create_alert_chip() -> None:
     assert "Burn trending high" in chip["summary"]
 
 
+def test_remind_me_chip_shows_what_will_be_sent() -> None:
+    chip = summarize_action(
+        tool_name="remind_me",
+        tool_input={"text": "Reply to Dana", "when": "2026-10-09T10:00"},
+        tool_result=json.dumps({"status": "set", "when": "Fri Oct 9, 10:00", "text": "Reply to [link]"}),
+    )
+    assert chip is not None
+    assert chip["summary"] == "Reminder set for Fri Oct 9, 10:00: Reply to [link]"
+
+
 def test_send_department_message_chip() -> None:
     chip = summarize_action(
         tool_name="send_department_message",
@@ -251,7 +261,8 @@ def test_call_tool_chip_uses_underlying_name() -> None:
     assert chip is not None
     # `tool` field reflects the actual MCP tool, not "call_tool" — UI can map.
     assert chip["tool"] == "google_workspace__send_gmail_message"
-    assert "google_workspace__send_gmail_message" in chip["summary"]
+    # The chip reads in plain words, never the raw server__tool name.
+    assert chip["summary"] == "Sent an email"
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +338,12 @@ _KNOWN_READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "search_tools",
     # workflow_run_tools — catalog read (run_workflow is in SIDE_EFFECTING_TOOLS)
     "list_workflows",
+    # mail_read_tools — reads of the speaker's own mailbox (Act as me)
+    "search_my_email",
+    "read_my_email",
+    "read_my_email_attachment",
+    "my_email_awaiting_reply",
+    "my_email_read_before",
 })
 
 

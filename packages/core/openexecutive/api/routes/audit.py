@@ -148,6 +148,40 @@ class UsageBySource(UsageTotals):
     source: str
 
 
+class ScriptUsage(BaseModel):
+    """What the sandboxed scripts (run_script) did over the window: how many
+    ran (and how many worked), the tool calls they made, the time they took,
+    and an upper bound on the model turns those calls would otherwise have
+    needed (each call past a script's first, unless batched)."""
+    scripts: int = 0
+    ok: int = 0
+    calls: int = 0
+    turns_avoided: int = 0
+    duration_ms: int = 0
+    in_workflows: int = 0
+
+
+class PythonJobUsage(BaseModel):
+    """What the Python jobs (run_python_job) did over the window: how many ran
+    (and worked), how many ran a kept Custom tool or took a chat attachment,
+    their time, CPU and largest peak memory, the bytes in and out, and the
+    model usage of the turns that ran one (the whole turn, not just the job)."""
+    jobs: int = 0
+    ok: int = 0
+    saved_runs: int = 0
+    attachments: int = 0
+    duration_ms: int = 0
+    cpu_ms: int = 0
+    peak_mb_max: int = 0
+    bytes_in: int = 0
+    bytes_out: int = 0
+    turns: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cost_usd: float = 0.0
+
+
 class UsageSummary(BaseModel):
     """Aggregate token usage + cost across ALL sessions over an optional time
     window, with by-day, by-model and by-source breakdowns. Derived from
@@ -159,6 +193,8 @@ class UsageSummary(BaseModel):
     by_day: list[UsageByDay]
     by_model: list[UsageByModel]
     by_source: list[UsageBySource] = []
+    scripts: ScriptUsage = ScriptUsage()
+    python_jobs: PythonJobUsage = PythonJobUsage()
 
 
 class Degradation(BaseModel):
@@ -636,6 +672,8 @@ def get_audit_usage(
         by_day=[UsageByDay(**d) for d in data["by_day"]],
         by_model=[UsageByModel(**m) for m in data["by_model"]],
         by_source=[UsageBySource(**s) for s in data.get("by_source", [])],
+        scripts=ScriptUsage(**data.get("scripts", {})),
+        python_jobs=PythonJobUsage(**data.get("python_jobs", {})),
     )
 
 

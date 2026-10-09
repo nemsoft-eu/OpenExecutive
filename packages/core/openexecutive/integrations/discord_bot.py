@@ -1195,7 +1195,7 @@ def create_discord_bot():
         await interaction.response.defer(thinking=True)
 
         async def send_fn(text: str) -> None:
-            await interaction.followup.send(text)
+            await interaction.followup.send(text, suppress_embeds=True)
 
         cleaned = prompt.strip()
         if not cleaned:
@@ -1347,13 +1347,15 @@ def create_discord_bot():
             # Reply in the same channel — for DMs that's the DM, for thread
             # continuations that's the existing thread. Do NOT call
             # message.create_thread() inside a thread; Discord rejects it.
+            # suppress_embeds: Discord would fetch a link in the reply on its
+            # own, and a reply can quote mail a sender wrote to carry data out.
             async def send_fn(text: str) -> None:
-                await message.channel.send(text)
+                await message.channel.send(text, suppress_embeds=True)
         elif mode == CLASSIFY_MENTION:
             # @mention inside an existing (human-owned) thread — reply inline,
             # don't try to spawn a sub-thread (Discord rejects nested threads).
             async def send_fn(text: str) -> None:
-                await message.channel.send(text)
+                await message.channel.send(text, suppress_embeds=True)
         elif mode == CLASSIFY_MENTION_CHANNEL:
             # @mention in a plain TextChannel. Defer the thread-vs-inline
             # decision until after the reply is generated — see the
@@ -1362,7 +1364,7 @@ def create_discord_bot():
             # executive.chat raised); the router replaces it before any
             # successful reply chunks are sent.
             async def send_fn(text: str) -> None:
-                await message.reply(text)
+                await message.reply(text, suppress_embeds=True)
 
             threshold_chars = settings.discord_mention_thread_threshold_chars
             reply_mode = settings.discord_mention_reply_mode
@@ -1393,7 +1395,7 @@ def create_discord_bot():
 
                 if not promote:
                     async def inline_send(text: str) -> None:
-                        await message.reply(text)
+                        await message.reply(text, suppress_embeds=True)
                     return MentionRouteResult(send_fn=inline_send)
 
                 # Promote: create a brand-new bot-owned thread and route
@@ -1411,7 +1413,7 @@ def create_discord_bot():
                         discord_channel,
                     )
                     async def inline_fallback(text: str) -> None:
-                        await message.reply(text)
+                        await message.reply(text, suppress_embeds=True)
                     return MentionRouteResult(send_fn=inline_fallback)
 
                 # Post a one-line pointer in the channel so people not
@@ -1438,7 +1440,7 @@ def create_discord_bot():
                         )
 
                 async def thread_send(text: str) -> None:
-                    await new_thread.send(text)
+                    await new_thread.send(text, suppress_embeds=True)
 
                 return MentionRouteResult(
                     send_fn=thread_send,
@@ -1451,7 +1453,7 @@ def create_discord_bot():
             # Defensive — _classify_inbound returned an unknown mode. Reply
             # inline so the user still gets an answer; no thread.
             async def send_fn(text: str) -> None:
-                await message.reply(text)
+                await message.reply(text, suppress_embeds=True)
 
         session_id = _compute_session_id(
             mode=mode,
@@ -1586,6 +1588,9 @@ def create_discord_bot():
     return bot
 
 
+_SUPPRESS_EMBEDS = 1 << 2
+
+
 async def send_dm(discord_user_id: str, text: str) -> str | None:
     """Send a Discord direct message to a specific user.
 
@@ -1632,7 +1637,8 @@ async def send_dm(discord_user_id: str, text: str) -> str | None:
             resp = await client.post(
                 f"https://discord.com/api/v10/channels/{channel_id}/messages",
                 headers=headers,
-                json={"content": chunk},
+                # SUPPRESS_EMBEDS: Discord would fetch a link in the text for its preview.
+                json={"content": chunk, "flags": _SUPPRESS_EMBEDS},
             )
             resp.raise_for_status()
             try:

@@ -129,6 +129,17 @@ def _keep_both_ends(text: str, limit: int) -> str:
     return text[:head] + _ELISION + text[-tail:]
 
 
+def history_window_start(total: int, max_turns: int = 20, step_turns: int = 10) -> int:
+    """Index of the first of ``total`` history messages the model is shown
+    (``Session.get_recent_history``): the last ``max_turns`` turns, the start
+    moving in steps of ``step_turns``. Messages before it are out of view."""
+    keep = max_turns * 2
+    if total <= keep:
+        return 0
+    step = max(1, step_turns) * 2
+    return ((total - keep) // step) * step
+
+
 @dataclass
 class Session:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -314,7 +325,13 @@ class Session:
         middle — accepted, since the alternative is unbounded fan-out cost.
         """
         parts: list[str] = []
-        for turn in self.get_recent_history(max_turns=turns):
+        # step_turns=1 for an EXACT `turns`-turn tail. The default (10) steps
+        # the window start in blocks to keep the Executive's prompt cache warm,
+        # which over-delivers badly at this scale: with `turns` at 2, a
+        # 23-message history steps to start=0 and hands a specialist all 11
+        # turns. There is no cache to protect here — this render goes into a
+        # specialist's user turn, which is uncached by design.
+        for turn in self.get_recent_history(max_turns=turns, step_turns=1):
             content = turn["content"]
             if not isinstance(content, str):
                 # Defensive, not a live path: today `add_assistant_message` is
@@ -374,8 +391,18 @@ class Session:
         conversation = rendered[-total_max_chars:]
         return f"{profile}\n\n{conversation}" if profile else conversation
 
-    def get_recent_history(self, max_turns: int = 20) -> list[dict[str, Any]]:
-        history = self.conversation_history[-(max_turns * 2):]
+    def get_recent_history(self, max_turns: int = 20, step_turns: int = 10) -> list[dict[str, Any]]:
+        """The last ``max_turns`` turns, give or take ``step_turns``.
+
+        The window's start moves in steps of ``step_turns`` rather than one
+        turn at a time, so a long conversation keeps between ``max_turns``
+        and ``max_turns + step_turns`` turns. A window that slid every turn
+        would change the first history message on every request, and the
+        prompt cache (``orchestrator.executive._apply_history_cache_marker``)
+        would miss and re-write the whole conversation each time.
+        """
+        start = history_window_start(len(self.conversation_history), max_turns, step_turns)
+        history = self.conversation_history[start:]
         # Anthropic requires messages to start with a user turn.
         # Drop a leading assistant message if history length is odd (can happen on error recovery).
         if history and history[0]["role"] != "user":

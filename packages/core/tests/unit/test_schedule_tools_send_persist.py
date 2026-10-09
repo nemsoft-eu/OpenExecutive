@@ -114,22 +114,23 @@ def test_send_discord_dm_roster_gate_does_not_persist(monkeypatch: pytest.Monkey
 # Slack
 # --------------------------------------------------------------------------- #
 
-def test_send_slack_dm_persists_done_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Roster gate: simulate a registered Slack person.
-    monkeypatch.setattr(
-        "openexecutive.people.store.find_person_by_slack_id",
-        lambda _id: object(),
-    )
+def test_send_slack_dm_persists_done_row() -> None:
+    sent: list[dict] = []
 
     class _FakeClient:
         def __init__(self, token: str) -> None:
             self.token = token
 
-        async def chat_postMessage(self, channel: str, text: str) -> dict:
+        async def chat_postMessage(self, **kw: object) -> dict:
+            sent.append(kw)
             return {"ok": True, "ts": "1.0"}
 
     with patch(
         "slack_sdk.web.async_client.AsyncWebClient", _FakeClient
+    ), patch(
+        # On the roster: send_slack_dm refuses an unrostered Slack id, as
+        # send_discord_dm and send_telegram_message already do.
+        "openexecutive.people.store.find_person_by_slack_id", lambda _ref: object()
     ):
         result = asyncio.run(
             schedule_tools.handle_send_slack_dm(
@@ -137,6 +138,8 @@ def test_send_slack_dm_persists_done_row(monkeypatch: pytest.MonkeyPatch) -> Non
             )
         )
     assert json.loads(result)["status"] == "sent"
+    # No previews: Slack would fetch a link in the text (reminders ride this DM).
+    assert sent[0]["unfurl_links"] is False and sent[0]["unfurl_media"] is False
 
     rows = _done_rows()
     assert len(rows) == 1

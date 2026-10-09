@@ -709,8 +709,10 @@ class ExecutiveReflectionWorkflow(Workflow):
         )
         from openexecutive.orchestrator.executive import (
             _ALL_SKILL_HANDLERS,
-            _ALL_SKILL_TOOLS,
+            _offered_skill_tools,
         )
+        # The Python job tool as this instance describes it (a runner's libraries).
+        _ALL_SKILL_TOOLS = _offered_skill_tools()
         from openexecutive.orchestrator.knowledge_tools import (
             KNOWLEDGE_TOOL_HANDLERS,
             KNOWLEDGE_TOOLS,
@@ -841,7 +843,9 @@ class ExecutiveReflectionWorkflow(Workflow):
         )
         tools, handlers, leading = _with_lead_tools(tools, handlers)
         if leading:
-            user_content += _LEAD_NOTE
+            from openexecutive.orchestrator import take_the_lead
+
+            user_content += _LEAD_NOTE + take_the_lead.learned_note()
         # Nobody reads what this pass sends before it goes: an outward tool
         # whose text names a person or figure absent from the input (or a
         # tool result so far) is refused with a reason the model can act on.

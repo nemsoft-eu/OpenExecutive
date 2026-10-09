@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -39,7 +40,7 @@ from openexecutive.memory.workspace_settings import (
     pin_turn_principal_role,
     pin_turn_workspace_mode,
 )
-from openexecutive.orchestrator import take_the_lead
+from openexecutive.orchestrator import take_the_lead, tool_groups
 from openexecutive.orchestrator.action_chips import summarize_action
 from openexecutive.orchestrator.activity_labels import (
     fallback_activity,
@@ -75,6 +76,7 @@ from openexecutive.orchestrator.delegation_tools import (
     DELEGATION_TOOL_HANDLERS,
     DELEGATION_TOOL_NAMES,
     DELEGATION_TOOLS,
+    MAILBOX_TOOL_NAMES,
 )
 from openexecutive.orchestrator.department_tools import (
     DEPARTMENT_TOOL_HANDLERS,
@@ -171,6 +173,9 @@ from openexecutive.orchestrator.workflow_run_tools import (
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
 from openexecutive.providers.translator import reasoning_replay_block
+from openexecutive.workflows import python_job, step_script
+from openexecutive.workflows.action_step import looks_like_error
+from openexecutive.workflows.python_job import PYTHON_JOB_TOOL_HANDLERS, PYTHON_JOB_TOOLS
 from openexecutive.workflows.tool_catalog import filter_search_results
 
 logger = logging.getLogger(__name__)
@@ -212,6 +217,18 @@ def _loggable_tool(label: str) -> str:
     return label if _LOGGABLE_TOOL_RE.fullmatch(label) else "call_tool:<unlisted>"
 
 
+def _log_value(tool_name: str, value: Any) -> str:
+    """A tool's input or result for the process log, which is not private to
+    anyone: withheld for the tools that read the speaker's own mailbox or
+    notes, and for every tool once the turn has read their mail (the private
+    audit row keeps it)."""
+    from openexecutive.delegation.settings import turn_touched_delegate_mail
+
+    if tool_name in DELEGATION_TOOL_NAMES or tool_name in HISTORY_TOOL_NAMES or turn_touched_delegate_mail():
+        return "<private>"
+    return _trunc(value)
+
+
 def _trunc(value: Any, limit: int = 200) -> str:
     """Render *value* for a log line, capped at *limit* chars.
 
@@ -233,9 +250,20 @@ _MIN_USEFUL_CAP = 1_000
 # under this (the longest in the MCP surface is ~40 chars); the bound exists
 # so a model-supplied name cannot inflate the marker past its own budget.
 _TOOL_NAME_MARKER_MAX = 80
+# Once a turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS) is used up, a
+# further tool result still shows this much, so the model sees what it got.
+_TURN_BUDGET_FLOOR = 3_000
+
+# Results the turn's reading budget counts but never cuts (see
+# _turn_result_limit).
+_NEVER_CUT_BY_TURN_BUDGET = frozenset(
+    {step_script.RUN_SCRIPT_TOOL, tool_groups.OPEN_TOOLS, "search_tools"}
+)
 
 
-def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
+def _cap_tool_result(
+    text: Any, *, tool_name: str, limit: int, budget_spent: bool = False, full_reread_left: bool = False
+) -> Any:
     """Bound one tool result before it enters the prompt.
 
     A circuit breaker, not a routine clipper: the default budget is set so
@@ -259,9 +287,16 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
 
     Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
     "never exceeds ``limit``" guarantee holds by reserving the marker
-    inside the budget, and the marker itself is ~284-383 chars — below
+    inside the budget, and the marker itself is ~280-850 chars — below
     that floor there is no room for it and the guarantee breaks. The
     config field enforces this with ``ge=1_000``.
+
+    ``budget_spent`` says the turn's reading budget, not this result's own
+    size, set ``limit``: the marker then says to answer from what the turn
+    has rather than read more, and never to edit from the cut text. With
+    ``full_reread_left`` it also offers the turn's one full re-read
+    (``_TurnReadingBudget``), so an edit the question asked for can still
+    be done from the whole document.
     """
     if not isinstance(text, str):
         return text
@@ -281,9 +316,30 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
         return (
             f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
             f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
-            "This is NOT the full result. To see more, call the tool again "
-            "with a narrower request — a page range, a section name, a query "
-            "or filter — rather than re-requesting the whole document.]"
+            "This is NOT the full result."
+            + (
+                # A narrower re-read would be cut the same way, so the
+                # budget note replaces the "ask again" advice.
+                " This question has already read as much as it can. Never "
+                "edit, rewrite or replace anything from this cut result."
+                + (
+                    " If you need this whole result to edit or rewrite it, "
+                    "call the tool again with exactly the same input: that "
+                    "repeat does not run the tool again, it brings back this "
+                    "same result in full (once per question)."
+                    if full_reread_left
+                    else " If you needed it to edit or rewrite something, say "
+                    "it was too long to work on here and offer to do it as "
+                    "its own request."
+                )
+                + " Otherwise answer from what you have, and say what you "
+                "could not read."
+                if budget_spent
+                else " To see more, call the tool again with a narrower "
+                "request — a page range, a section name, a query or filter — "
+                "rather than re-requesting the whole document."
+            )
+            + "]"
         )
 
     # Reserve the marker inside the budget so the capped result never
@@ -298,6 +354,175 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
         safe_name, len(text), shown, limit,
     )
     return text[:shown] + marker(shown, pct)
+
+
+def _turn_result_limit(name: str, *, per_result: int, turn_budget: int, used: int) -> tuple[int, bool]:
+    """The cap for one tool result, given what the turn has already read.
+
+    Every tool result stays in the prompt for each later call of the turn,
+    so a turn that reads several long documents re-sends all of them on
+    every call. ``turn_budget`` (TOOL_RESULTS_TURN_MAX_CHARS; 0 = off)
+    bounds what a turn's results add together: once ``used`` reaches it, a
+    further result is cut to ``_TURN_BUDGET_FLOOR``. Returns (limit, whether
+    the budget rather than ``per_result`` set it). A specialist's analysis
+    is the answer itself, not a read, so it neither counts nor is cut by the
+    budget. A built tool's result counts but is never cut below
+    ``per_result``: it is already bounded (step_script), and it lists the
+    writes that already ran, which a short cut would hide and the model would
+    then repeat. Tool discovery (``open_tools``, ``search_tools``) is treated
+    the same way: its result is the schema for the next call, and a cut one
+    would leave the model unable to make it.
+    """
+    if turn_budget <= 0 or name == "consult_specialist":
+        return per_result, False
+    if name in _NEVER_CUT_BY_TURN_BUDGET:
+        return per_result, False
+    remaining = turn_budget - used
+    if remaining >= per_result:
+        return per_result, False
+    return min(per_result, max(_TURN_BUDGET_FLOOR, remaining)), True
+
+
+class _TurnReadingBudget:
+    """One turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS), with one
+    escape hatch.
+
+    ``_turn_result_limit`` decides the cap from what the turn has used. A
+    read cut by the budget may be the very document the question asks to
+    edit, and an edit from a cut read would drop everything past the cut.
+    So the turn gets one full re-read: when the model repeats a call the
+    budget cut, same tool and same input, the loop answers it with the
+    result it already has (``replay``), under the per-result cap, and never
+    runs the tool again. Replaying rather than re-running matters: the
+    budget cuts any tool's result, and a repeated write (an event, a
+    message) would happen twice. Once per turn, so the budget still bounds
+    the turn: at most one extra ``per_result``.
+    """
+
+    def __init__(self, *, per_result: int, turn_budget: int) -> None:
+        self.per_result = per_result
+        self.turn_budget = turn_budget
+        self.used = 0
+        # Full text of each result the budget cut, by call.
+        self._cut_results: dict[str, str] = {}
+        # tool_use ids answered by ``replay``: shown in full, not cut again.
+        self._replayed: set[str] = set()
+        self.full_reread_left = True
+
+    @staticmethod
+    def _key(name: str, tool_input: Any) -> str:
+        try:
+            return name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return name + "\x00" + repr(tool_input)
+
+    def replay(self, tool_use: dict[str, Any]) -> str | None:
+        """The stored full result if ``tool_use`` repeats a call the budget
+        cut and the turn's one re-read is left; the caller then answers it
+        with this text instead of dispatching it. ``None`` otherwise."""
+        if not self.full_reread_left:
+            return None
+        full = self._cut_results.get(self._key(tool_use["name"], tool_use["input"]))
+        if full is None:
+            return None
+        self.full_reread_left = False
+        self._replayed.add(tool_use["id"])
+        return full
+
+    def cap(self, name: str, tool_input: Any, text: Any, tool_use_id: str = "") -> Any:
+        """``text`` capped for the prompt, counted against the budget."""
+        if tool_use_id and tool_use_id in self._replayed:
+            limit, budget_spent = self.per_result, False
+        else:
+            limit, budget_spent = _turn_result_limit(
+                name, per_result=self.per_result, turn_budget=self.turn_budget, used=self.used
+            )
+            if budget_spent and isinstance(text, str) and len(text) > limit:
+                self._cut_results[self._key(name, tool_input)] = text
+        content = _cap_tool_result(
+            text,
+            tool_name=name,
+            limit=limit,
+            budget_spent=budget_spent,
+            full_reread_left=self.full_reread_left,
+        )
+        if name != "consult_specialist" and isinstance(content, str):
+            self.used += len(content)
+        return content
+
+
+# The history breakpoint lives an hour: people answer in minutes, not
+# seconds, and a 5m entry would be gone before most next messages.
+_HISTORY_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
+
+
+def _apply_history_cache_marker(
+    system_blocks: list[dict[str, Any]], messages: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cache the conversation so far, so the next message reads it back.
+
+    Marks the newest non-empty message before the caller's last one (the
+    turn being answered): normally the previous reply. History turns are
+    stored as plain text and rebuilt identically every turn, so on the next
+    message everything up to that point is a cache read, and only what is
+    new (the last exchange, this turn's context) is written. Without it the
+    loop marker (``_apply_loop_cache_marker``) writes the whole history again
+    on every turn, because the previous turn's cached prefix ended inside
+    that turn's own context and tool calls, which history does not keep.
+
+    The API allows four breakpoints and the other three are spoken for, so
+    the history marker takes the slot of the 5m company-profile block's.
+    That block still sits in the cached prefix (covered by this marker),
+    and dropping its 5m marker keeps the TTLs in the order the API requires:
+    tools 1h, persona 1h, history 1h, then the 5m loop marker.
+
+    Returns new lists; the caller's blocks and messages are left as they
+    were. With no history (a first message, an unattended run) both come
+    back unchanged.
+    """
+    target = -1
+    for i in range(len(messages) - 2, -1, -1):
+        content = messages[i].get("content")
+        if isinstance(content, str) and content:
+            target = i
+            break
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "text" and b.get("text") for b in content
+        ):
+            target = i
+            break
+    if target < 0:
+        return system_blocks, messages
+
+    content = messages[target]["content"]
+    if isinstance(content, str):
+        marked_content: list[dict[str, Any]] = [
+            {"type": "text", "text": content, "cache_control": dict(_HISTORY_CACHE_CONTROL)}
+        ]
+    else:
+        marked_content = [
+            {k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
+            for b in content
+        ]
+        last_text = max(
+            j for j, b in enumerate(marked_content)
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        )
+        marked_content[last_text] = {
+            **marked_content[last_text], "cache_control": dict(_HISTORY_CACHE_CONTROL)
+        }
+    new_messages = list(messages)
+    new_messages[target] = {**messages[target], "content": marked_content}
+
+    new_system = [
+        {k: v for k, v in b.items() if k != "cache_control"}
+        if isinstance(b, dict)
+        and isinstance(b.get("cache_control"), dict)
+        and b["cache_control"].get("ttl") != "1h"
+        else b
+        for b in system_blocks
+    ]
+    return new_system, new_messages
 
 
 def _apply_loop_cache_marker(
@@ -457,7 +682,17 @@ _ALL_SKILL_TOOLS = [
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
     *FORM_TOOLS,
+    *PYTHON_JOB_TOOLS,
 ]
+
+
+def _offered_skill_tools() -> list[dict[str, Any]]:
+    """_ALL_SKILL_TOOLS with the Python job tool as this instance describes it
+    (python_job.offered_definition: a runner's extra libraries)."""
+    offered = python_job.offered_definition()
+    return [offered if t["name"] == python_job.TOOL_NAME else t for t in _ALL_SKILL_TOOLS]
+
+
 _ALL_SKILL_HANDLERS = {
     **SKILL_TOOL_HANDLERS,
     "create_alert": handle_create_alert,
@@ -476,6 +711,7 @@ _ALL_SKILL_HANDLERS = {
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
     **FORM_TOOL_HANDLERS,
+    **PYTHON_JOB_TOOL_HANDLERS,
 }
 
 
@@ -562,11 +798,15 @@ def _system_block_names(blocks: list[dict[str, Any]]) -> list[str]:
     the timeline can show which cached blocks were live during each step.
     Block layout in cache_manager.build_system_blocks() is fixed:
       0 = persona + knowledge_index (1h TTL)
-      1 = company_profile + org_context (5m TTL)
+      1 = company_profile + org_context (5m TTL, or unmarked when the
+          agent loop's history marker took its slot)
     """
     names: list[str] = []
     for i, b in enumerate(blocks):
-        ttl = (b.get("cache_control") or {}).get("ttl", "5m")
+        cc = b.get("cache_control")
+        # No marker: the block rides inside a later breakpoint's prefix (the
+        # history marker takes the company block's slot).
+        ttl = cc.get("ttl", "5m") if isinstance(cc, dict) else "none"
         if i == 0:
             names.append(f"persona+knowledge_index (ttl={ttl})")
         elif i == 1:
@@ -758,6 +998,17 @@ class Executive:
         self._settings = get_settings()
         self._mcp_gateway = mcp_gateway
         self._mcp_tools = MCP_TOOLS if mcp_gateway is not None else []
+        # run_script (workflows/step_script.py): one sandboxed script over the
+        # gateway tools a conversation has found, each call checked as a
+        # call_tool. Only with a gateway, and a constant definition so the
+        # cached tool prefix is stable.
+        self._script_tools = (
+            [step_script.CHAT_TOOL_DEFINITION, step_script.LIST_SAVED_TOOLS_DEFINITION]
+            if mcp_gateway is not None
+            and self._settings.chat_scripts
+            and step_script.available()
+            else []
+        )
 
     def _build_messages(
         self,
@@ -778,15 +1029,12 @@ class Executive:
         history = session.get_recent_history()
 
         for turn in history:
-            # No cache_control on history turns. The breakpoint budget is 4
-            # per request and the other three are always spoken for: two
-            # system blocks (cache_manager.build_system_blocks) plus the tool
-            # block, leaving exactly one for the agent loop's intra-turn
-            # marker (_apply_loop_cache_marker). A rolling marker here used
-            # to claim a latent fifth, which Anthropic rejects outright on
-            # the direct path; it never earned its slot anyway, since history
-            # turns are flat strings and the system + tool blocks already
-            # cover the expensive stable prefix.
+            # No cache_control here. The agent loop marks the newest history
+            # turn itself (_apply_history_cache_marker), taking the company
+            # block's slot so the request stays at the API's 4 breakpoints;
+            # other users of these messages (the committee revision) keep
+            # the plain layout. A rolling marker on every history turn used
+            # to claim a latent fifth, which Anthropic rejects outright.
             prev = messages[-1] if messages else None
             if (
                 prev is not None
@@ -2154,7 +2402,10 @@ class Executive:
         # an inbound email, a teammate's turn or Google Chat
         # (`content_trust.principal_only_withheld`).
         principal_withheld = principal_only_withheld(current_session.get())
-        not_offered = unattended_withheld | private_withheld | principal_withheld
+        # Python jobs need the sandbox the API image installs: without it the
+        # tool is not offered (fixed per process, so the prefix stays stable).
+        sandbox_missing = frozenset() if python_job.available() else frozenset({python_job.TOOL_NAME})
+        not_offered = unattended_withheld | private_withheld | principal_withheld | sandbox_missing
         withheld_tools = tools_withheld_in_mode(workspace_mode) | not_offered
         # Act as me: ghostwrite_email joins the toolkit only on a turn
         # pin_turn_delegation offered it to. Its own registry, never
@@ -2192,11 +2443,26 @@ class Executive:
         if origin and not unattended_withheld:
             take_the_lead.wake(f"a message on {origin}")
         current_messages = list(messages)
+        if self._settings.enable_caching:
+            system_blocks, current_messages = _apply_history_cache_marker(
+                system_blocks, current_messages
+            )
+        # Tool calls this turn's scripts have made, in all and per own tool
+        # (settings.chat_script_max_calls, step_script.CHAT_OWN_TOOL_CAPS).
+        script_counts: dict[str, int] = {}
+        # The fan-out hint (step_script.FANOUT_HINT) goes out once a turn.
+        fanout_hinted = False
         # Shallow copy — the caller owns every dict up to this index.
         caller_message_count = len(current_messages)
         last_full_text = ""
         specialists_consulted: list[str] = []
         synthesis_roster_size = 0
+        # What this turn's tool results have put in the prompt so far: every
+        # one is re-sent on each later call.
+        reading_budget = _TurnReadingBudget(
+            per_result=self._settings.tool_result_max_chars,
+            turn_budget=self._settings.tool_results_turn_max_chars,
+        )
 
         stream_model = model or self._settings.default_model
         if self._settings.routing_prepass_enabled:
@@ -2258,17 +2524,23 @@ class Executive:
             # Solo withholds the team-only tools before the sort, so each mode
             # has its own stable, sorted tool prefix (as do an unattended run
             # and a turn private to the principal).
-            client_tools = sorted(
-                (
-                    t for t in filter_tools_for_workspace_mode(
-                        [*SPECIALIST_TOOLS, *_ALL_SKILL_TOOLS, *self._mcp_tools,
-                         *delegation_tools, *extra_client_tools],
-                        workspace_mode,
-                    )
-                    if t["name"] not in not_offered
-                ),
-                key=lambda t: t["name"],
+            # The less common tools are offered through open_tools/use_tool
+            # rather than one by one (tool_groups), so the list is short and
+            # stays the same whichever groups the turn opens. The fork's
+            # client-side SearxNG `web_search` goes in here with the rest:
+            # it is not in tool_groups.DEFERRED, so split() puts it straight
+            # into direct_tools, exactly where it sat before.
+            direct_tools, deferred_tools = tool_groups.split(
+                t for t in filter_tools_for_workspace_mode(
+                    [
+                        *SPECIALIST_TOOLS, *_offered_skill_tools(), *self._mcp_tools,
+                        *self._script_tools, *delegation_tools, *extra_client_tools,
+                    ],
+                    workspace_mode,
+                )
+                if t["name"] not in not_offered
             )
+            client_tools = sorted(direct_tools, key=lambda t: t["name"])
             tools_with_cache: list[dict[str, Any]] = [
                 *client_tools[:-1],
                 {**client_tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}},
@@ -2366,8 +2638,31 @@ class Executive:
             if final_msg.stop_reason != "tool_use":
                 return
 
-            specialist_tool_uses = [tu for tu in tool_uses if tu["name"] == "consult_specialist"]
-            skill_tool_uses = [tu for tu in tool_uses if tu["name"] in turn_handlers]
+            # open_tools is answered here; a use_tool call becomes the call it
+            # stands for (same id), so every guard, handler, chip and audit
+            # row below sees the tool's own name, as for a direct call.
+            group_results: dict[str, str] = {}
+            for i, tu in enumerate(tool_uses):
+                if tu["name"] == tool_groups.OPEN_TOOLS:
+                    group_results[tu["id"]] = tool_groups.open_result(tu["input"], deferred_tools)
+                elif tu["name"] == tool_groups.USE_TOOL:
+                    call, error = tool_groups.unwrap(tu)
+                    if call is None:
+                        group_results[tu["id"]] = error or ""
+                    else:
+                        tool_uses[i] = call
+            # The turn's one full re-read of a result the reading budget cut
+            # is answered from that result, never by running the tool again
+            # (it may have been a write).
+            for tu in tool_uses:
+                if tu["id"] not in group_results:
+                    replayed = reading_budget.replay(tu)
+                    if replayed is not None:
+                        group_results[tu["id"]] = replayed
+            dispatch_uses = [tu for tu in tool_uses if tu["id"] not in group_results]
+
+            specialist_tool_uses = [tu for tu in dispatch_uses if tu["name"] == "consult_specialist"]
+            skill_tool_uses = [tu for tu in dispatch_uses if tu["name"] in turn_handlers]
             # Dispatch guard: a tool this mode does not offer never runs, even
             # if the model emits it anyway — it gets an error tool_result.
             withheld_uses = [tu for tu in skill_tool_uses if tu["name"] in withheld_tools]
@@ -2375,7 +2670,22 @@ class Executive:
                 skill_tool_uses = [
                     tu for tu in skill_tool_uses if tu["name"] not in withheld_tools
                 ]
-            mcp_tool_uses = [tu for tu in tool_uses if tu["name"] in MCP_TOOL_NAMES]
+            mcp_tool_uses = [tu for tu in dispatch_uses if tu["name"] in MCP_TOOL_NAMES]
+            script_tool_uses = [
+                tu for tu in dispatch_uses
+                if self._script_tools
+                and tu["name"] in (step_script.RUN_SCRIPT_TOOL, step_script.LIST_SAVED_TOOLS_TOOL)
+            ]
+            # A turn private to the principal is not offered run_script
+            # (PRIVATE_TURN_WITHHELD_TOOLS); the same guard refuses it.
+            if private_turn and script_tool_uses:
+                withheld_uses = [*withheld_uses, *script_tool_uses]
+                script_tool_uses = []
+            # list_saved_tools is principal-only (PRINCIPAL_ONLY_TOOLS).
+            refused_scripts = [tu for tu in script_tool_uses if tu["name"] in principal_withheld]
+            if refused_scripts:
+                withheld_uses = [*withheld_uses, *refused_scripts]
+                script_tool_uses = [tu for tu in script_tool_uses if tu not in refused_scripts]
             # A private turn is not offered load_mcp_server either (it
             # reaches any URL), nor any MCP tool through call_tool but those
             # in PRIVATE_TURN_MCP_TOOLS (Google Workspace reads, and the Gmail
@@ -2393,22 +2703,27 @@ class Executive:
                 mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in withheld_mcp_uses]
                 withheld_uses = [*withheld_uses, *withheld_mcp_uses]
             # Act as me: once the turn has read the principal's own mail (in
-            # an earlier round, or with a ghostwrite_email or recall_history
-            # in this one — a round's tools run together), nothing that reaches anyone else
-            # runs for the rest of the turn (delegation.lockdown). The offered
-            # list stays as it is, so the cached prefix never changes mid-turn.
+            # an earlier round, or with a ghostwrite_email, a mailbox read or
+            # recall_history in this one — a round's tools run together),
+            # nothing that opens a link, runs a script or workflow, or posts
+            # to everyone runs for the rest of the turn (delegation.lockdown).
+            # A later turn of that conversation stays private (touched_mail)
+            # but is not locked: it is the person asking again. The offered
+            # list stays as it is, so the cached prefix never changes
+            # mid-turn.
             mail_touched_uses: list[dict[str, Any]] = []
             if pinned_delegation is not None and (
-                pinned_delegation.touched_mail
-                or any(tu["name"] in DELEGATION_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in tool_uses)
+                pinned_delegation.read_mail
+                or any(tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in tool_uses)
             ):
                 mail_touched_uses = [
-                    tu for tu in [*skill_tool_uses, *mcp_tool_uses]
+                    tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
                     if mail_touched_withholds(tu["name"], tu["input"])
                 ]
-                if mail_touched_uses:
-                    skill_tool_uses = [tu for tu in skill_tool_uses if tu not in mail_touched_uses]
-                    mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in mail_touched_uses]
+            if mail_touched_uses:
+                skill_tool_uses = [tu for tu in skill_tool_uses if tu not in mail_touched_uses]
+                mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in mail_touched_uses]
+                script_tool_uses = [tu for tu in script_tool_uses if tu not in mail_touched_uses]
 
             # No per-call "context": the tool no longer advertises one, and the
             # orchestrator forwards a rendered conversation tail to every
@@ -2505,10 +2820,12 @@ class Executive:
             # Signal that tool calls are in flight so the client can show progress.
             yield self._THINKING
 
-            results_by_id: dict[str, str] = {}
+            results_by_id: dict[str, str] = dict(group_results)
             # tool_use ids whose handler reported a failure; their tool_result
             # carries is_error (see ToolOutcome for what that does and does
-            # not reach on the local path).
+            # not reach on the local path). open_tools/use_tool results from
+            # group_results are seeded above and never error-flagged: a bad
+            # group name comes back as a plain error payload, not a failure.
             error_tool_use_ids: set[str] = set()
 
             event_cursor = len(debug_collector._events) if debug_collector else 0
@@ -2707,7 +3024,7 @@ class Executive:
 
             if skill_tool_uses:
                 for tu in skill_tool_uses:
-                    logger.info("→ skill:%s  input=%s", tu["name"], _trunc(tu["input"]))
+                    logger.info("→ skill:%s  input=%s", tu["name"], _log_value(tu["name"], tu["input"]))
                 # return_exceptions=True: one crashing handler must not abort
                 # the whole turn. See `_tool_error_result`.
                 raw_skill_results = await asyncio.gather(
@@ -2767,7 +3084,7 @@ class Executive:
                     result, is_error = unwrap_tool_outcome(raw)
                     if is_error:
                         error_tool_use_ids.add(tu["id"])
-                    logger.info("← skill:%s  result=%s", tu["name"], _trunc(result))
+                    logger.info("← skill:%s  result=%s", tu["name"], _log_value(tu["name"], result))
                     results_by_id[tu["id"]] = result
                     # Inline action chip for side-effecting tools. None
                     # when the tool is read-only (search_skills, load_skill,
@@ -2848,10 +3165,10 @@ class Executive:
                         logger.info(
                             "→ %s  args=%s",
                             tu["input"].get("name", "call_tool"),
-                            _trunc(tu["input"].get("arguments", "")),
+                            _log_value(tu["name"], tu["input"].get("arguments", "")),
                         )
                     else:
-                        logger.info("→ %s  input=%s", tu["name"], _trunc(tu["input"]))
+                        logger.info("→ %s  input=%s", tu["name"], _log_value(tu["name"], tu["input"]))
                 # Same isolation as the skill gather above: a gateway crash on
                 # one tool must not take the turn down with it.
                 mcp_results = await asyncio.gather(
@@ -2892,7 +3209,7 @@ class Executive:
                     if private_turn and tu["name"] == "search_tools":
                         # Offer a private turn PRIVATE_TURN_MCP_TOOLS only.
                         result = filter_search_results(result, private_turn_allows_mcp_tool)
-                    logger.info("← %s  result=%s", tool_label, _trunc(result))
+                    logger.info("← %s  result=%s", tool_label, _log_value(tool_label, result))
                     results_by_id[tu["id"]] = result
                     # MCP chip emission. search_tools is read-only (gets
                     # filtered out by summarize_action's allowlist);
@@ -2924,6 +3241,284 @@ class Executive:
                         },
                     )
 
+            if script_tool_uses and self._mcp_gateway is not None:
+                # Each call a script makes is a call_tool in every way that
+                # matters: the gateway's own gates (discovery, deny-list,
+                # recipients), Take the lead's gate on an unattended run, and
+                # the same chip and audit row, as each call happens.
+                script_call = (
+                    take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
+                    if leading
+                    else self._mcp_gateway.call_tool
+                )
+                # The Executive's own tools a script may call this turn: the
+                # fixed list, less any this turn is not offered. Each runs
+                # through the turn's handler (Take the lead's gate included).
+                script_own = frozenset(
+                    n for n in step_script.CHAT_OWN_TOOLS
+                    if n in turn_handlers and n not in withheld_tools
+                )
+                # (call_tool input, result text, the exception if the call
+                # raised); an own tool's input is {"name", "arguments", "own": True}.
+                made: list[tuple[dict[str, Any], str, BaseException | None]] = []
+
+                async def _script_call(
+                    tool: str,
+                    arguments: dict[str, Any],
+                    _call: Any = script_call,
+                    _made: list[tuple[dict[str, Any], str, BaseException | None]] = made,
+                    _own: frozenset[str] = script_own,
+                    _handlers: dict[str, Any] = turn_handlers,
+                    _counts: dict[str, int] = script_counts,
+                    _iteration: int = iteration,
+                    _session_id: str | None = session_id,
+                    _turn_id: str | None = turn_id,
+                ) -> tuple[str, bool]:
+                    own = tool in _own
+                    call_input: dict[str, Any] = {"name": tool, "arguments": arguments}
+                    if own:
+                        call_input["own"] = True
+                    # Budgets for the whole turn: a direct call needs a
+                    # tool_use each, a script could otherwise make thousands.
+                    cap = step_script.CHAT_OWN_TOOL_CAPS.get(tool) if own else None
+                    if _counts.get("", 0) >= self._settings.chat_script_max_calls or (
+                        cap is not None and _counts.get(tool, 0) >= cap
+                    ):
+                        limit = cap if cap is not None and _counts.get(tool, 0) >= cap else (
+                            self._settings.chat_script_max_calls
+                        )
+                        text = json.dumps({
+                            "error": f"{tool} was not run: this turn's tools may make at most "
+                            f"{limit} such calls. Say what is left and offer to continue."
+                        })
+                        return text, True
+                    _counts[""] = _counts.get("", 0) + 1
+                    _counts[tool] = _counts.get(tool, 0) + 1
+                    try:
+                        if own:
+                            text = str(await _handlers[tool](arguments))
+                        else:
+                            text = str(await _call({"name": tool, "arguments": arguments}))
+                    except asyncio.CancelledError:
+                        # Stopped mid-call (the script's clock, or the turn):
+                        # it may have run, and the drain below won't see it.
+                        audit_log(
+                            "tool_invocation",
+                            f"{'skill' if own else 'mcp'}:{_loggable_tool(tool)} CANCELLED (run_script)",
+                            session_id=_session_id,
+                            turn_id=_turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tool[:200],
+                                "kind": "skill" if own else "mcp",
+                                "via": "run_script",
+                                "iteration": _iteration,
+                                "ok": False,
+                                "cancelled": True,
+                            },
+                        )
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "script call_tool:%s raised %s", _loggable_tool(tool), type(exc).__name__
+                        )
+                        text = _tool_error_result(tool, exc)
+                        _made.append((call_input, text, exc))
+                        return text, True
+                    _made.append((call_input, text, None))
+                    return text, looks_like_error(text)
+
+                # Well inside the turn's own deadline, so a long script ends
+                # here, with the list of calls it already made, rather than
+                # being cut off with the turn and leaving the model no record.
+                script_clock = max(30.0, min(600.0, self._settings.chat_stream_timeout_s / 2))
+                for tu in script_tool_uses:
+                    if tu["name"] == step_script.LIST_SAVED_TOOLS_TOOL:
+                        results_by_id[tu["id"]] = step_script.list_saved_tools_result()
+                        continue
+                    script_args = tu["input"] if isinstance(tu["input"], dict) else {}
+                    script = script_args.get("script")
+                    script_text = str(script or "")
+                    logger.info(
+                        "→ run_script  chars=%d saved_tool=%s",
+                        len(script_text), _loggable_tool(str(script_args.get("tool") or "-")),
+                    )
+                    script_result = json.dumps({"error": "the script did not finish"})
+                    script_failed = True
+                    script_stats: dict[str, Any] = {}
+                    # aclosing: a stopped turn closes the script, and with it
+                    # the Monty worker, instead of leaving it to the GC.
+                    async with contextlib.aclosing(
+                        step_script.run_script_tool(
+                            script_args,
+                            tools=None,
+                            call=_script_call,
+                            origin="chat",
+                            # Saving only while the principal speaks on a
+                            # verified, interactive surface: a saved tool
+                            # runs on whoever's turn calls it later.
+                            may_save=not principal_withheld and not unattended_withheld,
+                            # Running one too: someone else's turn would run
+                            # the principal's recipe with inputs they chose.
+                            may_run_saved=not principal_withheld and not unattended_withheld,
+                            wall_clock_s=script_clock,
+                            own_tools=script_own,
+                        )
+                    ) as script_steps:
+                        async for kind, payload in script_steps:
+                            for call_input, text, raised in made:
+                                label = str(call_input["name"])[:200]
+                                if call_input.get("own"):
+                                    # One of the Executive's own tools: the
+                                    # same chip and row as a direct call.
+                                    own_input = call_input["arguments"]
+                                    if raised is None:
+                                        chip = summarize_action(
+                                            tool_name=label,
+                                            tool_input=own_input,
+                                            tool_result=text,
+                                            iteration=iteration,
+                                            workspace_mode=workspace_mode,
+                                        )
+                                        if chip is not None:
+                                            yield chip
+                                    audit_log(
+                                        "tool_invocation",
+                                        (
+                                            f"skill:{label} input={audit_tool_input(label, own_input)} (run_script)"
+                                            if raised is None
+                                            else f"skill:{label} FAILED: {type(raised).__name__} (run_script)"
+                                        ),
+                                        session_id=session_id,
+                                        turn_id=turn_id,
+                                        actor="executive",
+                                        details={
+                                            "tool": label,
+                                            "kind": "skill",
+                                            "via": "run_script",
+                                            "iteration": iteration,
+                                            **(
+                                                {"result_preview": audit_tool_result(label, text)}
+                                                if raised is None
+                                                else {"ok": False, "error": repr(raised)[:ERROR_DETAIL_LEN]}
+                                            ),
+                                        },
+                                        full=(
+                                            {
+                                                "input": audit_tool_input_full(label, own_input),
+                                                "result": audit_tool_result_full(label, text),
+                                                "active_prompt_blocks": _system_block_names(system_blocks),
+                                            }
+                                            if raised is None
+                                            else None
+                                        ),
+                                        private=_private_tool_row(label),
+                                        private_to_person=_artifact_row_owner(label),
+                                    )
+                                    continue
+                                if raised is None:
+                                    chip = summarize_action(
+                                        tool_name="call_tool",
+                                        tool_input=call_input,
+                                        tool_result=text,
+                                        iteration=iteration,
+                                    )
+                                    if chip is not None:
+                                        yield chip
+                                    audit_log(
+                                        "tool_invocation",
+                                        f"mcp:{label} input={audit_tool_input(label, call_input)} (run_script)",
+                                        session_id=session_id,
+                                        turn_id=turn_id,
+                                        actor="executive",
+                                        details={
+                                            "tool": label,
+                                            "kind": "mcp",
+                                            "via": "run_script",
+                                            "iteration": iteration,
+                                            "result_preview": audit_tool_result(label, text),
+                                        },
+                                        full={
+                                            "input": audit_tool_input_full(label, call_input),
+                                            "result": audit_tool_result_full(label, text),
+                                            "active_prompt_blocks": _system_block_names(system_blocks),
+                                        },
+                                    )
+                                else:
+                                    # Same shape as a direct call_tool that raised.
+                                    audit_log(
+                                        "tool_invocation",
+                                        f"mcp:{label} FAILED: {type(raised).__name__} (run_script)",
+                                        session_id=session_id,
+                                        turn_id=turn_id,
+                                        actor="executive",
+                                        details={
+                                            "tool": label,
+                                            "kind": "mcp",
+                                            "via": "run_script",
+                                            "iteration": iteration,
+                                            "ok": False,
+                                            "error": repr(raised)[:ERROR_DETAIL_LEN],
+                                        },
+                                    )
+                            made.clear()
+                            if kind == "stats":
+                                script_stats = payload
+                            elif kind == "done":
+                                script_result, script_failed = payload
+                    logger.info("← run_script  result=%s", _trunc(script_result))
+                    results_by_id[tu["id"]] = script_result
+                    # Agent Activity: the built tool as one card, with the
+                    # calls it made (the result lists them, capped). Sent by
+                    # the round's event replay below, like specialist events.
+                    if debug_collector:
+                        try:
+                            listed = json.loads(script_result).get("calls") or []
+                        except (ValueError, AttributeError):
+                            listed = []
+                        debug_collector.emit("script_run", {
+                            "iteration": iteration,
+                            "ok": not script_failed,
+                            "saved_tool": script_args.get("tool"),
+                            "kept_as": script_args.get("save_as"),
+                            "calls": [
+                                {"tool": str(c.get("tool", ""))[:200], "ok": bool(c.get("ok"))}
+                                for c in listed if isinstance(c, dict)
+                            ],
+                            "calls_made": script_stats.get("calls", len(listed)),
+                            "duration_ms": script_stats.get("duration_ms"),
+                        })
+                    # The script itself: its source and what it returned, so
+                    # the per-call rows above can be traced back to it.
+                    audit_log(
+                        "tool_invocation",
+                        f"script:run_script ({'failed' if script_failed else 'ok'})",
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        actor="executive",
+                        details={
+                            "tool": step_script.RUN_SCRIPT_TOOL,
+                            "kind": "script",
+                            "iteration": iteration,
+                            "ok": not script_failed,
+                            # Calls made and time taken (the usage summary
+                            # adds these up: audit.logger.script_summary).
+                            **script_stats,
+                            "result_preview": audit_tool_result(step_script.RUN_SCRIPT_TOOL, script_result),
+                            **({"saved_tool": str(script_args["tool"])[:60]} if script_args.get("tool") else {}),
+                            **({"save_as": str(script_args["save_as"])[:60]} if script_args.get("save_as") else {}),
+                        },
+                        full={
+                            "input": {
+                                k: script_args.get(k)
+                                for k in ("script", "tool", "inputs", "save_as", "description")
+                                if script_args.get(k) is not None
+                            },
+                            "result": audit_tool_result_full(step_script.RUN_SCRIPT_TOOL, script_result),
+                            "active_prompt_blocks": _system_block_names(system_blocks),
+                        },
+                    )
+
             if debug_collector:
                 for evt in debug_collector._events[event_cursor:]:
                     yield debug_collector.to_sse_dict(evt)
@@ -2935,18 +3530,20 @@ class Executive:
             # leaves non-model consumers (the propose_form_values JSON
             # parse above, the audit trail) reading the full text.
             #
-            # Written as a loop rather than a comprehension because `is_error`
-            # is set conditionally — only the tool_uses whose handler reported
-            # or raised a failure carry the key.
+            # The cap is the turn-wide reading budget, which has to see every
+            # result in order, so this stays a loop. `is_error` is set inside
+            # it rather than in the dict literal because only the tool_uses
+            # whose handler reported or raised a failure carry the key.
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
-                    "content": _cap_tool_result(
+                    "content": reading_budget.cap(
+                        tu["name"],
+                        tu["input"],
                         results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
-                        tool_name=tu["name"],
-                        limit=self._settings.tool_result_max_chars,
+                        tu["id"],
                     ),
                 }
                 if tu["id"] in error_tool_use_ids:
@@ -2956,6 +3553,19 @@ class Executive:
             # round's user message, after the tool results (which must come
             # first). Only this loop's own, newest message changes, so the
             # cached prefix is untouched.
+            # A tool came back with a list and this turn may build a tool:
+            # nudge toward one run_script for the per-item work, once a
+            # turn, in this user message (never a cached block).
+            if (
+                not fanout_hinted
+                and self._script_tools
+                and step_script.RUN_SCRIPT_TOOL not in not_offered
+                and not (pinned_delegation is not None and pinned_delegation.read_mail)
+                and not any(tu["name"] == step_script.RUN_SCRIPT_TOOL for tu in tool_uses)
+                and any(step_script.lists_many(str(results_by_id.get(tu["id"], ""))) for tu in tool_uses)
+            ):
+                tool_results.append({"type": "text", "text": step_script.FANOUT_HINT})
+                fanout_hinted = True
             added = inbox.take() if inbox is not None else []
             if added:
                 tool_results.append({"type": "text", "text": render_added_messages(added)})

@@ -86,10 +86,12 @@ export const REPLIES_WAITING_TIP =
 
 // What the row is doing: idle, asking before sending (first or second
 // time), or waiting on the backend.
+// `allow`: Send + allow, in training (replies to them, or follow-ups to
+// these people, go on their own after).
 type Step =
   | { kind: "idle" }
-  | { kind: "ask"; recipients: string[] }
-  | { kind: "confirm"; message: string; recipients: string[]; threadMovedOn: boolean }
+  | { kind: "ask"; recipients: string[]; allow: boolean }
+  | { kind: "confirm"; message: string; recipients: string[]; threadMovedOn: boolean; allow: boolean }
   | { kind: "busy"; label: string };
 
 export function ReplyCardItem({
@@ -106,6 +108,9 @@ export function ReplyCardItem({
   const [step, setStep] = useState<Step>({ kind: "idle" });
   const [error, setError] = useState<string | null>(null);
   const [fullDraft, setFullDraft] = useState(false);
+  // Drafts in training: keep what you sent as an example when you changed it first.
+  const [keepExample, setKeepExample] = useState(true);
+  const learnsStyle = Boolean(card.learns_style);
   // Being settled: Gmail didn't confirm a send. The server says so, and the
   // section reads the cards again until it's settled.
   const unconfirmed = card.status === "executing";
@@ -129,13 +134,29 @@ export function ReplyCardItem({
     }
   };
 
-  const send = async (confirm: { recipients: string[]; thread_moved_on?: boolean }) => {
+  const send = async (confirm: { recipients: string[]; thread_moved_on?: boolean }, allow: boolean) => {
     setStep({ kind: "busy", label: "Sending…" });
     setError(null);
     try {
-      const result = await sendReplyCard(card.decision_id, confirm);
+      const result = await sendReplyCard(
+        card.decision_id,
+        {
+          ...confirm,
+          ...(allow ? { allow: true } : {}),
+          ...(learnsStyle && keepExample ? { example: true } : {}),
+        },
+      );
       if (result.status === "sent") {
-        onGone(card.decision_id, followUp ? `Sent your follow-up to ${who}.` : `Sent your reply to ${who}.`);
+        onGone(
+          card.decision_id,
+          followUp
+            ? allow
+              ? `Sent your follow-up to ${who}. Follow-ups to them go on their own from now on.`
+              : `Sent your follow-up to ${who}.`
+            : allow
+              ? `Sent your reply to ${who}. Replies to them go on their own from now on.`
+              : `Sent your reply to ${who}.`,
+        );
         return;
       }
       setStep({
@@ -143,6 +164,7 @@ export function ReplyCardItem({
         message: result.message,
         recipients: result.recipients,
         threadMovedOn: result.reasons.includes("thread_moved_on"),
+        allow,
       });
     } catch (err) {
       const code = err instanceof ReplySendError ? err.code : "error";
@@ -261,6 +283,23 @@ export function ReplyCardItem({
             <p className="text-sm text-amber-700 dark:text-amber-300">{step.message}</p>
           )}
           <p className="text-sm text-fg">{sendQuestion(step.recipients, mailbox)}</p>
+          {step.allow && (
+            <p className="mt-2 text-sm text-fg">
+              From now on, {followUp ? "follow-ups" : "replies"} to {who} go on their own while Handle it for me is
+              on. Topics that always wait, links and new people still wait for you.
+            </p>
+          )}
+          {learnsStyle && (
+            <label className="mt-2 flex min-h-touch items-center gap-2 text-sm text-fg">
+              <input
+                type="checkbox"
+                checked={keepExample}
+                onChange={(e) => setKeepExample(e.target.checked)}
+                className="h-4 w-4 accent-accent"
+              />
+              Do it like this next time (if you changed it in {mailbox})
+            </label>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button
               variant="primary"
@@ -269,6 +308,7 @@ export function ReplyCardItem({
                   step.kind === "confirm"
                     ? { recipients: step.recipients, thread_moved_on: step.threadMovedOn || undefined }
                     : { recipients: step.recipients },
+                  step.allow,
                 )
               }
             >
@@ -283,11 +323,20 @@ export function ReplyCardItem({
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <Button
             variant="primary"
-            onClick={() => setStep({ kind: "ask", recipients: card.draft_to })}
+            onClick={() => setStep({ kind: "ask", recipients: card.draft_to, allow: false })}
             disabled={busy}
           >
             {busy ? step.label : "Send"}
           </Button>
+          {card.can_allow && (
+            <Button
+              variant="secondary"
+              onClick={() => setStep({ kind: "ask", recipients: card.draft_to, allow: true })}
+              disabled={busy}
+            >
+              Send + allow
+            </Button>
+          )}
           {gmailLink && (
             <a
               href={gmailLink}

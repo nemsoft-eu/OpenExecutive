@@ -10,6 +10,13 @@ one setting, like the Agent Council's quality (``MODES``, ``RULES``):
 - ``bold``: also replies to strangers, longer ones, and replies with a link
   or an amount when it's very sure.
 
+**In training.** Act as me's Replies and Follow-ups can each be put in
+training (``delegation.training``): then the dial lets nothing go by itself.
+Only a reply to a sender, or a follow-up to people, the person allowed with
+Send + allow goes on its own, under the dial's limits (a stranger they
+allowed included) and every check below. Take the lead as you doesn't lift
+those limits while in training.
+
 Every other email waits on a card for the person to tap Send, as it did
 before. Only the person turns it on, from a session the API knows is theirs
 (``reply_send._check_caller``, the rule Send uses), and nobody else can.
@@ -168,6 +175,9 @@ REASONS: dict[str, str] = {
     "follow_up_level": "On this setting, a follow-up to this person waits for you to send it.",
     # Take the lead as you (orchestrator.take_the_lead).
     "lead_rule": "One of the rules you or your company added says this waits for you.",
+    # In training (delegation.training).
+    "training": "Replies are in training, and you haven't allowed replies to them yet.",
+    "follow_up_training": "Follow-ups are in training, and you haven't allowed follow-ups to them yet.",
 }
 
 # Take the lead as you lifts the setting's limits, but not this ceiling.
@@ -183,6 +193,29 @@ def leading(person_id: int, *, db_path: Path | None = None) -> bool:
         return take_the_lead.as_you_on(person_id, db_path=db_path)
     except Exception:
         return False
+
+
+def allowed_in_training(person_id: int, sender: str, *, db_path: Path | None = None) -> bool:
+    """Whether ``person_id`` allowed replies to ``sender`` (Send + allow).
+    Never raises: unreadable is no."""
+    from openexecutive.delegation import training
+
+    return training.allowed_sender(person_id, sender, db_path=db_path) is not None
+
+
+def follow_up_allowed(person_id: int, recipients: list[str], *, db_path: Path | None = None) -> bool:
+    """Whether ``person_id`` allowed follow-ups to exactly ``recipients``."""
+    from openexecutive.delegation import training
+
+    return training.allowed_follow_up(person_id, recipients, db_path=db_path) is not None
+
+
+def in_training(person_id: int, setting: str, *, db_path: Path | None = None) -> bool:
+    """Whether Act as me's ``setting`` is in training for ``person_id``.
+    Never raises (``training.get``)."""
+    from openexecutive.delegation import training
+
+    return training.get(person_id, db_path=db_path).on(setting)
 
 
 def _lead_rule(person_id: int, texts: list[str], going: list[str], db_path: Path | None) -> bool:
@@ -202,7 +235,8 @@ class HandleIt:
         return RULES.get(self.mode, RULES[DEFAULT_MODE])
 
     def level(self, kind: str) -> str:
-        """``handle`` when a reply to this kind of sender may go on its own."""
+        """``handle`` when a reply to this kind of sender may go on its own
+        by the dial (Replies in training overrides it: ``refusal``)."""
         if not self.enabled or (kind != KIND_REPLY_KNOWN and not self.rules.strangers):
             return LEVEL_ASK
         return LEVEL_HANDLE
@@ -376,12 +410,21 @@ def _refusal(
     person_id: int, message: Any, thread: Any, reply: Any, verdict: Any, *, relation: str, own: set[str],
     exec_address: str, now: datetime, db_path: Path | None,
 ) -> str | None:
+    from openexecutive.delegation import training
     from openexecutive.delegation.threads import MAX_RECIPIENTS
     from openexecutive.integrations.email_poller import sender_new_text
 
     settings = get(person_id, db_path=db_path)
-    lead = settings.enabled and leading(person_id, db_path=db_path)
-    if not lead and settings.level(kind_for(relation)) != LEVEL_HANDLE:
+    # In training only Send + allow lets a reply go: Take the lead as you
+    # doesn't lift its limits.
+    trained = in_training(person_id, training.REPLIES, db_path=db_path)
+    lead = settings.enabled and not trained and leading(person_id, db_path=db_path)
+    if trained:
+        if not settings.enabled:
+            return "level"
+        if not allowed_in_training(person_id, message.from_addr, db_path=db_path):
+            return "training"
+    elif not lead and settings.level(kind_for(relation)) != LEVEL_HANDLE:
         return "level"
     if not signing_ok():
         return "signing_off"
@@ -466,18 +509,26 @@ def _follow_up_refusal(
     person_id: int, sent: Any, reply: Any, *, relation: str, own: set[str], exec_address: str, now: datetime,
     db_path: Path | None,
 ) -> str | None:
+    from openexecutive.delegation import training
     from openexecutive.delegation.threads import MAX_RECIPIENTS
     from openexecutive.integrations.email_poller import sender_new_text
 
     settings = get(person_id, db_path=db_path)
-    lead = settings.enabled and leading(person_id, db_path=db_path)
-    if not lead and not settings.follows_up(relation):
-        return "follow_up_level"
-    if not signing_ok():
-        return "signing_off"
+    trained = in_training(person_id, training.FOLLOW_UPS, db_path=db_path)
+    lead = settings.enabled and not trained and leading(person_id, db_path=db_path)
     # Exactly the people their own email went to: nobody added, nobody left out.
     allowed = {*sent.to, *sent.cc} - own - ({exec_address} if exec_address else set())
     going = [*reply.to, *reply.cc]
+    if trained:
+        # Only follow-ups to exactly the people they allowed, whoever they are.
+        if not settings.enabled:
+            return "follow_up_level"
+        if not follow_up_allowed(person_id, going, db_path=db_path):
+            return "follow_up_training"
+    elif not lead and not settings.follows_up(relation):
+        return "follow_up_level"
+    if not signing_ok():
+        return "signing_off"
     if not going or len(going) > MAX_RECIPIENTS or set(going) != allowed:
         return "recipients"
     body = reply.body or ""

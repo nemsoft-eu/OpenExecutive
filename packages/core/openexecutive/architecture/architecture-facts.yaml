@@ -18,8 +18,8 @@ system:
     frontend: Next.js 15 · React 19 · TailwindCSS · Mermaid.js
   models:
     default: claude-sonnet-5-5
-    deep_reasoning: claude-opus-5-5
-    routing: claude-haiku-4-5
+    deep_reasoning: claude-sonnet-5-5
+    routing: claude-haiku-5-5
     provider_routing: |
       All LLM calls go through openexecutive.providers.get_provider(model).
       The registry returns the Anthropic SDK by default. When
@@ -142,7 +142,7 @@ system:
     - A global operator pause (scheduler.pause, `executive_control` table) gates every autonomous loop — the scheduler, the Gmail poller and the workflow resumer. Inbound conversations (web chat, Slack, Discord, Telegram, Google Chat) are never gated. Pausing holds work, never cancels it.
     - Each specialist gets its own RAG fetch filtered by its declared domain alias.
     - System-prompt blocks marked with cache_control must remain byte-identical across turns — any dynamic content in them breaks Anthropic prompt caching and roughly 10× the cost.
-    - Total cache_control blocks must stay ≤ 4 (the Anthropic API hard limit). The current layout uses 2 of those slots for the system prompt (see `caching.block_order`), leaving headroom for the rolling-history ephemeral marker on the penultimate assistant turn.
+    - Total cache_control blocks must stay ≤ 4 (the Anthropic API hard limit), with longer TTLs before shorter ones. The layout is tools 1h, persona 1h, then company 5m on a first message or the history marker 1h once there is history, then the agent loop's 5m marker (see `caching.breakpoint_budget`).
     - Tool definitions are sorted by name before being sent to the API so cache hits survive across processes.
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
@@ -179,15 +179,32 @@ caching:
     ephemeral markers the request uses).
   breakpoint_budget: |
     The full 4-block budget, and why none of it is spare:
-      1. persona + knowledge (1h)      — system block 0
-      2. company + org (5m, optional)  — system block 1
-      3. last client tool (1h)         — executive tool list
+      1. last client tool (1h)         — executive tool list
+      2. persona + knowledge (1h)      — system block 0
+      3. company + org (5m, optional)  — system block 1, on a turn with no
+         history; with history the slot goes to the history marker (1h) on
+         the newest non-empty history turn (normally the previous reply)
       4. newest tool_result (5m)       — the agent loop's intra-turn marker
-    History turns deliberately carry NO marker. A rolling marker on the
-    penultimate assistant turn used to claim a latent fifth breakpoint,
-    which Anthropic rejects outright on the direct (non-OpenRouter) path.
-    It never earned its slot: history turns are flat strings, and the
-    system + tool blocks already cover the expensive stable prefix.
+    The history marker (executive._apply_history_cache_marker, applied by
+    the agent loop, never by _build_messages) is what lets the next message
+    read the conversation back. History turns are rebuilt from plain text,
+    so the previous turn's loop entries (which ended inside that turn's
+    retrieved context and tool calls) never match; without the marker every
+    message re-wrote the whole history into the cache. The
+    company block keeps its place in the prefix, covered by the history
+    marker, and losing its own 5m marker keeps the TTLs in the order the API
+    requires (1h before 5m). 1h because people reply in minutes; a 5m entry
+    would mostly be gone. Session.get_recent_history moves its window's
+    start in steps of 10 turns (20 to 30 turns kept) so the first history
+    message, and with it the cached prefix, stays put between steps.
+    On OpenRouter the translator keeps every assistant turn as typed text
+    parts when a request carries the history marker
+    (translator._request_caches_assistant_text), so the marker is forwarded
+    and a reply has one shape whether marked or not.
+    The committee revision call reuses the turn's messages without the
+    history marker, so its request keeps the plain two-system-marker layout.
+    A rolling marker on every history turn used to claim a latent fifth
+    breakpoint, which Anthropic rejects outright on the direct path.
   block_order:
     - id: persona_and_knowledge
       ttl: 1h
@@ -291,6 +308,61 @@ caching:
     same prefix from its first round to its last. recall_history (Always in
     the loop, orchestrator.history_tools) joins the same way when
     history_tools.recall_person allows it, before the same sort.
+  turn_reading_budget: |
+    TOOL_RESULTS_TURN_MAX_CHARS (default 40,000; 0 = off) bounds what all of
+    one turn's tool results add together, since every result is re-sent on
+    each later call of the turn. executive._turn_result_limit gives each
+    result min(TOOL_RESULT_MAX_CHARS, what is left), never below 3,000
+    (_TURN_BUDGET_FLOOR), and _cap_tool_result(budget_spent=True) replaces the
+    marker's "call the tool again more narrowly" advice (that re-read would be
+    cut too) with: the question has read as much as it can: answer from what you
+    have and say what you could not read, and never edit, rewrite or replace
+    anything from that cut result, so a partial read never becomes a lossy
+    write. The read the question needs to edit may be the cut one, so
+    executive._TurnReadingBudget gives each turn one full re-read: repeating a
+    cut call with the same tool and input (compared as sorted JSON) is answered
+    with the stored full result (replay, before dispatch) under the per-result
+    cap, never by running the tool again (the cut may have been a write), and
+    the marker offers that while it is left;
+    after it, the marker says to offer the edit as its own request (a fresh
+    budget). A turn so reads at most the budget plus one result. A result short
+    enough not to be cut never spends the re-read. consult_specialist results neither
+    count nor are cut (they are the analysis, not a read); run_script results
+    count but are never cut below the per-result cap, since step_script puts
+    the list of writes that already ran at their head and a 3,000-character
+    cut would hide some, so the model would repeat them. open_tools and
+    search_tools results are treated the same way (_NEVER_CUT_BY_TURN_BUDGET):
+    they are the schema the next call needs. Pairs with
+    TOOL_BUILDING_ADDENDUM's multi-read rule: an answer that needs three or
+    more reads builds a run_script tool that returns only what answers the
+    question, so the budget is rarely reached.
+  deferred_tool_groups: |
+    The less common skill tools are not in the tool list. orchestrator.
+    tool_groups.GROUPS puts them in named groups (calendar, people, goals,
+    watch_and_alerts, workflows, documents, messaging, skills), and
+    tool_groups.split takes them out of the turn's offered tools after every
+    filter (workspace mode, unattended, private turn) and BEFORE the sort,
+    adding two small tools in their place: open_tools(group), whose
+    description names every offered group and its tools, and use_tool(name, input).
+    open_tools is answered in the loop with the group's tools (name,
+    description, input_schema) as a tool RESULT, never by changing the tool
+    list, because the list is the start of the cached prefix: a list that
+    grew mid-turn would miss the cache for the tools, the system blocks and
+    the whole history. So the list is the same on every call of every turn,
+    and a group's descriptions are paid for only on a turn that opens it.
+    open_tools' description (tool_groups.open_tools_tool) and its results
+    name only the tools the turn offers, so a private turn never sees a
+    withheld tool's name; the description depends only on that set, fixed
+    per kind of turn, so each kind keeps one stable list. A use_tool call is rewritten into the
+    tool's own call (same tool_use id, the model's assistant block left as
+    sent) before dispatch, so it meets the same guards (workspace mode,
+    private turn, unattended, Take the lead), handler, progress events and
+    audit rows as a direct call. use_tool accepts only names in
+    tool_groups.DEFERRED; anything else, or input that is not an object,
+    gets an error tool result. The everyday tools (consult_specialist,
+    propose_form_values, people and memory lookups, follow-ups, the MCP
+    meta-tools) stay direct. This cut the direct list from about 19.5k to
+    about 6-7k tokens, which every model call of a turn re-sends.
   rag_context_placement: User turn (NOT the system prompt) — RAG hits vary per query, would poison the cache if cached.
   intra_turn_cache: |
     executive._apply_loop_cache_marker moves a single ephemeral marker onto
@@ -309,7 +381,7 @@ caching:
     a marker nested inside tool_result["content"] would survive the gate and
     reach a backend that rejects the field.
   tool_result_bound: |
-    TOOL_RESULT_MAX_CHARS (default 50,000) caps one tool result before it
+    TOOL_RESULT_MAX_CHARS (default 20,000, about 5k tokens) caps one tool result before it
     enters the prompt. Applied at the single point every result reaches the
     model (the tool_results comprehension in _stream_agent_loop), not at each
     producer: that also covers specialist output, tool errors and the
@@ -318,7 +390,9 @@ caching:
     Capping upstream of that parse would feed it truncated JSON and silently
     drop the form_patch SSE event.
     A circuit breaker, not a routine clipper: the default is set so ordinary
-    tool output never reaches it. A cut result carries an explicit marker
+    tool output (a status, an email thread, a specialist's analysis) never
+    reaches it; a long document read does, and the marker asks for a
+    narrower request (a page range, a section). A cut result carries an explicit marker
     naming the tool and stating the result is incomplete — silent truncation
     is worse than none, because the model reads the cut text as the whole
     answer and confabulates the rest.
@@ -473,10 +547,22 @@ providers:
     - Claude model + OPENROUTER_ENABLED=true → OpenRouterProvider. The slug is DERIVED, not looked up — registry.openrouter_slug_for_claude maps ``claude-<family>-<major>[-<minor>][-<yyyymmdd>]`` to ``anthropic/claude-<family>-<major>[.<minor>]`` (claude-sonnet-5 → anthropic/claude-sonnet-5, claude-haiku-4-5-20251001 → anthropic/claude-haiku-4.5). The same regex defines "is a Claude model" for routing, so a previous-generation id persisted in agent_overrides (claude-opus-4-7) still routes to Anthropic instead of falling through to the non-Claude path.
     - Non-Claude model + OPENROUTER_ENABLED=true → OpenRouterProvider with the slug passed through verbatim (live catalog or the hardcoded fallback). A ``model_resolver`` callback (registry._openrouter_model_resolver) hands Claude ids and ``anthropic/claude-*`` catalog slugs the Claude feature spec; everything else gets the non-Claude default — so a catalog refresh after the provider singleton is built needs no rebuild.
     - Non-Claude model + OPENROUTER_ENABLED=false → HTTP 400 at the API boundary. No silent fallback.
+  generation_fit: |
+    Both provider paths pass every request through
+    feature_gate.fit_claude_generation(model, kwargs) after
+    relax_forced_tool_choice. A Claude model from the 5 generation on
+    never receives temperature / top_p / top_k (non-default values 400 and
+    the default is what it runs on). Haiku 5.5 thinks unless told not to,
+    where Haiku 4.5 thought only when asked; the helpers on ROUTING_MODEL
+    are sized for a reply without thinking, so a Haiku 5.5 request that sets
+    no thinking gets {"type": "disabled"} (kept off efforts xhigh / max,
+    where Anthropic rejects it). On the OpenAI-compatible path the
+    translator turns disabled thinking into reasoning {"enabled": false}.
+    Non-Claude and local slugs are left untouched.
   council_ui_dropdown_source: |
     openexecutive.providers.allowed_models_for(agent_id) — returns
     ANTHROPIC_DIRECT_MODELS (claude-fable-5-1, claude-opus-5-5, claude-opus-5,
-    claude-sonnet-5-5, claude-sonnet-5, claude-haiku-4-5) plus registry.openrouter_models() (live
+    claude-sonnet-5-5, claude-sonnet-5, claude-haiku-5-5, claude-haiku-4-5) plus registry.openrouter_models() (live
     catalog, else the OPENROUTER_MODELS fallback snapshot) when the toggle is
     on; catalog slugs that duplicate a direct id are dropped.
     Every agent (including utility_fast) gets the same list; the
@@ -537,7 +623,7 @@ providers:
     (max 4,000 chars; blank clears it).
   quality_presets: |
     The Council's Quality choice (agents/presets.py) sets every agent's model
-    and deep-reasoning flag at once. Fast: a small model (claude-haiku-4-5)
+    and deep-reasoning flag at once. Fast: a small model (claude-haiku-5-5, else claude-haiku-4-5)
     for every agent, deep reasoning off. Balanced: each agent's built-in
     defaults. Thorough: the largest allowed model (claude-opus-5-5, then
     claude-opus-5) for the Executive and the domain specialists, deep
@@ -1456,9 +1542,19 @@ routing:
     of outbound tools sit alongside each other:
 
       1. Per-Person DMs — `send_slack_dm`, `send_discord_dm`,
-         `send_telegram_message`. People-roster gated, and additionally
-         passed through the outbound anti-spam guard before the network
-         send (see `outbound_antispam_invariant`).
+         `send_telegram_message`. People-roster gated
+         (`schedule_tools._dm_recipient_on_roster`, unconditional on all
+         three), and additionally passed through the outbound anti-spam
+         guard before the network send (see
+         `outbound_antispam_invariant`). The gate is what keeps untrusted
+         turn content — inbound mail, a chat message, a knowledge document
+         — from aiming a DM at an arbitrary workspace member, so it is the
+         model-exposed `user_id`/`chat_id` argument it exists to constrain.
+         Until the gate was added to the Slack handler, that claim was
+         true of Discord and Telegram only: `send_slack_dm` looked the
+         recipient up solely when `turn_is_private_to_principal()`, a
+         per-turn flag the inbound mail poller sets, so an ordinary turn
+         reached `chat_postMessage` with no roster check at all.
       2. Department channels — `send_department_message(slug,
          integration, text)` posts to a configured room on the
          department row. No roster gate — channels are team-visible.
@@ -2826,9 +2922,10 @@ memory:
       notes, in a private chat (history_chat.private_chat, or
       Session.private_chat), with their switch on. Act as me isn't needed. Recall
       sets touched_mail first, for the principal too (private rows, no
-      memory, the lockdown from that round), and marks the conversation
-      mail_private so later turns start the same way and, for a team
-      member, the principal can't open it.
+      memory, the lockdown from that round: touched_mail and read_mail), and
+      marks the conversation mail_private so later turns are private the same
+      way (not locked down) and, for a team member, the principal can't open
+      it.
     - recall_history takes due=true to list only dated notes, a week overdue
       to two weeks ahead, soonest first ("what's due today?").
     - The owner's briefs read the owner's own notes (memory.history_brief):
@@ -4103,10 +4200,20 @@ people:
     exactly like an unknown id, with no name; no outbound reply linkage is
     recorded for a contact (their reply would otherwise be hydrated with
     the principal's conversation). PEER MEMORY: a private turn writes
-    nothing to peer or department memory, and the principal's own peer
-    memory answers only the principal (`ask_about_person` returns the empty
-    answer on anyone else's turn; `/memories/people` and `/conclusions`
-    show each caller only their own entry, the principal included). Still open: a row on the
+    nothing to peer or department memory, and a person's peer memory
+    answers only them (`ask_about_person` answers fully only when
+    `person_id` is the verified asker; `/memories/people` and
+    `/conclusions` show each caller only their own entry, the principal
+    included), unless they turned on "Share my work style with the team"
+    (Settings → About you, `history_work_style_sharing`, a team member in a
+    team workspace, off by default): then a verified principal or teammate
+    (never an inbound email, unverified chat or unattended run) may ask how
+    they work, the question wrapped in `people_tools.WORK_STYLE_FRAME` (role,
+    focus, how they like updates, working style; no health, family,
+    personal life or quotes; prompt guidance, not a filter) and
+    `target_person_id` refused; off a contacts-reachable turn, a question or
+    answer naming a contact (`_names_a_contact`) is refused or withheld. Not shared answers `shared: false` with the
+    same note whether or not anything is known. Still open: a row on the
     principal's own turn that names a contact some other way than their
     address, full name, person id or chat id (a first name, a nickname)
     is not recognised and stays readable by everyone.
@@ -4731,7 +4838,7 @@ chat:
   sse_event_types:
     - "chunk — one text delta from the assistant response stream. Fields: type, content, session_id."
     - "thinking — keepalive emitted at the start of EVERY tool-use round, not just specialist ones. Fields: type, session_id. It carries no tool information, so the UI uses it purely as an in-flight boolean and takes the wording from the `activity` event that immediately precedes it. It used to be the sole driver of a hardcoded 'Consulting specialists…' string, which is why an MCP or calendar round looked like a specialist fan-out."
-    - "activity — names the tool round that is in flight. Fields: type, label, tool, iteration. Emitted once per tool-use iteration, always immediately before `thinking`, so an ordered consumer has the label before it turns its indicator on. `label` is present-progressive, already ends in an ellipsis, and is capped at 60 chars for the one-line indicator — render it verbatim. `tool` is the canonical tool behind the label; for MCP `call_tool` it is the UNDERLYING tool name (matching the `action_taken` convention), sanitized and truncated to 48 chars because it is model-authored text bound for the DOM. Labels come from `openexecutive.orchestrator.activity_labels._LABELS`; an unmapped tool falls back to 'Working…' rather than going silent. A mixed round collapses to ONE label by priority rank (`_PRIORITY`), never by joining clauses — the indicator is a single muted line. Rank 0 is `consult_specialist`, so a round containing a real fan-out always renders the generic 'Consulting specialists…' and NEVER names an individual specialist (the one-voice invariant). Ephemeral: unlike `action_taken` it is progress only and is never persisted with the assistant message."
+    - "activity — names the tool round that is in flight. Fields: type, label, tool, iteration. Emitted once per tool-use iteration, always immediately before `thinking`, so an ordered consumer has the label before it turns its indicator on. `label` is present-progressive, already ends in an ellipsis, and is capped at 60 chars for the one-line indicator — render it verbatim. `tool` is the canonical tool behind the label; for MCP `call_tool` the label comes from `orchestrator/tool_labels.py` in plain words (never the raw name) and `tool` is the UNDERLYING tool name (matching the `action_taken` convention), sanitized and truncated to 48 chars because it is model-authored text bound for the DOM. Labels come from `openexecutive.orchestrator.activity_labels._LABELS`; an unmapped tool falls back to 'Working…' rather than going silent. A mixed round collapses to ONE label by priority rank (`_PRIORITY`), never by joining clauses — the indicator is a single muted line. Rank 0 is `consult_specialist`, so a round containing a real fan-out always renders the generic 'Consulting specialists…' and NEVER names an individual specialist (the one-voice invariant). Ephemeral: unlike `action_taken` it is progress only and is never persisted with the assistant message."
     - "phase — committee phase transition (drafting | reviewing | finalizing) when committee_review=true. Fields: type, phase, session_id."
     - "committee_critique — severity preview from a committee reviewer. Fields: type, reviewer, severity."
     - "action_taken — emitted whenever the Executive's tool-use loop completes a side-effecting tool call. Fields: type, tool, summary (≤80 chars, human-readable), target (person / channel ref / resource), link (optional in-app path the UI drills into), iteration. See `openexecutive.orchestrator.action_chips.SIDE_EFFECTING_TOOLS` for the canonical instrumented set; read-only tools (consult_specialist, lookup_person, list_people, search_skills, load_skill, search_tools, web_search, ask_about_person, list_workflows) never emit this event. The chip is suppressed when the handler returned an error payload — no green ✓ over a red outcome."
@@ -4945,6 +5052,25 @@ chat:
     audit log remains the independent durable record (every
     side-effecting tool also emits a `tool_invocation` row).
 
+    Chips with the same summary collapse into one chip with a count
+    (`packages/ui/src/lib/actionChips.ts`); tapping a repeat, or a single
+    connected-tool chip that has a target, lists what each run looked at
+    (its `target` and `link`): a bottom sheet on a phone, a card under the
+    chips on wider screens. Saved rows from before connected tools had
+    plain names ("Called server__tool") are turned into words client-side.
+
+  connected_tool_labels: |
+    A connected (MCP) tool reaches the Executive as `call_tool` wrapping a
+    raw name like `google_workspace__search_drive_files`. Users never see
+    that name: `orchestrator/tool_labels.py` holds one table of
+    (done, doing) phrases ("Searched Drive" / "Searching Drive"), read by
+    both `action_chips` (the chip summary) and `activity_labels` (the
+    progress line), so the two always agree. An unlisted tool is turned
+    into words with its service ("Listed task lists · Google"). The chip's
+    `tool` keeps the raw name; its `target` comes from
+    `tool_labels.detail_for`: the search words, the Drive file it opened,
+    or an email subject, cleaned to one short line.
+
 audit:
   purpose: Persistent, searchable record of valuable events. Separate from episodic memory (which biases future LLM behaviour) — audit is for humans to inspect what the system did.
   db: ./episodic_memory.db (shares the SQLite file used by episodic/alerts/cache — one file to look in)
@@ -5071,6 +5197,11 @@ audit:
     - delegation_reply_closed — the reconciler (or a Send that found it settled) closed a card Gmail settled. details carry person_id, decision_id and the reason (expired, sent_in_gmail, draft_deleted, draft_gone, you_replied, thread_gone). Always private.
     - delegation_handle_it_changed — a person changed Handle it for me via PUT /delegation/handle-it (or it went off with the inbox watcher). actor "user"; details carry person_id, enabled and mode. Always private.
     - delegation_reply_handled — Handle it for me sent an inbox reply on its own. details carry person_id, decision_id, thread_id, sent_message_id and recipient_count, or confirmed_later from the reconciler. Always private.
+    - delegation_reply_allowed — Send + allow in training: the person allowed replies to a sender (or follow-ups to those people) after sending one. details carry person_id, decision_id, allowed_id and setting. Always private.
+    - delegation_example_kept — Drafts in training: a reply the person changed in their mailbox and sent was kept as how they write to that person. details carry person_id, decision_id and allowed_id. Always private.
+    - delegation_actions_allowed / delegation_actions_handled / delegation_actions_held — Suggested actions in training: Approve + allow allowed those actions; a card of allowed actions was carried out on its own (details.outcomes); or it waited after all (details.reason). Always private.
+    - delegation_training_changed — a person put Act as me settings in or out of training (PUT /delegation/training). details carry person_id and each setting changed. Always private.
+    - delegation_learned_removed — a person removed something Act as me had learned (DELETE /delegation/learned/{id}). details carry person_id and allowed_id. Always private.
     - take_the_lead_changed — a Take the lead switch, Ask first switch or company rule changed (PUT /take-the-lead, its rules, PUT /delegation/take-the-lead). actor "user"; details carry the scope and what changed.
     - delegation_reply_sent — the person tapped Send and their draft went, exactly as it was in Gmail. details carry person_id, decision_id, thread_id, sent_message_id, recipient_count and edited, or confirmed_later when the reconciler found an unconfirmed send had gone. Always private.
     - grounding — unattended prose that named people or figures its inputs don't hold (briefing/grounding.py). One row per brief or digest that held back lines or used its repair call (details — surface, kind, mode, repaired, cited, names_bad, figures_bad, up to 5 held-back lines cut to 200 chars), per refused outward tool call in the reflection (tool, names_bad, figures_bad, a 200-char preview), per reflection flag section filtered, and per triage / review rewrite it replaced. actor=executive; private when the brief read the principal's private rows or the alert is private. In `report` mode the rows are written and nothing is changed — the way to measure false positives before enforcing.
@@ -6269,6 +6400,218 @@ workflows:
     form editor is `/jobs/new?edit=<name>&mode=advanced`; "Edit details"
     from an edit conversation opens `?edit=<name>&designer=<id>`, takes the
     current is_active from the stored workflow, and saves with PUT.
+
+    Step scripts (`run_script`, workflows/step_script.py): an action step is
+    also offered `run_script` (unless WORKFLOW_STEP_SCRIPTS=false) so the
+    agent can write one short Python script for repetitive work instead of a
+    model turn per call. It runs in Monty (pydantic-monty, a sandboxed
+    interpreter for model-written code) in a worker process per script,
+    stepped from the event loop with AsyncMonty feed_start/resume: each call
+    to an undefined function pauses the worker and is answered by
+    action_step._StepCalls.call, the same path as a direct tool_use
+    (allowlist — a name outside it is refused AND audited —, a budget: script
+    calls spend _StepCalls.script_call's own, 10x max_tool_calls capped by
+    WORKFLOW_SCRIPT_MAX_CALLS (default 500), not the 1-50 direct budget,
+    TargetPolicy with held writes returning {"status": "held"}, one
+    workflow_tool_call audit row per call), plus a `run_script` row. The
+    step's tools are identifier-mapped functions, plus call_tool(name,
+    arguments); OS calls get Monty's refusal; no files, network, env,
+    subprocess or third-party imports. Because the script is driven in the
+    step's own task, cancelling the run (or the wall clock) stops the worker
+    and the in-flight call together, and each call's progress/held events
+    reach the engine as they happen (run_script is an async generator). No
+    threads. Limits: execution time (excludes waiting on tools), memory,
+    recursion, a max_suspensions backstop above any step budget, wall clock,
+    script size; printed output past its cap is dropped, not fatal.
+    Each script yields ("stats", {calls, duration_ms}) before done; the
+    run_script audit rows (chat kind: script, workflow tool: run_script)
+    carry them, and AuditLogger.usage_summary adds them up as `scripts`
+    (scripts, ok, calls, turns_avoided = sum(calls - 1), duration_ms,
+    in_workflows) for the Token usage page. Actions taken collapses repeats. Results
+    and errors list the calls the script made, so a model fixing a script
+    that failed partway does not repeat writes that already ran. Scripts are
+    never stored; definitions stay data, not code. The workflow designer's
+    prompt keeps per-item work in ONE action step (items spelled out in its
+    goal) and never lists run_script; validate_definition rejects a step that
+    lists it, so the designer's repair turn removes it.
+
+    Chat scripts may also call the Executive's own tools in
+    step_script.CHAT_OWN_TOOLS (reads; create/ack alerts; open loops; goals;
+    watch list; schedule_followup; message_person; upsert_person) when the
+    turn is offered each (turn_handlers minus withheld_tools), via the
+    turn's handler (Take the lead gated_handlers on a leading run), with the
+    usual chip and a kind: skill, via: run_script audit row. Excluded:
+    broadcasts, calendar, memory/skill edits, workflows, research, documents,
+    Act as me. The cached persona gets the constant TOOL_BUILDING_ADDENDUM
+    (mcp_enabled and CHAT_SCRIPTS): build a tool rather than say there is
+    none, check list_saved_tools first, keep what recurs, and never say
+    "script"/"code" to people. People see saved tools as "Custom tools"
+    (Settings -> Advanced -> Custom tools, guide section custom_tools) and
+    the usage summary as "Done in one go".
+    A turn's chat scripts share CHAT_SCRIPT_MAX_CALLS (default 200) calls,
+    counted in Executive._stream_agent_loop's script_counts, plus per-turn
+    caps on own tools (step_script.CHAT_OWN_TOOL_CAPS: message_person 10,
+    upsert_person 25, create_alert 50). A CancelledError mid-call writes a
+    cancelled audit row before re-raising. TOOL_BUILDING_ADDENDUM is gated
+    on cache_manager._chat_scripts_on (setting + step_script.available()).
+    Worker slots: run_script acquires a per-event-loop asyncio.Semaphore of
+    SCRIPT_MAX_WORKERS (default 2) inside the wall clock before starting
+    AsyncMonty, released in a finally (also on aclosing/cancel). Measured:
+    a worker is ~8 MB RSS, exists only while its script runs, and none are
+    left after timeouts, memory-cap kills or cancellation.
+    Workflow approval of kept tools: saved_tools.workflow_version (NULL
+    until the owner turns it on; set_workflows(name, version) sets the version
+    the owner named, which must exist, so a version saved while they were
+    reviewing is never approved by accident; set_enabled(False) clears it).
+    Workflow steps use get_for_workflows / list_for_workflows (that version,
+    enabled only); chat uses the current version. A newer save never moves
+    workflow_version; pruning keeps it. PUT /saved-tools/{name}
+    {workflows: true} needs take_the_lead._provably_theirs (409 otherwise);
+    turning off doesn't. Prompted by the automated review: a principal turn
+    that read an injected email could keep an attacker-shaped tool that a
+    workflow then ran unattended.
+    Python jobs (workflows/python_job.py, run_python_job): Pyodide 314 in Deno,
+    one process per job (asyncio.Semaphore(1)), deno run --no-prompt --quiet
+    --no-remote --allow-read=<PYTHON_SANDBOX_DIR>,<worker>, env stripped to
+    PATH/HOME/DENO_DIR. Spike: under plain Node a job read all env vars, host
+    files and the network; Node --permission can't load Pyodide; Deno denied
+    env, fs, writes, run and net (incl. 127.0.0.1 and 169.254.169.254).
+    Job JSON on stdin {code, files b64, pyodide dir, wheels}; result on
+    stdout. Inputs: Knowledge files by plain name (company/docs) and
+    text_files; outputs kept 7 days in company/python_jobs/<uuid>/ and served
+    by GET /python-jobs/{id}/{name} (principal only). Image: npm pyodide +
+    deno, compiled wheels from cdn.jsdelivr.net/pyodide/v<ver>/full verified
+    by lock sha256 (docker/pysandbox-fetch.mjs), pip-pinned pypdf/openpyxl,
+    build smoke runs a job. Measured: ~2.2 s start, 4 s PDF split (214 MB),
+    11 s pandas+matplotlib (446 MB); image +~130 MB.
+    Security review fixes: memory capped by RLIMIT_DATA (PYTHON_JOB_MEMORY_MB,
+    default 1536; 1 GB broke pandas) plus --max-old-space-size=256 and
+    --wasm-max-mem-pages=12288; worker caps output at 20 files / 25 MB and
+    the API's stdout read is capped, sizes checked before base64 decoding;
+    withheld on unattended passes (UNATTENDED_WITHHELD_TOOLS); downloads are
+    no-store; npm deps via package-lock + npm ci, pip wheels --require-hashes;
+    links URL-encode the file name.
+    Documents: python-docx, python-pptx, fpdf2 (2.8.8; 2.8.9 was a week old),
+    XlsxWriter and defusedxml are pip-pinned with hashes; their compiled deps
+    come from Pyodide (lxml, pillow, fonttools, typing-extensions), which
+    loadPackagesFromImports can't infer for non-Pyodide packages, so the
+    worker's NEEDS map loads them per import (find_imports). One job writing
+    a docx, a pptx with a chart, a PDF table and an xlsxwriter chart: 7 s.
+    Second review: Deno writes v8/dep-analysis caches to DENO_DIR regardless
+    of job permissions and a job could feed it data: modules (330 MB in one
+    job, never pruned) -> per-job tempfile.mkdtemp DENO_DIR removed after the
+    job, --no-code-cache, _prune drops the old company/python_jobs/.deno.
+    stdout past the cap now kills at once (gather used to wait on stderr EOF
+    while Deno blocked on the full pipe); worker Deno.exit(0) after its result
+    so a leftover Worker can't hold the slot. Resources: preexec sets
+    oom_score_adj=1000 and nice 10 (2 GB shared-cpu machines: a ~900 MB worst
+    job plus the API); kept results capped at 200 MB total, oldest first.
+    Recheck: job code could undo the worker's Deno.exit or close stdout and
+    keep running, so the API reads only the result line (one line of JSON)
+    and kills the process then; the exit code no longer counts once a result
+    parsed. _prune runs under a lock and treats a vanished folder as gone
+    (concurrent prunes raised FileNotFoundError and lost the reply's links).
+    Remote runner (PYTHON_JOB_RUNNER_URL + PYTHON_JOB_RUNNER_KEY): run_job
+    POSTs {code, inputs, files b64, max_*, timeout_s, memory_mb} with the key
+    as a bearer token and no redirects; the reply is read up to
+    _MAX_STDOUT_BYTES and only result/error/printed (length-capped), files,
+    skipped and usage {peak_mb, cpu_ms} are kept; HTTP errors, timeouts and
+    unreadable replies become job errors. available() is true with a runner
+    and no local sandbox. URL must be https, or http to localhost/.internal/
+    .flycast, and needs the key (settings refuse a URL without one). Result
+    files must be str -> valid base64 (b64decode validate=True) or the job
+    errors, so a bad runner reply can't raise in the handler. The runner is
+    trusted to isolate jobs.
+    PYTHON_JOB_EXTRA_LIBRARIES (with a runner only; comma-separated package
+    names, each with an optional "(import <module>)", at most 300
+    chars; anything else is dropped with a warning, not fatal, since it may be
+    pushed to machines that must boot) is appended to the tool description by
+    python_job.offered_definition (cached per process, so the tool prefix
+    stays stable) for chat, research and reflection toolkits alike; the description otherwise says only the listed libraries
+    are installed, and the model refused jobs needing scipy and the like. The
+    workflows group label says jobs work with or without files: "on files"
+    alone made the model refuse jobs on data typed into the chat.
+    Kept jobs, attachments, metering: run_python_job takes save_as +
+    description (kept as saved_tools kind 'python', tools [], code as the
+    script; only when the job worked) and tool + inputs to run one again
+    (record_run with calls 0). Python tools are chat-only: _SELECT_WORKFLOW
+    filters kind 'script', set_workflows raises, PUT /saved-tools 409s,
+    run_script refuses them. attachment_files: POST /chat/upload binds the
+    uploads as sent (workflows/turn_files.py ContextVar, safe names, '(2)' on
+    repeats) for the whole SSE turn, so the model no longer retypes an
+    attachment (~$0.30 per 100 KB of output tokens) and can split an attached
+    PDF. inputs reach the code as a Python dict global. Each job logs a
+    python_job audit row (ok, duration_ms, cpu_ms and peak_mb from
+    /proc/<pid> just before the kill, bytes, attachments, saved_tool); the
+    worker now reads its job as one stdin line and waits on stdin after its
+    result so the API can measure it. GET /audit/usage python_jobs sums them
+    plus the cache_event usage of the turns that ran a job.
+    Fan-out nudge: after a round whose results hold a list of >= 5 items
+    (step_script.lists_many: top level or up to two levels into a JSON
+    object, not an error), with run_script offered and unused that round
+    (chat: not withheld, not mail-touched), the constant FANOUT_HINT is added
+    as a text block to that round's user message — once a turn in chat, once
+    a step in workflows. The addendum and run_script description state the
+    cost: every round re-reads the whole conversation.
+
+    Chat scripts: the Executive's chat is offered the same `run_script` tool
+    (step_script.CHAT_TOOL_DEFINITION, a constant so the cached tool prefix is
+    stable) whenever the gateway runs, unless CHAT_SCRIPTS=false. With no
+    allowlist (tools=None), any MCP-shaped function name (server__tool) or
+    call_tool(name, arguments) is a call by that exact name; the gateway
+    decides what may run (its discovered set — search_tools results, kept for
+    the gateway's process-wide session, not per conversation — its deny-list
+    and recipient gates). Dunder or one-sided names never become calls. Each
+    call is dispatched as a call_tool —
+    through take_the_lead.gated_call_tool on an unattended leading run — and
+    gets the same action chip and tool_invocation row (details.via =
+    run_script; ok: false + FAILED when it raised) as it happens, plus one
+    kind: script row with the source and result. Wall clock = half of
+    CHAT_STREAM_TIMEOUT_S (30-600 s), enforced per await so it holds although
+    the chat route drives the stream one task per step; contextlib.aclosing
+    closes the script and its worker when a turn stops. Held results
+    ({status: held | waiting_for_approval}) are marked in the returned calls
+    list. Not offered on a turn private to the principal
+    (in PRIVATE_TURN_WITHHELD_TOOLS; refused there if emitted anyway), and
+    withheld whole by the Act as me lockdown (MAIL_TOUCHED_WITHHELD_TOOLS).
+
+    Saved tools (workflows/saved_tools.py): run_script takes save_as +
+    description with a new script; a script that SUCCEEDS is saved with the
+    sorted set of tools it actually called (a failed one never is), and
+    run_script(tool=<name>, inputs={...}) runs the saved script with
+    `inputs` bound as a dict (exactly one of script/tool; save_as with tool
+    is refused). Only the principal's own turns save (run_script_tool
+    may_save): chat passes may_save when principal_only_withheld(session) is
+    empty (principal speaking on a verified interactive surface, not email)
+    and the run is attended; workflow steps pass False and their run_script
+    schema has no save_as/description. A saved tool runs with the authority
+    of whoever runs it, so its author must be at least as trusted as any
+    runner (an inbound email or teammate could otherwise plant or re-version
+    a tool the principal's turns and workflows then run). Running a saved
+    tool is likewise limited (may_run_saved): workflow steps and the
+    principal's own turns only; list_saved_tools is in
+    content_trust.PRINCIPAL_ONLY_TOOLS (not offered, refused if emitted), so
+    a stranger's email can't list the principal's automations or run one
+    with chosen inputs. Descriptions are normalized to one line (Cc/Cf to
+    spaces, whitespace collapsed); every save is audited saved_tool_changed
+    with actor executive. Beyond that,
+    saving is auto-approved by design: a saved tool runs through
+    whatever context calls it (step: _StepCalls.call; chat: gateway
+    call_tool and its gates), and a workflow step runs one only when
+    saved.tools is a subset of step.tools (else an error naming
+    missing_tools). Steps see usable saved tools in their run_script
+    description (step_script.tool_definition(tools, saved)); chat gets the
+    constant list_saved_tools tool (summaries, never scripts). Tables
+    saved_tools / saved_tool_versions / saved_tool_runs in the episodic DB:
+    a save with changed description, script or tools is a new version that
+    becomes current; an identical save changes nothing; a turned-off tool
+    stays off when the model saves a new version; runs keep the newest 200
+    per tool; at most 200 tools. Owner-only routes /saved-tools (list,
+    detail with script/versions/last 20 runs, PUT enabled, POST rollback;
+    audited saved_tool_changed) back Settings -> Advanced -> Saved tools.
+    SAVED_TOOLS_ENABLED=false stops saving and running everywhere.
+    list_saved_tools is allowed under the Act as me lockdown (local read)
+    and withheld on a turn private to the principal, like run_script.
 
     Action steps (workflows that act): `ActionStepSpec` {goal, tools,
     max_tool_calls 1-50, default 20} in dynamic_models. `tools` is an allowlist
@@ -7778,8 +8121,12 @@ integrations:
     result is rewritten from base64 to the file's text
     (_onedrive_content_as_text: drive_sync._extract on PDF / docx / xlsx /
     txt / md / csv, 20 MB, 200k chars; any other type gets a note pointing at
-    the ?format=pdf target). search-onedrive-files is in
-    PRIVATE_TURN_MCP_TOOLS beside search_drive_files. Not yet in
+    the ?format=pdf target). search-onedrive-files, list-drives,
+    get-drive-root-item, list-folder-files and get-drive-item are in
+    PRIVATE_TURN_MCP_TOOLS beside the Google Drive reads, and download-bytes
+    runs on a private or mail-touched turn only with a OneDrive content
+    target (schedule_tools.is_onedrive_file_read; mail attachments stay out,
+    as Gmail's do). Not yet in
     memory.drive_reads (Google only).
     OneDrive sync token: `ms365-mcp-launch.sh --access-token` (only argument
     allowed; after the placeholder scrub and cache-path defaults) execs
@@ -8129,8 +8476,12 @@ integrations:
     exact allow-list: the Google Workspace reads the code already uses or
     documents (search_gmail_messages and get_gmail_message_content from the
     email poller; get_events, list_calendars and query_freebusy from the
-    calendar surface below and the decisions route; search_drive_files, a
-    read in the Drive gate's tests) and the two gated Gmail tools
+    calendar surface below and the decisions route; the Drive, Docs and
+    Sheets reads search_drive_files, get_drive_file_content,
+    list_drive_items, search_docs, get_doc_content, list_docs_in_folder,
+    list_spreadsheets, get_spreadsheet_info, read_sheet_values and
+    list_sheet_tables, each marked read-only by workspace-mcp and run with a
+    read-only scope) and the two gated Gmail tools
     (send_gmail_message, draft_gmail_message), which the Gmail gate narrows
     to the principal on such a turn. Not a server prefix: at the complete
     tier much of Google Workspace reaches people with no recipient check —
@@ -9127,7 +9478,7 @@ delegation:
     NOT part of the offer (the handler checks it per call), so the cached
     tool prefix never flips when a token lapses. speaker_text is pinned
     because the turn's message joins the session history only after the
-    turn, and a new email may go to an address typed this turn — outside any
+    turn, and a draft's address typed this turn needs no check — outside any
     tag block an adapter added (settings.typed_addresses drops the
     <outbound_reply_context> backstory hydrated into a DM, and counts none
     at all when the message carries an attachment — an "[Attached: …]"
@@ -9164,12 +9515,153 @@ delegation:
     never Reply-To (flag reply_to_ignored), with cc only on reply_all (minus
     the writer and the sender; beyond 10 trimmed and flagged cc_trimmed);
     References from gmail.references_header — whole ids only, the parent
-    last, the oldest after the root dropped to fit one header; a new email goes only to roster people
-    (contacts only when contacts_reachable_now) or addresses in
-    speaker_text. Result {status drafted, draft_id, gmail_link, to, cc,
+    last, the oldest after the root dropped to fit one header; a new email
+    or a forward may go to any well-formed address (_new_recipients): it is
+    only a draft in their own mailbox, and they see who it is to before
+    they send it. An address neither on the roster (contacts only when
+    contacts_reachable_now) nor typed in speaker_text comes back in
+    not_in_people with check_address, and the persona names it for them to
+    check. Result {status drafted, draft_id, gmail_link, to, cc,
     subject, preview, flags, open_questions, note}; the link is built from a
     fixed https://mail.google.com/ prefix and the note marks the preview as
     data. action_chips gives it a chip only for status drafted.
+  read_before: |
+    my_email_read_before (orchestrator.mail_read_tools) lists the threads
+    read_my_email opened for the same person before, in any conversation, so
+    a later one reopens the email with read_my_email instead of asking them
+    to search again (where, never what). delegation.mail_reads keeps one row per (person_id,
+    mailbox, thread_id) in delegation_mail_read: subject and first sender as
+    one line each (160 chars), the mailbox address and read_at; never text,
+    attachments or recipients. Listed only for the speaker and the mailbox
+    open now, newest first, optional words matched against subject and
+    sender; rows older than RETENTION (30 days) are never listed and are
+    pruned on the next write, MAX_ROWS (200) per person, and PUT /delegation
+    with enabled false deletes the person's rows. It runs through _run like
+    the other reads (a search slot, _open_mailbox, touched_mail) and its
+    result carries the data-not-instructions note. recording is best-effort:
+    a failed write never fails read_my_email. The Act as me addendum says the
+    person's mailbox is not the Executive's: search theirs for mail sent to
+    them and never fall back to the Executive's own mailbox (it holds mail
+    private to the principal, and any speaker may be asking).
+  reads: |
+    search_my_email, read_my_email, read_my_email_attachment and
+    my_email_awaiting_reply (orchestrator.mail_read_tools) read the
+    speaker's own mailbox from chat.
+    They sit in DELEGATION_TOOLS / DELEGATION_TOOL_HANDLERS beside
+    ghostwrite_email, so they are offered, re-checked (_writer: the pin and
+    the verified surface) and locked down exactly as it is, and every call
+    is in DELEGATION_TOOL_NAMES (private rows, the round counts as touched).
+    Read-only: nothing is changed, labelled, drafted or sent. Each takes a
+    per-turn slot on the pin before the first await — 10 searches
+    (TurnDelegation.searches; my_email_awaiting_reply counts as one), 20
+    thread reads (threads_read) and 5 attachment reads (attachments_read) — then _open_mailbox (shared with
+    ghostwrite_email) sets touched_mail, marks the conversation
+    mail_private and runs gmail_status. search_my_email: a Gmail-style
+    query through the client's search_threads (Outlook translates it), or
+    with no query the newest message of each thread that reached their
+    Primary/Focused inbox in the last 3 days (inbox_message_ids +
+    get_message); summaries only (thread_id, subject, from, date), each on
+    one line. read_my_email: the thread's last 10 non-draft messages, each
+    sender's new text (sender_new_text, plain) cut to 4000 characters; a
+    message someone else wrote is wrapped in its own untrusted_content block
+    (content_trust.wrap_untrusted, source email), the speaker's own (SENT and
+    from their address, threads.mine) is marked Yours outside any block.
+    my_email_awaiting_reply: their list_sent (40) from the last 14 days, at
+    least a day old, to 1-10 people besides themselves and the Executive
+    (follow_ups.recipients), whose thread still ends with it. Results carry
+    a note that other people's words are data. Audit input and result are
+    redacted (my_email is a sensitive tool-name substring).
+    Attachments: read_my_email lists each shown message's files (message,
+    message_id, index, name, type, size_kb) — Gmail's from the message
+    (gmail._attachment_parts: parts naming a file, but an image with a
+    Content-ID the HTML shows in place), Outlook's from list_attachments only
+    when hasAttachments (Graph /attachments, isInline left out).
+    read_my_email_attachment(message_id, index) lists afresh, refuses a type
+    outside READABLE_SUFFIXES (pdf, docx, doc, xlsx, xlsm, csv, md, txt, rst)
+    or over 20 MB before downloading, then attachment_bytes looks the
+    provider id up on that fetch (Gmail's attachment id changes per fetch;
+    a small Gmail part's data is inline) and reads it.
+    attachments._extract_text (isolated worker for pdf/doc/xlsx, scanned PDFs
+    converted under the inbound page budget) and format_attached_text (an
+    untrusted_content block, source attachment, 15,000 characters). Never
+    build_attachment_output: that would add the person's private file to the
+    company knowledge (_schedule_ingest).
+    The lockdown refuses tools, not reply text, so the ways reply text
+    leaves without a click are closed where it is shown: Message.tsx loads
+    only root-relative images (lib/markdownImages.loadsInline; any other is
+    a link), Telegram sendMessage sets link_preview_options.is_disabled,
+    Slack's reply say passes unfurl_links/unfurl_media False, and every
+    Discord reply send passes suppress_embeds=True.
+  forward_and_remind: |
+    ghostwrite_email takes forward (a thread id) with to: a draft forwarding
+    the thread's latest non-draft message, intent the note above it (the
+    ghostwriter writes the note only), recipients by _new_recipients
+    (any address; not_in_people names ones to check), subject "Fwd: ...". DraftSpec.forward
+    (gmail.ForwardOf: message id, header block, the sender's own words).
+    Gmail: build_raw quotes the header and text under the note and attaches
+    DraftSpec.attachments; create_draft fills them from the original
+    (attachment_bytes), at most FORWARD_MAX_FILES 10 and FORWARD_MAX_BYTES
+    20 MB, counting the rest in CreatedDraft.skipped_attachments (flag
+    attachments_left_off). Outlook: POST /messages/{id}/createForward with
+    the note as comment and only recipients and the ghostwritten property
+    in message; the body is never patched.
+    remind_me(text, when) (orchestrator.reminder_tools) is in
+    DELEGATION_TOOLS but not MAILBOX_TOOL_NAMES: it opens no mailbox and
+    never sets touched_mail/read_mail. delegation.reminders.clean_text makes
+    the text one line, replaces anything a chat app could link (a URL of
+    any scheme, an address, a domain-like word, host:port, IPv4) with
+    [link], caps 300; when
+    is read in the workspace timezone (a date alone is 9:00), at least a
+    minute ahead and within a year. Caps: TurnDelegation.reminders 5 a turn,
+    MAX_PENDING 25 waiting; refused when delivery_order finds no channel.
+    Stored in delegation_reminders (person_id, text, due_at, created_at,
+    claimed_at, sent_at, cancelled_at), never scheduled_actions. The
+    scheduler hook _maybe_send_reminders -> reminders.maybe_send (once a
+    minute) -> send_due claims each due row (claimed_at compare-and-set),
+    drops it when over two days late, and sends "Reminder you set on <date>:
+    <text>" through
+    deliver_to_person to the setter alone, private audit rows
+    (delegation_reminder_set / _sent). In MAIL_TOUCHED_ALLOWED_TOOLS: it
+    reaches only the speaker, as fixed text, and nothing runs at fire time.
+    due_at is stored in UTC so _due's string comparison is in time order.
+    A due reminder whose person is outside their availability (quiet hours,
+    leave; OUTBOUND_RESPECT_QUIET_HOURS) is left unclaimed (_held) and goes
+    when it ends; the guard would otherwise suppress it after the claim.
+    The Slack and Discord DMs it may ride turn link previews off
+    (unfurl_links/unfurl_media False; Discord flags SUPPRESS_EMBEDS). A
+    forward's subject never goes into the composer's intent.
+  approval_cards: |
+    orchestrator.action_card_tools.propose_actions (in DELEGATION_TOOLS and
+    MAIL_TOUCHED_ALLOWED_TOOLS; not a MAILBOX_TOOL_NAMES tool) leaves the
+    speaker a card of up to 5 actions: invite (create_calendar_event input,
+    roster attendees), message (message_person: person_id + text as sent),
+    add_contact (principal's cards only). delegation.action_cards.check
+    validates each (roster, not archived, contacts only on the principal's
+    card, not themselves, times ahead) at propose and again at approve. A card
+    is a delegation_actions decision, approver = speaker, approver_only (404 to
+    everyone else, the principal too), never an alert; same actions still
+    waiting dedupe to one card. Caps: TurnDelegation.action_cards 3 a turn,
+    OPEN_CARDS_MAX 25 waiting, CARD_TTL 7 days. GET /delegation/actions lists
+    them. POST /decisions/{id}/approve (edits.only = indexes): caller_refusal
+    (signed caller is the card's person), Act as me on, not expired, then
+    claim_for_execution (once), each ticked action run as stored with no model
+    call in Session(unattended=True) under rows_for_person(person) (audit rows
+    theirs, no activity-rail row), grant_contact_egress for the principal;
+    message via schedule_tools.message_person(alert_fallback=False), so no
+    team-visible alert; approve also needs can_delegate.
+    An invite runs inside calendar_tools.approved_by(person): the meeting gate
+    books it now when its approver is that same person, else proposes to its
+    approver as usual (no authority widened). finish_execution keeps
+    final_payload.results (done | waiting | failed | skipped). Reject does
+    nothing else. Audit: delegation_actions_proposed / _approved / _dismissed,
+    private, kinds and outcomes only. Approved on the web only (chat apps
+    have no buttons); a card can come from any Act as me surface. In the web
+    chat the card shows under the reply that left it: the propose_actions
+    chip carries decision_id (action_chips), and ChatActionCards renders it
+    from GET /delegation/actions while it waits. There is no "always
+    allow" for contacts: a standing allowance would let mail-planted text
+    add its sender and email them in the same turn without a tap, so each
+    card still needs its own tap.
   ghostwriter: |
     delegation.ghostwriter.compose — the only text the Executive produces
     under someone else's name. System = the constant GHOSTWRITER_PROMPT +
@@ -9355,11 +9847,11 @@ delegation:
     with its owner, binding one to an ownerless row and refusing to read if
     that fails or the conversation is someone else's), after which only the
     session's owner may open it (chat._session_access) and working-style
-    learning skips it. Every later turn in it starts touched
+    learning skips it. Every later turn in it starts touched_mail
     (settings.pin_turn_delegation reads the flag, failing closed): the
     turn's rows are the owner's, and so are the web chat's rows before it
     (the inbound chat_turn and the knowledge_retrieval row); no memory pass
-    runs and the lockdown holds, even when the answer comes from history
+    runs, even when the answer comes from history
     alone; anyone else speaking there is not offered Act as me. A channel
     adapter's own pre-turn rows (integration_inbound, and the retrieval
     Discord and Telegram run first) are written as before. The inbox
@@ -9367,32 +9859,70 @@ delegation:
     owner sees counts only: drafts and sends in 30 days, inbox on or off.
   lockdown: |
     Once a turn has read the principal's own mail — from the round that
-    calls ghostwrite_email, since a round's tools run together — nothing that
-    reaches anyone else runs until the turn ends (delegation.lockdown): no
-    message, post, broadcast or invite, no queued or started work
-    (schedule_followup, suggest_workflow, run_workflow, save_workflow,
-    research), no fetch of an outside address (read_document,
-    load_mcp_server, the watchlist tools), and no write to state others or
-    later turns read (the roster, goals, skills, alerts, open loops,
-    decisions, standing facts, artifacts). Through MCP call_tool only the six
-    Google Workspace reads stay (MAIL_TOUCHED_MCP_READS, a subset of
-    PRIVATE_TURN_MCP_TOOLS). Every tool the Executive can be offered is in
-    exactly one of MAIL_TOUCHED_ALLOWED_TOOLS / MAIL_TOUCHED_WITHHELD_TOOLS
-    (a test fails on an unclassified one) and an unclassified name is
-    withheld. The dispatch guard in executive._stream_agent_loop refuses at
-    dispatch with a private tool_invocation row (details.refused
-    "mail_touched") and an error telling the model to offer it in a new
-    message; the offered list is unchanged, so the cached prefix is the same
-    all turn. Backstops fail closed in the send paths themselves
-    (schedule_tools._guard_outbound, which every DM and message_person goes
-    through; the broadcast, calendar, workflow, research and follow-up
-    handlers; MCPGateway.call_tool and load_mcp_server). The server-side
-    web_search stays, as on a turn private to the principal. The lockdown is
-    per turn: the principal's next message starts afresh, except in a
-    conversation that has read their mail (mail_private), where every turn
-    starts touched. The process log
-    names a refused call_tool's inner tool only when it is shaped like a
-    tool name (executive._loggable_tool, [a-z0-9_]{1,64}), else
+    calls ghostwrite_email or a mailbox read (search_my_email,
+    read_my_email, read_my_email_attachment, my_email_awaiting_reply) or
+    recall_history, since a round's tools run together — only a door to the
+    open internet or to everyone stays shut until the turn ends
+    (delegation.lockdown, MAIL_TOUCHED_WITHHELD_TOOLS): outside fetches
+    (read_document, load_mcp_server, add/tune_watchlist_entry,
+    run_executive_research, any call_tool outside PRIVATE_TURN_MCP_TOOLS),
+    scripts and library jobs (run_script, run_python_job), workflows
+    (suggest_workflow, run_workflow, save_workflow: they run later,
+    unattended, and may fetch or script), posts to everyone
+    (send_department_message, send_company_broadcast, create_alert) and
+    changes to who is on the roster or holds authority (archive_person,
+    set_department_head, resolve_roster_request), and text that steers
+    later turns (schedule_followup, whose intent runs unattended as a
+    prompt when due; create_goal, update_department_goal and
+    record_decision_outcome, shown to every later turn). The
+    risk is prompt injection: anyone can put text in the inbox, and a URL
+    could carry what the mail said anywhere. Everything else runs, because
+    it is fenced on its own: DMs and message_person reach only the roster
+    (_guard_outbound), calendar invites name attendees by person id, the
+    Executive's Gmail / Outlook send through call_tool checks every
+    recipient against _roster_allow_set, remember_fact and update_company_profile keep only the
+    speaker's own words, and playbook changes are drafts a person approves.
+    upsert_person runs only for a contact the speaker named this turn
+    (lockdown.speaker_named_contact: kind contact, only name, role, email,
+    leave and response fields; a word of the name in their own words, in
+    a message that asks to add, save or change someone; a new contact's
+    address one they typed or one that sent the mail this turn read
+    under the contact's name (TurnDelegation.mail_senders, noted by
+    mail_read_tools; lockdown._sent_by), never one the
+    mail's text only mentions; on an
+    update the stored name too, and a changed address must be one they
+    typed), because the roster is what every send check trusts. Any other
+    refused upsert_person gets lockdown.CONTACT_REFUSAL, which points the
+    model at an add_contact approval card instead of asking them to type
+    the address. What an
+    email itself asks for (a meeting, a message, a new contact) is still
+    never done on its say-so: the persona sends it to propose_actions.
+    Every tool the Executive can be offered is in exactly one of
+    MAIL_TOUCHED_ALLOWED_TOOLS / MAIL_TOUCHED_WITHHELD_TOOLS (a test fails
+    on an unclassified one) and an unclassified name is withheld. The
+    dispatch guard in executive._stream_agent_loop refuses at dispatch with
+    a private tool_invocation row (details.refused "mail_touched") and an
+    error telling the model to offer it in the next message; the offered
+    list is unchanged, so the cached prefix is the same all turn. The
+    handlers that reach outside or post to everyone check again
+    (lockdown.outside_reach_refusal: research, read_document, the
+    watchlist, workflows, broadcasts, MCPGateway.call_tool and
+    load_mcp_server). Drive reads are not remembered on such a turn
+    (drive_reads.may_remember). The server-side web_search stays, as on a
+    turn private to the principal. The lockdown is per turn
+    (TurnDelegation.read_mail, set only by the tools that read the mailbox
+    or notes): the next message starts afresh, in a mail_private
+    conversation too, which stays private (touched_mail) but is not locked
+    at all. History keeps only the speaker's words and the Executive's
+    final replies, never a tool's result, and the next message is the
+    person asking again after reading that reply. (Until 2026-10 a later
+    turn held the same tools for some 20 to 30 messages while the reading
+    turn was in view, lockdown.carried_withholds; it was dropped as too
+    restrictive: a refused contact add or link in a long chat app
+    conversation stayed refused even after the person confirmed.
+    sessions.mail_read_at is still stored by mark_mail_private.) The process
+    log names a refused call_tool's inner tool only when it is shaped like
+    a tool name (executive._loggable_tool, [a-z0-9_]{1,64}), else
     "call_tool:<unlisted>": that name is the model's own text, which mail
     could steer, and the log is not private (the audit row keeps it). The
     same goes for a turn private to the principal.
@@ -9643,6 +10173,52 @@ delegation:
     Card payload source follow_up (from_email = first recipient); the
     reconciler closes it "answered" and deletes its unedited draft when
     anyone else writes in the thread.
+    In training is per Act as me setting, not a dial step (owner's ask,
+    2026-10-09): delegation.training, one delegation_training row per
+    (person_id, setting), settings replies | follow_ups | actions | drafts,
+    PUT /delegation/training (putting replies/follow_ups in or actions out
+    is narrowing and needs no signed caller; anything else does). Every
+    allowance is a take_the_lead_allowed row, feature act_as_me, person_id
+    set, key act_as_me|person:<id>|<action>|<who>: reply|<address>,
+    follow_up|<sorted addresses>, message|person:<id>,
+    invite|people:<sorted ids, self left out>, style|<address> (a kept
+    example); training.setting_of(key) labels the one learned list. Theirs
+    alone, capped per person (ALLOWED_MAX), never in learned_note.
+    Replies in training: every reply waits (handle_it_reason training)
+    unless its sender was allowed with Send + allow (POST
+    /decisions/{id}/approve edits.allow); an allowed sender's reply goes on
+    its own only while Handle it is enabled, under the dial's Rules with
+    the stranger check skipped, every other refusal check, and again at
+    send time (removed since: handle_it_off). Follow-ups in training: the
+    same with follow_up_training and follow_up_refusal skipping the
+    relation check for exactly the allowed recipients. Take the lead as
+    you lifts nothing while either is in training (turned off when they go
+    in; PUT /delegation/take-the-lead answers 409 in_training). Suggested
+    actions in training: Approve + allow (edits.allow) on a
+    delegation_actions card allows each message/invite that ran (never
+    add_contact); propose_actions then carries out a card whose every
+    action is allowed at once (action_cards.on_its_own_refusal: training
+    on, Act as me on, signing_ok, not sensitive, no link or amount, message
+    <= 1200 chars, at most ON_ITS_OWN_PER_DAY 10 actions a day, under one
+    lock; run_on_its_own claims it, gate_mode auto_execute, status
+    executed; a refusal there hand_back()s it to an ordinary card). An
+    invite run on its own skips calendar_tools.approved_by, so the meeting
+    gate decides (security review: a mail-chosen time must not be booked
+    unasked).
+    Guardrail (accepted tradeoff, review of PR 408): propose_actions runs
+    on turns that read untrusted mail, so a message carried out on its own
+    has model-written text nobody reads first. The allowance covers who
+    and what kind, never the words; the sensitive/link/amount/length
+    checks and the daily cap are what bound it, and only allowed roster
+    people can receive it.
+    Drafts in training: on Send (plain or + allow) with edits.example and a
+    draft edited in the mailbox, the sent text is kept as style|<address>;
+    training.example_for (style key first, then an older reply-key example)
+    feeds the ghostwriter's <writer_example> (style only, untrusted block)
+    for inbox replies, follow-ups and chat drafts to that one person. An
+    old dial row on mode training moves to balanced + replies and
+    follow_ups in training
+    (schema._move_training_off_the_dial).
   prompt: |
     DELEGATION_ADDENDUM (prompts/executive_persona.py, a constant naming
     nobody) follows the unchanged identity addendum in block 0 while
@@ -9756,7 +10332,12 @@ delegation:
     person by id (message_person, assign_open_loop, the Slack / Telegram /
     Discord DMs), that person's addresses and name (_targets); an id the
     People list doesn't have counts as someone new. A name rule matches
-    whole words.
+    whole words. A direct message (message_person or a Slack / Telegram /
+    Discord DM) whose only recipient is the principal skips the gate and is
+    sent (_only_to_principal): the principal is who it would wait for, so a
+    card would only ask them to approve a message to themselves. Anything
+    that reaches or acts on anyone else is checked; an unreadable roster is
+    not the principal.
     Structured only: no model reads a rule. A held action is a
     take_the_lead_action decision (principal_and_approver: only the
     principal and its approver see or resolve it) with a Today card,
@@ -9775,10 +10356,41 @@ delegation:
     take_the_lead_log feeds Recent activity (kind took_the_lead, named not
     quoted); /today/activity adds the caller's own Handle it sends
     (sent_as_you). No separate What I did list.
+    In training (the executive row's training column; Settings shows Off /
+    In training / On): an action check() lets through still waits as a
+    training hold (Hit kind "training", always the principal's, alert tag
+    take_the_lead:training) unless take_the_lead_allowed has its allowance
+    key: action + who, <feature>|message|person:<id> for any direct message
+    channel, |book|people:<ids> for exactly those attendees, |assign|,
+    |workflow|<id>, |department|<slug>, |mcp|<tool>|<file name>|<argument names> (none
+    for a connected tool with no file name or that reaches people: to/cc,
+    recipient keys, an argument named for sharing, links or access, any
+    address in it; a new argument is a different action); someone off the People list gives
+    no key (keeps asking). edits.input is the principal's alone (403). The card's payload carries
+    allow {key, label} and fields (editable_fields: message text; a
+    meeting's title, start, end, description; a task and due date).
+    /decisions/{id}/approve edits.input applies only those fields
+    (apply_edits, EditError → 422) and finishes approved_with_edit;
+    edits.allow on a training card (only) needs the principal on a provable
+    request (403) and stores the allowance with the changed fields as its
+    example (the wording fields only: text, title, description, task).
+    Owner's choice: an edit with "Do it like this next time" both
+    keeps the example and allows at once. learned_note() (training flag +
+    the examples, the principal's own edited text only) is appended to the
+    reflection and research user turns. suggestions(): training cards
+    approved unchanged SUGGEST_AFTER (3) times in 30 days and not allowed;
+    POST /take-the-lead/learned allows only a current suggestion, DELETE
+    removes one (tightening, no proof needed; the row keeps removed_at so
+    only approvals after it count toward suggesting it again). Leaving training while on is
+    loosening (provable owner). The allowed list is shared across features
+    (feature column, owner's choice: one list, a switch per feature); Act as
+    me is the second (feature act_as_me, per person, a training switch per
+    setting: see delegation).
   state: |
     delegation_settings, delegation_voice, delegation_voice_history,
     delegation_drafts, delegation_inbox_watch, delegation_inbox_messages,
-    delegation_handle_it and delegation_handled (delegation.schema.TABLES) in the episodic DB (created by
+    delegation_handle_it, delegation_handled, delegation_reminders,
+    delegation_mail_read and delegation_training (delegation.schema.TABLES) in the episodic DB (created by
     memory.episodic.initialize_db via delegation.schema.ensure_schema); per
     company — in clients.slots._BLANK_WIPE_TABLES and
     cli.fixture_loader.reset_all_state. A reply card is a decision_instances
