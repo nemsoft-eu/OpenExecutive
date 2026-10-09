@@ -223,18 +223,19 @@ def main() -> int:
 
     if running != expected:
         source = "the version requested" if pinned else "this checkout"
-        # `docker compose` spelled out in full: there is no standalone
-        # `compose` executable, and from the repo root `docker compose` finds
-        # no file, this repo's being docker/docker-compose.yml — which is why
-        # the checkout path names the Makefile target that carries -f already.
+        # `docker compose` in full, because there is no standalone `compose`
+        # executable; and `make docker` rather than a compose line for the
+        # checkout path, because the target already carries `-f` *and* decides
+        # whether `--env-file .env` applies (`Makefile`'s `COMPOSE_ENV_FILE`
+        # omits it when there is no repo-root .env, where naming it explicitly
+        # would be an error). A cached layer needs more than one line, so that
+        # case points at the docs rather than guessing the operator's setup.
         fix = (
             "    Pull the tags you intend and recreate: `docker compose pull`, then "
             "`docker compose up -d`."
             if pinned
             else "    Rebuild from an up-to-date checkout: `git pull`, then `make docker`"
-            " (force a clean build with `docker compose --env-file .env"
-            " -f docker/docker-compose.yml build --no-cache` if a cached layer is"
-            " suspected)."
+            " (docs/deployment.md step 4 covers a suspected cached layer)."
         )
         say(
             "DEPLOY VERIFICATION FAILED",

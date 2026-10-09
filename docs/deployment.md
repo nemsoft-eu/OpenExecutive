@@ -383,9 +383,18 @@ host's Docker. Upgrade from the host instead.
    `--force-recreate`, which leaves an already-running `ui` container
    untouched. So a pull that adds or bumps a UI dependency can leave the dev
    server on stale modules while this script reports success. After such an
-   upgrade, restart that one service (`docker compose --env-file .env -f
-   docker/docker-compose.yml up -d --force-recreate ui`) so `npm install` runs
-   again.
+   upgrade, restart that one service so `npm install` runs again:
+
+   ```bash
+   # add --env-file .env before -f if you keep configuration in a repo-root
+   # .env; `make docker` adds it only when that file exists, and naming a
+   # missing env file explicitly is an error rather than a no-op
+   docker compose -f docker/docker-compose.yml up -d --force-recreate ui
+   ```
+
+   The same caveat applies to any compose command you run by hand here,
+   including a `build --no-cache` to defeat a cached layer — which is why the
+   script's own remediation names `make docker` instead of a compose line.
 
    Settings → About does not close the gap either: that card calls
    `GET /version`, which returns the *API's* version, so it re-reads the number
