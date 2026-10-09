@@ -371,14 +371,18 @@ host's Docker. Upgrade from the host instead.
    Use `--expect X.Y.Z` on the published-image path above: there the operator
    pins an image tag, so the *checkout's* version is unrelated to what was
    deployed and the bare invocation would compare against the wrong number.
-   The remediation printed on exit 1 follows the flag — `compose pull` for a
-   pinned install, a rebuild for a checkout one.
+   The remediation printed on exit 1 follows the flag — `docker compose pull`
+   for a pinned install, `make docker` for a checkout one.
 
-   **Only the API is checked, and Settings → About does not cover the gap** —
-   that card calls `GET /version`, which returns the *API's* version, so it
-   re-reads the number the script just read and a stale UI image is invisible
-   to both. Confirm the UI separately from the image it is actually running
-   (`docker compose images ui`).
+   **Only the API is checked**, and what that leaves out depends on which
+   upgrade path you took. On the `make docker` path it leaves out nothing: the
+   compose `ui` service is plain `node:22-alpine` running `npm run dev` over a
+   bind mount of `packages/ui`, so the UI always serves this checkout and has
+   no image of its own to go stale. On the published-image path the UI *is* a
+   real image — pull `openexecutive-ui` at the same tag as the API, because
+   nothing here checks it. Settings → About cannot cover that gap either: that
+   card calls `GET /version`, which returns the *API's* version, so it re-reads
+   the number this script just read.
 
    On 2026-10-08 this install served an image built from source 17 days and
    253 commits behind the checkout: the containers had been *recreated* the

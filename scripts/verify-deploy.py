@@ -377,16 +377,24 @@ def main() -> int:
             f"  - {args.url.rstrip('/')}{path} reports version {running}, but {source} "
             f"is {expected}. The deployment is not serving that code."
         )
+        # Spelled out rather than abbreviated to `compose …`: there is no
+        # standalone `compose` executable, and from the repo root
+        # `docker compose` finds no file at all because this repo's lives at
+        # docker/docker-compose.yml, which is why the checkout path points at
+        # the Makefile target that already carries -f and --env-file.
         if pinned:
             print(
-                "    Pull and recreate with the image tags you intend: `compose pull`, "
-                "then `compose up -d`."
+                "    Pull the tags you intend and recreate: `docker compose pull`, "
+                "then `docker compose up -d`."
             )
         else:
             print(
-                "    Rebuild from an up-to-date checkout: `git pull`, then "
-                "`compose up -d --build --force-recreate` (add `--no-cache` to the build "
-                "if a cached layer is suspected)."
+                "    Rebuild from an up-to-date checkout: `git pull`, then `make docker`."
+            )
+            print(
+                "    If a cached layer is suspected, force a clean build first: "
+                "`docker compose --env-file .env -f docker/docker-compose.yml "
+                "build --no-cache`."
             )
         return 1
 
