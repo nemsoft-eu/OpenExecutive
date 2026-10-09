@@ -360,13 +360,12 @@ host's Docker. Upgrade from the host instead.
    for that observed mismatch, 2 whenever the check could not be completed —
    API unreachable, any status other than 200, a redirect, an unparseable or
    implausibly large answer, an unreadable checkout, or an unexpected error. An
-   inconclusive result must never read as a pass. `/health` is outside the
-   shared-secret gate, so the default sends no credential at all; `--path
-   /version` reads the same number from the authenticated endpoint and takes
-   the secret from `$BACKEND_SHARED_SECRET` in the environment (never an
-   argument — a command line shows up in a process listing). That endpoint also
-   asks GitHub for the latest release unless `UPDATE_CHECK_ENABLED=false`, so
-   `/health` is the one to prefer on a host with no outbound access.
+   inconclusive result must never read as a pass. `/health` is the only
+   endpoint it probes, deliberately: that route is outside the shared-secret
+   gate and makes no outbound call, so the script carries no credential at all
+   and has none to leak over a cleartext URL, to a mistyped host, or across a
+   redirect — it refuses to follow one, and ignores `http_proxy`, so the host
+   named in `--url` is the host that answers.
 
    Use `--expect X.Y.Z` on the published-image path above: there the operator
    pins an image tag, so the *checkout's* version is unrelated to what was
@@ -374,15 +373,23 @@ host's Docker. Upgrade from the host instead.
    The remediation printed on exit 1 follows the flag — `docker compose pull`
    for a pinned install, `make docker` for a checkout one.
 
-   **Only the API is checked**, and what that leaves out depends on which
-   upgrade path you took. On the `make docker` path it leaves out nothing: the
-   compose `ui` service is plain `node:22-alpine` running `npm run dev` over a
-   bind mount of `packages/ui`, so the UI always serves this checkout and has
-   no image of its own to go stale. On the published-image path the UI *is* a
-   real image — pull `openexecutive-ui` at the same tag as the API, because
-   nothing here checks it. Settings → About cannot cover that gap either: that
-   card calls `GET /version`, which returns the *API's* version, so it re-reads
-   the number this script just read.
+   **This is an API-only verifier. The UI is a known gap — restart it.** On
+   the published-image path the UI is its own image, so pull
+   `openexecutive-ui` at the same tag as the API. On the `make docker` path the
+   compose `ui` service bind-mounts `packages/ui`, so *source* is always
+   current, but dependencies are not: `npm install` runs only when the
+   container starts, `node_modules` lives in a separate volume that survives
+   recreation, and `Makefile`'s target is `up --build` without
+   `--force-recreate`, which leaves an already-running `ui` container
+   untouched. So a pull that adds or bumps a UI dependency can leave the dev
+   server on stale modules while this script reports success. After such an
+   upgrade, restart that one service (`docker compose --env-file .env -f
+   docker/docker-compose.yml up -d --force-recreate ui`) so `npm install` runs
+   again.
+
+   Settings → About does not close the gap either: that card calls
+   `GET /version`, which returns the *API's* version, so it re-reads the number
+   this script just read.
 
    On 2026-10-08 this install served an image built from source 17 days and
    253 commits behind the checkout: the containers had been *recreated* the

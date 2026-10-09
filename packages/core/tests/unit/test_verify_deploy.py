@@ -20,7 +20,7 @@ its return value; the `_exit` wrapper is covered separately.
 from __future__ import annotations
 
 import importlib.util
-import json
+import os
 import socket
 import subprocess
 import sys
@@ -167,10 +167,8 @@ def test_redirect_is_inconclusive_not_followed(vd: Any, probe: _Probe) -> None:
     assert _run(vd, ["--url", probe.url, "--expect", "1.2.3"]) == 2
 
 
-def test_non_http_scheme_is_inconclusive(vd: Any, tmp_path: Path) -> None:
-    doc = tmp_path / "fake.json"
-    doc.write_text(json.dumps({"version": "1.2.3"}), encoding="utf-8")
-    assert _run(vd, ["--url", "file://", "--path", str(doc), "--expect", "1.2.3"]) == 2
+def test_non_http_scheme_is_inconclusive(vd: Any) -> None:
+    assert _run(vd, ["--url", "file:///tmp", "--expect", "1.2.3"]) == 2
 
 
 def test_oversized_body_is_inconclusive(vd: Any, probe: _Probe) -> None:
@@ -178,11 +176,6 @@ def test_oversized_body_is_inconclusive(vd: Any, probe: _Probe) -> None:
     padding = b" " * (vd.MAX_BODY_BYTES + 1024)
     probe.body = b'{"version": "1.2.3"}' + padding
     assert _run(vd, ["--url", probe.url, "--expect", "1.2.3"]) == 2
-
-
-def test_conflicting_version_keys_are_inconclusive(vd: Any, probe: _Probe) -> None:
-    probe.body = b'{"version": "1.1.1", "current": "2.2.2"}'
-    assert _run(vd, ["--url", probe.url, "--expect", "1.1.1"]) == 2
 
 
 def test_version_key_of_wrong_type_is_inconclusive(vd: Any, probe: _Probe) -> None:
@@ -219,32 +212,25 @@ def test_whitespace_only_difference_is_not_a_mismatch(vd: Any, probe: _Probe) ->
     assert _run(vd, ["--url", probe.url, "--expect", "1.2.3"]) == 0
 
 
-def test_path_without_leading_slash_still_works(vd: Any, probe: _Probe) -> None:
-    probe.body = b'{"version": "1.2.3"}'
-    assert _run(vd, ["--url", probe.url, "--path", "health", "--expect", "1.2.3"]) == 0
-
-
 # --------------------------------------------------------------------------- #
-# The credential never travels further than --url
+# No credential, and only the host named by --url
 # --------------------------------------------------------------------------- #
 
 
-def test_health_is_probed_without_the_shared_secret(
+def test_no_credential_is_ever_sent(
     vd: Any, probe: _Probe, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`/health` is outside the API's gate, so the script sends no secret.
+
+    This is the property that replaced an authenticated-probe option: with no
+    credential in the request there is nothing to leak over cleartext HTTP, to
+    a mistyped host, or across a redirect.
+    """
     monkeypatch.setenv("BACKEND_SHARED_SECRET", "probe-value-not-a-real-secret")
     probe.body = b'{"version": "1.2.3"}'
-    assert _run(vd, ["--url", probe.url, "--path", "/health", "--expect", "1.2.3"]) == 0
+    assert _run(vd, ["--url", probe.url, "--expect", "1.2.3"]) == 0
     assert "x-api-key" not in probe.seen_headers[0]
-
-
-def test_authenticated_path_carries_the_shared_secret(
-    vd: Any, probe: _Probe, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("BACKEND_SHARED_SECRET", "probe-value-not-a-real-secret")
-    probe.body = b'{"current": "1.2.3"}'
-    assert _run(vd, ["--url", probe.url, "--path", "/version", "--expect", "1.2.3"]) == 0
-    assert probe.seen_headers[0]["x-api-key"] == "probe-value-not-a-real-secret"
+    assert "authorization" not in probe.seen_headers[0]
 
 
 def test_http_proxy_in_the_environment_is_ignored(
@@ -252,10 +238,10 @@ def test_http_proxy_in_the_environment_is_ignored(
 ) -> None:
     """The environment must not get to choose which host answers.
 
-    urllib's default ProxyHandler reads `http_proxy`, which would both
-    misattribute the verdict and hand `x-api-key` to a host the operator never
-    named. The opener uses an empty ProxyHandler, so the probe — not the
-    unreachable proxy — answers.
+    urllib's default ProxyHandler reads `http_proxy`, which would attribute the
+    verdict to the URL the operator typed while another origin answered it.
+    The opener uses an empty ProxyHandler, so the probe — not the unreachable
+    proxy — answers.
     """
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
@@ -397,7 +383,7 @@ def test_tag_note_diverged_says_diverged(vd: Any, tagged_repo: Path) -> None:
 
 def test_tag_note_missing_tag_names_its_cause(vd: Any, tagged_repo: Path) -> None:
     note = vd.tag_distance("9.9.9")
-    assert note.startswith("commits since that release: unknown (")
+    assert note.startswith("distance from v9.9.9: unknown (")
     assert "no matching tag" not in note, "must not assert a cause it did not observe"
 
 
@@ -443,3 +429,31 @@ def test_broken_stdout_preserves_the_mismatch_exit_code(probe: _Probe) -> None:
     )
     assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
     assert "BrokenPipeError" not in proc.stderr
+
+
+def test_broken_unbuffered_stdout_keeps_an_inconclusive_at_two(tmp_path: Path) -> None:
+    """The nastier half: unbuffered output, `head -0`, on the inconclusive path.
+
+    With `PYTHONUNBUFFERED=1` the `print` itself raises, and it used to raise
+    from inside the `except Inconclusive` handler where the sibling `except`
+    could not catch it — so a probe that reached no conclusion exited 1, the
+    code reserved for an observed mismatch. Every verdict now goes through one
+    helper that absorbs it.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"python3 {SCRIPT} --url http://127.0.0.1:{dead} --timeout 3 | head -0; "
+            "exit ${PIPESTATUS[0]}",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert "Traceback" not in proc.stderr
