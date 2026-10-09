@@ -33,9 +33,10 @@ nothing inferred from a timestamp.
 **What this does not catch.** The version moves per *release*, not per commit.
 Every commit inside one release window reports the same version, so this cannot
 distinguish them — on an install that follows unreleased ``main`` it is a
-weaker signal, blind to everything merged since the last release. The run
-prints how far HEAD has moved past its version's tag so the size of that blind
-spot is visible rather than implied. It is a floor on staleness, not a proof of
+weaker signal, blind to everything merged since the last release. A passing run
+prints how HEAD sits relative to its version's tag — ahead, behind, diverged,
+exactly on it, or why git could not say — so the size of that blind spot is
+visible rather than implied. It is a floor on staleness, not a proof of
 freshness: pair it with the behaviour checks in ``docs/deployment.md`` step 4,
 or with a grep for the expected code inside the running container, which is
 exact but needs a shell in it.
@@ -43,32 +44,57 @@ exact but needs a shell in it.
 Usage::
 
     python3 scripts/verify-deploy.py
-    python3 scripts/verify-deploy.py --url https://exec.example.internal
+    python3 scripts/verify-deploy.py --url https://api.example.internal
     python3 scripts/verify-deploy.py --path /version   # needs the shared secret
     python3 scripts/verify-deploy.py --expect 0.5.1    # an install on pinned images
+
+Run it on the host in the reference topology: there only the UI origin is
+public and the API is reached through the UI's ``/api/backend/*`` proxy, which
+is gated on a verified session, so a bare request there answers 401 rather than
+a version. ``--url`` is for an install that exposes the API on its own
+hostname.
 
 ``--expect`` is the right flag whenever the checkout is not what was deployed —
 notably the published-image upgrade path, where the operator pins an image tag
 and the checkout's own version means nothing.
 
 ``/health`` is outside the shared-secret gate (``api/main.py``'s
-``_UNAUTHENTICATED_PATHS``), so the default needs no credential. ``/version``
-does; it is read from ``$BACKEND_SHARED_SECRET`` in the environment and never
+``_UNAUTHENTICATED_PATHS``), so the default sends no credential at all — the
+header is attached only for a path that needs it, such as ``/version``. The
+secret is read from ``$BACKEND_SHARED_SECRET`` in the environment and never
 accepted as an argument, because a command line is visible in a process
-listing. That header reaches the host named by ``--url`` and no other: only
-``http``/``https`` are accepted and a redirect is refused rather than followed,
-so neither the credential nor the verdict can be handed to a different origin.
+listing.
+
+Three deliberate restrictions keep that header, and the verdict, on the host
+the operator actually named. Only ``http``/``https`` are accepted; a redirect
+is refused rather than followed, because urllib copies request headers onto the
+redirected request; and the opener is built with an **empty** ``ProxyHandler``,
+because urllib's default one reads ``http_proxy``/``https_proxy`` from the
+environment — which would let the environment rather than ``--url`` decide
+which host answers, and hand it the credential in cleartext on the way. An
+earlier revision claimed this property while leaving the proxy hole open; it
+was reported and is closed here.
+
+``--path /version`` has one wrinkle worth knowing: unless
+``UPDATE_CHECK_ENABLED=false``, that route also asks GitHub for the latest
+release (5 s timeout). ``/health`` has no outbound dependency, which is another
+reason it is the default.
 
 Exit codes:
 
 * ``0`` — the deployment reports the expected version;
 * ``1`` — it reports a different one. Reserved for that observed mismatch and
   nothing else;
-* ``2`` — inconclusive: the API was unreachable, answered non-200 or a
-  redirect, returned something unparseable, or the checkout's version could not
-  be read. An inconclusive check must never read as a pass — that is the same
-  trap as the stale deployment one level up, so every unexpected failure lands
-  here too.
+* ``2`` — inconclusive: the API was unreachable, answered anything other than
+  200 (including another 2xx, or a redirect), returned something unparseable or
+  implausibly large, reported two conflicting versions, or the checkout's
+  version could not be read. An inconclusive check must never read as a pass —
+  that is the same trap as the stale deployment one level up, so every
+  unexpected exception lands here too.
+
+There is no fourth code. A closed stdout would otherwise surface as CPython's
+exit 120 at shutdown, which would hide a mismatch from a caller branching on
+1, so stdout is flushed before exiting.
 """
 from __future__ import annotations
 
@@ -94,15 +120,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "packages" / "core" / "pyproject.toml"
 
 # `/health` carries `version`, `/version` carries `current`, and no endpoint
-# carries both — so either key is accepted and the order is immaterial.
+# carries both. That is a fact about today's API rather than a guarantee, so
+# both keys are accepted and a body carrying two different values is reported
+# as inconclusive rather than silently resolved by this tuple's order.
 VERSION_KEYS = ("version", "current")
 
-# A version document is a few hundred bytes. The cap keeps a mistyped --url
-# aimed at a streaming endpoint from being read into memory; a body truncated
-# here fails to parse and reports inconclusive, which is the honest answer.
+# A version document is a few hundred bytes. One byte over the cap is read so
+# an oversized body can be rejected outright: truncating it could leave
+# parseable JSON and a confident wrong answer.
 MAX_BODY_BYTES = 64 * 1024
 
 ALLOWED_SCHEMES = ("http", "https")
+
+# Paths the API serves without the shared secret (`api/main.py`'s
+# `_UNAUTHENTICATED_PATHS`). The credential is withheld on these so the
+# documented default invocation sends none at all.
+UNAUTHENTICATED_PATHS = frozenset({"/health"})
 
 DEFAULT_TIMEOUT_S = 10.0
 # The advisory git call is not allowed to hang the verification step.
@@ -155,7 +188,9 @@ def checkout_version() -> str:
     version = project.get("version")
     if not isinstance(version, str) or not version.strip():
         raise Inconclusive(f"no usable [project].version in {PYPROJECT}")
-    return version
+    # Stripped, so surrounding whitespace on either side of the comparison
+    # cannot produce an exit 1 that reads as a real mismatch.
+    return version.strip()
 
 
 def deployed_version(url: str, path: str, timeout: float) -> str:
@@ -173,18 +208,27 @@ def deployed_version(url: str, path: str, timeout: float) -> str:
     request.add_header("Cache-Control", "no-cache, no-store")
     request.add_header("Pragma", "no-cache")
     secret = os.environ.get("BACKEND_SHARED_SECRET")
-    if secret:
+    sent_secret = bool(secret) and path not in UNAUTHENTICATED_PATHS
+    if secret and sent_secret:
         request.add_header("x-api-key", secret)
-    opener = urllib.request.build_opener(_RefuseRedirects)
+    # `ProxyHandler({})` rather than the default one: urllib's default reads
+    # `http_proxy`/`https_proxy` from the environment, which would let the
+    # environment — not --url — choose which host answers, and would send
+    # `x-api-key` to it in cleartext. With no proxy and no redirect, the
+    # request reaches the host named in --url or it fails.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirects)
     try:
         with opener.open(request, timeout=timeout) as response:
-            body = response.read(MAX_BODY_BYTES)
+            status = response.status
+            # One byte past the cap, so an over-long body is rejected rather
+            # than truncated into something that still parses.
+            body = response.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
         hint = ""
         if exc.code in (401, 403):
             hint = (
                 " — the shared secret in the environment was rejected"
-                if secret
+                if sent_secret
                 else " — authenticated; export BACKEND_SHARED_SECRET and retry"
             )
         raise Inconclusive(f"{endpoint} answered HTTP {exc.code}{hint}") from exc
@@ -195,6 +239,16 @@ def deployed_version(url: str, path: str, timeout: float) -> str:
         # http.client.HTTPException raised while reading the body, an SSL or
         # reset error mid-stream. None of them is a version mismatch.
         raise Inconclusive(f"{endpoint} could not be read: {exc!r}") from exc
+    if status != 200:
+        # A 2xx that is not 200 is not the answer this asks for: 203 is what a
+        # transforming proxy returns when it has rewritten the payload, and 206
+        # means the body is a fragment.
+        raise Inconclusive(f"{endpoint} answered HTTP {status}, not 200")
+    if len(body) > MAX_BODY_BYTES:
+        raise Inconclusive(
+            f"{endpoint} returned more than {MAX_BODY_BYTES} bytes; that is not a "
+            "version document"
+        )
     try:
         payload = json.loads(body)
     except ValueError as exc:
@@ -202,10 +256,20 @@ def deployed_version(url: str, path: str, timeout: float) -> str:
     if not isinstance(payload, dict):
         raise Inconclusive(f"{endpoint} returned {type(payload).__name__}, not an object")
     present = [key for key in VERSION_KEYS if key in payload]
+    usable = {
+        key: payload[key].strip()
+        for key in present
+        if isinstance(payload[key], str) and payload[key].strip()
+    }
+    if len(set(usable.values())) > 1:
+        # Rather than let VERSION_KEYS' order pick a winner silently.
+        raise Inconclusive(
+            f"{endpoint} reports two different versions: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(usable.items()))
+        )
     for key in VERSION_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
+        if key in usable:
+            return usable[key]
     if present:
         raise Inconclusive(
             f"{endpoint} returned {present[0]} but not as a non-empty string "
@@ -252,6 +316,14 @@ def tag_distance(version: str) -> str:
         behind, ahead = int(behind_s), int(ahead_s)
     except ValueError:
         return "commits since that release: unknown (unreadable git output)"
+    if ahead and behind:
+        # Checked before the plain-ahead case: "N past the tag" would be false
+        # here and would understate the gap, because the checkout is also
+        # *missing* commits the release contains.
+        return (
+            f"HEAD has diverged from v{version}: {ahead} commit(s) only it has, "
+            f"{behind} commit(s) of that release it is missing"
+        )
     if ahead:
         return (
             f"HEAD is {ahead} commit(s) past v{version}; those commits share this "
@@ -292,7 +364,7 @@ def main() -> int:
     pinned = args.expect is not None
     if pinned and not args.expect.strip():
         raise Inconclusive("--expect was given an empty value")
-    expected = args.expect if pinned else checkout_version()
+    expected = args.expect.strip() if pinned else checkout_version()
     # A leading slash is easy to drop, and without it the base URL and the path
     # fuse into a bad port rather than a request.
     path = "/" + args.path.lstrip("/")
@@ -325,24 +397,40 @@ def main() -> int:
         if pinned
         else tag_distance(expected)
     )
-    print(
-        f"OK: {args.url.rstrip('/')}{path} reports version {running}, matching {'that' if pinned else 'this checkout'}"
-    )
+    matched = "the version requested" if pinned else "this checkout"
+    print(f"OK: {args.url.rstrip('/')}{path} reports version {running}, matching {matched}")
     print(f"  note: {note}")
     print("  this is a floor on staleness, not a proof of freshness — also verify the")
     print("  behaviour you upgraded for (docs/deployment.md step 4).")
     return 0
 
 
+def _exit(code: int) -> None:
+    """Exit with ``code``, surviving a closed stdout.
+
+    Prints are block-buffered when stdout is a pipe, so a reader that has gone
+    away (``| head -1``) raises ``BrokenPipeError`` during interpreter
+    shutdown, which CPython reports as exit 120 — a fourth exit code this
+    contract does not define, and one that hides a real mismatch from a caller
+    branching on 1. Flushing here, with the remaining output sent to
+    ``/dev/null``, keeps the verdict in the exit code.
+    """
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    sys.exit(code)
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        _exit(main())
     except Inconclusive as exc:
         print(f"DEPLOY VERIFICATION INCONCLUSIVE: {exc}")
-        sys.exit(2)
+        _exit(2)
     except Exception as exc:
         # Exit 1 is reserved for an observed version mismatch. Anything else
         # that goes wrong is a tooling failure, and reporting it as "not
         # serving this code" would be its own false verdict.
         print(f"DEPLOY VERIFICATION INCONCLUSIVE: unexpected {type(exc).__name__}: {exc}")
-        sys.exit(2)
+        _exit(2)

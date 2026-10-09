@@ -340,29 +340,45 @@ host's Docker. Upgrade from the host instead.
 
    ```bash
    python3 scripts/verify-deploy.py                      # localhost:8000
-   python3 scripts/verify-deploy.py --url https://exec.example.internal
+   python3 scripts/verify-deploy.py --url https://api.example.internal
    python3 scripts/verify-deploy.py --expect X.Y.Z       # pinned-image install
    ```
+
+   **Run it on the host unless the API has its own public hostname.** In the
+   reference topology only the UI origin is public and the API is reached
+   through `/api/backend/*`, which the UI gates on a verified NextAuth session
+   — so a bare request there answers `401 unauthorized`, not a version. The
+   default `http://localhost:8000` is the normal invocation; `--url` is for an
+   install that exposes the API on its own hostname, as the Operations section
+   below assumes when it curls `api.example.com/health` directly.
 
    This is the step to not skip. A 200 from `/health` on its own does **not**
    prove the upgrade took — it answers with the configured company name
    whatever code is behind it. What narrows it is the `version` in that
    answer, which `verify-deploy.py` compares against
-   `packages/core/pyproject.toml` in this checkout: 0 when they match, 1 when
-   they do not, 2 when the check could not be completed (API unreachable,
-   non-200, a redirect, unparseable answer, unreadable checkout). An
+   `packages/core/pyproject.toml` in this checkout: 0 when they match, 1 only
+   for that observed mismatch, 2 whenever the check could not be completed —
+   API unreachable, any status other than 200, a redirect, an unparseable or
+   implausibly large answer, an unreadable checkout, or an unexpected error. An
    inconclusive result must never read as a pass. `/health` is outside the
-   shared-secret gate, so no credential is needed; `--path /version` reads the
-   same number from the authenticated endpoint and takes the secret from
-   `$BACKEND_SHARED_SECRET` in the environment.
+   shared-secret gate, so the default sends no credential at all; `--path
+   /version` reads the same number from the authenticated endpoint and takes
+   the secret from `$BACKEND_SHARED_SECRET` in the environment (never an
+   argument — a command line shows up in a process listing). That endpoint also
+   asks GitHub for the latest release unless `UPDATE_CHECK_ENABLED=false`, so
+   `/health` is the one to prefer on a host with no outbound access.
 
    Use `--expect X.Y.Z` on the published-image path above: there the operator
    pins an image tag, so the *checkout's* version is unrelated to what was
    deployed and the bare invocation would compare against the wrong number.
    The remediation printed on exit 1 follows the flag — `compose pull` for a
-   pinned install, a rebuild for a checkout one. Only the API is checked; the
-   UI image carries the same version, so pull both and read the UI's from
-   Settings → About.
+   pinned install, a rebuild for a checkout one.
+
+   **Only the API is checked, and Settings → About does not cover the gap** —
+   that card calls `GET /version`, which returns the *API's* version, so it
+   re-reads the number the script just read and a stale UI image is invisible
+   to both. Confirm the UI separately from the image it is actually running
+   (`docker compose images ui`).
 
    On 2026-10-08 this install served an image built from source 17 days and
    253 commits behind the checkout: the containers had been *recreated* the
@@ -377,16 +393,16 @@ host's Docker. Upgrade from the host instead.
    "a static string that does not move between commits" — and that claim was
    false. release-please writes the version into `pyproject.toml`, `uv.lock`,
    `packages/ui/package.json`, `api/main.py` and `api/models.py` on every
-   release, so it moves with each one. Settings → About shows the same number
-   and is just as usable by eye.
+   release, so it moves with each one.
 
    **What this does not catch.** The version moves per *release*, not per
    commit, so every commit inside one release window reports the same number
    and this check cannot tell them apart. Following unreleased `main` — as
    this install does — it is therefore a weaker signal, blind to everything
-   merged since the last release; a passing run prints how many commits HEAD
-   is ahead of its version's tag so the size of that gap is visible. Read it
-   as a floor on staleness, not a proof of freshness.
+   merged since the last release; a passing run prints how HEAD sits relative
+   to its version's tag — ahead, behind, diverged, exactly on it, or why git
+   could not say — so the size of that gap is visible. Read it as a floor on
+   staleness, not a proof of freshness.
 
    Which is why you then confirm the behaviour you upgraded for, not just the
    version. That part is not optional on an install between releases: it is
