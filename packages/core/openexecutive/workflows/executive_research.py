@@ -810,8 +810,10 @@ async def _executive_synthesis_loop(
     )
     from openexecutive.orchestrator.executive import (
         _ALL_SKILL_HANDLERS,
-        _ALL_SKILL_TOOLS,
+        _offered_skill_tools,
     )
+    # The Python job tool as this instance describes it (a runner's libraries).
+    _ALL_SKILL_TOOLS = _offered_skill_tools()
     from openexecutive.orchestrator.schedule_tools import (
         configured_integrations,
         current_session,
@@ -895,6 +897,11 @@ async def _executive_synthesis_loop(
     # the model emitted them anyway. Solo also withholds the team tools and
     # meeting booking, and messages only the principal.
     tools, handlers = unattended_toolkit(tools, _ALL_SKILL_HANDLERS, mode, source="research")
+    # Take the lead: whether it's in training, and the owner's own edits on
+    # earlier cards as examples of how they want those done.
+    from openexecutive.orchestrator import take_the_lead
+
+    user_content += take_the_lead.learned_note()
     # Build the system prompt for the SAME configured set, so the routing
     # menu never names a DM channel the model can't actually use.
     synthesis_system = _build_synthesis_system(configured, has_roster, mode=mode)
@@ -1213,10 +1220,12 @@ _SYNTHESIS_EXCLUDED_TOOLS = frozenset({
     # Raw per-channel DM tools are withheld from synthesis: the model kept
     # passing the wrong identifier into them (a person_id, another channel's
     # id, or an invented Slack-style handle), so DMs failed their handler's
-    # roster gate — and the Slack one, which had no such gate then, failed at
-    # the Slack API instead, which is no better. message_person(person_id,
-    # text) is the only DM path here — the server resolves the channel + real
-    # id, so there is nothing to fabricate.
+    # roster gate. Slack had no such gate when this was written and failed at
+    # the Slack API instead, which was no better; it carries one now, so all
+    # three refuse identically and the reason to withhold them is the wasted
+    # round rather than the Slack exception. message_person(person_id, text)
+    # is the only DM path here — the server resolves the channel + real id, so
+    # there is nothing to fabricate.
     "send_slack_dm",
     "send_discord_dm",
     "send_telegram_message",

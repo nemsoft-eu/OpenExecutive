@@ -149,9 +149,27 @@ merges both copies cleanly and flags nothing. Each must return exactly 1:
 
 ```bash
 for p in "def _routing_prepass" "def resolve_specialist_name" "def to_specialist_block" \
-         "def select_web_search_tool" "def _build_body" "def _log_bot_crash"; do
-  printf '%-34s %s\n' "$p" "$(grep -rac "$p" --include='*.py' packages/core/openexecutive/ | awk -F: '{s+=$2} END{print s+0}')"
+         "def select_web_search_tool" "def render_conversation_context" \
+         "def get_recent_history" "def active_principals" "def deliver_to_each_principal" \
+         "def _dm_recipient_on_roster"; do
+  printf '%-36s %s\n' "$p" "$(grep -rac "$p" --include='*.py' packages/core/openexecutive/ | awk -F: '{s+=$2} END{print s+0}')"
 done
+```
+
+**A `0` is a finding too, not a pass** — it means upstream renamed or removed
+the symbol and the line is now checking nothing. `_build_body` and
+`_log_bot_crash` sat in this list reading 0 until the 2026-10-09 sync; replace
+an entry the moment it stops matching.
+
+Duplicate *calls* matter as much as duplicate definitions, and the definition
+sweep cannot see them. Count call sites for every gate the fork added, against
+what the merged code should have — on 2026-10-09 upstream had merged the fork's
+own Slack roster gate (#404) in a different position, so `handle_send_slack_dm`
+came out of a clean merge calling `_dm_recipient_on_roster` **twice**:
+
+```bash
+grep -n "_dm_recipient_on_roster" packages/core/openexecutive/orchestrator/schedule_tools.py
+# expect one definition + exactly one call per channel handler (slack, discord, telegram)
 ```
 
 Finally, re-read every "the only …" / "today X is the only …" / "never" claim in

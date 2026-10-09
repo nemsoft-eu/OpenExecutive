@@ -1,9 +1,14 @@
+import logging
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# One PYTHON_JOB_EXTRA_LIBRARIES entry: a package name, optionally with its
+# import name when that differs ("scikit-learn (import sklearn)").
+_EXTRA_LIBRARY = re.compile(r"[A-Za-z0-9_.\-]+( \(import [A-Za-z0-9_.]+\))?")
 
 # Walk up from this file to find the repo root .env. If no .env exists
 # (CI, fresh checkouts), `_ROOT` becomes `cwd` so file-path defaults stay
@@ -108,8 +113,12 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str | None = Field(None, alias="ANTHROPIC_WORKSPACE_ID")
 
     default_model: str = Field("claude-sonnet-5-5", alias="DEFAULT_MODEL")
-    deep_reasoning_model: str = Field("claude-opus-5-5", alias="DEEP_REASONING_MODEL")
-    routing_model: str = Field("claude-haiku-4-5", alias="ROUTING_MODEL")
+    # The model the specialists with deep reasoning on by default (CFO, legal,
+    # strategy, board comms) run on. Deep reasoning stays on whatever it is;
+    # set DEEP_REASONING_MODEL=claude-opus-5-5 (or apply the Council's
+    # Thorough preset) to put them on the largest model.
+    deep_reasoning_model: str = Field("claude-sonnet-5-5", alias="DEEP_REASONING_MODEL")
+    routing_model: str = Field("claude-haiku-5-5", alias="ROUTING_MODEL")
     # Model for the executive_research specialist fan-out (research-mode turn
     # only — the chat path still uses each agent's deep_reasoning_model). The
     # research turn is retrieve-from-web-search + summarize, which does not
@@ -147,6 +156,11 @@ class Settings(BaseSettings):
     )
     knowledge_builtin_n_results: int = Field(5, alias="KNOWLEDGE_BUILTIN_N_RESULTS")
     knowledge_company_n_results: int = Field(3, alias="KNOWLEDGE_COMPANY_N_RESULTS")
+    # A specialist's own retrieval (router._retrieve_for_call) takes fewer
+    # chunks than the Executive's: it answers one narrow question. The company
+    # count also caps each synced source (Notion, Drive, OneDrive, Confluence).
+    specialist_builtin_n_results: int = Field(3, alias="SPECIALIST_BUILTIN_N_RESULTS", ge=0)
+    specialist_company_n_results: int = Field(2, alias="SPECIALIST_COMPANY_N_RESULTS", ge=0)
 
     # Max parallel `consult_specialist` calls dispatched in one chat turn.
     # 0 (default) is inert: resolve_fanout_cap() falls back to the specialist
@@ -159,9 +173,14 @@ class Settings(BaseSettings):
 
     # Run a routing pre-pass before the main chat turn: one call offering only
     # `consult_specialist`, whose picks are dispatched before the full tool
-    # surface is ever shown. `consult_specialist` otherwise competes with ~58
-    # client tools, and a smaller model loses it in the crowd — measured on
-    # qwen3.8:27b, a strategic sequencing question consulted on 1/12 turns with
+    # surface is ever shown. `consult_specialist` otherwise competes with the
+    # rest of the direct tool list, and a smaller model loses it in the crowd —
+    # measured on qwen3.8:27b against a ~58-tool surface, before
+    # `orchestrator.tool_groups` moved the less common tools behind
+    # `open_tools`/`use_tool` and cut the direct list to roughly 21. The
+    # measurement below therefore describes a wider surface than a turn sees
+    # today; re-measure before concluding the pre-pass has stopped earning its
+    # call. A strategic sequencing question consulted on 1/12 turns with
     # the full surface, and on 9/12 and 11/12 across two runs with the pre-pass
     # plus the persona's "Consulting Your Leadership Team" section. An action
     # turn ("schedule X") consulted 0/12 and 1/12 in the same two runs, so the
@@ -633,11 +652,108 @@ class Settings(BaseSettings):
     # Upper bound on a single tool result's characters before it enters the
     # prompt. A circuit breaker against an unbounded result (a large document
     # fetch) dominating a turn and then being re-sent on every remaining
-    # iteration of the tool loop — deliberately set high enough that ordinary
-    # tool output never reaches it. Applies to every tool, not just MCP.
+    # iteration of the tool loop. 20,000 characters (about 5,500 tokens) is
+    # well above a typical result; a longer one is cut with a marker that
+    # asks for a narrower request. Applies to every tool, not just MCP.
     tool_result_max_chars: int = Field(
-        50_000, alias="TOOL_RESULT_MAX_CHARS", ge=1_000
+        20_000, alias="TOOL_RESULT_MAX_CHARS", ge=1_000
     )
+    # What all of one turn's tool results may add together, in characters
+    # (specialists' answers aside): each stays in the prompt for every later
+    # call of the turn. Past it a result shows its first 3,000 characters and
+    # says the turn has read enough. 0 turns it off.
+    tool_results_turn_max_chars: int = Field(
+        40_000, alias="TOOL_RESULTS_TURN_MAX_CHARS", ge=0
+    )
+    # Workflow action steps may also act through one short sandboxed script
+    # (`run_script`, workflows/step_script.py) that calls the step's own tools
+    # — each call through the same allowlist, budget, target check and audit.
+    # Off: the step only calls its tools one by one, as before.
+    workflow_step_scripts: bool = Field(True, alias="WORKFLOW_STEP_SCRIPTS")
+    # A step's script calls have a budget of their own, 10x the step's
+    # max_tool_calls up to this ceiling: they cost no model turn each, so the
+    # direct-call budget (1-50) would cap a folder at ~50 files. Each call
+    # still goes through the allowlist, target check and audit.
+    workflow_script_max_calls: int = Field(
+        500, alias="WORKFLOW_SCRIPT_MAX_CALLS", ge=1, le=5_000
+    )
+    # The same in chat: the Executive may run one sandboxed script over the
+    # gateway tools a conversation has found, each call checked exactly as a
+    # call_tool. Never offered on a turn private to the principal.
+    chat_scripts: bool = Field(True, alias="CHAT_SCRIPTS")
+    # The most tool calls a chat turn's scripts may make in all (gateway and
+    # the Executive's own tools); message_person and upsert_person have
+    # tighter caps of their own (step_script.CHAT_OWN_TOOL_CAPS).
+    chat_script_max_calls: int = Field(200, alias="CHAT_SCRIPT_MAX_CALLS", ge=1, le=5_000)
+    # How many scripts (each a Monty worker process, up to 128 MB and one CPU
+    # core while computing) may run at once across the whole server, chat and
+    # workflows together. More wait their turn, within their own time limit.
+    script_max_workers: int = Field(2, alias="SCRIPT_MAX_WORKERS", ge=1, le=32)
+    # Python jobs (workflows/python_job.py): Python with real libraries on
+    # files, in a WebAssembly sandbox run by Deno. Offered only when the
+    # sandbox is installed at PYTHON_SANDBOX_DIR (the API image does that).
+    python_jobs_enabled: bool = Field(True, alias="PYTHON_JOBS_ENABLED")
+    python_sandbox_dir: Path = Field(Path("/opt/pysandbox"), alias="PYTHON_SANDBOX_DIR")
+    python_job_timeout_s: float = Field(120.0, alias="PYTHON_JOB_TIMEOUT_S", ge=5, le=900)
+    # The sandbox process's data limit (RLIMIT_DATA): measured, pandas plus a
+    # chart needs about 1.5 GB of it; 1 GB is too little.
+    python_job_memory_mb: int = Field(1536, alias="PYTHON_JOB_MEMORY_MB", ge=512, le=16384)
+    # Run Python jobs on a separate runner instead of the local sandbox: each
+    # job is POSTed there (workflows/python_job.py, _run_remote) with this key
+    # as a bearer token, and the local sandbox isn't needed. https only, or
+    # plain http to localhost or a .internal / .flycast name. The key is
+    # required with the URL.
+    python_job_runner_url: str | None = Field(None, alias="PYTHON_JOB_RUNNER_URL")
+    python_job_runner_key: str | None = Field(None, alias="PYTHON_JOB_RUNNER_KEY")
+    # Libraries the runner has beyond the local sandbox's, named in the job
+    # tool's description (e.g. "scipy, scikit-learn (import sklearn)"). Used
+    # only with PYTHON_JOB_RUNNER_URL; the local sandbox can't install more.
+    python_job_extra_libraries: str | None = Field(None, alias="PYTHON_JOB_EXTRA_LIBRARIES")
+
+    @field_validator("python_job_runner_url")
+    @classmethod
+    def _validate_python_job_runner_url(cls, v: str | None) -> str | None:
+        from urllib.parse import urlparse
+        v = (v or "").strip()
+        if not v:
+            return None
+        parsed = urlparse(v)
+        host = (parsed.hostname or "").lower()
+        private = host in {"localhost", "127.0.0.1", "::1"} or host.endswith((".internal", ".flycast"))
+        if not host or not (parsed.scheme == "https" or (parsed.scheme == "http" and private)):
+            raise ValueError(
+                "PYTHON_JOB_RUNNER_URL must be an https URL (plain http only to localhost, .internal or .flycast)"
+            )
+        return v
+
+    @field_validator("python_job_extra_libraries")
+    @classmethod
+    def _validate_python_job_extra_libraries(cls, v: str | None) -> str | None:
+        # It goes into a tool description, so only package names, each with an
+        # optional import name ("scikit-learn (import sklearn)"). A bad
+        # value is dropped, not fatal: it is optional and the control plane may
+        # push it to machines that must still boot.
+        v = " ".join((v or "").split())
+        if not v:
+            return None
+        items = [item.strip() for item in v.split(",")]
+        if len(v) > 300 or not all(_EXTRA_LIBRARY.fullmatch(item) for item in items):
+            logging.getLogger(__name__).warning(
+                "PYTHON_JOB_EXTRA_LIBRARIES ignored: not a short comma-separated list of package names"
+            )
+            return None
+        return ", ".join(items)
+
+    @model_validator(mode="after")
+    def _validate_python_job_runner_key(self) -> "Settings":
+        # Without a key every job (code and files) would go out unauthenticated.
+        if self.python_job_runner_url and not (self.python_job_runner_key or "").strip():
+            raise ValueError("PYTHON_JOB_RUNNER_URL requires PYTHON_JOB_RUNNER_KEY")
+        return self
+    # A script that worked may be saved and run again by name (saved tools,
+    # workflows/saved_tools.py). Off: run_script ignores save_as/tool and
+    # list_saved_tools lists nothing; saved tools stay stored.
+    saved_tools_enabled: bool = Field(True, alias="SAVED_TOOLS_ENABLED")
 
     # ---- Scanned PDFs (knowledge/pdf_reader.py) ----
     # A PDF with no text layer (a scan, or one printed to PDF as images) is

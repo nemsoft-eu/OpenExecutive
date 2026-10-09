@@ -20,6 +20,9 @@ export interface ActionTaken {
   target?: string | null;
   link?: string | null;
   iteration?: number;
+  // An approval card's id (propose_actions): the chat shows the card itself
+  // under the message.
+  decision_id?: number;
 }
 
 // Names the round of tool calls currently in flight, so the progress line can
@@ -75,6 +78,7 @@ export type DebugEventKind =
   | "synthesis_start"
   | "synthesis_done"
   | "skill_invocation"
+  | "script_run"
   | "turn_complete"
   | "turn_error"
   | "committee_review_start"
@@ -1626,6 +1630,8 @@ export interface DelegationSettings {
   inbox?: InboxWatch;
   // Absent (or null) on a backend that predates Handle it for me.
   handle_it?: HandleIt | null;
+  // Absent (or null) on a backend that predates per-setting training.
+  training?: Training | null;
   // The owner's "Let team members use Act as me", while the install allows
   // it; null (or absent) for everyone else.
   team?: DelegationTeam | null;
@@ -1667,6 +1673,30 @@ export interface InboxWatch {
 // level; "ask" leaves a card as before.
 // How much Handle it for me sends on its own (delegation/handle_it.py RULES).
 export type HandleItMode = "careful" | "balanced" | "bold";
+
+// Act as me's settings that can each be in training (delegation/training.py).
+export type TrainingSetting = "replies" | "follow_ups" | "actions" | "drafts";
+
+// Something Act as me learned in training, yours alone (DELETE
+// /delegation/learned/{id}): a person replies or follow-ups may go to, an
+// action allowed with Approve + allow, or how you write to someone.
+export interface TrainingLearned {
+  id: number;
+  label: string;
+  setting: TrainingSetting;
+  // What you sent after changing a draft, kept as an example ("").
+  example: string;
+  uses: number;
+  created_at: string;
+}
+
+export interface Training {
+  replies: boolean;
+  follow_ups: boolean;
+  actions: boolean;
+  drafts: boolean;
+  learned: TrainingLearned[];
+}
 
 export interface HandleIt {
   enabled: boolean;
@@ -1725,6 +1755,11 @@ export interface ReplyCard {
   waited_because?: string;
   // "follow_up": the draft chases your own unanswered email.
   source?: string;
+  // In training: Send + allow is offered (replies, or a follow-up's people,
+  // aren't allowed yet).
+  can_allow?: boolean;
+  // Drafts in training: "Do it like this next time" keeps your changed draft.
+  learns_style?: boolean;
 }
 
 // "How I write": learned from your own sent mail; you can edit and lock it.
@@ -1810,6 +1845,7 @@ export async function updateHistorySettings(patch: {
   reply_notes?: boolean;
   retention_days?: number | null;
   company_retention_days?: number | null;
+  share_work_style?: boolean;
 }): Promise<HistoryState> {
   const res = await fetch(`${API_BASE}/memories/history/settings`, {
     method: "PUT",
@@ -1878,6 +1914,24 @@ export async function setInboxWatch(enabled: boolean): Promise<DelegationSetting
   return res.json();
 }
 
+// Forget one thing it learned in training: it asks again from now on.
+export async function removeTrainingLearned(id: number): Promise<DelegationSettings> {
+  const res = await fetch(`${API_BASE}/delegation/learned/${id}`, { method: "DELETE" });
+  if (!res.ok) throw await delegationError(res, "Couldn't remove that.");
+  return (await res.json()) as DelegationSettings;
+}
+
+// Put Act as me's settings in or out of training.
+export async function setTraining(update: Partial<Record<TrainingSetting, boolean>>): Promise<DelegationSettings> {
+  const res = await fetch(`${API_BASE}/delegation/training`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't change training.");
+  return (await res.json()) as DelegationSettings;
+}
+
 export async function setHandleIt(update: {
   enabled?: boolean;
   mode?: HandleItMode;
@@ -1940,9 +1994,12 @@ function strings(value: unknown): string[] {
 // Send the reply's draft from your Gmail, exactly as it is there (POST
 // /decisions/{id}/approve). `confirm` is your second yes: the recipients you
 // were shown, and that a newer message in the thread is fine.
+// `allow` is Send + allow in training: replies to this sender (follow-ups to
+// these people) go on their own from now on; `example` keeps your sent
+// version when you changed the draft (Drafts in training).
 export async function sendReplyCard(
   id: number,
-  confirm?: { recipients: string[]; thread_moved_on?: boolean },
+  confirm?: { recipients: string[]; thread_moved_on?: boolean; allow?: boolean; example?: boolean },
 ): Promise<SendReplyResult> {
   const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
     method: "POST",
@@ -1958,6 +2015,75 @@ export async function sendReplyCard(
     return { status: "confirm", message, reasons: strings(detail.reasons), recipients: strings(detail.recipients) };
   }
   throw new ReplySendError(message, code);
+}
+
+// A card of actions the Executive suggested from your email (Act as me),
+// yours alone. Nothing on it happens until you approve it here: Approve
+// (POST /decisions/{id}/approve) does the ticked actions exactly as shown;
+// Dismiss (POST /decisions/{id}/reject) drops it.
+export interface ActionCardAction {
+  index: number;
+  // invite, message or add_contact.
+  kind: string;
+  summary: string;
+  // A message's text as it will be sent, or a meeting's description.
+  text: string;
+}
+
+export interface ActionCard {
+  decision_id: number;
+  status: string;
+  created_at: string;
+  why: string;
+  actions: ActionCardAction[];
+  // In training: Approve + allow is offered.
+  can_allow?: boolean;
+}
+
+// What happened to one action: done, waiting (sent to whoever approves
+// meetings), failed or skipped (you unticked it).
+export interface ActionCardResult {
+  index: number;
+  status: string;
+  detail: string;
+}
+
+// null when this viewer has none to see (403) or the backend predates them (404).
+export async function getActionCards(signal?: AbortSignal): Promise<ActionCard[] | null> {
+  const res = await fetch(`${API_BASE}/delegation/actions`, { signal });
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw await delegationError(res, "Couldn't load the cards waiting for you.");
+  const body = (await res.json()) as { cards: ActionCard[] };
+  return body.cards;
+}
+
+// Do the ticked actions (`only`, by index) of an action card. Returns what
+// happened to each. `allow` is Approve + allow (Suggested actions in
+// training): the same kind, with the same people, happens on its own from now on.
+export async function approveActionCard(id: number, only: number[], allow = false): Promise<ActionCardResult[]> {
+  const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edits: allow ? { only, allow: true } : { only } }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't do that.");
+  const body = (await res.json()) as { final_payload_json?: string | null };
+  try {
+    const payload = JSON.parse(body.final_payload_json ?? "{}") as { results?: ActionCardResult[] };
+    return Array.isArray(payload.results) ? payload.results : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function dismissActionCard(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/decisions/${id}/reject`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: "" }),
+  });
+  if (res.status === 404 || res.status === 409) return; // already gone or handled
+  if (!res.ok) throw await delegationError(res, "Couldn't dismiss that card.");
 }
 
 // Dismiss a reply card. Its draft is deleted from your Gmail unless you
@@ -3355,6 +3481,40 @@ export interface UsageSummary {
   by_model: UsageByModel[];
   // Absent on a backend older than the by-source breakdown.
   by_source?: UsageBySource[];
+  // Sandboxed scripts (run_script). Absent on an older backend.
+  scripts?: ScriptUsage;
+  // Python jobs (run_python_job). Absent on an older backend.
+  python_jobs?: PythonJobUsage;
+}
+
+export interface PythonJobUsage {
+  jobs: number;
+  ok: number;
+  saved_runs: number;
+  attachments: number;
+  duration_ms: number;
+  cpu_ms: number;
+  // The largest peak memory of any one job, in MB.
+  peak_mb_max: number;
+  bytes_in: number;
+  bytes_out: number;
+  // Model usage on the turns that ran a job (the whole turn, not just the job).
+  turns: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cost_usd: number;
+}
+
+export interface ScriptUsage {
+  scripts: number;
+  ok: number;
+  calls: number;
+  // Upper bound: each call past a script's first would otherwise have needed
+  // a model turn, unless the model had batched it with others.
+  turns_avoided: number;
+  duration_ms: number;
+  in_workflows: number;
 }
 
 export async function getAuditUsage(
@@ -4879,10 +5039,31 @@ export interface LeadRule {
   value: string;
 }
 
+// An action it was allowed in training, and the edit it keeps as an example.
+export interface LeadLearned {
+  id: number;
+  label: string;
+  // The feature it learned it in ("take_the_lead" for now).
+  feature: string;
+  example: Record<string, string>;
+  uses: number;
+  created_at: string;
+}
+
+// An action you approved unchanged often enough that it suggests allowing it.
+export interface LeadSuggested {
+  key: string;
+  label: string;
+  approvals: number;
+}
+
 export interface TakeTheLead {
   enabled: boolean;
+  training: boolean;
   ask_first: { kind: string; label: string; hint: string; on: boolean }[];
   rules: LeadRule[];
+  learned: LeadLearned[];
+  suggested: LeadSuggested[];
   available: boolean;
   paused: boolean;
 }
@@ -4908,6 +5089,7 @@ export async function getTakeTheLead(signal?: AbortSignal): Promise<TakeTheLead 
 
 export async function setTakeTheLead(update: {
   enabled?: boolean;
+  training?: boolean;
   ask_first?: Record<string, boolean>;
 }): Promise<TakeTheLead> {
   const res = await fetch(`${API_BASE}/take-the-lead`, {
@@ -4932,6 +5114,69 @@ export async function addCompanyLeadRule(kind: LeadRuleKind, value: string): Pro
 export async function deleteCompanyLeadRule(id: number): Promise<TakeTheLead> {
   const res = await fetch(`${API_BASE}/take-the-lead/rules/${id}`, { method: "DELETE" });
   if (!res.ok) throw await leadError(res, "Couldn't remove the rule.");
+  return res.json();
+}
+
+export async function allowLeadSuggestion(key: string): Promise<TakeTheLead> {
+  const res = await fetch(`${API_BASE}/take-the-lead/learned`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) throw await leadError(res, "Couldn't allow it.");
+  return res.json();
+}
+
+export async function removeLeadLearned(id: number): Promise<TakeTheLead> {
+  const res = await fetch(`${API_BASE}/take-the-lead/learned/${id}`, { method: "DELETE" });
+  if (!res.ok) throw await leadError(res, "Couldn't remove it.");
+  return res.json();
+}
+
+// A field a Take the lead card lets you change before approving.
+export interface LeadCardField {
+  field: string;
+  label: string;
+  long: boolean;
+  value: string;
+}
+
+// What a Take the lead card holds (its decision's payload), for the card's
+// Edit and Approve + allow. Only its approver and the owner can read it.
+export interface LeadCardPayload {
+  summary: string;
+  reason: string;
+  kind: string;
+  fields: LeadCardField[];
+  allow?: { key: string; label: string };
+}
+
+export async function getLeadCard(id: number, signal?: AbortSignal): Promise<LeadCardPayload> {
+  const res = await fetch(`${API_BASE}/decisions/${id}`, { signal });
+  if (!res.ok) throw await leadError(res, "Couldn't load this card.");
+  const instance: DecisionInstance = await res.json();
+  const payload = JSON.parse(instance.proposed_payload_json || "{}");
+  return {
+    summary: String(payload.summary ?? ""),
+    reason: String(payload.reason ?? ""),
+    kind: String(payload.kind ?? ""),
+    fields: Array.isArray(payload.fields) ? payload.fields : [],
+    allow: payload.allow && typeof payload.allow.key === "string" ? payload.allow : undefined,
+  };
+}
+
+// Approve a Take the lead card: ``input`` changes its editable fields first,
+// ``allow`` (training cards, the owner's) lets it do this from now on.
+export async function approveLeadCard(
+  id: number,
+  edits: { input?: Record<string, string>; allow?: boolean },
+): Promise<DecisionInstance> {
+  const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edits }),
+  });
+  if (!res.ok) throw await leadError(res, "Couldn't approve it.");
   return res.json();
 }
 
@@ -4965,4 +5210,106 @@ export async function deleteMyLeadRule(id: number): Promise<LeadRule[]> {
   const res = await fetch(`${API_BASE}/delegation/take-the-lead/rules/${id}`, { method: "DELETE" });
   if (!res.ok) throw await delegationError(res, "Couldn't remove the rule.");
   return ((await res.json()) as { rules: LeadRule[] }).rules;
+}
+
+// ── Custom tools (Settings → Advanced → Custom tools) ───────────────────────
+// Scripts the Executive kept to run again by name. The owner's alone.
+
+export interface SavedTool {
+  name: string;
+  description: string;
+  enabled: boolean;
+  version: number;
+  uses_tools: string[];
+  origin: string;
+  created_at: string;
+  updated_at: string;
+  // The version workflows may run (the owner turned it on), or null.
+  workflow_version?: number | null;
+  // "script" or "python" (a kept Python job: chat only). Absent on an older backend.
+  kind?: "script" | "python";
+}
+
+export interface SavedToolVersion {
+  version: number;
+  description: string;
+  script: string;
+  uses_tools: string[];
+  origin: string;
+  created_at: string;
+}
+
+export interface SavedToolRun {
+  version: number;
+  ok: boolean;
+  calls: number;
+  duration_ms: number;
+  origin: string;
+  at: string;
+}
+
+export interface SavedToolDetail extends SavedTool {
+  script: string;
+  versions: SavedToolVersion[];
+  runs: SavedToolRun[];
+}
+
+async function savedToolError(res: Response, fallback: string): Promise<Error> {
+  try {
+    const body = await res.json();
+    if (typeof body?.detail === "string") return new Error(body.detail);
+  } catch {
+    // not JSON
+  }
+  return new Error(fallback);
+}
+
+/** Null when the caller isn't the owner (403). */
+export async function listSavedTools(
+  signal?: AbortSignal,
+): Promise<{ enabled: boolean; tools: SavedTool[] } | null> {
+  const res = await fetch(`${API_BASE}/saved-tools`, { signal });
+  if (res.status === 403) return null;
+  if (!res.ok) throw await savedToolError(res, "Couldn't load the custom tools.");
+  return res.json();
+}
+
+export async function getSavedTool(name: string, signal?: AbortSignal): Promise<SavedToolDetail> {
+  const res = await fetch(`${API_BASE}/saved-tools/${encodeURIComponent(name)}`, { signal });
+  if (!res.ok) throw await savedToolError(res, "Couldn't load that tool.");
+  return res.json();
+}
+
+export async function setSavedToolEnabled(name: string, enabled: boolean): Promise<SavedToolDetail> {
+  return updateSavedTool(name, { enabled });
+}
+
+/** Turn `version` (the one shown to the owner) on for workflows, or
+ * workflows off (null). Naming the version means a newer one the Executive
+ * saved meanwhile is never approved by accident. */
+export async function setSavedToolWorkflows(name: string, version: number | null): Promise<SavedToolDetail> {
+  return updateSavedTool(name, version == null ? { workflows: false } : { workflows: true, version });
+}
+
+async function updateSavedTool(
+  name: string,
+  update: { enabled?: boolean; workflows?: boolean; version?: number },
+): Promise<SavedToolDetail> {
+  const res = await fetch(`${API_BASE}/saved-tools/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) throw await savedToolError(res, "Couldn't change that tool.");
+  return res.json();
+}
+
+export async function rollbackSavedTool(name: string, version: number): Promise<SavedToolDetail> {
+  const res = await fetch(`${API_BASE}/saved-tools/${encodeURIComponent(name)}/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version }),
+  });
+  if (!res.ok) throw await savedToolError(res, "Couldn't switch the version.");
+  return res.json();
 }

@@ -12,6 +12,25 @@ FROM node:20-bookworm-slim AS ms365-build
 RUN npm install -g --omit=optional --no-audit --no-fund \
     "@softeria/ms-365-mcp-server@0.154.2"
 
+# Python job sandbox (workflows/python_job.py): Pyodide (Python in
+# WebAssembly) run by Deno, which grants it read access to /opt/pysandbox only:
+# no network, environment, writes or processes. Both come from npm, pinned with
+# integrity hashes in docker/pysandbox/package-lock.json; the compiled libraries
+# jobs may import come from Pyodide's CDN, each checked against the sha256 in
+# Pyodide's pyodide-lock.json. PYODIDE_VERSION must match the lock's pyodide:
+# its pyodide-lock.json names the wheels this exact Pyodide can load.
+FROM node:20-bookworm-slim AS pysandbox-build
+ARG PYODIDE_VERSION=314.0.7
+WORKDIR /build
+COPY docker/pysandbox/package.json docker/pysandbox/package-lock.json docker/pysandbox-fetch.mjs ./
+RUN npm ci --no-audit --no-fund \
+    && mkdir -p /opt/pysandbox/wheels \
+    && cp -L node_modules/deno/deno /opt/pysandbox/deno \
+    && cp -r node_modules/pyodide /opt/pysandbox/pyodide \
+    && node pysandbox-fetch.mjs /opt/pysandbox/pyodide \
+       "https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full" \
+       numpy pandas matplotlib pillow lxml fonttools typing-extensions
+
 FROM python:3.11-slim AS api
 
 WORKDIR /app
@@ -67,7 +86,7 @@ COPY packages/core/pyproject.toml packages/core/uv.lock ./
 # the system interpreter's prefix, so the packages land in system
 # site-packages exactly as before: the model bakes below and the runtime CMD
 # rely on that.
-# (The fastembed install further down is a separate, unpinned resolution into
+# (The fastembed install further down is a separate resolution into
 # the same env; today it moves nothing because the locked versions already
 # satisfy its constraints.)
 RUN UV_PROJECT_ENVIRONMENT=/usr/local \
@@ -97,8 +116,14 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 # load the model from disk (offline, see HF_HUB_OFFLINE below) instead of the
 # network. No `|| true`: if the bake can't fetch, fail the build rather than ship
 # an image that silently re-downloads — the model is deterministic.
+# Pin the SAME fastembed the gateway's uvx env resolves under its
+# --exclude-newer cutoff (orchestrator/mcp_gateway.py), not a floating one: a
+# cache baked by fastembed 0.9.0 can't be loaded offline by 0.8.1, so when
+# 0.9.0 shipped the gateway hung at startup, timed out, and the
+# deployment came up with no MCP tools (Google included). Bump this together
+# with the cutoff.
 ENV FASTEMBED_CACHE_PATH=/opt/fastembed-cache
-RUN uv pip install --system "fastembed>=0.6.0" \
+RUN uv pip install --system "fastembed==0.8.1" \
     && python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')"
 
 # Google Workspace MCP server, run co-located as a stdio child of the MCP gateway
@@ -147,6 +172,16 @@ RUN printf '#!/bin/sh\nexec /usr/local/bin/node /usr/local/lib/node_modules/@sof
     && rm -rf /tmp/ms365-smoke \
     && node --input-type=module -e "const m = await import('/usr/local/bin/ms365-access-token.mjs'); const A = await m.loadAuthManager(); for (const f of ['loadTokenCache', 'getCurrentAccount']) if (typeof A.prototype[f] !== 'function') throw new Error('AuthManager.' + f + ' is missing'); if (typeof A.create !== 'function') throw new Error('AuthManager.create is missing');"
 
+# The Python job sandbox, plus the pure-Python libraries jobs get on every run
+# (pypdf, openpyxl), pinned by hash. The smoke after `uv pip install` below runs
+# a job that imports them, pandas and matplotlib, with the same Deno
+# permissions the API uses, so a broken sandbox fails the build.
+COPY --from=pysandbox-build /opt/pysandbox /opt/pysandbox
+COPY docker/pysandbox/requirements.txt /tmp/pysandbox-requirements.txt
+RUN pip download --no-deps --only-binary=:all: --require-hashes \
+        -r /tmp/pysandbox-requirements.txt --dest /opt/pysandbox/wheels \
+    && rm /tmp/pysandbox-requirements.txt
+
 COPY packages/core/ .
 
 # Demo fixtures live at the repo root, not inside packages/core/. Copy them
@@ -160,6 +195,15 @@ COPY fixtures/ ./fixtures/
 # Dependencies were already installed in the earlier layer, so --no-deps
 # keeps this fast and cache-friendly.
 RUN uv pip install --system --no-deps .
+
+RUN W=/app/openexecutive/workflows/python_job_worker.mjs \
+    && WHEELS=$(ls /opt/pysandbox/wheels/*.whl | sed 's/.*/"&"/' | paste -sd, -) \
+    && printf '{"code":"import pypdf, openpyxl, pandas, matplotlib, docx, pptx, fpdf\\nstr(len(pypdf.__version__) > 0)","pyodide":"/opt/pysandbox/pyodide","wheels":[%s],"files":{}}' "$WHEELS" \
+       | env -i PATH=/usr/bin:/bin HOME=/tmp DENO_DIR=/tmp/deno-smoke DENO_NO_UPDATE_CHECK=1 \
+         /opt/pysandbox/deno run --no-prompt --quiet --no-remote --no-code-cache \
+         --v8-flags=--max-old-space-size=256,--wasm-max-mem-pages=12288 \
+         --allow-read=/opt/pysandbox,$W $W | grep -q '"result":"True"' \
+    && rm -rf /tmp/deno-smoke
 
 ENV PYTHONUNBUFFERED=1
 ENV VECTOR_STORE_PATH=/data/chroma_db

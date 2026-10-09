@@ -1040,7 +1040,12 @@ def slack_reached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         def __init__(self, token: str) -> None:
             self.token = token
 
-        async def chat_postMessage(self, channel: str, text: str) -> dict:  # type: ignore[type-arg]
+        # **kw, not a fixed signature: the handler also passes the unfurl
+        # flags, and a stub that names only the arguments it cares about turns
+        # every future keyword into a TypeError the handler logs as "send
+        # failed" — which reads as the egress gate refusing, the opposite of
+        # what this fixture exists to observe.
+        async def chat_postMessage(self, channel: str, text: str, **kw: object) -> dict:  # type: ignore[type-arg]
             reached.append(channel)
             return {"ok": True, "ts": "1.0"}
 

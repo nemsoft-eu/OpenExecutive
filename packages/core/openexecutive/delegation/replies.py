@@ -41,6 +41,12 @@ class ReplyCard:
     # "follow_up" when the draft chases the person's own unanswered email
     # (delegation.follow_ups); "" for a reply to someone else's.
     source: str = ""
+    # Send + allow: Replies (Follow-ups, on a follow-up) is in training and
+    # this sender (these people) isn't allowed yet (delegation.training).
+    can_allow: bool = False
+    # Drafts is in training: "Do it like this next time" keeps a draft they
+    # changed as how they write to this person.
+    learns_style: bool = False
 
 
 def _strings(value: Any) -> list[str]:
@@ -49,6 +55,7 @@ def _strings(value: Any) -> list[str]:
 
 def cards(person: Any) -> list[ReplyCard]:
     """``person``'s open reply cards, newest first."""
+    from openexecutive.delegation import training
     from openexecutive.delegation.gmail import mailbox_link
     from openexecutive.delegation.handle_it import REASONS
     from openexecutive.delegation.inbox import card_payload, ledger_flags, open_cards
@@ -57,6 +64,7 @@ def cards(person: Any) -> list[ReplyCard]:
     payloads = [(c, card_payload(c)) for c in open_]
     added = ledger_flags(person.id, [str(p.get("message_id") or "") for _, p in payloads])
     email = (person.email or "").strip().lower()
+    trained = training.get(person.id)
     out: list[ReplyCard] = []
     for card, payload in payloads:
         thread_id = str(payload.get("thread_id") or "")
@@ -85,8 +93,20 @@ def cards(person: Any) -> list[ReplyCard]:
             gmail_link=mailbox_link(email, thread_id=thread_id, draft_id=draft_id) if email and thread_id else "",
             waited_because=REASONS.get(str(payload.get("handle_it_reason") or ""), ""),
             source="follow_up" if payload.get("source") == "follow_up" else "",
+            can_allow=_can_allow(person.id, payload, trained),
+            learns_style=trained.drafts,
         ))
     return out
+
+
+def _can_allow(person_id: int, payload: dict[str, Any], trained: Any) -> bool:
+    from openexecutive.delegation import handle_it
+
+    if payload.get("source") == "follow_up":
+        going = _strings(payload.get("draft_to"))
+        return bool(trained.follow_ups and going and not handle_it.follow_up_allowed(person_id, going))
+    sender = str(payload.get("from_email") or "")
+    return bool(trained.replies and sender and not handle_it.allowed_in_training(person_id, sender))
 
 
 async def dismiss(instance: Any, *, gmail: Any = None) -> str:
