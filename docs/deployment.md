@@ -185,8 +185,12 @@ skipping the check.
 can reach it unauthenticated. It returns:
 
 ```json
-{"status": "ok", "builtin_knowledge_chunks": 1234, "version": "0.1.0"}
+{"status": "ok", "builtin_knowledge_chunks": 1234, "version": "0.5.2"}
 ```
+
+That `version` is release-please-managed, so it moves with every release and is
+the cheapest signal that an upgrade actually took — see step 4 of
+[Upgrading](#upgrading), which compares it against the checkout.
 
 **Give it a startup grace period of about 5 minutes.** A cold container builds
 the MCP tool-discovery vector index and loads Chroma before it serves. The
@@ -332,8 +336,103 @@ host's Docker. Upgrade from the host instead.
    ```
 
    Never run `docker compose down -v` to upgrade: `-v` deletes the volume.
-4. **Check it came back.** `curl -s http://localhost:8000/health` reports the
-   new `version`, and Settings → About shows it.
+4. **Check it came back — and that it is actually the new code.**
+
+   ```bash
+   python3 scripts/verify-deploy.py                      # localhost:8000
+   python3 scripts/verify-deploy.py --url https://api.example.internal
+   python3 scripts/verify-deploy.py --expect X.Y.Z       # pinned-image install
+   ```
+
+   **Run it on the host unless the API has its own public hostname.** In the
+   reference topology only the UI origin is public and the API is reached
+   through `/api/backend/*`, which the UI gates on a verified NextAuth session
+   — so a bare request there answers `401 unauthorized`, not a version. The
+   default `http://localhost:8000` is the normal invocation; `--url` is for an
+   install that exposes the API on its own hostname, as the Operations section
+   below assumes when it curls `api.example.com/health` directly.
+
+   This is the step to not skip. A 200 from `/health` on its own does **not**
+   prove the upgrade took — it answers with the configured company name
+   whatever code is behind it. What narrows it is the `version` in that
+   answer, which `verify-deploy.py` compares against
+   `packages/core/pyproject.toml` in this checkout: 0 when they match, 1 only
+   for that observed mismatch, 2 whenever the check could not be completed —
+   API unreachable, any status other than 200, a redirect, an unparseable or
+   implausibly large answer, an unreadable checkout, or an unexpected error. An
+   inconclusive result must never read as a pass. `/health` is the only
+   endpoint it probes, deliberately: that route is outside the shared-secret
+   gate and makes no outbound call, so the script carries no credential at all
+   and has none to leak over a cleartext URL, to a mistyped host, or across a
+   redirect — it refuses to follow one, and ignores `http_proxy`, so the host
+   named in `--url` is the host that answers.
+
+   Use `--expect X.Y.Z` on the published-image path above: there the operator
+   pins an image tag, so the *checkout's* version is unrelated to what was
+   deployed and the bare invocation would compare against the wrong number.
+   The remediation printed on exit 1 follows the flag — `docker compose pull`
+   for a pinned install, `make docker` for a checkout one.
+
+   **This is an API-only verifier. The UI is a known gap — restart it.** On
+   the published-image path the UI is its own image, so pull
+   `openexecutive-ui` at the same tag as the API. On the `make docker` path the
+   compose `ui` service bind-mounts `packages/ui`, so *source* is always
+   current, but dependencies are not: `npm install` runs only when the
+   container starts, `node_modules` lives in a separate volume that survives
+   recreation, and `Makefile`'s target is `up --build` without
+   `--force-recreate`, which leaves an already-running `ui` container
+   untouched. So a pull that adds or bumps a UI dependency can leave the dev
+   server on stale modules while this script reports success. After such an
+   upgrade, restart that one service so `npm install` runs again:
+
+   ```bash
+   # add --env-file .env before -f if you keep configuration in a repo-root
+   # .env; `make docker` adds it only when that file exists, and naming a
+   # missing env file explicitly is an error rather than a no-op
+   docker compose -f docker/docker-compose.yml up -d --force-recreate ui
+   ```
+
+   The same caveat applies to any compose command you run by hand here,
+   including a `build --no-cache` to defeat a cached layer — which is why the
+   script's own remediation names `make docker` instead of a compose line.
+
+   Settings → About does not close the gap either: that card calls
+   `GET /version`, which returns the *API's* version, so it re-reads the number
+   this script just read.
+
+   On 2026-10-08 this install served an image built from source 17 days and
+   253 commits behind the checkout: the containers had been *recreated* the
+   evening before, which rebuilt nothing, because step 3's `git pull` was
+   skipped — the build rebuilt the *same* old source and succeeded. Health was
+   green the whole time while the standing briefs ran two-week-old code, and
+   because the briefs' delivery failure is itself silent, nothing surfaced it.
+
+   `/health` would have named that on day one: it reported `0.1.0` (the
+   pre-upstream-sync literal) while the checkout read `0.5.2`. An earlier
+   version of this step claimed the opposite — that the reported `version` is
+   "a static string that does not move between commits" — and that claim was
+   false. release-please writes the version into `pyproject.toml`, `uv.lock`,
+   `packages/ui/package.json`, `api/main.py` and `api/models.py` on every
+   release, so it moves with each one.
+
+   **What this does not catch.** The version moves per *release*, not per
+   commit, so every commit inside one release window reports the same number
+   and this check cannot tell them apart. Following unreleased `main` — as
+   this install does — it is therefore a weaker signal, blind to everything
+   merged since the last release; a passing run prints how HEAD sits relative
+   to its version's tag — ahead, behind, diverged, exactly on it, or why git
+   could not say — so the size of that gap is visible. Read it as a floor on
+   staleness, not a proof of freshness.
+
+   Which is why you then confirm the behaviour you upgraded for, not just the
+   version. That part is not optional on an install between releases: it is
+   what distinguishes two commits sharing a version without reaching inside the
+   container. (The other way is exact and more intrusive — `exec` into the API
+   container and grep the changed code under
+   `/usr/local/lib/python3.11/site-packages/openexecutive/`.) For a
+   scheduler change, `GET /scheduled?status=pending` should list the expected
+   rows, and a route added by the release should return 200 where it
+   previously 404'd.
 
 To go back, see **Rollback** under [Operations](#operations).
 
