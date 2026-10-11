@@ -361,7 +361,15 @@ caching:
     raises). draft_artifact(supersedes=) refuses a collection's document.
     The alert pipeline strips collection: tags, so only an extension's own
     code files into its collection. A module failing partway through
-    register() is rolled back.
+    register() is rolled back. ExtraTool(workflow=True) also offers the tool
+    to workflow action steps as oe__<name> (tool_catalog._extension_specs,
+    merged under the fixed built-ins, which win a clash; name at most 60
+    chars so the prefixed name fits 64). offered() is not asked there: the
+    step's approved tool list is the approval, and the call runs inside
+    extensions.workflow_step(name) so in_workflow_step(name) is True for
+    that tool only, and the handler decides what an unattended call may do
+    (it must not call other extension handlers or leave tasks running). read_only=True is the
+    only way to be labelled reads-only on the review card.
   deferred_tool_groups: |
     The less common skill tools are not in the tool list. orchestrator.
     tool_groups.GROUPS puts them in named groups (calendar, people, goals,
@@ -1806,13 +1814,45 @@ knowledge:
     says so with `builtin_distance_threshold`.
   skills: |
     Skills are Markdown procedures with YAML frontmatter (name, description,
-    when_to_use, category). The UI calls them PLAYBOOKS and shows them as a
-    tab on Workflows (`/jobs?tab=playbooks`; `/skills` redirects there). The
+    when_to_use, category). The UI shows each one as "How it's done" on the
+    page of the workflow that follows it (components/jobs/HowItsDone.tsx:
+    Edit = PUT /skills/{name}, a customized copy on a built-in; Reset to
+    original = DELETE on that copy); there is no separate Playbooks tab
+    any more, and `/skills` redirects to `/jobs`. The
     mental model the UI and persona teach: a playbook is HOW the Executive
     does a piece of work (method, template, checklist; no inputs, schedule or
     side effects); a workflow is the runnable job that produces an artifact.
-    Backend names (`/skills`, the five `*_skill` tools, the `skills`
+    Every playbook belongs to a workflow: a built-in or custom one that
+    follows it, or else its own Quick workflow (below). Backend names
+    (`/skills`, the `search_skills` / `load_skill` tools, the `skills`
     collection) are unchanged.
+
+    Quick workflows (workflows/quick.py): one per playbook in effect that no
+    built-in or custom workflow follows (switched-off custom ones count),
+    derived whenever the catalog is read, never stored. Name
+    `quick_<playbook, dashes as underscores>` (custom workflows may not take
+    the `quick_` prefix, validate_definition); WorkflowMeta.quick is true.
+    One required field, `request`; steps context (profile + RAG for the
+    category's specialist) -> draft (that specialist follows the playbook
+    via playbook_clause, one Markdown document). Category -> specialist /
+    section: strategy cso (Growth), finance cfo (Capital), hr chro (People),
+    legal gc (Risk), operations coo (Operating), marketing cmo (Growth),
+    product cpo, board board_comms, sales (Growth), general cso
+    (Operating). list_workflows() = built-ins + Quick + active custom;
+    get_workflow resolves a Quick name after the registry. The 8 built-in
+    playbooks no built-in workflow follows are Quick: board-update-memo,
+    exec-1on1-template ("1:1 agenda"), layoff-comms-plan,
+    positioning-statement, post-mortem-template ("Post-mortem"),
+    customer-interview-plan, feature-prioritization, market-sizing. A
+    company's own playbook shows up as one; hiding a built-in drops it; a
+    custom workflow that starts following one replaces it. If the custom
+    store can't be read, no Quick workflows are offered (unknown followers).
+    Playbooks whose names map to one Quick name (market-sizing,
+    market_sizing) get none, so sort order never picks the method. A
+    custom workflow stored under a `quick_` name before the prefix was
+    reserved keeps it: no Quick workflow takes a name a built-in or stored
+    custom one already has. A run whose playbook can't be read (hidden or
+    broken since listing) ends with an error rather than a generic draft.
 
     Storage: built-ins ship in git under knowledge/builtin/skills/<category>/;
     company skills in company/skills/<category>/ (gitignored, copied with
@@ -1842,8 +1882,8 @@ knowledge:
       - Hidden built-ins are invisible to search_skills/load_skill and to
         list_skills unless include_hidden; `GET /skills/{name}` still reads
         them so the UI can show one before `POST /skills/{name}/restore`.
-      - create_skill conflicts with every existing name, hidden built-ins
-        included (customizing goes through update).
+      - skills_repo.create_skill conflicts with every existing name, hidden
+        built-ins included (customizing goes through update).
 
     Index reconciliation: `sync_builtin_skill_index` makes the built-in rows
     match "built-ins in effect" (on disk, not hidden, not customized) —
@@ -1853,31 +1893,17 @@ knowledge:
     non-empty, so a built-in added in a release never reached an existing
     install's index.
 
-    Chat proposes, a person approves (knowledge/skill_drafts.py): the
-    create/update/delete_skill tools never change the library — they save a
-    draft JSON in company/skills/.drafts/<name>.json (one per name, newest
-    wins; not *.md, so never listed, indexed, searched, loaded or followed;
-    carried by client slots and cleared by fixture reset with the rest of
-    company/skills). Every save stamps a new `id`; approve (body {id}) and
-    discard (?id=) act only on that version (409 SkillDraftChangedError
-    otherwise), and approval removes the draft only if it is still that
-    version. Drafts also report `followers` (workflows naming the playbook),
-    creates included. The Playbooks tab's "To review" strip approves
-    (POST /skill-drafts/{name}/approve -> the ordinary repo op; 409 keeps
-    the draft on conflict / vanished target), edits then saves, or discards.
-    Chips read "Drafted playbook / Drafted a change to / Proposed deleting"
-    and link to /jobs?tab=playbooks&draft=<name>. The persona must say it's
-    a draft and never claim a playbook was saved.
-
-    Chat tools stay off built-ins: `update_skill` / `delete_skill` in
-    orchestrator/skills_tools.py refuse any name a built-in ships under
-    (code "builtin"), including the company's customized copy. Workflows
-    read built-ins by fixed name and the tool loop also runs on inbound
-    email/Slack/etc., so letting the model customize or hide one would let a
-    crafted message rewrite what board_prep / quarterly_plan follow.
-    Customize / revert / hide / restore are HTTP-only (the Playbooks tab).
-
-    Chat chips: see "Chat proposes, a person approves" above.
+    Chat does not change playbooks: it has only search_skills and
+    load_skill. Repeatable work is saved as a workflow (draft_workflow ->
+    the user confirms -> save_workflow), with the method in its steps; a
+    playbook's body is changed by a person (How it's done on the workflow
+    page; the HTTP API also keeps hide / restore). Workflows read playbooks at run
+    time, including approved scheduled custom ones whose later action steps
+    write to already-approved targets unattended, and the tool loop also
+    runs on inbound email/Slack/etc., so no model a crafted message could
+    steer may rewrite one. (The old create/update/delete_skill chat tools
+    and their draft review queue, /skill-drafts, are removed; a leftover
+    company/skills/.drafts/ folder is ignored.)
 
     Workflows follow playbooks (workflows/playbooks.py): `load_playbook`
     returns the body in effect ("" when hidden, missing or malformed — never
@@ -1891,17 +1917,10 @@ knowledge:
     (board_prep used to also load board-update-memo and never use it; that
     dead load is gone.) Custom workflows: SpecialistStepSpec.playbook,
     validated at save, appended AFTER {field} rendering. playbook_users()
-    feeds SkillMeta.used_by, search_skills hits' `workflows`, and the UI's
-    hide/revert/delete warnings, and the chat-tool guard: update_skill /
-    delete_skill also refuse (code "followed_by_workflow") any company
-    playbook any workflow follows (switched-off custom ones too, via
-    list_definitions(active_only=False)) — an approved scheduled custom
-    workflow reads it at each run and later action steps write to
-    already-approved targets unattended, so a crafted inbound message must
-    not be able to rewrite it. create_skill runs the same follower check
-    (a deleted playbook's name a workflow still follows can't be refilled
-    from chat), and the check uses playbook_users(strict=True): a store
-    error refuses with code "unverifiable" instead of failing open.
+    feeds SkillMeta.used_by, search_skills hits' `workflows` (Quick ones
+    included), and the UI's hide/revert/delete warnings; it counts
+    switched-off custom workflows (list_definitions(active_only=False)), and
+    followed_by_workflows() is the same set without the Quick ones.
     load_playbook catches every exception; a
     custom step whose playbook is unavailable emits a `progress` event.
     Persona routing: a hit with `workflows` +
@@ -3875,7 +3894,7 @@ departments:
     cadence is due, then `enqueue_next()` chains the following
     occurrence. The fire is NOT passed through the authority gate
     (`kind != "dept_cadence"` in `_execute_action`): cadence rows always
-    carry their department and the seeded departments are propose_only,
+    carry their department and new departments are propose_only,
     so gating it turned each check-in into a one-shot proposal card,
     marked the row done and never chained — the chain died until the next
     boot. The check-in has no outbound side effect (goal verdicts, one
@@ -3906,22 +3925,30 @@ departments:
     — left `running`, requeued by the boot sweep — never duplicates the
     next occurrence. Cost note: with the gate bug
     fixed, check-ins actually run — about three specialist calls each —
-    bounded by the skip rule (seeded departments have no Goals, so they
-    skip until someone adds one). Lifecycle cleanup: deleting a department cancels its
+    bounded by the skip rule (a department with no Goals skips until
+    someone adds one). Lifecycle cleanup: deleting a department cancels its
     pending `dept_cadence` rows in the same transaction, and the
     lifespan runs `cancel_orphaned_cadences()` on boot (before
     `bootstrap_cadences`) to cancel pending cadences whose department no
     longer exists — so a removed department stops firing check-in alerts.
   seeding: |
-    openexecutive.departments.store.seed_default_departments — the 8
-    default departments are seeded exactly once per database on first
-    boot, tracked by the `default_departments_seeded` row in the
-    `departments_meta` table. After that the user owns the list:
-    departments they delete stay deleted across restarts and the
-    defaults are never re-inserted. A database that predates the
-    sentinel but already holds departments is adopted as the baseline
-    (sentinel set, nothing inserted) so deploying this code never
-    resurrects rows the user removed.
+    Nothing creates departments at boot: a new install, a blank client
+    slot and the factory reset all start with none. Setup's commit
+    (onboarding/commit.reconcile_onboarding_departments) creates only the
+    departments its draft names, so a solo workspace or a team that names
+    none has zero, and the create_goal chat tool creates one when a goal
+    names an area that has none. A department named after one of the eight
+    catalogue areas (departments/charters DEFAULT_DEPARTMENTS) starts from
+    that area's charter (store.default_charter_for, applied inside
+    create_department unless a mission is given), and setup and create_goal
+    wire it to the matching specialist (store.specialist_key_for_area, at
+    most one department per specialist). Why: eight empty departments meant
+    eight daily check-ins in Coming up, eight empty cards and "no head"
+    warnings for companies that never had those functions. Workspaces
+    created before this keep what they have; nothing is removed.
+    store.seed_default_departments still inserts the full catalogue once
+    per database (tracked by the `default_departments_seeded` row in
+    `departments_meta`), but only tests and tooling call it.
   workspace_settings: |
     openexecutive.memory.workspace_settings — one row (id=1) in
     `workspace_settings` (episodic DB): `mode` ('team' default | 'solo'),
@@ -4179,8 +4206,7 @@ people:
     private, the entry on everyone's /watchlist); draft_artifact (visible
     to the whole team; its handler refuses too); update_department_goal
     (goal text in every turn's org block and on /today); save_workflow
-    (listed on /jobs); create_skill / update_skill / delete_skill (the
-    shared skill review list); load_mcp_server (connects to any HTTPS URL,
+    (listed on /jobs); load_mcp_server (connects to any HTTPS URL,
     which can itself carry the turn's content — the dispatch guard covers
     MCP tool uses too). Of the MCP tools it may use only
     `schedule_tools.PRIVATE_TURN_MCP_TOOLS` (Google Workspace reads and the
@@ -4859,8 +4885,16 @@ today:
     Read-side only — no writes happen here.
 
 chat:
+  chats_search: |
+    GET /sessions?q= searches the caller's own chats (same scope as the
+    list) by title and message text, case-insensitive with LIKE
+    wildcards escaped. Each result adds match_count (0 = title only) and
+    snippet (newest matching message around the match). The Chats page
+    debounces it and opens a message match with /?session=…&find=…, and
+    the chat starts on that message with previous/next and highlights
+    the words (CSS Custom Highlight API where the browser has it).
   module: openexecutive.api.routes.chat
-  endpoint: POST /chat — server-sent events stream of the live turn. POST /chat/stop halts one mid-flight. POST /chat/add hands it a message the person typed while it works.
+  endpoint: POST /chat — server-sent events stream of the live turn. POST /chat/stop halts one mid-flight. POST /chat/add hands it a message the person typed while it works. POST /chat/background starts a new chat the server answers to the end with no reader (202 + session_id; the caller request is wrapped so is_disconnected is always false, the stream is drained by a task kept in _background_tasks; at most 3 per owner key in _background_counts, claimed before the first await so a burst cannot pass together, else 429).
   sse_event_types:
     - "chunk — one text delta from the assistant response stream. Fields: type, content, session_id."
     - "thinking — keepalive emitted at the start of EVERY tool-use round, not just specialist ones. Fields: type, session_id. It carries no tool information, so the UI uses it purely as an in-flight boolean and takes the wording from the `activity` event that immediately precedes it. It used to be the sole driver of a hardcoded 'Consulting specialists…' string, which is why an MCP or calendar round looked like a specialist fan-out."
@@ -5192,7 +5226,7 @@ audit:
     - alert — alert created by the triage pipeline
     - integration_inbound — Slack / Discord / email / Telegram / Google Chat message received. The chat adapters put the first 160 characters of the message in the summary; the email poller keeps the summary to sender and subject and stores the text in the full payload (`message` — the sender's new text, cut at 20,000 escaped JSON chars, the measure the 64 KB cap uses; `attachments` — filenames, 8,000 escaped chars; `body` — the whole body with its quoted chain, only on a row private to the principal, since the chain quotes other people's mail and a public row is every signed-in user's) with `details.preview` (120 chars of the new text) and `details.body_len`, so /audit shows the request next to the reply's `chat_turn` row. `details.outcome` distinguishes the non-reply paths — `rejected_unknown_sender` (not on the People roster), `skipped_gate` (response gate said no), `dropped_thread_unreadable` (Slack wouldn't return a thread the bot is in, so a continuation went unanswered; the sender was told), and `handler_error` (the turn raised; the user got the generic apology). The error row carries the same `session_id` as the inbound row, so /audit can join a failed turn to the message that caused it.
     - knowledge_retrieval — one row per `knowledge.retriever.retrieve()` call; details carry chunk counts + domains, full payload carries each chunk's source, distance, and text preview so the session view shows "which RAG chunks influenced this response"
-    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, and the chat memory extractor (memory_extractor). Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
+    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, the chat memory extractor (memory_extractor), alert review (alert_review), the brief's narrative and grounding repair (briefing_narrative / briefing_grounding), the end_of_day_digest, executive_reflection and weekly_review workflows, wait_for_human reply parsing (workflow replies and roster answers) and the inbound_resolver, committee reviewers (committee_reviewer), the fixture and engagement generators (their agent names), and the utility calls — session_title, response_gate, person_insight, initiatives_consolidation, pdf_reader, the chat page's suggested_prompts / followup_suggestion, and the eval runner's eval_judge. `tests/unit/test_usage_recording.py::test_every_model_call_records_usage` walks the package's AST and fails on any function that calls `messages_create` / `messages_stream` without calling `log_model_usage` (directly, through a same-module wrapper such as the Executive's `_emit_cache_event`, or from an enclosing function), so a new call site cannot skip the row silently; `providers/` and the runtime-dead `architecture/generator.py` are exempt, and the repo-root `evals/` harness (a separate client process with its own SDK client) is out of scope. Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
     - memory_snapshot — one row at Executive turn entry; captures the system-block layout, conversation history length, episodic context (full text in `full_json`), and a company-profile hash so the session view can render "what the agent saw" before any API call
     - committee_review — one row per committee-reviewed turn; carries draft length, final length, per-reviewer critiques and timings (previously emitted but newly declared as a recognised event_type)
     - peer_memory — one row per `openexecutive.memory.honcho_client` call (prefetch / sync_turn / seed_identity / directional_chat / prefetch_department / sync_department_turn / append_department_note); carries `op`, `person_id`, optional `department_slug`, `outcome` (ok / timeout / error / disabled / no_person / no_department / no_loop / empty), `duration_ms`, plus op-specific details (query preview, reasoning_level, peer count, co_present_person_ids, co_present_department_slugs, originating_person_id, target_person_id, session_id, kind) so the flow-chart view renders the peer_memory path alongside `<retrieved_context>` and `<past_decisions>`. Disabled / no-Person / no-Department turns still emit (outcome marker) so audit absence equals "code path never ran" instead of "the provider was down."
@@ -6548,6 +6582,12 @@ workflows:
     files must be str -> valid base64 (b64decode validate=True) or the job
     errors, so a bad runner reply can't raise in the handler. The runner is
     trusted to isolate jobs.
+    A non-200 reply whose JSON body has run_locally: true (and an optional
+    reason, at most 300 chars; body read up to 4 KiB, _turned_away) makes
+    run_job run the job in the local sandbox when _local_sandbox_ready(),
+    else the job fails with the reason. Only an explicit true falls back: any
+    other non-200 stays a job error, so a busy or broken runner never moves
+    every job onto the machine.
     PYTHON_JOB_EXTRA_LIBRARIES (with a runner only; comma-separated package
     names, each with an optional "(import <module>)", at most 300
     chars; anything else is dropped with a warning, not fatal, since it may be
@@ -7322,6 +7362,35 @@ integrations:
     point (asyncio.run + start_async) remains for development but must not
     run alongside an API that has the Slack tokens, or every message is
     answered twice.
+  chat_app_conversations: |
+    A Telegram chat, a Slack or Discord DM and a person's @mentions in
+    one channel are each one endless stream with a fixed base id
+    (telegram:{chat}, slack:dm:{user}, slack:channel:{c}:{user},
+    discord:dm:{user}, discord:channel:{c}:{user}). memory.conversations
+    cuts it into conversations so the Chats page shows each one, titled,
+    instead of one chat that never ends, and replayed history starts
+    clean.
+      • A message starts the next conversation when the stream has been
+        quiet for two hours (CONVERSATION_GAP). The first keeps the bare
+        base id; later ones are base~2, base~3 (memory.conversation_ids).
+      • "/new", "new chat" or "new conversation" as the whole message
+        starts one now; the reply names the conversation it ended. The
+        empty row stays off GET /sessions until its first turn.
+      • After a conversation's first exchange it is titled in the
+        background (utils.session_title, else its first words).
+      • Threads, email and web chats are never cut.
+      • What spans the stream compares base ids: inbound_resolver
+        (an approval asked before a cut is answered after it) and the
+        session-scoped decisions/advice in format_for_prompt.
+      • Boot (and a client-slot restore) runs split_existing_streams
+        once per DB (app_migrations): old history is cut by the same
+        rule, each part titled from its first message, a read-mail lock
+        carried to every part with mail_read_at unknown (fails closed).
+      • An adapter outside the package registers its streams with
+        conversation_ids.register_rolling and runs
+        split_existing_streams(migration=<its own name>, only=<its base
+        ids>) once, since the built-in sweep may have run before it
+        registered. Boot runs the sweep off the event loop (to_thread).
   channel_access: |
     Channel access splits into INBOUND (does the message reach the
     Executive at all?) and OUTBOUND (can the Executive reply via the
@@ -7759,6 +7828,16 @@ integrations:
     audit ts for the channel's actor). Order = setup_checks.LABELS. The
     UI adds its own sign-in light (lib/setupStatus.ts signInCheck, from
     the UI's env) and sorts worst-first.
+    LABELS is the whole row list and run_checks emits one row per key, so
+    there is NO hide-when-fine mechanism: a condition that should show
+    nothing when healthy cannot have its own row, it has to ride an
+    existing one. That is why the pinned-Google-tools drift signal folds
+    into check_gmail as a warn branch (see mcp.prime_pinned_tools) rather
+    than adding a google_tools row, which would sit there as ok | off
+    forever. A stand-in gateway in a test has no pinned_tools attribute
+    at all, which is NOT the same as a real gateway whose probe has not
+    finished (None) - check_gmail keys on a sentinel so the first case
+    reads exactly as it did before the drift branch existed.
     Probes — at most one free read-only call per service, each bounded
     by PROBE_TIMEOUT_S (5 s), via one shared httpx client per run:
     Anthropic models.list(limit=1) through configured_async_client
@@ -8027,8 +8106,30 @@ integrations:
     DiscoveredToolsFilter runs only tools one of the session's searches
     returned and keeps them for the session's life, so the lifespan runs
     MCPGateway.prime_pinned_tools() once in the background when
-    google_workspace is configured (exact-name searches; misses logged as
-    drift), and call_tool retries a PINNED name once after discovering it when
+    google_workspace is configured. It probes the SAME narrowed set the
+    prompt advertises (connected_systems.pinned_google_tools, filtered by
+    WORKSPACE_MCP_TOOLS and WORKSPACE_MCP_TOOL_TIER), so a service that was
+    never imported is never probed and never warned about. A name neither
+    can account for is logged once naming both causes - excluded by those
+    two variables, or renamed by workspace-mcp since the pin - because the
+    old text named only the rename and sent operators to the manifest for
+    what was usually a service-list setting (exact-name searches; misses
+    kept on the gateway as PinnedToolsProbe, not only logged: GET /health
+    reports them as google_tools_missing and Setup status turns the Email
+    (Gmail) row amber naming a few and counting the rest. The probe is ONE
+    frozen value assigned once, so no reader has to reconcile two attributes:
+    missing=() means it ran and found everything, missing=None means the probe
+    itself failed, and the attribute still being None means it has not
+    finished. Only () reads green anywhere, so a probe that died can never
+    look healthy. prime_pinned_tools catches BaseException, not Exception,
+    because anyio wraps a session failure in BaseExceptionGroup, which is not
+    an Exception - the same reasoning as the gateway's startup guard in
+    api.main; CancelledError still propagates, since that is shutdown
+    cancelling the task and the probe genuinely has no answer. Settings are
+    read once for the whole run and passed into each probe, because
+    get_settings() builds a fresh Settings every call and this read the
+    environment once per missing tool),
+    and call_tool retries a PINNED name once after discovering it when
     the reply is extensible-mcp's "has not been discovered via search_tools"
     refusal — after every gate has passed the same arguments. Unpinned tools
     still need the model's own search; nothing here widens what a call may do
@@ -8914,10 +9015,11 @@ company_onboarding:
   departments_are_additive: |
     THE key difference from the fixture path. cli/fixture_loader._seed_departments
     DELETEs every department and goal before inserting — correct when swapping
-    in a demo company, destructive here: it would drop the eight defaults from
-    seed_default_departments along with their specialist_key wiring, and
-    onboarding's create_department calls pass no specialist_key (NULL), so a
-    wiped default can never be recreated properly. onboarding/commit.reconcile_onboarding_departments
+    in a demo company, destructive here: a re-run of setup would drop the
+    departments the workspace already has, with their goals and
+    specialist_key wiring. An unmatched draft is created with the specialist
+    its name maps to (specialist_key_for_area) unless another department
+    already has that specialist. onboarding/commit.reconcile_onboarding_departments
     instead matches each drafted department onto an existing one by slug or
     case-insensitive title (`departments.store.match_department`, shared with
     the create_goal chat tool), UPDATEs matches in place (preserving charter scope
@@ -9279,9 +9381,9 @@ clients:
     materialize_to_dir). No state.db; live state untouched; not activated.
     On first activation the blank-restore path applies the seed files with
     the fixture loader's seeders (people → memory → departments, so heads
-    and assigned ids resolve by name) and skips the default 8-department
-    reseed when the draft supplied an org (brief/cadence bootstraps still
-    run and pick up the seeded departments). After the first save-back
+    and assigned ids resolve by name); no default departments are added
+    (brief/cadence bootstraps still run and pick up the seeded
+    departments). After the first save-back
     writes state.db, the seed files remain as the engagement's birth record
     but are no longer consulted. meta.json records origin="generated" +
     the intake_description.
@@ -9916,7 +10018,8 @@ delegation:
     (_guard_outbound), calendar invites name attendees by person id, the
     Executive's Gmail / Outlook send through call_tool checks every
     recipient against _roster_allow_set, remember_fact and update_company_profile keep only the
-    speaker's own words, and playbook changes are drafts a person approves.
+    speaker's own words, and a workflow drafted in chat is saved only once
+    a person confirms it.
     upsert_person runs only for a contact the speaker named this turn
     (lockdown.speaker_named_contact: kind contact, only name, role, email,
     leave and response fields; a word of the name in their own words, in
@@ -10273,12 +10376,19 @@ delegation:
     x-caller-email unless local login; turning it on needs gmail_status
     connected (409 gmail_not_connected / gmail_needs_reconnect /
     gmail_mismatch / no_email / shared_mailbox / gmail_error). Every change
-    writes a private audit row. PUT /delegation/inbox {enabled} (409
+    writes a private audit row. PUT /delegation/inbox {enabled?,
+    mailbox_drafts?} (mailbox_drafts: also save each reply in their Drafts,
+    off by default, so a reply lives on its card alone until Send makes the
+    draft from it: delegation.card_drafts; 409
     act_as_me_off or the Gmail codes; the same DelegationOut back, whose
     inbox field is {enabled, status, message, watch_since, last_poll_at,
     checking}); POST /delegation/inbox/check (202 with the inbox state; 409
     inbox_off / in_progress); GET /delegation/replies ({cards: [...]}, see
-    reply_cards). Send is POST /decisions/{id}/approve (edits carry the
+    reply_cards; each card says in_mailbox and mailbox); PUT
+    /delegation/replies/{id}/text {text} changes a reply's words on its card
+    and, when it is in their Drafts, there too, only while that draft is still
+    the version the card last saw (409 draft_changed / draft_not_plain /
+    caller_signing_required, 422 empty / too_long); it sends nothing. Send is POST /decisions/{id}/approve (edits carry the
     second yes; 409 confirm / caller_signing_required / draft_gone /
     you_replied / inbox_off / client_slot / the Gmail codes, 429
     rate_limited, 502 gmail_error / send_unconfirmed); Dismiss is POST

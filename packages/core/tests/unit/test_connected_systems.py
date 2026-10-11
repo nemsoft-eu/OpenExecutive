@@ -16,7 +16,10 @@ from openexecutive.orchestrator.mcp_gateway import MCPGateway, gateway_server_na
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.prompts.connected_systems import (
     GOOGLE_TOOL_MANIFEST,
+    GOOGLE_TOOLS_ABOVE_CORE,
     PINNED_GOOGLE_TOOLS,
+    google_tool_manifest,
+    pinned_google_tools,
     render_connected_systems,
 )
 
@@ -63,6 +66,81 @@ def test_google_connected_lists_every_pinned_name(channel_env: Any) -> None:
     for name in PINNED_GOOGLE_TOOLS:
         assert f"`{name}`" in text
     assert "no `search_tools` needed" in text
+
+
+def test_a_service_subset_is_neither_named_nor_pinned(channel_env: Any) -> None:
+    """The bug this fix is for: `WORKSPACE_MCP_TOOLS` decides which service
+    modules workspace-mcp imports, so naming all five and pinning all 24 tells
+    the model a tool is "already available" when it is not in the index at all.
+    It then calls it, gets extensible-mcp's "has not been discovered via
+    search_tools" refusal, and cannot reconcile that with its instructions.
+    """
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "gmail,calendar,drive")
+    text = _render(("google_workspace",))
+
+    assert "Gmail, Calendar and Drive" in text
+    assert "Docs" not in text and "Sheets" not in text
+
+    for name in GOOGLE_TOOL_MANIFEST["Gmail"]:
+        assert f"`{name}`" in text
+    for dropped in GOOGLE_TOOL_MANIFEST["Docs"] + GOOGLE_TOOL_MANIFEST["Sheets"]:
+        assert dropped not in text
+
+
+def test_the_core_tier_drops_the_tools_it_does_not_register(channel_env: Any) -> None:
+    """The second axis. Tiers are cumulative and `extended`/`complete` carry all
+    24, so only `core` subtracts anything — the ten names in
+    `GOOGLE_TOOLS_ABOVE_CORE`, read from workspace-mcp 1.29.0's
+    `core/tool_tiers.yaml`."""
+    channel_env.setenv("WORKSPACE_MCP_TOOL_TIER", "core")
+    text = _render(("google_workspace",))
+
+    # A service whose core tools survive is still named...
+    assert "Gmail" in text
+    assert "`google_workspace__search_gmail_messages`" in text
+    # ...while the above-core names are gone.
+    for name in GOOGLE_TOOLS_ABOVE_CORE:
+        assert name not in text
+
+
+def test_the_default_install_is_unchanged(channel_env: Any) -> None:
+    """Backward compatibility, stated as a test rather than assumed: with the
+    Dockerfile's `all` / `complete` the filter is a no-op and every pinned name
+    is still advertised."""
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "all")
+    channel_env.setenv("WORKSPACE_MCP_TOOL_TIER", "complete")
+    text = _render(("google_workspace",))
+    assert "Gmail, Calendar, Drive, Docs and Sheets" in text
+    for name in PINNED_GOOGLE_TOOLS:
+        assert f"`{name}`" in text
+    assert pinned_google_tools(get_settings()) == PINNED_GOOGLE_TOOLS
+
+
+def test_priming_probes_exactly_what_the_prompt_advertises(channel_env: Any) -> None:
+    """One source of truth. If priming probed the full manifest while the
+    prompt advertised a subset, the boot log would warn once per unloaded tool
+    and send the operator looking for a rename that never happened — which is
+    what it did before this change."""
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "gmail")
+    settings = get_settings()
+
+    advertised = {
+        n for names in google_tool_manifest(settings).values() for n in names
+    }
+    assert pinned_google_tools(settings) == advertised
+    assert advertised == set(GOOGLE_TOOL_MANIFEST["Gmail"])
+    assert advertised < PINNED_GOOGLE_TOOLS
+
+
+def test_block_0_stays_one_stable_cached_block_under_a_subset(channel_env: Any) -> None:
+    """The expensive failure mode would be a block 0 that varies. Both inputs
+    are process-constant, so a subset changes the text once and then holds."""
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "gmail,drive")
+    a = build_system_blocks(mcp_servers=("google_workspace",))
+    b = build_system_blocks(mcp_servers=("google_workspace",))
+    assert a == b
+    assert a[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert a[0]["text"].count("## Connected Systems") == 1
 
 
 def test_without_google_nothing_claims_gmail_or_drive(channel_env: Any) -> None:
@@ -236,3 +314,86 @@ def test_prime_pinned_tools_searches_each_and_reports_the_missing() -> None:
 def test_prime_survives_a_dead_session() -> None:
     gateway = MCPGateway()  # never started: every search raises
     assert sorted(asyncio.run(gateway.prime_pinned_tools())) == sorted(PINNED_GOOGLE_TOOLS)
+
+
+def _priming_gateway(missing: set[str]) -> MCPGateway:
+    """A started gateway whose searches return every pinned tool except ``missing``."""
+    gateway = MCPGateway()
+    session = MagicMock()
+
+    async def search(tool: str, args: dict[str, Any]) -> MagicMock:
+        assert tool == "search_tools"
+        wanted = next(n for n in PINNED_GOOGLE_TOOLS if re.sub(r"_+", " ", n) == args["query"])
+        return _result("No matching tools found." if wanted in missing else _search_hit(wanted))
+
+    session.call_tool = AsyncMock(side_effect=search)
+    gateway._session = session
+    return gateway
+
+
+def test_prime_records_the_misses_for_health_and_setup_status() -> None:
+    gateway = _priming_gateway({"google_workspace__create_doc"})
+    assert gateway.pinned_tools is None, "nothing probed yet"
+
+    asyncio.run(gateway.prime_pinned_tools())
+
+    assert gateway.pinned_tools is not None
+    assert gateway.pinned_tools.missing == ("google_workspace__create_doc",)
+
+
+def test_prime_records_an_empty_tuple_when_every_pinned_tool_is_there() -> None:
+    gateway = _priming_gateway(set())
+    asyncio.run(gateway.prime_pinned_tools())
+    assert gateway.pinned_tools is not None
+    assert gateway.pinned_tools.missing == ()
+
+
+def test_prime_records_a_failure_rather_than_an_empty_result() -> None:
+    """A BaseExceptionGroup is what anyio raises out of a failing session, and
+    it is not an Exception — so a plain `except Exception` would let it past and
+    leave the probe looking unfinished forever."""
+    gateway = MCPGateway()
+    session = MagicMock()
+    session.call_tool = AsyncMock(
+        side_effect=BaseExceptionGroup("session died", [KeyboardInterrupt()])
+    )
+    gateway._session = session
+
+    assert asyncio.run(gateway.prime_pinned_tools()) == []
+
+    assert gateway.pinned_tools is not None
+    assert gateway.pinned_tools.missing is None, "a failed probe must not read as 'all found'"
+
+
+def test_prime_records_nothing_when_shutdown_cancels_it() -> None:
+    gateway = MCPGateway()
+    session = MagicMock()
+    session.call_tool = AsyncMock(side_effect=asyncio.CancelledError())
+    gateway._session = session
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(gateway.prime_pinned_tools())
+
+    assert gateway.pinned_tools is None, "cancelled at shutdown is not a failed probe"
+
+
+def test_prime_reads_settings_once_for_the_whole_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every pinned tool missing means every probe reaches the warning that
+    names the settings — which must still be the one read priming already did."""
+    from openexecutive.orchestrator import mcp_gateway as gw_mod
+
+    calls = 0
+    real = gw_mod.get_settings
+
+    def counted() -> Any:
+        nonlocal calls
+        calls += 1
+        return real()
+
+    monkeypatch.setattr(gw_mod, "get_settings", counted)
+    gateway = _priming_gateway(set(PINNED_GOOGLE_TOOLS))
+
+    missing = asyncio.run(gateway.prime_pinned_tools())
+
+    assert sorted(missing) == sorted(PINNED_GOOGLE_TOOLS)
+    assert calls == 1
