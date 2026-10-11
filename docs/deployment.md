@@ -185,8 +185,16 @@ skipping the check.
 can reach it unauthenticated. It returns:
 
 ```json
-{"status": "ok", "builtin_knowledge_chunks": 1234, "version": "0.5.2"}
+{"status": "ok", "builtin_knowledge_chunks": 1234, "google_tools_missing": [], "version": "0.5.4"}
 ```
+
+`google_tools_missing` is the pinned Google tools startup priming could not
+find. `[]` means it checked and they are all there — the only value that says
+so. A list of names means a `workspace-mcp` update renamed one, or the
+configured services and tool tier never loaded it; Settings → Setup status
+names them too. `null` means no answer: Google Workspace is not configured, or
+the probe has not finished, or it failed. Expect `null` during the startup
+grace period below, so alert on a non-empty list rather than on "not `[]`".
 
 That `version` is release-please-managed, so it moves with every release and is
 the cheapest signal that an upgrade actually took — see step 4 of
@@ -249,6 +257,52 @@ share with People on the roster.
 Every Google Workspace call acts as the Executive's own account: the gateway
 refuses a call whose `user_google_email` names any other address.
 
+#### Narrowing the Google tool surface (optional)
+
+Two variables decide how much of Google Workspace the co-located child loads.
+Both default to everything; leave them unset unless you want less.
+
+| Variable | Default | Values |
+|---|---|---|
+| `WORKSPACE_MCP_TOOLS` | `all` | `all`, or comma-separated service names: `gmail`, `calendar`, `drive`, `docs`, `sheets` (also `chat`, `forms`, `slides`, `tasks`, `contacts`, `search`, `appscript`) |
+| `WORKSPACE_MCP_TOOL_TIER` | `complete` | `core`, `extended`, `complete` |
+
+`WORKSPACE_MCP_TOOLS` reaches workspace-mcp as `--tools`, which decides which
+service **modules** it imports. A service you leave out is never imported, so
+none of its tools exist — not in the index, and not callable. The tier decides
+how many tools per service are registered; tiers are cumulative, and `core` is
+the smallest.
+
+Both are prompt-visible. The Connected Systems block in the cached system
+prompt names only the services actually loaded and pins only the tool names
+that exist at the active tier, and startup priming probes the same set — so the
+Executive is never told a tool is "already available" when it is not. If you
+narrow these, expect the block to name fewer services; that is the intended
+effect, not a fault.
+
+Two things worth knowing before narrowing:
+
+- `core` leaves out ten of the pinned tools — Gmail drafts, threads and
+  attachments, Drive item listing, calendar freebusy, and the Docs/Sheets
+  listing and info tools. `extended` and `complete` both cover all of them.
+- `all` means every service only as the **whole** value (surrounding commas or
+  spaces are fine). `gmail,all` is passed through as the two names `gmail` and
+  `all`, and since `all` is not a service name, workspace-mcp's argument parser
+  rejects it and **the child does not start at all** — you lose every Google
+  tool, not just the misspelled one. Write `all` on its own, or list only real
+  service names.
+- Both variables reach the child through the `env` block of the
+  `google_workspace` entry in `mcp_servers.json`, which must forward them
+  (`"WORKSPACE_MCP_TOOLS": "$WORKSPACE_MCP_TOOLS"` and the same for
+  `WORKSPACE_MCP_TOOL_TIER`, as
+  [mcp_servers.json.example](../packages/core/mcp_servers.json.example) does).
+  A config that forwards only one of them leaves the API filtering the prompt
+  on a value the child never saw, which hides tools that are in fact callable.
+
+A pinned tool that priming cannot find is logged once at startup, naming both
+possible causes — the service list or tier excluding it, or workspace-mcp having
+renamed it since the pin in `docker/Dockerfile`.
+
 ### Your own Gmail or Outlook (Act as me, optional)
 
 Act as me lets the Executive draft replies **as the owner**, in the owner's
@@ -285,10 +339,10 @@ MS365_MCP_CLIENT_ID=<app id> uv run python scripts/connect-own-outlook.py --emai
 
 No restart is needed. The address must be the owner's email on the People
 page, and it must not be the Executive's own `EXEC_EMAIL_ADDRESS`. Then turn
-it on in Settings → Act as me; the setup status page shows the connection.
+it on in Delegate → Act as me; the setup status page shows the connection.
 
 **Team members (optional).** Set `DELEGATION_TEAM_MEMBERS=true` and the owner
-gets **Let team members use it** in Settings → Act as me. Once they turn it
+gets **Let team members use it** in Delegate → Act as me. Once they turn it
 on, each team member connects their own Gmail or Outlook the same way (the script with
 their own address, one file each in the same directory) and turns it on for
 themselves. A team member's mail, drafts, reply cards and audit rows are

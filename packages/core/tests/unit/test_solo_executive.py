@@ -44,16 +44,17 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # sha256 of EXECUTIVE_PERSONA_PROMPT before it was split into sections. The
 # split must not move a single byte of the team prompt. Updated once since,
 # deliberately: the inbound-email reply step names the `--- REPLY ---` block
-# instead of the Gmail send tool, so it holds for Outlook too.
+# instead of the Gmail send tool, so it holds for Outlook too. And once more:
+# the Skills paragraph saves repeatable work as a workflow, not a playbook.
 #
 # FORK DELTA (2026-10-07 upstream sync): this digest necessarily differs from
 # upstream's. The fork adds a "## Consulting Your Leadership Team" section —
 # the local model ignores `tool_choice`, so the persona has to ask for the
 # consult in prose — and it lives in the SHARED _PERSONA_TAIL so BOTH the team
-# and solo prompts carry it. Upstream's value was
-# 419725695c173451666ff8a64849bb13a5fabcbbb8f56ac0c1831e0cf61db5c4.
+# and solo prompts carry it. Upstream's value is
+# 1132deffbe673c84c5d69aa93240c0c237904bd612bb1c51ce69967599d10be0.
 # The test keeps its purpose: any *unintended* byte change still fails here.
-TEAM_PERSONA_SHA256 = "1c29ce002fe73da8e2e7f5e2b45196ea44e3a57da5ce020c2ef4d741a8d22461"
+TEAM_PERSONA_SHA256 = "0635df5264894fb985537d6003393d3007968a49c2b00ff286be82b0c920ea18"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",

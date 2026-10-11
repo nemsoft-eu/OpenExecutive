@@ -878,20 +878,6 @@ export async function peekExternalSource(
   return res.json();
 }
 
-// Mirrors SKILL_CATEGORIES in packages/core/openexecutive/knowledge/skills.py.
-export const SKILL_CATEGORIES = [
-  "strategy",
-  "finance",
-  "hr",
-  "legal",
-  "operations",
-  "marketing",
-  "product",
-  "board",
-  "sales",
-  "general",
-] as const;
-
 export interface SkillMeta {
   name: string;
   category: string;
@@ -922,15 +908,6 @@ export interface SkillInput {
 /** What DELETE did: removed, reverted a customization, or hid a built-in. */
 export type SkillDeleteOutcome = "deleted" | "reverted" | "hidden";
 
-export interface SkillSearchHit {
-  name: string;
-  category: string;
-  description: string;
-  when_to_use: string;
-  source: "builtin" | "company";
-  score: number;
-}
-
 async function skillError(res: Response, fallback: string): Promise<Error> {
   const err = await res.json().catch(() => ({}));
   const detail = (err as { detail?: unknown }).detail;
@@ -948,27 +925,6 @@ export async function listSkills(includeHidden = false): Promise<SkillMeta[]> {
 export async function getSkill(name: string): Promise<SkillDetail> {
   const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(name)}`);
   if (!res.ok) throw await skillError(res, "Failed to load playbook");
-  return res.json();
-}
-
-export async function searchSkills(
-  q: string,
-  n = 5
-): Promise<SkillSearchHit[]> {
-  const params = new URLSearchParams({ q, n: String(n) });
-  const res = await fetch(`${API_BASE}/skills/search?${params.toString()}`);
-  if (!res.ok) throw new Error("Failed to search playbooks");
-  const data = await res.json();
-  return data.results;
-}
-
-export async function createSkill(input: SkillInput): Promise<SkillDetail> {
-  const res = await fetch(`${API_BASE}/skills`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await skillError(res, "Failed to create playbook");
   return res.json();
 }
 
@@ -992,82 +948,28 @@ export async function deleteSkill(name: string): Promise<SkillDeleteOutcome> {
   return data.outcome;
 }
 
-export async function restoreSkill(name: string): Promise<SkillDetail> {
-  const res = await fetch(
-    `${API_BASE}/skills/${encodeURIComponent(name)}/restore`,
-    { method: "POST" }
-  );
-  if (!res.ok) throw await skillError(res, "Failed to restore playbook");
-  return res.json();
-}
-
-/** A playbook change the Executive proposed from chat, awaiting review. */
-export interface SkillDraft {
-  action: "create" | "update" | "delete";
-  name: string;
-  category: string;
-  description: string;
-  when_to_use: string;
-  body: string;
-  proposed_at: string;
-  /** Version token: approve/discard act only on this exact draft. */
-  id: string;
-  /** The playbook in effect now (null for a create). */
-  current: SkillDetail | null;
-  /** Workflows that follow this name (for a create too). */
-  followers: { name: string; title: string; is_custom: boolean }[];
-}
-
-export async function listSkillDrafts(): Promise<SkillDraft[]> {
-  const res = await fetch(`${API_BASE}/skill-drafts`);
-  if (!res.ok) throw new Error("Failed to list playbook drafts");
-  const data = await res.json();
-  return data.drafts;
-}
-
-export async function getSkillDraft(name: string): Promise<SkillDraft> {
-  const res = await fetch(`${API_BASE}/skill-drafts/${encodeURIComponent(name)}`);
-  if (!res.ok) throw await skillError(res, "Failed to load draft");
-  return res.json();
-}
-
-/** Approve the reviewed version (`id`); 409 if the draft changed since. */
-export async function approveSkillDraft(
-  name: string,
-  id: string
-): Promise<{ action: SkillDraft["action"]; skill: SkillDetail | null }> {
-  const res = await fetch(
-    `${API_BASE}/skill-drafts/${encodeURIComponent(name)}/approve`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    }
-  );
-  if (!res.ok) throw await skillError(res, "Failed to approve draft");
-  return res.json();
-}
-
-/** Discard the reviewed version (`id`); resolves quietly if it's already gone. */
-export async function discardSkillDraft(name: string, id: string): Promise<void> {
-  const qs = new URLSearchParams({ id }).toString();
-  const res = await fetch(`${API_BASE}/skill-drafts/${encodeURIComponent(name)}?${qs}`, {
-    method: "DELETE",
-  });
-  if (!res.ok && res.status !== 404) throw await skillError(res, "Failed to discard draft");
-}
-
 export interface SessionSummary {
   session_id: string;
   title: string;
   created_at: string;
   updated_at: string;
   message_count: number;
+  /** Search results only: messages containing the words (0 = title match). */
+  match_count?: number;
+  /** Search results only: the newest matching message around the match. */
+  snippet?: string;
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
   const res = await fetch(`${API_BASE}/sessions`);
   if (!res.ok) throw new Error("Failed to list sessions");
+  return res.json();
+}
+
+/** The caller's own chats whose title or messages contain `query`. */
+export async function searchSessions(query: string, signal?: AbortSignal): Promise<SessionSummary[]> {
+  const res = await fetch(`${API_BASE}/sessions?q=${encodeURIComponent(query)}`, { signal });
+  if (!res.ok) throw new Error("Failed to search sessions");
   return res.json();
 }
 
@@ -1666,6 +1568,8 @@ export interface InboxWatch {
   watch_since: string | null;
   last_poll_at: string | null;
   checking: boolean;
+  // Also save each reply in your mailbox's Drafts (off: on its card alone).
+  mailbox_drafts?: boolean;
 }
 
 // Handle it for me: the inbox watcher sends some replies on its own,
@@ -1760,6 +1664,11 @@ export interface ReplyCard {
   can_allow?: boolean;
   // Drafts in training: "Do it like this next time" keeps your changed draft.
   learns_style?: boolean;
+  // Also saved in your mailbox's Drafts; false when it waits on this card
+  // alone until you send it.
+  in_mailbox?: boolean;
+  // Which of your mailboxes it sends from: "Gmail" or "Outlook".
+  mailbox?: string;
 }
 
 // "How I write": learned from your own sent mail; you can edit and lock it.
@@ -1904,14 +1813,28 @@ export async function setDelegationTeam(enabled: boolean): Promise<DelegationSet
   return res.json();
 }
 
-export async function setInboxWatch(enabled: boolean): Promise<DelegationSettings> {
+export async function setInboxWatch(
+  update: { enabled?: boolean; mailbox_drafts?: boolean },
+): Promise<DelegationSettings> {
   const res = await fetch(`${API_BASE}/delegation/inbox`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify(update),
   });
   if (!res.ok) throw await delegationError(res, "Couldn't change Draft replies to my inbox.");
   return res.json();
+}
+
+// Change a waiting reply's words before Send: on its card, and in your
+// mailbox's Drafts when it's there too. Sends nothing.
+export async function editReplyText(id: number, text: string): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/text`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't save your change.");
+  return (await res.json()) as ReplyCard;
 }
 
 // Forget one thing it learned in training: it asks again from now on.
@@ -2237,8 +2160,10 @@ export interface WorkflowMeta {
   // Run by the system itself (scheduler, onboarding, reflection); the catalog
   // files these under "System".
   background?: boolean;
-  /** Playbooks (skills) this workflow's steps follow. */
+  /** Playbooks (skills) this workflow's steps follow: its "How it's done". */
   playbooks?: string[];
+  /** One field, one document drafted by following a playbook nothing else follows. */
+  quick?: boolean;
 }
 
 // ---- User-created (dynamic) workflows ----
@@ -5033,7 +4958,7 @@ export async function updateClientMeta(
   return res.json();
 }
 
-// ── Take the lead (Settings → Your Executive) ────────────────
+// ── Take the lead (Delegate → Take the lead) ────────────────
 
 export type LeadRuleKind = "person" | "domain" | "words" | "amount";
 
