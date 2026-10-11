@@ -24,8 +24,8 @@ from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
     SearchBudget,
-    _host_matches,
     _normalise_host,
+    host_matches,
     make_search_handler,
 )
 from openexecutive.orchestrator.web_search_tool import (
@@ -373,6 +373,8 @@ def test_malformed_entries_are_skipped_and_fields_truncated(
     patcher, _ = _patch_http(_response({"results": [
         "not a dict",
         {"url": "https://ok.example/\nsplit", "title": "t", "content": "c"},
+        {"url": "https://ok.example/\x00nul", "title": "t", "content": "c"},
+        {"url": "https://ok.example/\x7fdel", "title": "t", "content": "c"},
         {"url": "https://ok.example/long", "title": "T" * 1000,
          "content": "S" * 5000},
     ]}))
@@ -380,7 +382,7 @@ def test_malformed_entries_are_skipped_and_fields_truncated(
     with patcher:
         outcome = asyncio.run(handler({"query": "q"}))
     results = json.loads(outcome.content)["results"]
-    # The string entry and the control-character URL are both dropped.
+    # The string entry and the control-character URLs are all dropped.
     assert [r["url"] for r in results] == ["https://ok.example/long"]
     assert len(results[0]["title"]) == 200
     assert len(results[0]["snippet"]) == 400
@@ -512,7 +514,7 @@ def test_blocklist_matches_internationalised_domains_in_either_form(
 )
 def test_host_matches(host: str, domain: str, expected: bool) -> None:
     """Boundary logic only; both inputs arrive pre-normalised."""
-    assert _host_matches(host, domain) is expected
+    assert host_matches(host, domain) is expected
 
 
 @pytest.mark.parametrize(
