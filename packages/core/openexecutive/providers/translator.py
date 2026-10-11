@@ -421,8 +421,11 @@ def _anthropic_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
         if not isinstance(t, dict):
             continue
         # Skip Anthropic server tools (no input_schema, uses 'type' instead).
+        # web_fetch_ has no OpenRouter equivalent; selection never sends it
+        # here, and this keeps a stray one from becoming a schemaless
+        # function tool the model could call.
         if "input_schema" not in t and t.get("type", "").startswith(
-            ("web_search_", "computer_", "bash_", "code_execution_")
+            ("web_search_", "web_fetch_", "computer_", "bash_", "code_execution_")
         ):
             continue
         params = t.get("input_schema") or {"type": "object", "properties": {}}

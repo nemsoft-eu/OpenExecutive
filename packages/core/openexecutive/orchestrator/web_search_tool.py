@@ -19,6 +19,12 @@ from typing import Any, Literal
 from openexecutive.config import get_settings
 
 WEB_SEARCH_TOOL_NAME = "web_search"
+WEB_FETCH_TOOL_NAME = "web_fetch"
+
+# Roughly what one page may put in the prompt through the server fetch tool:
+# the same reading budget as the client tool's page cap (web_fetch.py), so
+# one page cannot crowd out the rest of the turn on either path.
+WEB_FETCH_MAX_CONTENT_TOKENS = 4_000
 
 
 def build_web_search_tool(*, max_uses: int | None = None) -> dict[str, Any] | None:
@@ -45,6 +51,26 @@ def build_web_search_tool(*, max_uses: int | None = None) -> dict[str, Any] | No
     return tool
 
 
+def build_web_fetch_tool() -> dict[str, Any]:
+    """Return Anthropic's web_fetch server tool dict.
+
+    The API itself fetches only URLs already present in the conversation,
+    so unlike the client tool there is no seen-URL set to keep here.
+    """
+    settings = get_settings()
+    tool: dict[str, Any] = {
+        "type": "web_fetch_20260309",
+        "name": WEB_FETCH_TOOL_NAME,
+        "max_uses": settings.web_fetch_max_uses,
+        "max_content_tokens": WEB_FETCH_MAX_CONTENT_TOKENS,
+    }
+    if settings.web_search_allowed_domains:
+        tool["allowed_domains"] = settings.web_search_allowed_domains
+    if settings.web_search_blocked_domains:
+        tool["blocked_domains"] = settings.web_search_blocked_domains
+    return tool
+
+
 @dataclass(frozen=True)
 class WebSearchSelection:
     """Which of the two search implementations a call should use.
@@ -63,11 +89,20 @@ class WebSearchSelection:
     ``max_uses`` is carried so a caller with its own cap (the research
     fan-out's ``RESEARCH_WEB_SEARCH_MAX_USES``) can size the client-side
     budget with the same number it puts on the server tool.
+
+    ``fetch_tool`` is the matching ``web_fetch`` tool of the same kind, or
+    None where there is none (a Claude id on OpenRouter, or
+    ``WEB_FETCH_MAX_USES=0``). It goes where ``tool`` goes. Only the chat
+    loop offers it today: the research fan-out and standing queries read
+    ``tool`` alone and build their handlers without a seen-URL set, which
+    leaves the client fetch handler out.
     """
 
     kind: Literal["server", "client"]
     tool: dict[str, Any]
     max_uses: int
+    fetch_tool: dict[str, Any] | None = None
+    fetch_max_uses: int = 0
 
 
 def select_web_search_tool(
@@ -93,23 +128,41 @@ def select_web_search_tool(
         max_uses if max_uses is not None else settings.web_search_max_uses
     )
 
+    fetch_max = settings.web_fetch_max_uses
+
     # Imported here rather than at module scope: the registry pulls in every
     # provider, and this module is imported by the Executive at startup.
-    from openexecutive.providers.registry import supports_server_web_search
+    from openexecutive.providers.registry import (
+        supports_server_web_fetch,
+        supports_server_web_search,
+    )
 
     if supports_server_web_search(model):
         server_tool = build_web_search_tool(max_uses=effective_max)
         assert server_tool is not None  # the enable flag was checked above
-        return WebSearchSelection("server", server_tool, effective_max)
+        server_fetch = (
+            build_web_fetch_tool()
+            if fetch_max > 0 and supports_server_web_fetch(model)
+            else None
+        )
+        return WebSearchSelection(
+            "server", server_tool, effective_max, server_fetch,
+            fetch_max if server_fetch is not None else 0,
+        )
 
     if not settings.searxng_url:
         return None
 
-    # searxng_search imports WEB_SEARCH_TOOL_NAME from this module, so a
+    # searxng_search and web_fetch import names from this module, so a
     # module-level import here would be circular.
     from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL
+    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
 
-    return WebSearchSelection("client", SEARXNG_WEB_SEARCH_TOOL, effective_max)
+    client_fetch = WEB_FETCH_TOOL if fetch_max > 0 else None
+    return WebSearchSelection(
+        "client", SEARXNG_WEB_SEARCH_TOOL, effective_max, client_fetch,
+        fetch_max if client_fetch is not None else 0,
+    )
 
 
 def client_search_handlers(selection: WebSearchSelection | None) -> dict[str, Any]:
