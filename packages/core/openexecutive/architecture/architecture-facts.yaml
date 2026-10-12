@@ -147,7 +147,8 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. Callers do NOT need to know which model they're routing to.
+    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. The web_fetch server tool goes only to a Claude model sent to Anthropic direct; OpenRouter models get no fetch, and local slugs get the client-side `web_fetch` beside SearXNG. Callers do NOT need to know which model they're routing to.
+    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail. The server web_fetch is left out of the tool list on both (from the start on a private turn, from the next round after a mail read), because Anthropic opens any URL a client tool result echoes and an allowed tool can echo one the model wrote, so the mail could leave in a query string. The server web_search stays.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -480,7 +481,8 @@ providers:
     runs inside the OpenRouter provider before translation. Spec-driven
     stripping covers cache_control on system/tool/user blocks, adaptive
     thinking + output_config, and — for the local backend only — the
-    Anthropic server-side web_search tool; every OpenRouter model keeps
+    Anthropic server-side web_search and web_fetch tools (any `web_search_*`
+    / `web_fetch_*` type, `_strip_web_search_tools`); every OpenRouter model keeps
     web_search (supports_web_search=True on both non-Claude specs) so the
     translator can turn it into OpenRouter's ``openrouter:web_search``
     server tool. A misrouted call cannot ship an unsupported field.
@@ -550,7 +552,12 @@ providers:
     allowed_domains, excluded_domains}}`` server tool for ANY model routed
     via OpenRouter, Claude or not — without this a call routed
     via OpenRouter would silently lose web search (the executive_research
-    council emitted zero findings). Server-side tool calls in the response
+    council emitted zero findings). The web_fetch server tool has no
+    OpenRouter equivalent: selection never sends one there
+    (`supports_server_web_fetch` is Anthropic-direct only), and
+    `_anthropic_tools_to_openai` skips `web_fetch_*` with the other server
+    tool types, so a stray one never becomes a schemaless function tool the
+    model could call. Server-side tool calls in the response
     (``tool_calls[].type`` starting with ``openrouter:``, including the
     untyped continuation chunks of a streamed call) are skipped, never
     surfaced as tool_use blocks for the caller to run; a response whose
@@ -977,8 +984,11 @@ routing:
         specialist's documents are not recorded (see failure_isolation).
         Never raises.
       - web: record_web_sources(final_msg.content) per model response — pages
-        cited by text-block citations (add(cited=True)) and the first 3
-        results of each web_search_tool_result. Never raises.
+        cited by text-block citations (add(cited=True)), the first 3
+        results of each web_search_tool_result, and the page of each
+        web_fetch_tool_result (`content.url`, titled from the fetched
+        document; an error block has no url and is skipped). The client
+        SearXNG search and client web_fetch record nothing. Never raises.
     Caps, applied in payload(): cited pages first, then documents, then
     other search results, until 12 in all and 6 web — so a page the reply
     cites is listed whatever was recorded before it. Dedupe on (kind, url or
@@ -1131,6 +1141,88 @@ routing:
     A local model with no SEARXNG_URL would otherwise be told it has a tool
     it was never given. The value is a deterministic bit, so the 1h-TTL
     persona block stays cacheable as two stable variants.
+
+    `web_fetch` rides with search in the same selection
+    (`WebSearchSelection.fetch_tool` / `fetch_max_uses`), so the Executive
+    can read a page whose address it has instead of reasoning from a
+    snippet. It is in the chat loop only: the research fan-out and
+    standing queries read `selection.tool` alone and build their handlers
+    without a seen-URL set, which leaves fetch out.
+
+      - Claude routed to Anthropic direct (`registry.supports_server_web_fetch`,
+        mirroring get_provider's precedence) → Anthropic's
+        `web_fetch_20250910` server tool from `build_web_fetch_tool`, with
+        `max_uses` = WEB_FETCH_MAX_USES (per model request, so a turn of
+        several tool rounds may read more) and `max_content_tokens` = 4,000
+        (`WEB_FETCH_MAX_CONTENT_TOKENS`, the same reading budget as the
+        client tool's 12,000-character page cap). The basic variant on
+        purpose, like search's: `_20260209` and later filter pages with code
+        execution and need a Claude 4.6 or later model, and the Executive
+        may be pinned to any Claude model. Appended after the server search;
+        its `server_tool_use` and `web_fetch_tool_result` blocks are echoed
+        like search's (a missing result leaves an orphaned call), each fetch
+        writes a `tool_invocation` audit row (`kind: server_tool`, `url`),
+        and `server_tool_use.web_fetch_requests` is recorded. Anthropic
+        opens only a URL already in the conversation — a user message, a
+        client tool result (even one echoing the model's own text) or an
+        earlier search or fetch result — so the loop leaves it out on a turn
+        private to the principal and from the round after the speaker's
+        mail is read (`pinned_delegation.read_mail`); the server search
+        stays on both.
+      - Any model on OpenRouter → no fetch. OpenRouter has no fetch tool to
+        swap in, and the translator drops a stray `web_fetch_*` entry.
+      - A slug in LOCAL_MODELS with SEARXNG_URL set → the CLIENT-side
+        `web_fetch` from `orchestrator.web_fetch`, sorted into the cached
+        client-tool list beside the SearXNG search, with its own
+        `SearchBudget(max_uses=fetch_max_uses)` built once per turn by
+        `client_search_handlers(search, seen)`.
+      - WEB_FETCH_MAX_USES=0, or ENABLE_WEB_SEARCH=false → no fetch on any
+        path. Fetch shares WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS.
+
+    The client fetch applies Anthropic's seen-URL rule in our code.
+    `_stream_agent_loop(seen_url_text=)` seeds a per-turn `SeenUrls` from
+    the caller's `memory_text` — never the `_speaker_text` fallback to
+    `user_message`, which carries attachment text, inbound mail, a DM's
+    hydrated backstory and retrieved documents — then adds each message the
+    person sends mid-turn (turn_inbox) and every result URL the search
+    handler returns (`make_search_handler(on_result_url=)`). A caller that
+    passes no `memory_text` (unrostered email, the scheduler, evals, MCP)
+    makes nothing in its message fetchable, only that turn's search
+    results: fail closed. Earlier turns are never seeded
+    (history rows hold the packed prompt), so the refusal asks the model to
+    have the person paste the link again. URLs are matched exactly after
+    normalising (scheme and host lowercased, IDNA host, default port and
+    fragment dropped, empty path as `/`, path and query in httpx's wire
+    form); the URL regex stops at Slack's `<url|label>` delimiters, and a
+    host whose IDNA 2003 and 2008 forms differ (`straße.de`) is never seen.
+
+    The handler (`make_fetch_handler`) never raises. In order: the
+    mail-touched refusal (`outside_reach_refusal`), the input shape, the
+    seen set, the URL shape (`searxng_search.is_usable_url`: http(s), no
+    userinfo, no C0 control or DEL), the domain lists, the budget, then
+    the fetch. The fetch is SSRF-safe by construction: `_PinnedBackend`
+    wraps httpcore's AnyIO backend, resolves the host once, refuses unless
+    every address is global (IPv4-mapped, 6to4, Teredo and the NAT64
+    prefixes unwrapped first — Python reports `64:ff9b::7f00:1` as global)
+    and connects to the checked address while TLS verifies the hostname,
+    so there is no DNS-rebinding window (the gap
+    `monitoring.sources._http.validate_target_url` documents). The
+    transport subclasses `httpx.AsyncHTTPTransport` and swaps its private
+    `_pool`; a unit test fails loudly if that attribute goes away. Proxy
+    env is ignored (`trust_env=False`), redirects are followed by hand (at
+    most 3, each re-checked for shape, domain and address, but not against
+    the seen set — the model chose only the first URL), the read is capped
+    at 2 MiB while streaming and WEB_FETCH_TIMEOUT_S (default 15 s) bounds
+    the whole exchange. `Accept-Encoding: identity`, and any other
+    `Content-Encoding` is refused unread (stacked gzip inflated 590 bytes to
+    256 MiB inside httpx). Any non-2xx is an error. HTML and XHTML go
+    through `utils.html_tags.visible_text`, text/plain is decoded as is,
+    anything else is refused; the declared charset is used, falling back to
+    utf-8 with replacement. The result is JSON with an untrusted-content
+    notice, `url`, `final_url`, `status`, at most 12,000 characters of
+    `content` and `truncated`. Failures log the host, never the query.
+    Client fetch pages are not added to the turn's sources, as client
+    search results never were.
   channel_tools: |
     `lookup_person`, `send_discord_dm`, `send_telegram_message`,
     `send_slack_dm`, and `schedule_followup` are exposed as tools so the
@@ -3137,7 +3229,18 @@ peer_memory:
       was derived as "<person> was asked to …", and a "?" in a headline
       inside the sentence voided the extraction quote gate. An email's
       subject is dropped when it is a reply's or forward's (Re:/Fwd:) —
-      the earlier message's subject, often the Executive's own. ``co_present_person_ids``
+      the earlier message's subject, often the Executive's own.
+      ``memory_text`` has a second reader: with messages added mid-turn and
+      the turn's search results, it is the only text whose URLs the chat's
+      client-side ``web_fetch`` may open (``SeenUrls``, seeded from
+      ``memory_text or ""``, never the ``user_message`` fallback), so a
+      caller that passes none makes nothing in its message fetchable. For that reason
+      every interactive entry point now passes it: the web chat route (the
+      typed message when the client sent none), Slack always (it used to
+      pass it only with files), Telegram, Discord (``_handle_message(own_words=)``),
+      Google Chat (each the typed text plus ``(Attached files: …)``) and the
+      CLI. A rostered email sender's is ``_email_memory_text``; an
+      unrostered sender, the scheduler, the evals and MCP pass none. ``co_present_person_ids``
       enumerates other humans in the conversation context (Discord
       thread members, Slack thread participants, email To+Cc) so
       Honcho can store them as session peers — the data shape that
@@ -5595,7 +5698,7 @@ external_monitoring:
       - "stock — Yahoo Finance Chart endpoint (the same endpoint yfinance scrapes, used directly via httpx to avoid pandas/numpy). Watchlist `target` is the ticker; signals fire when |intraday vs previous close| ≥ `trigger.abs_change_pct_gte` (default 5%). Severity hint scales with the magnitude of the move (≥10% URGENT, ≥5% HIGH, ≥2% MEDIUM, else LOW). v2 candidate: swap behind the same Source interface for a paid Alpha Vantage / Finnhub feed if Yahoo brittleness bites."
       - "query — standing web-search query. Watchlist `target` is a natural-language query (e.g. 'Acme Corp layoffs OR restructuring OR funding'); each poll runs it through `BaseAgent.analyze_with_tools` with the web_search tool (model pinned to `get_research_model()`, honouring an OpenRouter Council override — the provider layer translates native web_search into OpenRouter's `plugins:[{id:web}]`, see providers/translator). The model reports distinct results via the `emit_query_results` tool; each result with a valid clickable URL becomes a Signal (the adapter emits a flat severity hint LOW because it can't judge materiality per-hit — the pipeline regrades this from the capture-time relevance read BEFORE the floor gate via `_grade_query_severity`, so a material hit clears a medium/high floor instead of being suppressed; dedup key `query:` + first 32 hex chars of sha256(slug + NUL + canonical_url); URL-less results dropped to uphold the provenance invariant). UNLIKE the keyless feed adapters this source is BILLED (one LLM call + web searches per poll), so it polls slowly (default 360 min), is bounded by `web_search_max_uses` + per-row `config.max_results` (default 5, ceiling 10), and has its own kill switch `EXTERNAL_MONITOR_QUERY_ENABLED`. Optional `trigger.keywords` filters like rss; `config.allowed_domains`/`blocked_domains` are best-effort prompt hints only (NOT enforced, and not honoured by the OpenRouter web plugin). This is the 'watch arbitrary conditions' primitive that no feed publishes."
       - "edgar — SEC EDGAR filings. Watchlist `target` is a ticker (e.g. 'AAPL') or CIK; polls SEC's browse-edgar Atom feed (`/cgi-bin/browse-edgar?action=getcompany&CIK=…&output=atom`, whose CIK param resolves a ticker server-side, so no ticker→CIK table is shipped), parsed with feedparser. Emits one Signal per new filing whose form is in the filter (`trigger.forms`, default {8-K, 10-K, 10-Q}; amendments like 8-K/A match their base form). Dedup on the filing's accession number (globally unique — the cleanest natural key of any source). Provenance is the filing-index URL. Severity hint: 8-K HIGH (material-event report), 10-K/10-Q MEDIUM, else LOW. Keyless, but SEC's fair-access policy requires a descriptive User-Agent with a contact — sent via the EDGAR_USER_AGENT setting (operators should override the default with a real contact). Reuses fetch_bounded (now with a per-call user_agent override), validate_target_url, and the standard dedup/Signal pattern. The entry's <updated> lands on Signal.published_at and the adapter declares `seed_on_first_poll`, so a new watch baselines past filings instead of replaying them and filings older than EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS are `suppressed_stale`."
-      - "page_watch — generic web-page change detection for feed-less pages (pricing, careers, leadership, ToS). Watchlist `target` is the page URL. STATEFUL (the first stateful adapter): each poll fetches the page (bounded, SSRF-guarded), reduces it to normalized visible text (drops script/style/comments/tags, unescapes entities, collapses whitespace — so markup/layout churn doesn't register), hashes the FULL normalized text (so a change anywhere registers — no length blind spot), and compares to the last-seen hash in `page_watch_state`. First observation stores a baseline and emits NOTHING; an unchanged page emits nothing; a changed page emits ONE Signal carrying a difflib-based change summary (~N% differs + the added text; the diff/snapshot are length-capped but detection is not) and updates the baseline. Severity hint LOW (page diffs are noisy — enrichment + severity_floor filter). Dedup key folds slug + UTC date + content hash (mirrors stock — a state seen again on a later day re-alerts; same-day repeats dedup). Optional `trigger.keywords` only surfaces a change when the change itself (summary + added text) matches. Reads/writes its state via the db_path threaded through Source.poll. The reduction (html_to_text, which insert-time validation also runs on the request path) takes whatever the server sends and runs synchronously on the event loop, so every step is one forward pass: comments and script/style/noscript blocks by a scan (_strip_blocks), the remaining tags by utils.html_tags.strip_tags (shared with delegation.gmail), never a backtracking regex. The `<[^>]+>` strip it replaced rescanned to the end of the page from every '<' that nothing closed — about 40 minutes of CPU for a 2 MB page, with the API frozen meanwhile. Such a '<' stays text, and a unit test times crafted pages. The keyless httpx fetcher is the only fetch path. A row written before the xcrawl scrape path was removed still carries `config.fetch = \"xcrawl\"` (PAGE_WATCH_FETCH_LEGACY_XCRAWL) and a baseline hashed from scraped markdown; the adapter treats that marker as a stale baseline — the next poll re-captures the baseline from the plain fetch WITHOUT emitting a signal and clears the marker in place (store.remove_watchlist_config_key, a SQL json_remove so a concurrent edit to another config key is kept), so the change of fetcher is never reported as a page change. An unsaved item (no id) cannot have its marker cleared and is compared normally."
+      - "page_watch — generic web-page change detection for feed-less pages (pricing, careers, leadership, ToS). Watchlist `target` is the page URL. STATEFUL (the first stateful adapter): each poll fetches the page (bounded, SSRF-guarded), reduces it to normalized visible text (drops script/style/comments/tags, unescapes entities, collapses whitespace — so markup/layout churn doesn't register), hashes the FULL normalized text (so a change anywhere registers — no length blind spot), and compares to the last-seen hash in `page_watch_state`. First observation stores a baseline and emits NOTHING; an unchanged page emits nothing; a changed page emits ONE Signal carrying a difflib-based change summary (~N% differs + the added text; the diff/snapshot are length-capped but detection is not) and updates the baseline. Severity hint LOW (page diffs are noisy — enrichment + severity_floor filter). Dedup key folds slug + UTC date + content hash (mirrors stock — a state seen again on a later day re-alerts; same-day repeats dedup). Optional `trigger.keywords` only surfaces a change when the change itself (summary + added text) matches. Reads/writes its state via the db_path threaded through Source.poll. The reduction (html_to_text, which insert-time validation also runs on the request path) takes whatever the server sends and runs synchronously on the event loop, so every step is one forward pass: comments and script/style/noscript blocks by a scan, the remaining tags by utils.html_tags.strip_tags (shared with delegation.gmail), never a backtracking regex. That reduction is utils.html_tags.visible_text (with its _strip_blocks scan), shared with the chat's client-side web_fetch; html_to_text keeps only the utf-8 decode of the bytes. The scan lowercases ASCII only, because str.lower() lengthens some characters (İ becomes two) and the scan slices the original by positions found in the lowered copy; a watched page whose old reduction that misalignment altered (an İ before a script or style block, for instance) therefore hashed differently once after that fix and raised one change signal. The `<[^>]+>` strip it replaced rescanned to the end of the page from every '<' that nothing closed — about 40 minutes of CPU for a 2 MB page, with the API frozen meanwhile. Such a '<' stays text, and a unit test times crafted pages. The keyless httpx fetcher is the only fetch path. A row written before the xcrawl scrape path was removed still carries `config.fetch = \"xcrawl\"` (PAGE_WATCH_FETCH_LEGACY_XCRAWL) and a baseline hashed from scraped markdown; the adapter treats that marker as a stale baseline — the next poll re-captures the baseline from the plain fetch WITHOUT emitting a signal and clears the marker in place (store.remove_watchlist_config_key, a SQL json_remove so a concurrent edit to another config key is kept), so the change of fetcher is never reported as a page change. An unsaved item (no id) cannot have its marker cleared and is compared normally."
   insert_validation: |
     monitoring.target_validation.validate_and_normalize_target — runs at
     insert time on BOTH watchlist surfaces (POST /watchlist and the
@@ -7519,7 +7622,10 @@ integrations:
     "-----Original Message-----", an Outlook From:/Sent: block, "--
     Forwarded message --", ">" lines) and the ``--- ATTACHMENTS ---``
     filenames — see ``honcho.sync_turn``. Only computed for a rostered
-    sender (an unrostered one has no peer). The email text is sender-
+    sender (an unrostered one has no peer). It is also the only text of the
+    mail whose URLs the client-side ``web_fetch`` may open, so nothing in a
+    stranger's mail (which passes none) or in the quoted chain is
+    fetchable. The email text is sender-
     controlled, so attachment lines are split from the right and length-
     capped rather than matched with one regex: a pattern with adjacent
     ``\s+`` / ``.+?`` groups backtracked cubically on a long run of spaces
@@ -9788,7 +9894,8 @@ delegation:
     html_to_text (HTML-only bodies and the sendAs signature) runs on mail
     anyone can send, on the event loop, so every step is one forward pass:
     the <br> and block patterns end at the next "<" as well as ">", tags
-    (utils.html_tags.strip_tags, shared with page_watch) and script / style
+    (utils.html_tags.strip_tags, shared with page_watch and the chat's
+    client-side web_fetch through visible_text) and script / style
     elements are cut by scanning forward, and a decimal
     character reference past Unicode's range becomes U+FFFD before
     html.unescape (which raises past 4,300 digits). A unit test times
@@ -9940,11 +10047,20 @@ delegation:
     error telling the model to offer it in the next message; the offered
     list is unchanged, so the cached prefix is the same all turn. The
     handlers that reach outside or post to everyone check again
-    (lockdown.outside_reach_refusal: research, read_document, the
-    watchlist, workflows, broadcasts, MCPGateway.call_tool and
-    load_mcp_server). Drive reads are not remembered on such a turn
-    (drive_reads.may_remember). The server-side web_search stays, as on a
-    turn private to the principal. The lockdown is per turn
+    (lockdown.outside_reach_refusal: research, read_document, the client
+    web_fetch, the watchlist, workflows, broadcasts, MCPGateway.call_tool
+    and load_mcp_server). The client web_search and web_fetch (SearXNG,
+    local models) are in MAIL_TOUCHED_WITHHELD_TOOLS; the search handler
+    relies on the dispatch guard alone. Drive reads are not remembered on
+    such a turn (drive_reads.may_remember). The server-side web_search
+    stays, as on a turn private to the principal: it runs inside the
+    provider's generation and dropping it would change the cached prefix.
+    The server-side web_fetch is the exception, left out of the tool list
+    from the round after read_mail is set (one cache write for the rest of
+    the turn): Anthropic opens any URL already in the conversation, client
+    tool results included, and ghostwrite_email keeps a link that is in its
+    intent and returns the draft's text, so the mail could otherwise leave
+    in a query string. The lockdown is per turn
     (TurnDelegation.read_mail, set only by the tools that read the mailbox
     or notes): the next message starts afresh, in a mail_private
     conversation too, which stays private (touched_mail) but is not locked
