@@ -185,6 +185,8 @@ def test_translator_drops_a_stray_server_fetch_tool() -> None:
         "2002:7f00:1::",  # 6to4 around 127.0.0.1
         "64:ff9b::7f00:1",  # NAT64 around 127.0.0.1
         "64:ff9b::a00:1",  # NAT64 around 10.0.0.1
+        "::7f00:1",  # IPv4-compatible around 127.0.0.1
+        "::a00:1",  # IPv4-compatible around 10.0.0.1
         "not-an-ip",
     ],
 )
@@ -286,6 +288,24 @@ async def test_pinned_transport_connects_to_the_checked_address(
     assert b"Host: pinned.invalid" in heads[0]
 
 
+async def test_pinned_transport_falls_back_to_the_next_checked_address(
+    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first address that refuses the connection is not the end of the
+    fetch: the next checked address is tried, as a browser would."""
+    port, heads = local_server
+    monkeypatch.setattr(web_fetch, "is_public_address", lambda _a: True)
+
+    async def resolver(host: str, _port: int) -> list[str]:
+        # Nothing listens on 127.0.0.2 at this port, so it refuses.
+        return ["127.0.0.2", "127.0.0.1"]
+
+    async with httpx.AsyncClient(transport=PinnedTransport(resolver)) as client:
+        response = await client.get(f"http://pinned.invalid:{port}/page")
+    assert response.text == "hello"
+    assert len(heads) == 1
+
+
 def test_pinned_transport_still_owns_the_httpx_pool() -> None:
     """``PinnedTransport`` replaces httpx's private ``_pool``. If an httpx
     upgrade renames it, the replacement would silently stop applying."""
@@ -375,6 +395,8 @@ def test_trailing_slash_and_query_are_part_of_the_url() -> None:
         ("见 https://example.com/zh。", "https://example.com/zh"),
         ("see https://example.com's homepage", "https://example.com/"),
         ("see https://example.com:8443's admin", "https://example.com:8443/"),
+        # A quote in a query with no path is the query's, not a possessive.
+        ("https://example.com?q='x'y", "https://example.com/?q='x'y"),
     ],
 )
 def test_urls_in_the_forms_people_paste_are_seen(text: str, url: str) -> None:

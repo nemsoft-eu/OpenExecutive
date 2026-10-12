@@ -22,12 +22,14 @@ an SSRF surface. Two rules bound it:
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import ipaddress
 import json
 import logging
 import re
 import socket
+import ssl
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -119,12 +121,14 @@ WEB_FETCH_TOOL: dict[str, Any] = {
 # tests can stand in for DNS; production uses the event loop's getaddrinfo.
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 
-# NAT64 prefixes (RFC 6052 well-known, RFC 8215 local-use). The last 32 bits
-# are an IPv4 address the gateway forwards to, and Python reports
-# ``64:ff9b::7f00:1`` (127.0.0.1 behind NAT64) as global.
+# NAT64 prefixes (RFC 6052 well-known, RFC 8215 local-use) and the deprecated
+# IPv4-compatible ``::a.b.c.d`` (as knowledge.confluence_client checks). The
+# last 32 bits are an IPv4 address a gateway or tunnel may deliver to, and
+# Python reports ``64:ff9b::7f00:1`` and ``::7f00:1`` (127.0.0.1) as global.
 _NAT64_PREFIXES = (
     ipaddress.IPv6Network("64:ff9b::/96"),
     ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("::/96"),
 )
 
 
@@ -214,10 +218,20 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
         # than trusted to keep choosing the public one.
         if not all(is_public_address(a) for a in addresses):
             raise BlockedAddressError(f"{host} resolves to a non-public address")
-        return await self._inner.connect_tcp(
-            addresses[0], port, timeout=timeout, local_address=local_address,
-            socket_options=socket_options,
-        )
+        # Each checked address in resolver order, as a browser falls back: a
+        # site whose first address is down (or IPv6 this host cannot route)
+        # still loads. The fetch's outer deadline bounds the attempts.
+        failure: Exception | None = None
+        for address in dict.fromkeys(addresses):
+            try:
+                return await self._inner.connect_tcp(
+                    address, port, timeout=timeout, local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                failure = exc
+        assert failure is not None  # addresses is non-empty (checked above)
+        raise failure
 
     async def connect_unix_socket(
         self,
@@ -231,6 +245,14 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
         await self._inner.sleep(seconds)
 
 
+@functools.cache
+def _ssl_context() -> ssl.SSLContext:
+    """The verifying TLS context every fetch shares. Safe across concurrent
+    connections: httpcore's only change to it is to set the same ALPN list
+    (HTTP/1.1, as http2 is off) on each connect."""
+    return httpx.create_ssl_context(verify=True, trust_env=False)
+
+
 class PinnedTransport(httpx.AsyncHTTPTransport):
     """httpx transport whose connections go through ``_PinnedBackend``.
 
@@ -240,9 +262,12 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
     """
 
     def __init__(self, resolver: Resolver = _system_resolver) -> None:
-        super().__init__(verify=True, trust_env=False, retries=0, http2=False)
+        # One context for both pools: building one loads the CA bundle, on
+        # the event loop, and a transport is made per fetch.
+        ssl_context = _ssl_context()
+        super().__init__(verify=ssl_context, trust_env=False, retries=0, http2=False)
         self._pool = httpcore.AsyncConnectionPool(
-            ssl_context=httpx.create_ssl_context(verify=True, trust_env=False),
+            ssl_context=ssl_context,
             http1=True,
             http2=False,
             retries=0,
@@ -300,11 +325,14 @@ def _trim_url(candidate: str) -> str:
 
     A single quote is never part of a host, so one there ends the URL: that
     is a possessive ("https://example.com's homepage"), while a quote in the
-    path (/Schindler's_List) is kept.
+    path, query or fragment (/Schindler's_List, ?q='x') is kept.
     """
     start = candidate.find("://") + 3
-    slash = candidate.find("/", start)
-    quote = candidate.find("'", start, len(candidate) if slash == -1 else slash)
+    host_end = min(
+        (k for k in (candidate.find(c, start) for c in "/?#") if k != -1),
+        default=len(candidate),
+    )
+    quote = candidate.find("'", start, host_end)
     if quote != -1:
         candidate = candidate[:quote]
     while True:

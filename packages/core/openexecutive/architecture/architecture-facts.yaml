@@ -1202,9 +1202,10 @@ routing:
     userinfo, no C0 control or DEL), the domain lists, the budget, then
     the fetch. The fetch is SSRF-safe by construction: `_PinnedBackend`
     wraps httpcore's AnyIO backend, resolves the host once, refuses unless
-    every address is global (IPv4-mapped, 6to4, Teredo and the NAT64
-    prefixes unwrapped first — Python reports `64:ff9b::7f00:1` as global)
-    and connects to the checked address while TLS verifies the hostname,
+    every address is global (IPv4-mapped, IPv4-compatible, 6to4, Teredo and
+    the NAT64 prefixes unwrapped first — Python reports `64:ff9b::7f00:1`
+    as global) and connects to the checked addresses, each in resolver
+    order until one answers, while TLS verifies the hostname,
     so there is no DNS-rebinding window (the gap
     `monitoring.sources._http.validate_target_url` documents). The
     transport subclasses `httpx.AsyncHTTPTransport` and swaps its private
