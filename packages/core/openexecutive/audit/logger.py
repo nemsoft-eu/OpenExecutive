@@ -257,7 +257,6 @@ _USAGE_INT_FIELDS: tuple[str, ...] = (
     "cache_creation_input_tokens",
     "output_tokens",
     "web_search_requests",
-    "web_fetch_requests",
 )
 
 
@@ -307,7 +306,6 @@ _USAGE_SUM_COLS = """
     SUM(COALESCE(CAST(json_extract(details_json,'$.cache_creation_input_tokens') AS INTEGER),0)) AS cache_creation_input_tokens,
     SUM(COALESCE(CAST(json_extract(details_json,'$.output_tokens') AS INTEGER),0)) AS output_tokens,
     SUM(COALESCE(CAST(json_extract(details_json,'$.web_search_requests') AS INTEGER),0)) AS web_search_requests,
-    SUM(COALESCE(CAST(json_extract(details_json,'$.web_fetch_requests') AS INTEGER),0)) AS web_fetch_requests,
     SUM(COALESCE(CAST(json_extract(details_json,'$.cost_usd') AS REAL),0)) AS cost_usd
 """
 

@@ -379,6 +379,16 @@ class SeenUrls:
         return norm is not None and norm in self._urls
 
 
+def server_search_result_urls(block: Any) -> list[str]:
+    """The result URLs of an Anthropic ``web_search_tool_result`` block, which
+    a turn may open as it may the client search's; none for an error block."""
+    results = getattr(block, "content", None)
+    if not isinstance(results, list):  # a WebSearchToolResultError
+        return []
+    urls = (getattr(result, "url", None) for result in results)
+    return [url for url in urls if isinstance(url, str) and url]
+
+
 # --- the handler ------------------------------------------------------------
 
 

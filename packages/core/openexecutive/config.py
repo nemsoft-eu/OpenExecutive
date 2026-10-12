@@ -927,12 +927,10 @@ class Settings(BaseSettings):
     # constraint, so this is deliberately smaller than a browser's page 1.
     searxng_max_results: int = Field(5, alias="SEARXNG_MAX_RESULTS")
 
-    # Page reads through web_fetch: per model request with Anthropic's server
-    # tool on a direct-Anthropic model (its max_uses, so a turn of several
-    # tool rounds may read more), per turn with the client tool beside
-    # SearXNG on a local one (orchestrator/web_fetch.py). 0 turns fetching
-    # off; it is also off whenever ENABLE_WEB_SEARCH is. Shares the domain
-    # lists above.
+    # Page reads per chat turn through web_fetch, the client-side tool every
+    # model gets beside its search (orchestrator/web_fetch.py). 0 turns
+    # fetching off; it is also off whenever ENABLE_WEB_SEARCH is. Shares the
+    # domain lists above.
     web_fetch_max_uses: int = Field(3, alias="WEB_FETCH_MAX_USES")
     # Whole-exchange deadline for one client-side fetch, redirects included.
     web_fetch_timeout_s: float = Field(15.0, alias="WEB_FETCH_TIMEOUT_S")

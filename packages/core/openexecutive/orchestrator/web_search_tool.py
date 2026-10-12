@@ -1,17 +1,23 @@
-"""Anthropic native server-side web search and fetch tools, and the choice
-between them and the client-side ones (``searxng_search``, ``web_fetch``).
+"""Anthropic native server-side web search tool, the choice between it and
+the client-side SearXNG one (``searxng_search``), and the client-side
+``web_fetch`` that goes with either.
 
-The `web_search_20250305` and `web_fetch_20250910` tools are executed by
-the Anthropic API itself — no client-side handler is needed. The model
-issues `server_tool_use` blocks during a generation and the API returns
-`web_search_tool_result` / `web_fetch_tool_result` blocks inline; both must
-be preserved in the assistant turn echoed back on the next iteration so the
-model retains context for what it searched and read.
+The `web_search_20250305` tool is executed by the Anthropic API itself — no
+client-side handler is needed. The model issues `server_tool_use` blocks
+during a generation and the API returns `web_search_tool_result` blocks
+inline; both must be preserved in the assistant turn echoed back on the
+next iteration so the model retains context for what it searched.
 
 Because the block carries a `type` field instead of an `input_schema`, it
 cannot be cached the way client-side tools are. The Executive keeps it
 separate from the alphabetically-sorted client-tool list so the
 `cache_control` marker stays on a real client tool.
+
+Page reads are always the client tool, never Anthropic's ``web_fetch``
+server tool: that one opens any URL in a client tool result, including one
+echoing text the model wrote (a specialist's answer quoting it), so an
+injected instruction could send the turn's data out in a query string. The
+client tool opens only URLs the person wrote or a search returned.
 """
 from __future__ import annotations
 
@@ -25,11 +31,6 @@ if TYPE_CHECKING:
 
 WEB_SEARCH_TOOL_NAME = "web_search"
 WEB_FETCH_TOOL_NAME = "web_fetch"
-
-# Roughly what one page may put in the prompt through the server fetch tool:
-# the same reading budget as the client tool's page cap (web_fetch.py), so
-# one page cannot crowd out the rest of the turn on either path.
-WEB_FETCH_MAX_CONTENT_TOKENS = 4_000
 
 
 def build_web_search_tool(*, max_uses: int | None = None) -> dict[str, Any] | None:
@@ -48,30 +49,6 @@ def build_web_search_tool(*, max_uses: int | None = None) -> dict[str, Any] | No
         "type": "web_search_20250305",
         "name": WEB_SEARCH_TOOL_NAME,
         "max_uses": max_uses if max_uses is not None else settings.web_search_max_uses,
-    }
-    if settings.web_search_allowed_domains:
-        tool["allowed_domains"] = settings.web_search_allowed_domains
-    if settings.web_search_blocked_domains:
-        tool["blocked_domains"] = settings.web_search_blocked_domains
-    return tool
-
-
-def build_web_fetch_tool() -> dict[str, Any]:
-    """Return Anthropic's web_fetch server tool dict.
-
-    The API itself fetches only URLs already present in the conversation,
-    so unlike the client tool there is no seen-URL set to keep here.
-
-    The basic variant, like the search tool's: the later ones (``_20260209``
-    on) filter pages with code execution and need a Claude 4.6 or later
-    model, and the Executive may be pinned to any Claude model.
-    """
-    settings = get_settings()
-    tool: dict[str, Any] = {
-        "type": "web_fetch_20250910",
-        "name": WEB_FETCH_TOOL_NAME,
-        "max_uses": settings.web_fetch_max_uses,
-        "max_content_tokens": WEB_FETCH_MAX_CONTENT_TOKENS,
     }
     if settings.web_search_allowed_domains:
         tool["allowed_domains"] = settings.web_search_allowed_domains
@@ -99,12 +76,12 @@ class WebSearchSelection:
     fan-out's ``RESEARCH_WEB_SEARCH_MAX_USES``) can size the client-side
     budget with the same number it puts on the server tool.
 
-    ``fetch_tool`` is the matching ``web_fetch`` tool of the same kind, or
-    None where there is none (a Claude id on OpenRouter, or
-    ``WEB_FETCH_MAX_USES=0``). It goes where ``tool`` goes. Only the chat
-    loop offers it today: the research fan-out and standing queries read
+    ``fetch_tool`` is the client-side ``web_fetch`` tool, whatever the
+    search kind, or None with ``WEB_FETCH_MAX_USES=0``. It is a function
+    tool, so it always joins the sorted client list. Only the chat loop
+    offers it today: the research fan-out and standing queries read
     ``tool`` alone and build their handlers without a seen-URL set, which
-    leaves the client fetch handler out.
+    leaves the fetch handler out.
     """
 
     kind: Literal["server", "client"]
@@ -137,42 +114,32 @@ def select_web_search_tool(
         max_uses if max_uses is not None else settings.web_search_max_uses
     )
 
-    fetch_max = settings.web_fetch_max_uses
-
     # Imported here rather than at module scope: the registry pulls in every
     # provider, and this module is imported by the Executive at startup.
-    from openexecutive.providers.registry import (
-        supports_server_web_fetch,
-        supports_server_web_search,
-    )
+    # searxng_search and web_fetch import names from this module, so a
+    # module-level import of either would be circular.
+    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
+    from openexecutive.providers.registry import supports_server_web_search
+
+    fetch_max = settings.web_fetch_max_uses
+    fetch_tool = WEB_FETCH_TOOL if fetch_max > 0 else None
 
     if supports_server_web_search(model):
         server_tool = build_web_search_tool(max_uses=effective_max)
         assert server_tool is not None  # the enable flag was checked above
-        server_fetch = (
-            build_web_fetch_tool()
-            if fetch_max > 0 and supports_server_web_fetch(model)
-            else None
-        )
         return WebSearchSelection(
             "server", server_tool, effective_max,
-            fetch_tool=server_fetch,
-            fetch_max_uses=fetch_max if server_fetch is not None else 0,
+            fetch_tool=fetch_tool, fetch_max_uses=fetch_max,
         )
 
     if not settings.searxng_url:
         return None
 
-    # searxng_search and web_fetch import names from this module, so a
-    # module-level import here would be circular.
     from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL
-    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
 
-    client_fetch = WEB_FETCH_TOOL if fetch_max > 0 else None
     return WebSearchSelection(
         "client", SEARXNG_WEB_SEARCH_TOOL, effective_max,
-        fetch_tool=client_fetch,
-        fetch_max_uses=fetch_max if client_fetch is not None else 0,
+        fetch_tool=fetch_tool, fetch_max_uses=fetch_max,
     )
 
 
@@ -181,30 +148,32 @@ def client_search_handlers(
 ) -> dict[str, Any]:
     """Handler map for ``selection``: the budgeted client handlers, or empty.
 
-    Only the client variant needs a handler; the server variant runs inside
-    the provider's generation. Each call builds a FRESH budget, so call it
+    The client search needs a handler; the server search runs inside the
+    provider's generation. Each call builds a FRESH budget, so call it
     once per turn (or per research call) — never inside a tool-use loop,
     where a new budget per iteration would reset on every model round trip
     and multiply the cap.
 
     With ``seen`` (the chat loop's turn), a selection carrying a fetch tool
-    also gets the ``web_fetch`` handler, with its own budget, and every
-    search result URL joins ``seen`` so it can be opened. Without it (the
-    research fan-out, standing queries) only the search handler is built.
+    also gets the ``web_fetch`` handler, with its own budget, whatever the
+    search kind, and every client search result URL joins ``seen`` so it
+    can be opened (the chat loop adds the server search's results itself).
+    Without it (the research fan-out, standing queries) only the client
+    search handler is built.
     """
-    if selection is None or selection.kind != "client":
+    if selection is None:
         return {}
     from openexecutive.orchestrator.searxng_search import (
         SearchBudget,
         make_search_handler,
     )
 
-    handlers: dict[str, Any] = {
-        WEB_SEARCH_TOOL_NAME: make_search_handler(
+    handlers: dict[str, Any] = {}
+    if selection.kind == "client":
+        handlers[WEB_SEARCH_TOOL_NAME] = make_search_handler(
             SearchBudget(max_uses=selection.max_uses),
             on_result_url=seen.add if seen is not None else None,
         )
-    }
     if seen is not None and selection.fetch_tool is not None:
         from openexecutive.orchestrator.web_fetch import make_fetch_handler
 

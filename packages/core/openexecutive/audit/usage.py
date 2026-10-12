@@ -91,7 +91,6 @@ def usage_counts(message: Any) -> dict[str, Any] | None:
         "cache_read_input_tokens": _as_int(getattr(usage, "cache_read_input_tokens", 0)),
         "cost_usd": cost_usd,
         "web_search_requests": _as_int(getattr(server, "web_search_requests", 0)),
-        "web_fetch_requests": _as_int(getattr(server, "web_fetch_requests", 0)),
     }
 
 
@@ -164,7 +163,6 @@ class UsageRollup:
         "cache_creation_input_tokens",
         "output_tokens",
         "web_search_requests",
-        "web_fetch_requests",
     )
 
     def __init__(self) -> None:

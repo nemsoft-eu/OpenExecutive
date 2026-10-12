@@ -11,9 +11,8 @@ timed-out replies included, and saves it with the message
   them through ``retrieve(record_source=...)``. That covers the Executive's
   own search and each specialist that answered; a specialist that failed
   never passed its documents on, so they are left out. The Executive records
-  the pages its reply cites, a few results of each web search and each page
-  the server-side web_fetch opened. Cited pages are always kept ahead of the
-  rest.
+  the pages its reply cites and a few results of each web search. Cited
+  pages are always kept ahead of the rest.
 - **Unavailable areas** are parts of the analysis (finance, legal, ...) whose
   specialist failed or said nothing every time it was asked this turn, so the
   reply went ahead without them. They are named by area, never by
@@ -211,9 +210,8 @@ def _web_title(title: object, url: str) -> str:
 
 def record_web_sources(sources: TurnSources, content: Iterable[Any]) -> None:
     """Record the web pages in one model response: the pages its text cites,
-    the first few results of each web search it ran, and each page a web
-    fetch opened. Never raises — a label under the answer must not cost the
-    answer."""
+    and the first few results of each web search it ran. Never raises — a
+    label under the answer must not cost the answer."""
     try:
         blocks = list(content)
         for block in blocks:
@@ -235,13 +233,5 @@ def record_web_sources(sources: TurnSources, content: Iterable[Any]) -> None:
                 url = getattr(result, "url", None)
                 if isinstance(url, str) and url:
                     sources.add("web", _web_title(getattr(result, "title", None), url), url)
-        for block in blocks:
-            if getattr(block, "type", None) != "web_fetch_tool_result":
-                continue
-            page = getattr(block, "content", None)
-            url = getattr(page, "url", None)  # a WebFetchToolResultErrorBlock has none
-            if isinstance(url, str) and url:
-                document = getattr(page, "content", None)
-                sources.add("web", _web_title(getattr(document, "title", None), url), url)
     except Exception:
         logger.warning("recording web sources failed", exc_info=True)

@@ -1816,12 +1816,9 @@ def unattended_withheld_error(tool_name: str) -> str:
 # - read_document: reads company documents and other downloaded files, so a
 #   contact's email must not steer it; the poller already reads that email's
 #   own attachments into the turn.
-# - web_fetch (the client tool, for local models): it opens a URL from inside
-#   our network, so a contact's email must not steer it either. The server
-#   web_fetch is left out on a private turn too, by the tool list rather
-#   than this set (it is not a client tool): Anthropic opens a URL a client
-#   tool result echoes, so the mail could leave in a query string
-#   (delegation/lockdown.py). The server web_search stays offered.
+# - web_fetch (the client tool every model gets beside its search): it opens
+#   a URL from inside our network, so a contact's email must not steer it
+#   either. The server web_search stays offered.
 # - remember_fact, forget_fact, update_company_profile: a standing fact (or
 #   its retirement) and the company profile are read on everyone's turns and
 #   in every brief. They also refuse any surface but the principal's verified

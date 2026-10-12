@@ -147,8 +147,8 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. The web_fetch server tool goes only to a Claude model sent to Anthropic direct; OpenRouter models get no fetch, and local slugs get the client-side `web_fetch` beside SearXNG. Callers do NOT need to know which model they're routing to.
-    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail. The server web_fetch is left out of the tool list on both (from the start on a private turn, from the next round after a mail read), because Anthropic opens any URL a client tool result echoes and an allowed tool can echo one the model wrote, so the mail could leave in a query string. The server web_search stays.
+    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. `web_fetch` is the client-side tool on every model that has a search tool (beside the server web_search on Anthropic direct and OpenRouter, beside SearXNG on a local slug); Anthropic's web_fetch server tool is never sent. Callers do NOT need to know which model they're routing to.
+    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail; the offered tool list never changes mid-turn, and the server web_search stays. Anthropic's server web_fetch is not used because it opens any URL a client tool result echoes, even text the model wrote, so an injected instruction could have the turn's data leave in a query string.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -552,12 +552,8 @@ providers:
     allowed_domains, excluded_domains}}`` server tool for ANY model routed
     via OpenRouter, Claude or not — without this a call routed
     via OpenRouter would silently lose web search (the executive_research
-    council emitted zero findings). The web_fetch server tool has no
-    OpenRouter equivalent: selection never sends one there
-    (`supports_server_web_fetch` is Anthropic-direct only), and
-    `_anthropic_tools_to_openai` skips `web_fetch_*` with the other server
-    tool types, so a stray one never becomes a schemaless function tool the
-    model could call. Server-side tool calls in the response
+    council emitted zero findings). The client-side `web_fetch` is an
+    ordinary function tool and translates like any other. Server-side tool calls in the response
     (``tool_calls[].type`` starting with ``openrouter:``, including the
     untyped continuation chunks of a streamed call) are skipped, never
     surfaced as tool_use blocks for the caller to run; a response whose
@@ -984,11 +980,9 @@ routing:
         specialist's documents are not recorded (see failure_isolation).
         Never raises.
       - web: record_web_sources(final_msg.content) per model response — pages
-        cited by text-block citations (add(cited=True)), the first 3
-        results of each web_search_tool_result, and the page of each
-        web_fetch_tool_result (`content.url`, titled from the fetched
-        document; an error block has no url and is skipped). The client
-        SearXNG search and client web_fetch record nothing. Never raises.
+        cited by text-block citations (add(cited=True)) and the first 3
+        results of each web_search_tool_result. The client SearXNG search
+        and web_fetch (always the client tool) record nothing. Never raises.
     Caps, applied in payload(): cited pages first, then documents, then
     other search results, until 12 in all and 6 web — so a page the reply
     cites is listed whatever was recorded before it. Dedupe on (kind, url or
@@ -1149,43 +1143,36 @@ routing:
     standing queries read `selection.tool` alone and build their handlers
     without a seen-URL set, which leaves fetch out.
 
-      - Claude routed to Anthropic direct (`registry.supports_server_web_fetch`,
-        mirroring get_provider's precedence) → Anthropic's
-        `web_fetch_20250910` server tool from `build_web_fetch_tool`, with
-        `max_uses` = WEB_FETCH_MAX_USES (per model request, so a turn of
-        several tool rounds may read more) and `max_content_tokens` = 4,000
-        (`WEB_FETCH_MAX_CONTENT_TOKENS`, the same reading budget as the
-        client tool's 12,000-character page cap). The basic variant on
-        purpose, like search's: `_20260209` and later filter pages with code
-        execution and need a Claude 4.6 or later model, and the Executive
-        may be pinned to any Claude model. Appended after the server search;
-        its `server_tool_use` and `web_fetch_tool_result` blocks are echoed
-        like search's (a missing result leaves an orphaned call), each fetch
-        writes a `tool_invocation` audit row (`kind: server_tool`, `url`),
-        and `server_tool_use.web_fetch_requests` is recorded. Anthropic
-        opens only a URL already in the conversation — a user message, a
-        client tool result (even one echoing the model's own text) or an
-        earlier search or fetch result — so the loop leaves it out on a turn
-        private to the principal and from the round after the speaker's
-        mail is read (`pinned_delegation.read_mail`); the server search
-        stays on both.
-      - Any model on OpenRouter → no fetch. OpenRouter has no fetch tool to
-        swap in, and the translator drops a stray `web_fetch_*` entry.
-      - A slug in LOCAL_MODELS with SEARXNG_URL set → the CLIENT-side
-        `web_fetch` from `orchestrator.web_fetch`, sorted into the cached
-        client-tool list beside the SearXNG search, with its own
-        `SearchBudget(max_uses=fetch_max_uses)` built once per turn by
-        `client_search_handlers(search, seen)`.
+      - Every selection, server or client, carries the CLIENT-side
+        `web_fetch` (`orchestrator.web_fetch.WEB_FETCH_TOOL`): beside
+        Anthropic's server web_search on a Claude model sent to Anthropic
+        direct, beside OpenRouter's search (any model routed there), and
+        beside the SearXNG search on a LOCAL_MODELS slug with SEARXNG_URL
+        set. It is an ordinary function tool sorted into the cached
+        client-tool list (`extra_client_tools`); only the server web_search
+        is appended after it. Its own
+        `SearchBudget(max_uses=fetch_max_uses)` is built once per turn by
+        `client_search_handlers(search, seen)`, whatever the search kind.
       - WEB_FETCH_MAX_USES=0, or ENABLE_WEB_SEARCH=false → no fetch on any
         path. Fetch shares WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS.
+      - Anthropic's `web_fetch` server tool is never sent. Anthropic's
+        docs say it may open any URL in a client tool result, even one
+        echoing text Claude produced, so an injected instruction could
+        have a specialist's answer quote a URL carrying the turn's data and
+        the fetch would send it out. The client tool opens only URLs the
+        person wrote or a search returned.
 
-    The client fetch applies Anthropic's seen-URL rule in our code.
+    The client fetch keeps a seen-URL rule in our code.
     `_stream_agent_loop(seen_url_text=)` seeds a per-turn `SeenUrls` from
     the caller's `memory_text` — never the `_speaker_text` fallback to
     `user_message`, which carries attachment text, inbound mail, a DM's
     hydrated backstory and retrieved documents — then adds each message the
-    person sends mid-turn (turn_inbox) and every result URL the search
-    handler returns (`make_search_handler(on_result_url=)`). A caller that
+    person sends mid-turn (turn_inbox) and every result URL of this turn's
+    searches: the SearXNG handler's (`make_search_handler(on_result_url=)`)
+    and the server search's, read from each `web_search_tool_result` block
+    in the Executive's block parser (`web_fetch.server_search_result_urls`;
+    an error block has none). OpenRouter returns no result blocks, so on
+    that path only the person's own links open. A caller that
     passes no `memory_text` (unrostered email, the scheduler, evals, MCP)
     makes nothing in its message fetchable, only that turn's search
     results: fail closed. The channels enter through `Executive.chat()`,
@@ -1233,8 +1220,11 @@ routing:
     utf-8 with replacement. The result is JSON with an untrusted-content
     notice, `url`, `final_url`, `status`, at most 12,000 characters of
     `content` and `truncated`. Failures log the host, never the query.
-    Client fetch pages are not added to the turn's sources, as client
-    search results never were.
+    Fetched pages are not added to the turn's sources, as client search
+    results never were; the server search's still are. The fetch is
+    withheld on a turn private to the principal (PRIVATE_TURN_WITHHELD_TOOLS)
+    and, after a mail read, refused at dispatch and by its handler
+    (`delegation.lockdown`); the offered tool list never changes mid-turn.
   channel_tools: |
     `lookup_person`, `send_discord_dm`, `send_telegram_message`,
     `send_slack_dm`, and `schedule_followup` are exposed as tools so the
@@ -10066,18 +10056,15 @@ delegation:
     handlers that reach outside or post to everyone check again
     (lockdown.outside_reach_refusal: research, read_document, the client
     web_fetch, the watchlist, workflows, broadcasts, MCPGateway.call_tool
-    and load_mcp_server). The client web_search and web_fetch (SearXNG,
-    local models) are in MAIL_TOUCHED_WITHHELD_TOOLS; the search handler
-    relies on the dispatch guard alone. Drive reads are not remembered on
-    such a turn (drive_reads.may_remember). The server-side web_search
-    stays, as on a turn private to the principal: it runs inside the
-    provider's generation and dropping it would change the cached prefix.
-    The server-side web_fetch is the exception, left out of the tool list
-    from the round after read_mail is set (one cache write for the rest of
-    the turn): Anthropic opens any URL already in the conversation, client
-    tool results included, and ghostwrite_email keeps a link that is in its
-    intent and returns the draft's text, so the mail could otherwise leave
-    in a query string. The lockdown is per turn
+    and load_mcp_server). The client web_search (SearXNG, local models)
+    and web_fetch (every model) are in MAIL_TOUCHED_WITHHELD_TOOLS; the
+    search handler relies on the dispatch guard alone. Drive reads are not
+    remembered on such a turn (drive_reads.may_remember). The server-side
+    web_search stays, as on a turn private to the principal: it runs inside
+    the provider's generation and dropping it would change the cached
+    prefix. web_fetch is never Anthropic's server tool, which opens any URL
+    a client tool result echoes, and ghostwrite_email returns the draft's
+    text, so with it the mail could leave in a query string. The lockdown is per turn
     (TurnDelegation.read_mail, set only by the tools that read the mailbox
     or notes): the next message starts afresh, in a mail_private
     conversation too, which stays private (touched_mail) but is not locked

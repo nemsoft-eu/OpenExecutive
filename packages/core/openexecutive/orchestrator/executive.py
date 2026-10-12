@@ -156,7 +156,7 @@ from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
 )
-from openexecutive.orchestrator.web_fetch import SeenUrls
+from openexecutive.orchestrator.web_fetch import SeenUrls, server_search_result_urls
 from openexecutive.orchestrator.web_search_tool import (
     WEB_FETCH_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
@@ -715,10 +715,6 @@ _ALL_SKILL_HANDLERS = {
     **FORM_TOOL_HANDLERS,
     **PYTHON_JOB_TOOL_HANDLERS,
 }
-
-
-# The input field each server tool's audit row records.
-_SERVER_TOOL_INPUT_KEYS = {WEB_SEARCH_TOOL_NAME: "query", WEB_FETCH_TOOL_NAME: "url"}
 
 
 def builtin_tool_names() -> frozenset[str]:
@@ -2461,8 +2457,8 @@ class Executive:
         pinned_delegation = turn_delegation(current_session.get())
         ghostwrite_offered = pinned_delegation is not None and pinned_delegation.offered
         delegation_tools = DELEGATION_TOOLS if ghostwrite_offered else []
-        # The URLs the client web_fetch may open this turn; search results
-        # join through the search handler.
+        # The URLs web_fetch may open this turn; search results join through
+        # the client search handler, or as the server search's blocks arrive.
         seen_urls = SeenUrls()
         seen_urls.add_from_text(seen_url_text)
         # The client search and fetch handlers join the canonical dispatch map
@@ -2575,12 +2571,18 @@ class Executive:
             # last one carries the cache_control marker. Anthropic server-side
             # tools (e.g. web_search) are appended after — they use a `type`
             # field instead of input_schema and cannot accept cache_control.
-            # The SearXNG search tool and the client web_fetch are ordinary
-            # client tools and join the sorted list; only the server variants
-            # are appended (below).
+            # The SearXNG search tool and web_fetch (always the client tool,
+            # web_search_tool explains why) are ordinary client tools and join
+            # the sorted list; only the server search is appended (below).
             extra_client_tools = (
-                [t for t in (search.tool, search.fetch_tool) if t is not None]
-                if search is not None and search.kind == "client"
+                [
+                    t for t in (
+                        search.tool if search.kind == "client" else None,
+                        search.fetch_tool,
+                    )
+                    if t is not None
+                ]
+                if search is not None
                 else []
             )
             # Solo withholds the team-only tools before the sort, so each mode
@@ -2609,22 +2611,6 @@ class Executive:
             ]
             if search is not None and search.kind == "server":
                 tools_with_cache.append(search.tool)
-                # Never on a private turn, nor after a mail read on this turn
-                # (a later turn gets it back; see delegation.lockdown): Anthropic opens any
-                # URL in a client tool result, and an allowed tool can echo one
-                # the model wrote (a ghostwrite_email preview), so the turn's
-                # mail could leave in a query string. A private turn knows at
-                # the start (web_fetch is in PRIVATE_TURN_WITHHELD_TOOLS, which
-                # names the client and server tool alike) and has a prefix of
-                # its own anyway; a mail read drops it from the next round on,
-                # at the cost of one cache write for the rest of that turn
-                # (delegation.lockdown).
-                if (
-                    search.fetch_tool is not None
-                    and search.fetch_tool["name"] not in not_offered
-                    and not (pinned_delegation is not None and pinned_delegation.read_mail)
-                ):
-                    tools_with_cache.append(search.fetch_tool)
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
                 max_tokens=8192,
@@ -2657,8 +2643,7 @@ class Executive:
                 model=stream_model,
             )
 
-            # (tool name, input key, value) per server tool call, for the audit
-            server_calls: list[tuple[str, str, str]] = []
+            web_search_queries: list[str] = []
             for block in final_msg.content:
                 if block.type == "text":
                     response_content.append({"type": "text", "text": block.text})
@@ -2668,19 +2653,20 @@ class Executive:
                         {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
                     )
                 elif block.type == "server_tool_use":
-                    # Anthropic resolves server tools (web_search, web_fetch)
-                    # within the same generation; we just echo the block back
-                    # on the next iteration so the model retains continuity.
-                    # No handler runs.
+                    # Anthropic resolves server tools (web_search) within the
+                    # same generation; we just echo the block back on the next
+                    # iteration so the model retains continuity. No handler runs.
                     response_content.append(block.model_dump(exclude_none=True))
-                    key = _SERVER_TOOL_INPUT_KEYS.get(block.name)
-                    value = (block.input or {}).get(key, "") if key else ""
-                    if key and isinstance(value, str) and value:
-                        server_calls.append((block.name, key, value))
-                elif block.type in ("web_search_tool_result", "web_fetch_tool_result"):
-                    # Echoed with its server_tool_use: without the result the
-                    # next request carries an orphaned call.
+                    if block.name == WEB_SEARCH_TOOL_NAME:
+                        query = (block.input or {}).get("query", "")
+                        if isinstance(query, str) and query:
+                            web_search_queries.append(query)
+                elif block.type == "web_search_tool_result":
                     response_content.append(block.model_dump(exclude_none=True))
+                    # Its result URLs may be opened, as the client search's are
+                    # (searxng_search's on_result_url).
+                    for url in server_search_result_urls(block):
+                        seen_urls.add(url)
                 elif (replay := reasoning_replay_block(block)) is not None:
                     # OpenRouter reasoning continuity across tool iterations
                     # (replayed as ``reasoning_details`` by the translator).
@@ -2690,32 +2676,31 @@ class Executive:
 
             last_full_text = full_text
 
-            web_search_queries = [v for name, _, v in server_calls if name == WEB_SEARCH_TOOL_NAME]
-            if web_search_queries and debug_collector:
-                evt = debug_collector.emit("web_search_invocation", {
-                    "iteration": iteration,
-                    "queries": web_search_queries,
-                })
-                yield debug_collector.to_sse_dict(evt)
-            # The client tools of the same names audit through the skill
-            # dispatch below, as client_tool; the server ones are seen only here.
-            if server_calls:
+            if web_search_queries:
                 session_id = getattr(current_session.get(), "session_id", None)
-                block_names = _system_block_names(system_blocks)
-                for name, key, value in server_calls:
+                if debug_collector:
+                    evt = debug_collector.emit("web_search_invocation", {
+                        "iteration": iteration,
+                        "queries": web_search_queries,
+                    })
+                    yield debug_collector.to_sse_dict(evt)
+                for q in web_search_queries:
                     audit_log(
                         "tool_invocation",
-                        f"{name}: {value[:200]}",
+                        f"web_search: {q[:200]}",
                         session_id=session_id,
                         turn_id=turn_id,
                         actor="executive",
                         details={
-                            "tool": name,
+                            "tool": WEB_SEARCH_TOOL_NAME,
                             "kind": "server_tool",
                             "iteration": iteration,
-                            key: value[:500],
+                            "query": q[:500],
                         },
-                        full={key: value, "active_prompt_blocks": block_names},
+                        full={
+                            "query": q,
+                            "active_prompt_blocks": _system_block_names(system_blocks),
+                        },
                     )
 
             if final_msg.stop_reason != "tool_use":
@@ -2793,8 +2778,7 @@ class Executive:
             # A later turn of that conversation stays private (touched_mail)
             # but is not locked: it is the person asking again. The offered
             # list stays as it is, so the cached prefix never changes
-            # mid-turn — except the server web_fetch, which the tool list
-            # above drops from the next round on.
+            # mid-turn.
             mail_touched_uses: list[dict[str, Any]] = []
             if pinned_delegation is not None and (
                 pinned_delegation.read_mail

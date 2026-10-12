@@ -32,31 +32,23 @@ until a new tool is), and anything unclassified is withheld.
 
 The dispatch guard in ``orchestrator.executive`` refuses a withheld call
 without changing the offered tool list (the cached prefix stays the same all
-turn, but for the server ``web_fetch`` below), and treats a round that calls
-any of them as already touched, because a round's tools run concurrently. The handlers that reach outside
+turn), and treats a round that calls any of them as already touched,
+because a round's tools run concurrently. The handlers that reach outside
 check again (``outside_reach_refusal``). The server-side ``web_search``
 stays, as on a turn private to the owner: it runs inside the provider's
 generation, never through this dispatch, and dropping it would change the
-cached prefix. The server-side ``web_fetch`` is the one exception: the loop
-leaves it out from the round after the mail is read, at the cost of one
-cache write for the rest of the turn. Anthropic opens any URL already in the
-conversation, client tool results included, and an allowed tool can echo a
-URL the model wrote (``ghostwrite_email`` keeps a link that is in its
-intent, and returns the draft's text), so with it the mail could leave in a
-query string. The client ``web_search``
-and ``web_fetch`` (SearXNG, local models) are withheld like any other
-outside fetch (the fetch handler also checks again; the search handler
-relies on the dispatch guard). The lockdown lasts for the turn
+cached prefix. The client ``web_search`` (SearXNG, local models) and
+``web_fetch`` are withheld like any other outside fetch (the fetch handler
+also checks again; the search handler relies on the dispatch guard).
+``web_fetch`` is always that client tool, never Anthropic's server one,
+which opens any URL a client tool result echoes — and an allowed tool here
+can echo one the model wrote (``ghostwrite_email`` returns the draft's
+text), so the mail could leave in a query string
+(``orchestrator.web_search_tool``). The lockdown lasts for the turn
 (``TurnDelegation.read_mail``) and no longer. A later turn of that
 conversation stays private to its owner (``touched_mail``), and its history
 carries only their words and the Executive's replies, never the mail a tool
 returned: their next message is them asking again, having read the reply.
-The server ``web_fetch`` is offered again on that turn (only the email
-poller's sessions are private to the principal, not a chat that read mail).
-No tool result survives into it to carry the mail out, but a link the
-Executive wrote into its reply does. Whether Anthropic counts a URL in an
-assistant turn as already in the conversation is unverified; if it does, an
-injected link quoted in the reply could be opened on the next turn.
 """
 from __future__ import annotations
 
@@ -131,7 +123,7 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
 MAIL_TOUCHED_WITHHELD_TOOLS: frozenset[str] = frozenset({
     # Fetches of an outside address: a URL can carry the mail anywhere. The
     # client web_search and web_fetch (a search query carries text out too);
-    # the server-side tools of the same names are never dispatched here.
+    # the server-side web_search is never dispatched here.
     "read_document",
     "web_fetch",
     "web_search",

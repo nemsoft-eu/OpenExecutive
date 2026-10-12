@@ -237,7 +237,6 @@ def test_usage_summary_empty_db_returns_zeros(tmp_path: Path) -> None:
         "cache_creation_input_tokens": 0,
         "output_tokens": 0,
         "web_search_requests": 0,
-        "web_fetch_requests": 0,
         "cost_usd": 0.0,
     }
     assert s["by_day"] == []

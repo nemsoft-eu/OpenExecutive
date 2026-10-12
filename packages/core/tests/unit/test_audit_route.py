@@ -243,22 +243,15 @@ def test_usage_endpoint_breaks_down_by_source(tmp_path: Path) -> None:
     client = _session_client(tmp_path)
     audit = client.app.state.audit  # type: ignore[attr-defined]
     audit.log("cache_event", "chat", session_id="sA", turn_id="t1", actor="executive",
-              details={"model": "m", "input_tokens": 100, "web_search_requests": 1,
-                       "web_fetch_requests": 2})
+              details={"model": "m", "input_tokens": 100, "web_search_requests": 1})
     audit.log("cache_event", "research", actor="specialist_research",
               details={"model": "m", "input_tokens": 40, "web_search_requests": 4})
 
     data = client.get("/audit/usage").json()
     assert data["totals"]["web_search_requests"] == 5
-    assert data["totals"]["web_fetch_requests"] == 2
     by_source = {s["source"]: s for s in data["by_source"]}
     assert by_source["executive"]["calls"] == 1
-    assert by_source["executive"]["web_fetch_requests"] == 2
     assert by_source["specialist_research"]["web_search_requests"] == 4
-    # A row from before fetch capture counts as none.
-    assert by_source["specialist_research"]["web_fetch_requests"] == 0
-    cost = client.get("/audit/sessions/sA").json()["cost_summary"]
-    assert cost["web_fetch_requests"] == 2 and cost["per_turn"][0]["web_fetch_requests"] == 2
 
 
 def test_usage_endpoint_cost_missing_rows_contribute_zero(tmp_path: Path) -> None:

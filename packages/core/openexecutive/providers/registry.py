@@ -530,22 +530,6 @@ def supports_server_web_search(model: str) -> bool:
     return feature_spec_for(model).supports_web_search
 
 
-def supports_server_web_fetch(model: str) -> bool:
-    """Whether ``model``'s provider runs Anthropic's ``web_fetch`` server tool.
-
-    True only when ``get_provider`` would send ``model`` to Anthropic direct.
-    Unlike search, OpenRouter has no fetch equivalent for the translator to
-    swap in, so a Claude id routed through OpenRouter gets no fetch at all,
-    and a local model gets the client-side tool instead. Mirrors
-    ``get_provider``'s precedence for the same reason ``feature_spec_for``
-    does.
-    """
-    settings = get_settings()
-    if model in _local_models(settings):
-        return False
-    return _is_claude(model) and not settings.openrouter_enabled
-
-
 def pdf_input_supported(model: str) -> bool:
     """Whether a PDF ``document`` block sent to ``model`` reaches a reader.
 

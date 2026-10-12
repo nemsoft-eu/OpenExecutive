@@ -20,7 +20,6 @@ from openexecutive.orchestrator.web_fetch import (
     is_public_address,
 )
 from openexecutive.orchestrator.web_search_tool import select_web_search_tool
-from openexecutive.providers.translator import to_openai_request
 
 from ._search_helpers import clear_search_env, use_local_model
 
@@ -34,37 +33,22 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- selection --------------------------------------------------------------
 
 
-def test_direct_claude_gets_anthropics_server_fetch() -> None:
-    selection = select_web_search_tool("claude-sonnet-5")
-    assert selection is not None and selection.kind == "server"
-    assert selection.fetch_tool == {
-        # The basic variant: the later ones need a Claude 4.6+ model.
-        "type": "web_fetch_20250910",
-        "name": "web_fetch",
-        "max_uses": 3,
-        "max_content_tokens": 4_000,
-    }
-    assert selection.fetch_max_uses == 3
-
-
-def test_server_fetch_carries_the_domain_list(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "example.com")
-    selection = select_web_search_tool("claude-sonnet-5")
-    assert selection is not None and selection.fetch_tool is not None
-    assert selection.fetch_tool["blocked_domains"] == ["example.com"]
-
-
-@pytest.mark.parametrize("model", ["claude-sonnet-5", "openai/gpt-6-astra"])
-def test_openrouter_gets_search_but_no_fetch(
-    model: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("model", "openrouter"),
+    [("claude-sonnet-5", False), ("claude-sonnet-5", True), ("openai/gpt-6-astra", True)],
+)
+def test_a_server_search_model_gets_the_client_fetch(
+    model: str, openrouter: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """OpenRouter has no fetch to swap in, Claude id or not."""
-    monkeypatch.setenv("OPENROUTER_ENABLED", "true")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-used")
+    """Never Anthropic's server web_fetch: it opens any URL a client tool
+    result echoes, so the turn's data could leave in a query string."""
+    if openrouter:
+        monkeypatch.setenv("OPENROUTER_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-used")
     selection = select_web_search_tool(model)
     assert selection is not None and selection.kind == "server"
-    assert selection.fetch_tool is None
-    assert selection.fetch_max_uses == 0
+    assert selection.fetch_tool is WEB_FETCH_TOOL
+    assert selection.fetch_max_uses == 3
 
 
 def test_local_model_with_searxng_gets_the_client_fetch(
@@ -115,30 +99,6 @@ def test_disabling_search_disables_fetch(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.parametrize(
-    ("model", "route", "expected"),
-    [
-        ("claude-sonnet-5", "direct", True),
-        ("claude-sonnet-5", "openrouter", False),
-        # selection takes the client path for these before asking, so only a
-        # direct call shows the predicate keeps them off the server tool
-        ("claude-proxy-1", "local", False),
-        ("openai/gpt-6-astra", "direct", False),
-    ],
-)
-def test_only_a_direct_anthropic_route_supports_the_server_fetch(
-    model: str, route: str, expected: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from openexecutive.providers.registry import supports_server_web_fetch
-
-    if route == "openrouter":
-        monkeypatch.setenv("OPENROUTER_ENABLED", "true")
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-used")
-    elif route == "local":
-        use_local_model(monkeypatch, model)
-    assert supports_server_web_fetch(model) is expected
-
-
-@pytest.mark.parametrize(
     ("key", "value"),
     [("WEB_FETCH_MAX_USES", "-1"), ("WEB_FETCH_TIMEOUT_S", "0"), ("WEB_FETCH_TIMEOUT_S", "-1")],
 )
@@ -148,21 +108,6 @@ def test_config_rejects_bad_fetch_bounds(
     monkeypatch.setenv(key, value)
     with pytest.raises(ValueError):
         get_settings()
-
-
-def test_translator_drops_a_stray_server_fetch_tool() -> None:
-    """A web_fetch server tool reaching OpenRouter must not become a
-    schemaless function tool the model could call."""
-    body = to_openai_request(
-        "anthropic/claude-opus-4.7",
-        {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3}],
-        },
-    )
-    assert "tools" not in body or all(
-        t.get("function", {}).get("name") != "web_fetch" for t in body["tools"]
-    )
 
 
 # --- address policy -------------------------------------------------------
