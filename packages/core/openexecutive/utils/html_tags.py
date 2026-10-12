@@ -22,11 +22,15 @@ import string
 # attacker's to shape.
 _DROP_BLOCK_TAGS = ("script", "style", "noscript")
 _WS_RE = re.compile(r"\s+")
-# ASCII-only lowercasing for the block scan. str.lower() can lengthen a
-# string ("İ" becomes two code points), and the scan finds positions in the
+# ASCII-only lowercasing for the block scan, used when str.lower() changes the
+# length ("İ" becomes two code points): the scan finds positions in the
 # lowered copy to slice the original, so the two must stay the same length.
-# Tag names are ASCII, so nothing else needs folding.
+# translate is about 20 times slower than lower() on non-ASCII text, hence
+# only the fallback. A same-length lower() is as good for the scan: the only
+# non-ASCII letter it folds to ASCII is the Kelvin sign (to "k"), which no
+# block tag contains.
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_DECIMAL_REF_RE = re.compile(r"&#(\d+)(;?)")
 
 
 def strip_tags(text: str, *, repl: str = "") -> str:
@@ -58,7 +62,20 @@ def visible_text(markup: str) -> str:
     """
     markup = _strip_blocks(markup)
     markup = strip_tags(markup, repl=" ")
-    return _WS_RE.sub(" ", html.unescape(markup)).strip()
+    return _WS_RE.sub(" ", unescape(markup)).strip()
+
+
+def unescape(text: str) -> str:
+    """``html.unescape`` that cannot raise on a page's numeric references."""
+    return html.unescape(_DECIMAL_REF_RE.sub(_short_decimal_ref, text))
+
+
+def _short_decimal_ref(match: re.Match[str]) -> str:
+    # html.unescape turns the digits into an int, and Python refuses more than
+    # 4,300 of them (ValueError). Beyond seven significant digits the value is
+    # past Unicode's range, which unescape reads as U+FFFD anyway.
+    digits = match.group(1).lstrip("0") or "0"
+    return "�" if len(digits) > 7 else f"&#{digits}{match.group(2)}"
 
 
 def _strip_blocks(markup: str) -> str:
@@ -66,8 +83,10 @@ def _strip_blocks(markup: str) -> str:
     included) in one pass that is linear in the page length. An unterminated
     comment or block runs to the end of the page: a truncated script is not
     visible text either."""
-    lower = markup.translate(_ASCII_LOWER)
     n = len(markup)
+    lower = markup.lower()
+    if len(lower) != n:
+        lower = markup.translate(_ASCII_LOWER)
     out: list[str] = []
     i = 0
     while i < n:

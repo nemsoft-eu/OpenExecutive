@@ -42,8 +42,7 @@ from openexecutive.agents.tool_outcome import ToolOutcome
 from openexecutive.config import Settings, get_settings
 from openexecutive.orchestrator.searxng_search import (
     SearchBudget,
-    bare_hosts,
-    host_matches,
+    domain_refusal,
     host_of,
     is_usable_url,
 )
@@ -189,13 +188,9 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
     the checked IP here leaves SNI and certificate verification untouched.
     """
 
-    def __init__(
-        self,
-        resolver: Resolver = _system_resolver,
-        inner: httpcore.AsyncNetworkBackend | None = None,
-    ) -> None:
+    def __init__(self, resolver: Resolver = _system_resolver) -> None:
         self._resolver = resolver
-        self._inner = inner or httpcore.AnyIOBackend()
+        self._inner = httpcore.AnyIOBackend()
 
     async def connect_tcp(
         self,
@@ -383,12 +378,10 @@ def _target_problem(url: str, settings: Settings) -> str | None:
     """Why ``url`` may not be opened, or None. Run on every hop."""
     if not is_usable_url(url):
         return "it is not a plain http(s) address."
-    host = host_of(url)
-    allowed = bare_hosts(settings.web_search_allowed_domains)
-    if allowed and not any(host_matches(host, d) for d in allowed):
+    refusal = domain_refusal(host_of(url), settings)
+    if refusal == "not_allowed":
         return "its site is not on this install's list of allowed domains."
-    blocked = bare_hosts(settings.web_search_blocked_domains)
-    if blocked and any(host_matches(host, d) for d in blocked):
+    if refusal == "blocked":
         return "its site is on this install's list of blocked domains."
     return None
 
@@ -437,13 +430,13 @@ def make_fetch_handler(
 class _FetchError(Exception):
     """A fetch that ended without a readable page.
 
-    ``message`` is what the model is told; ``reason`` is what the log says.
+    ``message`` is what the model is told; the exception's own text, the
+    reason, is what the log says.
     """
 
     def __init__(self, message: str, reason: str) -> None:
         super().__init__(reason)
         self.message = message
-        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -473,7 +466,7 @@ async def _run_fetch(url: str, settings: Settings) -> ToolOutcome:
                        settings.web_fetch_timeout_s, host)
         return ToolOutcome("The page did not load in time.", is_error=True)
     except _FetchError as exc:
-        logger.warning("web_fetch: %s for host %s", exc.reason, host)
+        logger.warning("web_fetch: %s for host %s", exc, host)
         return ToolOutcome(exc.message, is_error=True)
     except httpx.ConnectError as exc:
         if isinstance(exc.__cause__, BlockedAddressError):
@@ -493,7 +486,9 @@ async def _run_fetch(url: str, settings: Settings) -> ToolOutcome:
 
     text = _decode(page.body, page.charset)
     if page.media_type in _HTML_TYPES:
-        text = visible_text(text)
+        # Off the event loop: a 2 MB page takes 100+ ms to reduce, and the
+        # turn's other streams would wait on it.
+        text = await asyncio.to_thread(visible_text, text)
     return ToolOutcome(json.dumps({
         "notice": UNTRUSTED_PAGE_NOTICE,
         "url": url,

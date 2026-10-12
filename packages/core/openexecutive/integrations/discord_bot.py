@@ -1490,11 +1490,9 @@ def create_discord_bot():
         att_image_blocks: list[dict] = []
         # What the sender wrote and the files' names (as Slack records it),
         # taken before attachment text is put in front of `cleaned`.
-        file_note = (
-            f"(Attached files: {', '.join(a.filename for a in message.attachments)})"
-            if message.attachments else ""
-        )
-        own_words = "\n\n".join(p for p in (cleaned, file_note) if p)
+        from openexecutive.integrations.attachments import own_words as _own_words
+
+        own_words = _own_words(cleaned, (a.filename for a in message.attachments))
         if message.attachments and _is_rostered(discord_user_id):
             try:
                 from openexecutive.integrations.attachments import (

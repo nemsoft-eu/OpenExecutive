@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import html
 import json
 import logging
 import re
@@ -54,7 +53,7 @@ from urllib.parse import quote
 
 import httpx
 
-from openexecutive.utils.html_tags import strip_tags
+from openexecutive.utils.html_tags import strip_tags, unescape
 
 logger = logging.getLogger(__name__)
 
@@ -396,16 +395,7 @@ _BLOCK_EDGE_RE = re.compile(
 _HIDDEN = {
     name: (re.compile(rf"(?i)<{name}\b"), re.compile(rf"(?i)</{name}\s*>")) for name in ("script", "style")
 }
-_DECIMAL_REF_RE = re.compile(r"&#(\d+)(;?)")
 _EDGE = "\x00"
-
-
-def _short_decimal_ref(match: re.Match[str]) -> str:
-    # html.unescape turns the digits into an int, and Python refuses more than
-    # 4,300 of them (ValueError). Beyond seven significant digits the value is
-    # past Unicode's range, which unescape reads as U+FFFD anyway.
-    digits = match.group(1).lstrip("0") or "0"
-    return "�" if len(digits) > 7 else f"&#{digits}{match.group(2)}"
 
 
 def _drop_hidden(markup: str) -> str:
@@ -432,7 +422,7 @@ def html_to_text(markup: str) -> str:
     ``<div><br></div>`` a blank line."""
     text = _drop_hidden(markup.replace(_EDGE, ""))
     text = _BLOCK_EDGE_RE.sub(_EDGE, _BR_RE.sub("\n", text))
-    text = html.unescape(_DECIMAL_REF_RE.sub(_short_decimal_ref, strip_tags(text)))
+    text = unescape(strip_tags(text))
     out: list[str] = []
     has_text = False
     for piece in re.split(f"({_EDGE}|\n)", text):

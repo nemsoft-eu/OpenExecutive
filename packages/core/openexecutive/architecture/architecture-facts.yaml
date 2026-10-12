@@ -9909,7 +9909,9 @@ delegation:
     client-side web_fetch through visible_text) and script / style
     elements are cut by scanning forward, and a decimal
     character reference past Unicode's range becomes U+FFFD before
-    html.unescape (which raises past 4,300 digits). A unit test times
+    html.unescape (which raises past 4,300 digits) — utils.html_tags.unescape,
+    which visible_text uses too, so page_watch and web_fetch cannot raise on
+    such a page either. A unit test times
     crafted input.
     Callers never name Gmail's query syntax: they use inbox_message_ids
     (the Primary inbox since a time, not from the person) and

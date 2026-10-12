@@ -216,11 +216,11 @@ async def _process_and_reply(
 
     # What the sender wrote and the files' names, as Slack records it: the
     # attachment text and the DM hydration below go into the prompt only.
-    file_note = (
-        f"(Attached files: {', '.join(name for _id, name, _type in attachment_file_ids)})"
-        if attachment_file_ids else ""
+    from openexecutive.integrations.attachments import own_words as _own_words
+
+    own_words = _own_words(
+        message_text, (name for _id, name, _type in attachment_file_ids or ())
     )
-    own_words = "\n\n".join(p for p in (message_text, file_note) if p)
 
     # Process file / photo attachments before entering the chat lock so that
     # slow downloads don't hold the lock while the chat serialises.

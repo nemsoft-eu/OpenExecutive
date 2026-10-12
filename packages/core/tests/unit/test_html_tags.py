@@ -43,6 +43,10 @@ def test_strip_tags_matches_the_regex_it_replaced(repl: str) -> None:
         ("before<!-- never closed", "before"),
         # "İ".lower() is two code points; the scan must not drift past it.
         ("İİİ<SCRIPT>leak()</SCRIPT>after", "İİİ after"),
+        # Non-ASCII that lower() keeps the same length takes the fast path.
+        ("Café ÉTÉ<SCRIPT>leak()</SCRIPT>after", "Café ÉTÉ after"),
+        # html.unescape raises on a decimal reference past 4,300 digits.
+        ("a&#" + "1" * 5000 + ";b", "a�b"),
     ],
 )
 def test_visible_text(markup: str, expected: str) -> None:

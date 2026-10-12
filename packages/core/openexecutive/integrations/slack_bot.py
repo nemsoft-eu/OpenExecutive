@@ -520,9 +520,9 @@ async def create_slack_app():
         # What the sender sent, in their own words plus the files' names —
         # the "(Attached files: …)" note the web upload route uses. A
         # file-only message has no words, so the note stands in for them.
-        file_note = (
-            f"(Attached files: {', '.join(_file_name(f) for f in files)})" if files else ""
-        )
+        from openexecutive.integrations.attachments import attached_files_note
+
+        file_note = attached_files_note(_file_name(f) for f in files)
         own_words = "\n\n".join(p for p in (cleaned, file_note) if p)
         if not cleaned:
             cleaned = file_note

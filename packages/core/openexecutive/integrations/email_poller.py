@@ -340,9 +340,9 @@ def _email_memory_text(raw: str) -> str:
     if forwarded:
         parts.append("[Forwarded an earlier message]")
     if names:
-        # Not "[Attached: …]": that line marks inlined document text, and the
-        # open-loop pass skips any turn carrying it (see open_loops).
-        parts.append(f"(Attached files: {', '.join(names)})")
+        from openexecutive.integrations.attachments import attached_files_note
+
+        parts.append(attached_files_note(names))
     return "\n\n".join(parts)
 
 

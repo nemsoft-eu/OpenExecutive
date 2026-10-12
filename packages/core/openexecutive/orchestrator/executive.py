@@ -717,6 +717,10 @@ _ALL_SKILL_HANDLERS = {
 }
 
 
+# The input field each server tool's audit row records.
+_SERVER_TOOL_INPUT_KEYS = {WEB_SEARCH_TOOL_NAME: "query", WEB_FETCH_TOOL_NAME: "url"}
+
+
 def builtin_tool_names() -> frozenset[str]:
     """Every tool name the chat loop knows itself, which an extension's tool
     may not take (orchestrator/extensions.py)."""
@@ -2609,12 +2613,15 @@ class Executive:
                 # URL in a client tool result, and an allowed tool can echo one
                 # the model wrote (a ghostwrite_email preview), so the turn's
                 # mail could leave in a query string. A private turn knows at
-                # the start and has a prefix of its own anyway; a mail read
-                # drops it from the next round on, at the cost of one cache
-                # write for the rest of that turn (delegation.lockdown).
-                if search.fetch_tool is not None and not (
-                    private_turn
-                    or (pinned_delegation is not None and pinned_delegation.read_mail)
+                # the start (web_fetch is in PRIVATE_TURN_WITHHELD_TOOLS, which
+                # names the client and server tool alike) and has a prefix of
+                # its own anyway; a mail read drops it from the next round on,
+                # at the cost of one cache write for the rest of that turn
+                # (delegation.lockdown).
+                if (
+                    search.fetch_tool is not None
+                    and search.fetch_tool["name"] not in not_offered
+                    and not (pinned_delegation is not None and pinned_delegation.read_mail)
                 ):
                     tools_with_cache.append(search.fetch_tool)
             async with get_provider(stream_model).messages_stream(
@@ -2649,8 +2656,8 @@ class Executive:
                 model=stream_model,
             )
 
-            web_search_queries: list[str] = []
-            web_fetch_urls: list[str] = []
+            # (tool name, input key, value) per server tool call, for the audit
+            server_calls: list[tuple[str, str, str]] = []
             for block in final_msg.content:
                 if block.type == "text":
                     response_content.append({"type": "text", "text": block.text})
@@ -2665,14 +2672,10 @@ class Executive:
                     # on the next iteration so the model retains continuity.
                     # No handler runs.
                     response_content.append(block.model_dump(exclude_none=True))
-                    if block.name == WEB_SEARCH_TOOL_NAME:
-                        query = (block.input or {}).get("query", "")
-                        if isinstance(query, str) and query:
-                            web_search_queries.append(query)
-                    elif block.name == WEB_FETCH_TOOL_NAME:
-                        url = (block.input or {}).get("url", "")
-                        if isinstance(url, str) and url:
-                            web_fetch_urls.append(url)
+                    key = _SERVER_TOOL_INPUT_KEYS.get(block.name)
+                    value = (block.input or {}).get(key, "") if key else ""
+                    if key and isinstance(value, str) and value:
+                        server_calls.append((block.name, key, value))
                 elif block.type in ("web_search_tool_result", "web_fetch_tool_result"):
                     # Echoed with its server_tool_use: without the result the
                     # next request carries an orphaned call.
@@ -2686,52 +2689,33 @@ class Executive:
 
             last_full_text = full_text
 
-            if web_search_queries:
+            web_search_queries = [v for name, _, v in server_calls if name == WEB_SEARCH_TOOL_NAME]
+            if web_search_queries and debug_collector:
+                evt = debug_collector.emit("web_search_invocation", {
+                    "iteration": iteration,
+                    "queries": web_search_queries,
+                })
+                yield debug_collector.to_sse_dict(evt)
+            # The client tools of the same names audit through the skill
+            # dispatch below, as client_tool; the server ones are seen only here.
+            if server_calls:
                 session_id = getattr(current_session.get(), "session_id", None)
-                if debug_collector:
-                    evt = debug_collector.emit("web_search_invocation", {
-                        "iteration": iteration,
-                        "queries": web_search_queries,
-                    })
-                    yield debug_collector.to_sse_dict(evt)
-                for q in web_search_queries:
+                block_names = _system_block_names(system_blocks)
+                for name, key, value in server_calls:
                     audit_log(
                         "tool_invocation",
-                        f"web_search: {q[:200]}",
+                        f"{name}: {value[:200]}",
                         session_id=session_id,
                         turn_id=turn_id,
                         actor="executive",
                         details={
-                            "tool": WEB_SEARCH_TOOL_NAME,
+                            "tool": name,
                             "kind": "server_tool",
                             "iteration": iteration,
-                            "query": q[:500],
+                            key: value[:500],
                         },
-                        full={
-                            "query": q,
-                            "active_prompt_blocks": _system_block_names(system_blocks),
-                        },
+                        full={key: value, "active_prompt_blocks": block_names},
                     )
-            # The client web_fetch audits through the skill dispatch below,
-            # as a client_tool; the server one is seen only here.
-            for url in web_fetch_urls:
-                audit_log(
-                    "tool_invocation",
-                    f"web_fetch: {url[:200]}",
-                    session_id=getattr(current_session.get(), "session_id", None),
-                    turn_id=turn_id,
-                    actor="executive",
-                    details={
-                        "tool": WEB_FETCH_TOOL_NAME,
-                        "kind": "server_tool",
-                        "iteration": iteration,
-                        "url": url[:500],
-                    },
-                    full={
-                        "url": url,
-                        "active_prompt_blocks": _system_block_names(system_blocks),
-                    },
-                )
 
             if final_msg.stop_reason != "tool_use":
                 return

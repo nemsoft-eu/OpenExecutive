@@ -28,6 +28,7 @@ import base64
 import logging
 import re
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -257,6 +258,22 @@ def _build_image_block(data: bytes, content_type: str) -> dict[str, Any]:
             "data": base64.standard_b64encode(data).decode(),
         },
     }
+
+
+def attached_files_note(names: Iterable[str]) -> str:
+    """``(Attached files: a, b)`` naming the files a message carried, or ""
+    for none — how a sender's own words (``memory_text``) record them. Not
+    the ``[Attached: …]`` label: that marks inlined document text, and the
+    open-loop pass skips any turn carrying it (``attunement.open_loops``)."""
+    names = list(names)
+    return f"(Attached files: {', '.join(names)})" if names else ""
+
+
+def own_words(text: str, names: Iterable[str]) -> str:
+    """What a sender wrote plus the note naming their files: the text the
+    chat channels hand the Executive as ``memory_text``, taken before any
+    attachment text or backstory joins the prompt."""
+    return "\n\n".join(p for p in (text, attached_files_note(names)) if p)
 
 
 def format_attached_text(

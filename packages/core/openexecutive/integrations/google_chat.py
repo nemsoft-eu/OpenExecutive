@@ -313,14 +313,14 @@ async def _process_and_reply(
         chat_message = message_text
         # What the sender wrote and the files' names, as Slack records it: any
         # attachment text below goes into the prompt only.
-        file_note = (
-            f"(Attached files: {', '.join(map(_attachment_name, attachments))})"
-            if attachments else ""
-        )
+        from openexecutive.integrations.attachments import attached_files_note
+        from openexecutive.integrations.attachments import own_words as _own_words
+
+        names = [_attachment_name(a) for a in attachments or ()]
         # A file-only message already arrives as that note (the webhook).
         own_words = (
-            message_text if message_text == file_note
-            else "\n\n".join(p for p in (message_text, file_note) if p)
+            message_text if message_text == attached_files_note(names)
+            else _own_words(message_text, names)
         )
         image_blocks: list[dict] = []
         # The webhook authenticates Google, not the sender: anyone in a space
@@ -335,10 +335,9 @@ async def _process_and_reply(
                 # Before the words, as the other chat channels inline it.
                 chat_message = f"{att_text}\n\n{message_text}"
         elif attachments:
-            names = ", ".join(map(_attachment_name, attachments))
             chat_message = (
                 f"(Attached files, not read — files are read only from people on "
-                f"the team: {names})\n\n{message_text}"
+                f"the team: {', '.join(names)})\n\n{message_text}"
             )
 
         response = await Executive(mcp_gateway=get_active_gateway()).chat(
@@ -413,7 +412,9 @@ async def google_chat_webhook(request: Request, background_tasks: BackgroundTask
     if not cleaned:
         # A file-only message: its names stand in for the words, as the web
         # upload route records one.
-        cleaned = f"(Attached files: {', '.join(map(_attachment_name, attachments))})"
+        from openexecutive.integrations.attachments import attached_files_note
+
+        cleaned = attached_files_note(map(_attachment_name, attachments))
 
     background_tasks.add_task(
         _process_and_reply,

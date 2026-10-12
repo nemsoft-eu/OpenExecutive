@@ -25,7 +25,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -284,9 +284,6 @@ def _shape_results(
     Order matters: capping first and filtering second can return zero
     results while allowed-domain hits sat further down the list.
     """
-    allowed = bare_hosts(settings.web_search_allowed_domains)
-    blocked = bare_hosts(settings.web_search_blocked_domains)
-
     shaped: list[dict[str, str]] = []
     for raw in raw_results:
         if len(shaped) >= settings.searxng_max_results:
@@ -294,12 +291,7 @@ def _shape_results(
         if not isinstance(raw, dict):
             continue
         url = str(raw.get("url") or "").strip()
-        if not is_usable_url(url):
-            continue
-        host = host_of(url)
-        if allowed and not any(host_matches(host, d) for d in allowed):
-            continue
-        if blocked and any(host_matches(host, d) for d in blocked):
+        if not is_usable_url(url) or domain_refusal(host_of(url), settings):
             continue
         shaped.append({
             "title": str(raw.get("title") or "")[:_MAX_TITLE_CHARS],
@@ -360,6 +352,19 @@ def host_of(url: str) -> str:
     except ValueError:
         return ""
     return _normalise_host(host) if host else ""
+
+
+def domain_refusal(host: str, settings: Settings) -> Literal["not_allowed", "blocked"] | None:
+    """Why ``host`` is outside WEB_SEARCH_ALLOWED_DOMAINS or inside
+    WEB_SEARCH_BLOCKED_DOMAINS, or None. Search results and every
+    ``web_fetch`` hop share it, so the two cannot disagree on a site."""
+    allowed = bare_hosts(settings.web_search_allowed_domains)
+    if allowed and not any(host_matches(host, d) for d in allowed):
+        return "not_allowed"
+    blocked = bare_hosts(settings.web_search_blocked_domains)
+    if blocked and any(host_matches(host, d) for d in blocked):
+        return "blocked"
+    return None
 
 
 def bare_hosts(entries: list[str]) -> list[str]:
