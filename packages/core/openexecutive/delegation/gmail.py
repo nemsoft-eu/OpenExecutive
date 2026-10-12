@@ -94,7 +94,7 @@ STATUS_MESSAGES: dict[str, str] = {
     "connected": "Connected.",
     "not_configured": (
         "Your mailbox isn't connected. Run scripts/connect-own-gmail.py (Gmail) or "
-        "scripts/connect-own-outlook.py (Outlook) as yourself (Settings → Act as me "
+        "scripts/connect-own-outlook.py (Outlook) as yourself (Delegate → Act as me "
         "shows how)."
     ),
     "needs_reconnect": (
@@ -152,6 +152,16 @@ class GmailRateLimited(GmailError):
 
 class GmailNotFound(GmailError):
     """No such message, thread or draft (404). For a draft: sent or deleted."""
+
+
+class DraftChanged(GmailError):
+    """A draft can't be rewritten from the card: it changed in the mailbox
+    since it was last read (``reason`` "changed"), or it holds more than plain
+    text, such as files ("not_plain")."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"draft {reason}")
+        self.reason = reason
 
 
 class GmailAuthError(GmailError):
@@ -1030,6 +1040,46 @@ class DelegateGmail:
             except GmailNotFound:
                 return False
         return True
+
+    async def update_draft_text(self, draft_id: str, expected_version: str, text: str) -> str:
+        """Replace the words of the draft ``draft_id`` with ``text``, keeping
+        every header (who it goes to, the subject, the thread), when it is
+        still the version ``expected_version``. Returns its new version (the
+        message id Gmail gives the edited draft). Raises ``GmailNotFound``
+        when it is gone and ``DraftChanged`` when it changed meanwhile or is
+        more than plain text. Nothing is sent."""
+        if not valid_id(draft_id):
+            raise GmailError("invalid draft id")
+        async with self._client() as client:
+            data = await self._get(client, f"/drafts/{draft_id}", {"format": "raw"})
+            current = data.get("message")
+            current = current if isinstance(current, dict) else {}
+            if str(current.get("id") or "") != expected_version:
+                raise DraftChanged("changed")
+            raw = current.get("raw")
+            if not isinstance(raw, str):
+                raise GmailError("gmail returned no draft")
+            try:
+                from email import message_from_bytes, policy
+
+                msg = message_from_bytes(_b64decode(raw), policy=policy.default)
+            except (ValueError, TypeError) as exc:
+                raise GmailError("gmail returned an unreadable draft") from exc
+            if not isinstance(msg, EmailMessage) or msg.is_multipart() or msg.get_content_type() != "text/plain":
+                raise DraftChanged("not_plain")
+            msg.set_content(text)
+            message: dict[str, Any] = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")}
+            thread_id = current.get("threadId")
+            if isinstance(thread_id, str) and valid_id(thread_id):
+                message["threadId"] = thread_id
+            updated = await self._request(
+                client, "PUT", f"/drafts/{draft_id}", json_body={"id": draft_id, "message": message},
+            )
+        saved = updated.get("message")
+        version = str(saved.get("id") or "") if isinstance(saved, dict) else ""
+        if not version:
+            raise GmailError("gmail returned no edited draft", maybe_done=True)
+        return version
 
     async def send_draft(self, draft_id: str) -> SentMessage:
         """Send the draft ``draft_id`` exactly as it is in Gmail now: the

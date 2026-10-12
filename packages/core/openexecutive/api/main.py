@@ -47,7 +47,6 @@ from openexecutive.api.routes import (
     scheduled,
     sessions,
     setup_status,
-    skill_drafts,
     skills,
     take_the_lead,
     today,
@@ -447,16 +446,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "cancelled %d orphaned talent/onboarding reminder(s) on startup", _swept
             )
 
+    # One-shot: cut each chat app's saved stream into conversations by the
+    # same quiet-gap rule new messages follow (memory.conversations).
+    from openexecutive.memory.conversations import split_existing_streams
+    try:
+        await asyncio.to_thread(split_existing_streams)
+    except Exception:
+        logging.getLogger("openexecutive").exception("chat-app conversation split failed")
+
     # Departments: persistent state layer over the 8 specialist agents. Init
     # AFTER episodic_db so the additive ALTERs (department column on decisions,
     # initiatives, advice_given, scheduled_actions) have already run by the
     # time anything else writes to those tables.
+    # No departments are created here: a new install starts with none, and
+    # setup creates only the ones the company has.
     from openexecutive.departments.store import (
         initialize_db as initialize_departments_db,
     )
-    from openexecutive.departments.store import seed_default_departments
     initialize_departments_db()
-    seed_default_departments()
 
     # Solo installs have no team to be incomplete: the check only warns
     # about departments with no head, which is every department there.
@@ -859,7 +866,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.5.3",  # x-release-please-version
+        version="0.5.4",  # x-release-please-version
         lifespan=lifespan,
     )
 
@@ -963,7 +970,6 @@ def create_app() -> FastAPI:
     app.include_router(documents.router, tags=["documents"])
     app.include_router(knowledge.router, tags=["knowledge"])
     app.include_router(skills.router, tags=["skills"])
-    app.include_router(skill_drafts.router, tags=["skills"])
     # Ahead of workflows.router so no /workflows/{name}/... pattern can shadow
     # the literal /workflows/designer/* paths.
     app.include_router(workflow_designer.router, tags=["workflows"])

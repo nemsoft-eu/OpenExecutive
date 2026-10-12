@@ -77,6 +77,23 @@ class ChatRequest(BaseModel):
     memory_text: str | None = Field(None, min_length=1, max_length=2000)
 
 
+class BackgroundChatRequest(BaseModel):
+    """Body of POST /chat/background: a new chat that runs to the end on the
+    server, whether or not the caller stays to watch (a phone app approving
+    a card, then closing). `message` and `memory_text` mean what they do on
+    `ChatRequest`."""
+
+    message: str = Field(..., min_length=1, max_length=32000)
+    memory_text: str | None = Field(None, min_length=1, max_length=2000)
+
+
+class BackgroundChatResponse(BaseModel):
+    """Where the background turn's chat will be: open it from the chat list
+    once the turn has answered."""
+
+    session_id: str
+
+
 class StopChatRequest(BaseModel):
     """Body of POST /chat/stop — the `client_turn_id` sent with the turn."""
 
@@ -160,7 +177,13 @@ class HealthResponse(BaseModel):
     company_name: str | None = None
     builtin_skills: int = 0
     company_skills: int = 0
-    version: str = "0.5.3"  # x-release-please-version
+    # The pinned Google tools startup priming could not find. `[]` is the only
+    # value that asserts every one is present; `null` means no answer — Google
+    # Workspace is not configured, or the probe has not finished, or it failed.
+    # Setup status says which. A non-empty list means a workspace-mcp rename or
+    # a tool the configured services and tier never loaded.
+    google_tools_missing: list[str] | None = None
+    version: str = "0.5.4"  # x-release-please-version
 
 
 class VersionResponse(BaseModel):
@@ -215,43 +238,6 @@ class SkillDeleteResponse(BaseModel):
     outcome: Literal["deleted", "reverted", "hidden"]
 
 
-class SkillDraftOut(BaseModel):
-    """A playbook change the Executive proposed from chat, awaiting review."""
-
-    action: Literal["create", "update", "delete"]
-    name: str
-    category: str
-    description: str
-    when_to_use: str
-    body: str
-    proposed_at: str
-    # Version token: send it back to approve or discard exactly this draft.
-    id: str
-    # The playbook in effect now (None for a create) — what an update or
-    # delete would change.
-    current: SkillDetail | None = None
-    # Workflows that follow this name — for a create too, since a workflow
-    # may still name a playbook that was deleted.
-    followers: list[SkillWorkflowRef] = []
-
-
-class SkillDraftDecision(BaseModel):
-    id: str
-
-
-class SkillDraftListResponse(BaseModel):
-    drafts: list[SkillDraftOut]
-
-
-class SkillDraftApproval(BaseModel):
-    action: Literal["create", "update", "delete"]
-    name: str
-    # Set for an approved delete: deleted / reverted / hidden.
-    outcome: Literal["deleted", "reverted", "hidden"] | None = None
-    # Set for an approved create or update.
-    skill: SkillDetail | None = None
-
-
 class SkillSearchHit(BaseModel):
     name: str
     category: str
@@ -271,6 +257,10 @@ class SessionSummary(BaseModel):
     created_at: str
     updated_at: str
     message_count: int = 0
+    # Set only on a search (`GET /sessions?q=`): how many messages contain the
+    # words (0 when only the title does) and the newest one around the match.
+    match_count: int | None = None
+    snippet: str | None = None
 
 
 class TargetCustomerData(BaseModel):
