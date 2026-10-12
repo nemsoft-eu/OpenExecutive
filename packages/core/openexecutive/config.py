@@ -927,9 +927,10 @@ class Settings(BaseSettings):
     # constraint, so this is deliberately smaller than a browser's page 1.
     searxng_max_results: int = Field(5, alias="SEARXNG_MAX_RESULTS")
 
-    # Page reads per Executive turn, through web_fetch: Anthropic's server
-    # tool on a direct-Anthropic model, the client tool beside SearXNG on a
-    # local one (orchestrator/web_fetch.py). 0 turns fetching off; it is also
+    # Page reads through web_fetch: per model request with Anthropic's server
+    # tool on a direct-Anthropic model (its max_uses, so a turn of several
+    # tool rounds may read more), per turn with the client tool beside
+    # SearXNG on a local one (orchestrator/web_fetch.py). 0 turns fetching off; it is also
     # off whenever ENABLE_WEB_SEARCH is. Shares the domain lists above.
     web_fetch_max_uses: int = Field(3, alias="WEB_FETCH_MAX_USES")
     # Whole-exchange deadline for one client-side fetch, redirects included.

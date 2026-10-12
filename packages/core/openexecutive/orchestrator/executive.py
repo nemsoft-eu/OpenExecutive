@@ -2600,10 +2600,17 @@ class Executive:
             ]
             if search is not None and search.kind == "server":
                 tools_with_cache.append(search.tool)
-                # Offered on a private or mail-touched turn too, like the
-                # server web_search: dropping it would change the cached
-                # prefix (delegation.lockdown).
-                if search.fetch_tool is not None:
+                # Never on a private or mail-touched turn: Anthropic opens any
+                # URL in a client tool result, and an allowed tool can echo one
+                # the model wrote (a ghostwrite_email preview), so the turn's
+                # mail could leave in a query string. A private turn knows at
+                # the start and has a prefix of its own anyway; a mail read
+                # drops it from the next round on, at the cost of one cache
+                # write for the rest of that turn (delegation.lockdown).
+                if search.fetch_tool is not None and not (
+                    private_turn
+                    or (pinned_delegation is not None and pinned_delegation.read_mail)
+                ):
                     tools_with_cache.append(search.fetch_tool)
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
@@ -2796,7 +2803,8 @@ class Executive:
             # A later turn of that conversation stays private (touched_mail)
             # but is not locked: it is the person asking again. The offered
             # list stays as it is, so the cached prefix never changes
-            # mid-turn.
+            # mid-turn — except the server web_fetch, which the tool list
+            # above drops from the next round on.
             mail_touched_uses: list[dict[str, Any]] = []
             if pinned_delegation is not None and (
                 pinned_delegation.read_mail

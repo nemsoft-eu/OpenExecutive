@@ -286,6 +286,13 @@ def test_reading_mail_in_that_later_turn_locks_it_again(
     assert kept_private[-1].read_mail is True
 
 
+def _without_server_fetch(tools: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        [t for t in tools if not str(t.get("type", "")).startswith("web_fetch_")],
+        sort_keys=True,
+    )
+
+
 def test_the_offered_tools_never_change_mid_turn(sent: list[dict[str, Any]]) -> None:
     _, touched = _turn(
         [ToolUseBlock("tu1", "ghostwrite_email", GHOSTWRITE)],
@@ -293,10 +300,16 @@ def test_the_offered_tools_never_change_mid_turn(sent: list[dict[str, Any]]) -> 
     )
     _, untouched = _turn([ToolUseBlock("tu2", "send_slack_dm", SLACK)])
     # The cached tool prefix is byte-identical across the turn and to a turn
-    # that never read mail.
-    first = json.dumps(touched[0]["tools"], sort_keys=True)
-    assert all(json.dumps(c["tools"], sort_keys=True) == first for c in touched)
-    assert json.dumps(untouched[0]["tools"], sort_keys=True) == first
+    # that never read mail, but for the server web_fetch: Anthropic opens a URL
+    # a client tool result echoes, so it leaves from the round after the read.
+    first = _without_server_fetch(touched[0]["tools"])
+    assert all(_without_server_fetch(c["tools"]) == first for c in touched)
+    assert _without_server_fetch(untouched[0]["tools"]) == first
+    fetch_offered = [
+        any(str(t.get("type", "")).startswith("web_fetch_") for t in c["tools"])
+        for c in touched
+    ]
+    assert fetch_offered[0] and not any(fetch_offered[1:])
 
 
 def test_the_outside_handlers_refuse_on_their_own() -> None:

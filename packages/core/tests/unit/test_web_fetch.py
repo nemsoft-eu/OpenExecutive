@@ -38,7 +38,8 @@ def test_direct_claude_gets_anthropics_server_fetch() -> None:
     selection = select_web_search_tool("claude-sonnet-5")
     assert selection is not None and selection.kind == "server"
     assert selection.fetch_tool == {
-        "type": "web_fetch_20260309",
+        # The basic variant: the later ones need a Claude 4.6+ model.
+        "type": "web_fetch_20250910",
         "name": "web_fetch",
         "max_uses": 3,
         "max_content_tokens": 4_000,
@@ -132,7 +133,7 @@ def test_translator_drops_a_stray_server_fetch_tool() -> None:
         "anthropic/claude-opus-4.7",
         {
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "web_fetch_20260309", "name": "web_fetch", "max_uses": 3}],
+            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3}],
         },
     )
     assert "tools" not in body or all(

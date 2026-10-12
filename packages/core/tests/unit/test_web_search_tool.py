@@ -265,7 +265,7 @@ def test_executive_appends_web_search_after_cached_client_tools() -> None:
         # of the cache_control slot, which is reserved for client-side tools.
         assert [t["name"] for t in tools[-2:]] == ["web_search", "web_fetch"]
         assert tools[-2]["type"] == "web_search_20250305"
-        assert tools[-1]["type"] == "web_fetch_20260309"
+        assert tools[-1]["type"] == "web_fetch_20250910"
         # The last client-side tool is the one that carries cache_control.
         # The server tools must NOT carry it.
         assert all("cache_control" not in t for t in tools[-2:])
@@ -305,6 +305,93 @@ def test_executive_omits_the_server_fetch_when_its_budget_is_zero() -> None:
         assert "web_fetch" not in names
     finally:
         os.environ.pop("WEB_FETCH_MAX_USES", None)
+        _reset_settings_cache()
+
+
+def _tool_lists_for_turn(final_msgs: list[object], during_round=None) -> list[list[dict]]:
+    """Drive one stream_chat turn whose model rounds return ``final_msgs`` in
+    order, and return the tool list each round was sent. ``during_round(i)``
+    runs once round ``i``'s tool list is built, standing in for what that
+    round's tools then do."""
+    from openexecutive.orchestrator.executive import Executive
+    from openexecutive.orchestrator.session import Session
+
+    captured: list[list[dict]] = []
+
+    def fake_stream(**kwargs):
+        if during_round is not None:
+            during_round(len(captured))
+        captured.append(kwargs["tools"])
+        return _make_stream_cm(final_msgs[len(captured) - 1])
+
+    async def _run() -> None:
+        async for _ in Executive().stream_chat("hi", Session(session_id="t-fetch-drop")):
+            pass
+
+    with patch(
+        "openexecutive.orchestrator.executive.get_provider",
+        return_value=SimpleNamespace(messages_stream=fake_stream),
+    ):
+        asyncio.run(_run())
+    return captured
+
+
+def test_a_private_turn_is_never_offered_the_server_fetch() -> None:
+    """Anthropic opens a URL a client tool result echoes, so on a turn that
+    carries a contact's mail the server fetch could send it out in a query
+    string. Search stays: it is not that channel."""
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    try:
+        done = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn",
+        )
+        with patch(
+            "openexecutive.orchestrator.executive.turn_is_private_to_principal",
+            return_value=True,
+        ):
+            tools = _tool_lists_for_turn([done])[0]
+        names = [t.get("name") for t in tools]
+        assert names[-1] == "web_search"
+        assert "web_fetch" not in names
+    finally:
+        _reset_settings_cache()
+
+
+def test_the_server_fetch_leaves_from_the_round_after_mail_is_read() -> None:
+    """Mail-touched is decided mid-turn: the round that read mail was sent
+    with the fetch, every later round without it."""
+    from openexecutive.delegation.settings import TurnDelegation
+
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    try:
+        pinned = TurnDelegation()
+        # A tool the loop does not know: refused with an error result, which
+        # is enough to send a second round.
+        calls = SimpleNamespace(
+            content=[SimpleNamespace(
+                type="tool_use", id="toolu_1", name="no_such_tool", input={},
+            )],
+            stop_reason="tool_use",
+        )
+        done = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn",
+        )
+
+        def round_one_reads_mail(i: int) -> None:
+            if i == 0:
+                pinned.read_mail = True
+
+        with patch(
+            "openexecutive.orchestrator.executive.turn_delegation", return_value=pinned,
+        ):
+            first, second = _tool_lists_for_turn([calls, done], round_one_reads_mail)
+        assert [t.get("name") for t in first][-2:] == ["web_search", "web_fetch"]
+        names = [t.get("name") for t in second]
+        assert names[-1] == "web_search"
+        assert "web_fetch" not in names
+    finally:
         _reset_settings_cache()
 
 

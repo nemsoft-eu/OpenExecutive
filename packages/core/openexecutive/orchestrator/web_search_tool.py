@@ -1,7 +1,7 @@
 """Anthropic native server-side web search and fetch tools, and the choice
 between them and the client-side ones (``searxng_search``, ``web_fetch``).
 
-The `web_search_20250305` and `web_fetch_20260309` tools are executed by
+The `web_search_20250305` and `web_fetch_20250910` tools are executed by
 the Anthropic API itself — no client-side handler is needed. The model
 issues `server_tool_use` blocks during a generation and the API returns
 `web_search_tool_result` / `web_fetch_tool_result` blocks inline; both must
@@ -61,10 +61,14 @@ def build_web_fetch_tool() -> dict[str, Any]:
 
     The API itself fetches only URLs already present in the conversation,
     so unlike the client tool there is no seen-URL set to keep here.
+
+    The basic variant, like the search tool's: the later ones (``_20260209``
+    on) filter pages with code execution and need a Claude 4.6 or later
+    model, and the Executive may be pinned to any Claude model.
     """
     settings = get_settings()
     tool: dict[str, Any] = {
-        "type": "web_fetch_20260309",
+        "type": "web_fetch_20250910",
         "name": WEB_FETCH_TOOL_NAME,
         "max_uses": settings.web_fetch_max_uses,
         "max_content_tokens": WEB_FETCH_MAX_CONTENT_TOKENS,

@@ -129,7 +129,7 @@ def test_claude_keeps_only_the_server_tool_even_with_searxng_configured(
     assert len(web) == 1
     assert web[0]["type"] == "web_search_20250305"
     fetch = [t for t in tools if t.get("name") == "web_fetch"]
-    assert len(fetch) == 1 and fetch[0]["type"] == "web_fetch_20260309"
+    assert len(fetch) == 1 and fetch[0]["type"] == "web_fetch_20250910"
     assert tools[-2:] == [web[0], fetch[0]], "server tools must stay appended last"
     assert all("cache_control" not in t for t in tools[-2:])
     assert tools[-3].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}

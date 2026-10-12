@@ -31,17 +31,21 @@ until a new tool is), and anything unclassified is withheld.
 
 The dispatch guard in ``orchestrator.executive`` refuses a withheld call
 without changing the offered tool list (the cached prefix stays the same all
-turn), and treats a round that calls any of them as already touched,
+turn, but for the server ``web_fetch`` below), and treats a round that calls any of them as already touched,
 because a round's tools run concurrently. The handlers that reach outside
 check again (``outside_reach_refusal``). The server-side ``web_search``
-and ``web_fetch`` stay, as on a turn private to the owner: they run inside
-the provider's generation, never through this dispatch, and dropping them
-from the tool list would change the cached prefix. That leaves the server
-``web_fetch`` one opening: Anthropic opens only a URL already in the
-conversation, so a URL written in the mail can be fetched as it stands (a
-beacon to whoever wrote it), but nothing the turn read can be added to it.
-The client ``web_search`` and ``web_fetch`` (SearXNG, local models) are
-withheld like any other outside fetch. The lockdown lasts for the turn
+stays, as on a turn private to the owner: it runs inside the provider's
+generation, never through this dispatch, and dropping it would change the
+cached prefix. The server-side ``web_fetch`` is the one exception: the loop
+leaves it out from the round after the mail is read, at the cost of one
+cache write for the rest of the turn. Anthropic opens any URL already in the
+conversation, client tool results included, and an allowed tool can echo a
+URL the model wrote (``ghostwrite_email`` keeps a link that is in its
+intent, and returns the draft's text), so with it the mail could leave in a
+query string. The client ``web_search``
+and ``web_fetch`` (SearXNG, local models) are withheld like any other
+outside fetch (the fetch handler also checks again; the search handler
+relies on the dispatch guard). The lockdown lasts for the turn
 (``TurnDelegation.read_mail``) and no longer. A later turn of that
 conversation stays private to its owner (``touched_mail``), and its history
 carries only their words and the Executive's replies, never the mail a tool
