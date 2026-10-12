@@ -454,6 +454,39 @@ def test_non_http_and_credentialed_urls_are_dropped(
     assert urls == ["https://ok.example/y"]
 
 
+def test_only_the_results_the_model_sees_reach_on_result_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chat loop makes these fetchable, so a dropped result must not be."""
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "blocked.example")
+    monkeypatch.setenv("SEARXNG_MAX_RESULTS", "2")
+    patcher, _ = _patch_http(_response(_results(
+        "https://blocked.example/a",
+        "javascript:alert(1)",
+        "https://user:pw@a.example/x",
+        "https://ok.example/1",
+        "https://ok.example/2",
+        "https://ok.example/3",  # past the cap
+    )))
+    seen: list[str] = []
+    handler = make_search_handler(SearchBudget(max_uses=1), on_result_url=seen.append)
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert seen == urls == ["https://ok.example/1", "https://ok.example/2"]
+
+
+def test_a_failed_search_reports_no_result_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(_response(_results("https://ok.example/1"), status=500))
+    seen: list[str] = []
+    handler = make_search_handler(SearchBudget(max_uses=1), on_result_url=seen.append)
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert outcome.is_error and seen == []
+
+
 @pytest.mark.parametrize(
     "entry",
     ["example.com", "https://example.com", "example.com:443",

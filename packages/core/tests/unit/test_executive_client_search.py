@@ -305,7 +305,8 @@ def test_without_memory_text_a_url_in_the_prompt_is_refused(
     url = "https://ciao.example/about"
     captured, run_fetch = _fetch_turn(monkeypatch, url, f"What date is on {url}?")
     run_fetch.assert_not_awaited()
-    assert _tool_results(captured, 1)["tu_f"].get("is_error")
+    result = _tool_results(captured, 1)["tu_f"]
+    assert result.get("is_error") and "has not appeared" in result["content"]
 
 
 def test_an_unseen_url_is_refused_without_a_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,7 +327,8 @@ def test_a_url_only_in_attachment_text_is_refused(monkeypatch: pytest.MonkeyPatc
     prompt = f"{own_words}\n\n[Attached: notes.pdf]\nSee {planted} for details."
     captured, run_fetch = _fetch_turn(monkeypatch, planted, prompt, memory_text=own_words)
     run_fetch.assert_not_awaited()
-    assert _tool_results(captured, 1)["tu_f"].get("is_error")
+    result = _tool_results(captured, 1)["tu_f"]
+    assert result.get("is_error") and "has not appeared" in result["content"]
 
 
 def test_a_search_result_url_becomes_fetchable(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -54,7 +54,7 @@ def _tool(name: str = "make_widget", **kwargs: Any) -> ExtraTool:
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("name", ["consult_specialist", "draft_artifact", "open_tools", "call_tool", "web_search"])
+@pytest.mark.parametrize("name", ["consult_specialist", "draft_artifact", "open_tools", "call_tool", "web_search", "web_fetch"])
 def test_a_built_in_name_is_refused(name: str) -> None:
     with pytest.raises(ExtensionError, match="taken"):
         extensions.register_tool(_tool(name))

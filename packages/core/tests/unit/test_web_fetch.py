@@ -115,6 +115,30 @@ def test_disabling_search_disables_fetch(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.parametrize(
+    ("model", "route", "expected"),
+    [
+        ("claude-sonnet-5", "direct", True),
+        ("claude-sonnet-5", "openrouter", False),
+        # selection takes the client path for these before asking, so only a
+        # direct call shows the predicate keeps them off the server tool
+        ("claude-proxy-1", "local", False),
+        ("openai/gpt-6-astra", "direct", False),
+    ],
+)
+def test_only_a_direct_anthropic_route_supports_the_server_fetch(
+    model: str, route: str, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.providers.registry import supports_server_web_fetch
+
+    if route == "openrouter":
+        monkeypatch.setenv("OPENROUTER_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-used")
+    elif route == "local":
+        use_local_model(monkeypatch, model)
+    assert supports_server_web_fetch(model) is expected
+
+
+@pytest.mark.parametrize(
     ("key", "value"),
     [("WEB_FETCH_MAX_USES", "-1"), ("WEB_FETCH_TIMEOUT_S", "0"), ("WEB_FETCH_TIMEOUT_S", "-1")],
 )
@@ -592,23 +616,28 @@ async def test_a_seen_url_that_is_not_plain_is_refused(
 
 
 @pytest.mark.parametrize(
-    ("key", "value", "url", "refused"),
+    ("key", "value", "url", "refusal"),
     [
-        ("WEB_SEARCH_BLOCKED_DOMAINS", "example.com", "https://www.example.com/", True),
-        ("WEB_SEARCH_BLOCKED_DOMAINS", "example.com", "https://evil-example.com/", False),
-        ("WEB_SEARCH_ALLOWED_DOMAINS", "https://example.com/blog", "https://other.org/", True),
-        ("WEB_SEARCH_ALLOWED_DOMAINS", "example.com", "https://docs.example.com/", False),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "example.com", "https://www.example.com/",
+         "list of blocked domains"),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "example.com", "https://evil-example.com/", None),
+        ("WEB_SEARCH_ALLOWED_DOMAINS", "https://example.com/blog", "https://other.org/",
+         "list of allowed domains"),
+        ("WEB_SEARCH_ALLOWED_DOMAINS", "example.com", "https://docs.example.com/", None),
     ],
 )
 async def test_the_domain_lists_apply(
-    key: str, value: str, url: str, refused: bool, monkeypatch: pytest.MonkeyPatch
+    key: str, value: str, url: str, refusal: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(key, value)
     requested = _serve(monkeypatch, {url: (200, _html(), b"<p>ok</p>")})
-    handle, _ = _fetcher(url)
+    handle, budget = _fetcher(url)
     outcome = await handle({"url": url})
-    assert outcome.is_error is refused
-    assert requested == ([] if refused else [url])
+    if refusal is None:
+        assert not outcome.is_error and requested == [url]
+    else:
+        assert outcome.is_error and refusal in outcome.content
+        assert requested == [] and budget.used == 0
 
 
 async def test_the_handler_refuses_on_a_turn_that_read_mail(
@@ -851,4 +880,24 @@ async def test_failures_never_log_the_path_or_query(
         outcome = await handle({"url": url})
     assert outcome.is_error and "unexpectedly" not in outcome.content  # not the backstop
     assert "a.example" in caplog.text
+    assert "s3cret" not in caplog.text and "/private/path" not in caplog.text
+
+
+async def test_an_unexpected_failure_is_an_error_not_a_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One raised handler would abort the Executive's whole gather round."""
+
+    async def boom(url: str, settings: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(web_fetch, "_run_fetch", boom)
+    _propagate_app_logs(monkeypatch)
+    url = "https://a.example/private/path?token=s3cret"
+    handle, budget = _fetcher(url)
+    with caplog.at_level("WARNING", logger=web_fetch.logger.name):
+        outcome = await handle({"url": url})
+    assert outcome.is_error and outcome.content == "The fetch failed unexpectedly."
+    assert budget.used == 1
+    assert "unexpected failure for host a.example" in caplog.text
     assert "s3cret" not in caplog.text and "/private/path" not in caplog.text
