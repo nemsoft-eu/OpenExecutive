@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import html
 import ipaddress
 import json
 import logging
@@ -47,7 +46,7 @@ from openexecutive.orchestrator.searxng_search import (
     is_usable_url,
 )
 from openexecutive.orchestrator.web_search_tool import WEB_FETCH_TOOL_NAME
-from openexecutive.utils.html_tags import visible_text
+from openexecutive.utils.html_tags import unescape, visible_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +55,8 @@ logger = logging.getLogger(__name__)
 # A page past it is refused rather than cut: the cut lands mid-markup.
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
-# What one page may put in the prompt. Under TOOL_RESULT_MAX_CHARS (20,000),
-# so one page cannot take a whole result, and about the 4,000 tokens the
+# What one page may put in the prompt. Under TOOL_RESULT_MAX_CHARS's 20,000
+# default, so one page cannot take a whole result, and about the 4,000 tokens the
 # server tool's max_content_tokens allows (web_search_tool).
 _MAX_PAGE_CHARS = 12_000
 
@@ -346,6 +345,7 @@ class SeenUrls:
     ``memory_text``), never from a message a caller packed with attachment
     text, mail or retrieved context: a URL inside any of those must stay
     unfetchable.
+
     Every method is synchronous, so the handlers of one ``asyncio.gather``
     round cannot interleave an update with a check.
     """
@@ -364,7 +364,7 @@ class SeenUrls:
             self.add(url)
             # Slack escapes "&" in message text as "&amp;", and the model may
             # copy the link either way.
-            self.add(html.unescape(url))
+            self.add(unescape(url))
 
     def allows(self, url: str) -> bool:
         norm = normalise_url(url)

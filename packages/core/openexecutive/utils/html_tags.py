@@ -3,11 +3,12 @@ someone else's HTML to text.
 
 ``monitoring.sources.page_watch`` reads pages a watched site's server shapes,
 ``orchestrator.web_fetch`` reads pages the model asked for, and
-``delegation.gmail`` reads mail anyone can send. All run on the event loop, so
-all drop tags with this forward scan rather than ``re.sub(r"<[^>]+>", ...)``:
-on text with many "<" and no ">", that pattern runs from each "<" to the end of
-the text, fails, and starts over at the next "<" — quadratic, about 40 minutes
-of CPU for a 2 MB page.
+``delegation.gmail`` reads mail anyone can send. page_watch and gmail run on
+the event loop and web_fetch in a worker thread; all drop tags with this
+forward scan rather than ``re.sub(r"<[^>]+>", ...)``: on text with many "<" and
+no ">", that pattern runs from each "<" to the end of the text, fails, and
+starts over at the next "<" — quadratic, about 40 minutes of CPU for a 2 MB
+page.
 """
 from __future__ import annotations
 
@@ -30,6 +31,8 @@ _WS_RE = re.compile(r"\s+")
 # non-ASCII letter it folds to ASCII is the Kelvin sign (to "k"), which no
 # block tag contains.
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+# A decimal character reference, shortened before html.unescape (see unescape).
 _DECIMAL_REF_RE = re.compile(r"&#(\d+)(;?)")
 
 

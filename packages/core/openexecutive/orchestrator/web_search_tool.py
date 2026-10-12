@@ -155,8 +155,9 @@ def select_web_search_tool(
             else None
         )
         return WebSearchSelection(
-            "server", server_tool, effective_max, server_fetch,
-            fetch_max if server_fetch is not None else 0,
+            "server", server_tool, effective_max,
+            fetch_tool=server_fetch,
+            fetch_max_uses=fetch_max if server_fetch is not None else 0,
         )
 
     if not settings.searxng_url:
@@ -169,8 +170,9 @@ def select_web_search_tool(
 
     client_fetch = WEB_FETCH_TOOL if fetch_max > 0 else None
     return WebSearchSelection(
-        "client", SEARXNG_WEB_SEARCH_TOOL, effective_max, client_fetch,
-        fetch_max if client_fetch is not None else 0,
+        "client", SEARXNG_WEB_SEARCH_TOOL, effective_max,
+        fetch_tool=client_fetch,
+        fetch_max_uses=fetch_max if client_fetch is not None else 0,
     )
 
 

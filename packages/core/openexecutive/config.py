@@ -930,8 +930,9 @@ class Settings(BaseSettings):
     # Page reads through web_fetch: per model request with Anthropic's server
     # tool on a direct-Anthropic model (its max_uses, so a turn of several
     # tool rounds may read more), per turn with the client tool beside
-    # SearXNG on a local one (orchestrator/web_fetch.py). 0 turns fetching off; it is also
-    # off whenever ENABLE_WEB_SEARCH is. Shares the domain lists above.
+    # SearXNG on a local one (orchestrator/web_fetch.py). 0 turns fetching
+    # off; it is also off whenever ENABLE_WEB_SEARCH is. Shares the domain
+    # lists above.
     web_fetch_max_uses: int = Field(3, alias="WEB_FETCH_MAX_USES")
     # Whole-exchange deadline for one client-side fetch, redirects included.
     web_fetch_timeout_s: float = Field(15.0, alias="WEB_FETCH_TIMEOUT_S")

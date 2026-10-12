@@ -164,6 +164,7 @@ def test_translator_drops_a_stray_server_fetch_tool() -> None:
         t.get("function", {}).get("name") != "web_fetch" for t in body["tools"]
     )
 
+
 # --- address policy -------------------------------------------------------
 
 
@@ -403,6 +404,14 @@ def test_urls_in_the_forms_people_paste_are_seen(text: str, url: str) -> None:
     seen = web_fetch.SeenUrls()
     seen.add_from_text(text)
     assert seen.allows(url)
+
+
+def test_a_huge_character_reference_in_a_pasted_url_does_not_raise() -> None:
+    """html.unescape raises past 4,300 digits; seeding runs before the
+    turn's first model call, so a raise there would end the turn."""
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text("see https://a.example/?x=&#" + "1" * 5000 + ";")
+    assert seen.allows("https://a.example/?x=&#" + "1" * 5000 + ";")
 
 
 def test_a_lookalike_of_a_seen_url_is_not_allowed() -> None:

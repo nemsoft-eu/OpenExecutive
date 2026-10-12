@@ -358,16 +358,16 @@ def domain_refusal(host: str, settings: Settings) -> Literal["not_allowed", "blo
     """Why ``host`` is outside WEB_SEARCH_ALLOWED_DOMAINS or inside
     WEB_SEARCH_BLOCKED_DOMAINS, or None. Search results and every
     ``web_fetch`` hop share it, so the two cannot disagree on a site."""
-    allowed = bare_hosts(settings.web_search_allowed_domains)
+    allowed = _bare_hosts(settings.web_search_allowed_domains)
     if allowed and not any(host_matches(host, d) for d in allowed):
         return "not_allowed"
-    blocked = bare_hosts(settings.web_search_blocked_domains)
+    blocked = _bare_hosts(settings.web_search_blocked_domains)
     if blocked and any(host_matches(host, d) for d in blocked):
         return "blocked"
     return None
 
 
-def bare_hosts(entries: list[str]) -> list[str]:
+def _bare_hosts(entries: list[str]) -> list[str]:
     """Reduce configured domain entries to bare lowercase hostnames.
 
     The lists are shared with the server tool, whose API accepts forms such

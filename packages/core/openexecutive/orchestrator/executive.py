@@ -1266,7 +1266,8 @@ class Executive:
         ``user_message`` for the passes above, but makes nothing in it
         fetchable. ``fetch_own_urls=False`` makes nothing in ``memory_text``
         fetchable either, while it still feeds those passes: ``chat()``
-        passes it for a sender the channel matched to no one on the roster.
+        leaves it off unless the caller turns it on, which a channel does only
+        for a sender on the roster.
         """
         logger.info(
             "chat turn: %s",

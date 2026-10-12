@@ -13,8 +13,9 @@ tab. What is not fenced is a door to the open internet. So from the round it
 runs in until the turn ends, only that stays shut: no outside fetch (a URL
 can carry what the mail said anywhere: ``read_document``, the client
 ``web_fetch``, research, the watchlist, ``load_mcp_server``, any gateway
-tool but ``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can reach either),
-no workflow (it runs later, unattended, and may fetch or script), no post
+tool but ``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can
+reach either), no workflow (it runs later, unattended, and may fetch or
+script), no post
 to everyone (broadcasts, department messages, alerts), and no change to who
 is on the roster or holds authority (archiving someone, a department head, a
 roster request), since every send and approval check trusts it.
@@ -31,8 +32,8 @@ until a new tool is), and anything unclassified is withheld.
 
 The dispatch guard in ``orchestrator.executive`` refuses a withheld call
 without changing the offered tool list (the cached prefix stays the same all
-turn, but for the server ``web_fetch`` below), and treats a round that calls any of them as already touched,
-because a round's tools run concurrently. The handlers that reach outside
+turn, but for the server ``web_fetch`` below), and treats a round that calls
+any of them as already touched, because a round's tools run concurrently. The handlers that reach outside
 check again (``outside_reach_refusal``). The server-side ``web_search``
 stays, as on a turn private to the owner: it runs inside the provider's
 generation, never through this dispatch, and dropping it would change the

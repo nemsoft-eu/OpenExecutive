@@ -23,7 +23,8 @@ from openexecutive.api.models import (
 )
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit import principal_turn_rows, rows_for_person
-from openexecutive.integrations.attachments import attached_files_note, build_attachment_output
+from openexecutive.integrations.attachments import build_attachment_output
+from openexecutive.integrations.attachments import own_words as sender_words_with_files
 from openexecutive.orchestrator.answer_sources import TurnSources
 from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.orchestrator.turn_inbox import TurnInbox
@@ -1699,7 +1700,7 @@ async def chat_upload(
         # caller's: recorded in peer memory it becomes facts about the caller.
         # "(Attached files: …)", not the "[Attached: …]" label that marks
         # inlined document text — the open-loop pass skips turns carrying that.
-        memory_text=f"{message}\n\n{attached_files_note(filenames)}",
+        memory_text=sender_words_with_files(message, filenames),
         turn_files=turn_files.collect(uploads),
     )
 

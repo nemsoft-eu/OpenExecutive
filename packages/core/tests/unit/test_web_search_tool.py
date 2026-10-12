@@ -24,6 +24,8 @@ _SEARCH_ENV_KEYS = (
     "WEB_SEARCH_MAX_USES",
     "WEB_SEARCH_ALLOWED_DOMAINS",
     "WEB_SEARCH_BLOCKED_DOMAINS",
+    "WEB_FETCH_MAX_USES",
+    "SEARXNG_URL",
 )
 
 
@@ -304,7 +306,6 @@ def test_executive_omits_the_server_fetch_when_its_budget_is_zero() -> None:
         assert names[-1] == "web_search"
         assert "web_fetch" not in names
     finally:
-        os.environ.pop("WEB_FETCH_MAX_USES", None)
         _reset_settings_cache()
 
 
@@ -638,23 +639,20 @@ def test_search_results_join_the_seen_set_and_the_fetch_budget_is_its_own() -> N
     handlers = client_search_handlers(_client_selection(), seen)
     payload = json.dumps({"results": [{"url": "https://r.example/a", "title": "A", "content": "s"}]})
     run_fetch = AsyncMock(return_value=ToolOutcome('{"content": "page"}'))
-    try:
-        with (
-            patch(
-                "openexecutive.orchestrator.searxng_search._fetch_capped",
-                new=AsyncMock(return_value=payload.encode()),
-            ),
-            patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch),
-        ):
-            async def _go() -> list[ToolOutcome]:
-                before = await handlers["web_fetch"]({"url": "https://r.example/a"})
-                await handlers["web_search"]({"query": "ciao"})
-                after = [await handlers["web_fetch"]({"url": "https://r.example/a"}) for _ in range(4)]
-                return [before, *after]
+    with (
+        patch(
+            "openexecutive.orchestrator.searxng_search._fetch_capped",
+            new=AsyncMock(return_value=payload.encode()),
+        ),
+        patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch),
+    ):
+        async def _go() -> list[ToolOutcome]:
+            before = await handlers["web_fetch"]({"url": "https://r.example/a"})
+            await handlers["web_search"]({"query": "ciao"})
+            after = [await handlers["web_fetch"]({"url": "https://r.example/a"}) for _ in range(4)]
+            return [before, *after]
 
-            outcomes = asyncio.run(_go())
-    finally:
-        os.environ.pop("SEARXNG_URL", None)
+        outcomes = asyncio.run(_go())
     assert seen.allows("https://r.example/a")
     assert outcomes[0].is_error and "has not appeared" in outcomes[0].content
     assert [o.is_error for o in outcomes[1:]] == [False, False, False, True]
