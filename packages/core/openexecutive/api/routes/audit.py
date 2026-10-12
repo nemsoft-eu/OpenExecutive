@@ -109,6 +109,8 @@ class TokenCounts(BaseModel):
     output_tokens: int
     # Server-side web searches the calls made (0 for rows that predate capture).
     web_search_requests: int = 0
+    # Server-side web fetches, likewise.
+    web_fetch_requests: int = 0
 
 
 class TurnCost(TokenCounts):
@@ -486,6 +488,7 @@ def _compute_cost_summary(events: list[Any]) -> CostSummary | None:
         "cache_creation_input_tokens",
         "output_tokens",
         "web_search_requests",
+        "web_fetch_requests",
     )
 
     def _as_int(value: Any) -> int:

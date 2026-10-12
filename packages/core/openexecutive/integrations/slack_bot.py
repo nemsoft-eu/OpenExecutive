@@ -955,8 +955,9 @@ async def create_slack_app():
                     co_present_person_ids=co_present_person_ids or None,
                     attachment_blocks=att_image_blocks or None,
                     # Peer memory records what the sender wrote and the files'
-                    # names, never a document's text as their words.
-                    memory_text=own_words if files else None,
+                    # names, never a document's text or a DM's hydrated
+                    # backstory as their words; web_fetch opens only URLs in it.
+                    memory_text=own_words,
                 )
 
                 # No unfurls: Slack would fetch a link in the reply on its own,

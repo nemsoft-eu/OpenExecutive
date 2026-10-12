@@ -317,7 +317,9 @@ def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
 
 def test_run_executive_skips_the_parse_for_an_unrostered_sender() -> None:
     """No peer to record into, so attacker-shaped mail from a stranger is
-    never parsed for memory at all."""
+    never parsed for memory at all. None also means the client web_fetch
+    may open no URL from it: a stranger's mail must not steer a fetch from
+    inside our network, as a contact's may not (PRIVATE_TURN_WITHHELD_TOOLS)."""
     captured = _run(lambda _addr, **_kw: None)
     assert captured["person_id"] is None
     assert captured["memory_text"] is None

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -479,6 +480,13 @@ async def test_a_compressed_page_is_refused_unread(
     assert reads == 0
 
 
+def _propagate_app_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.main's logging setup turns propagation off on "openexecutive" when
+    any earlier test on this worker imported the app; caplog listens on the
+    root logger, so turn it back on for the test (as test_top_three does)."""
+    monkeypatch.setattr(logging.getLogger("openexecutive"), "propagate", True)
+
+
 async def test_an_unencodable_host_label_is_a_failed_lookup(
     local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -492,6 +500,7 @@ async def test_an_unencodable_host_label_is_a_failed_lookup(
         raise UnicodeError("label empty or too long")
 
     monkeypatch.setattr(web_fetch, "_new_transport", lambda: PinnedTransport(resolver))
+    _propagate_app_logs(monkeypatch)
     url = f"http://site.example:{port}/"
     handle, _ = _fetcher(url)
     with caplog.at_level("WARNING", logger=web_fetch.logger.name):
@@ -835,6 +844,7 @@ async def test_failures_never_log_the_path_or_query(
 ) -> None:
     url = "https://a.example/private/path?token=s3cret"
     _serve(monkeypatch, {url: reply})
+    _propagate_app_logs(monkeypatch)
     handle, _ = _fetcher(url)
     with caplog.at_level("WARNING", logger=web_fetch.logger.name):
         outcome = await handle({"url": url})

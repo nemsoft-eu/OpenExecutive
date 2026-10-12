@@ -1,10 +1,12 @@
-"""Anthropic native server-side web search tool.
+"""Anthropic native server-side web search and fetch tools, and the choice
+between them and the client-side ones (``searxng_search``, ``web_fetch``).
 
-The `web_search_20250305` tool is executed by the Anthropic API itself — no
-client-side handler is needed. The model issues `server_tool_use` blocks
-during a generation and the API returns `web_search_tool_result` blocks
-inline; both must be preserved in the assistant turn echoed back on the
-next iteration so the model retains context for what it searched.
+The `web_search_20250305` and `web_fetch_20260309` tools are executed by
+the Anthropic API itself — no client-side handler is needed. The model
+issues `server_tool_use` blocks during a generation and the API returns
+`web_search_tool_result` / `web_fetch_tool_result` blocks inline; both must
+be preserved in the assistant turn echoed back on the next iteration so the
+model retains context for what it searched and read.
 
 Because the block carries a `type` field instead of an `input_schema`, it
 cannot be cached the way client-side tools are. The Executive keeps it
@@ -14,9 +16,12 @@ separate from the alphabetically-sorted client-tool list so the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from openexecutive.config import get_settings
+
+if TYPE_CHECKING:
+    from openexecutive.orchestrator.web_fetch import SeenUrls
 
 WEB_SEARCH_TOOL_NAME = "web_search"
 WEB_FETCH_TOOL_NAME = "web_fetch"
@@ -165,14 +170,21 @@ def select_web_search_tool(
     )
 
 
-def client_search_handlers(selection: WebSearchSelection | None) -> dict[str, Any]:
-    """Handler map for ``selection``: one budgeted handler, or empty.
+def client_search_handlers(
+    selection: WebSearchSelection | None, seen: SeenUrls | None = None
+) -> dict[str, Any]:
+    """Handler map for ``selection``: the budgeted client handlers, or empty.
 
     Only the client variant needs a handler; the server variant runs inside
     the provider's generation. Each call builds a FRESH budget, so call it
     once per turn (or per research call) — never inside a tool-use loop,
     where a new budget per iteration would reset on every model round trip
     and multiply the cap.
+
+    With ``seen`` (the chat loop's turn), a selection carrying a fetch tool
+    also gets the ``web_fetch`` handler, with its own budget, and every
+    search result URL joins ``seen`` so it can be opened. Without it (the
+    research fan-out, standing queries) only the search handler is built.
     """
     if selection is None or selection.kind != "client":
         return {}
@@ -181,11 +193,19 @@ def client_search_handlers(selection: WebSearchSelection | None) -> dict[str, An
         make_search_handler,
     )
 
-    return {
+    handlers: dict[str, Any] = {
         WEB_SEARCH_TOOL_NAME: make_search_handler(
-            SearchBudget(max_uses=selection.max_uses)
+            SearchBudget(max_uses=selection.max_uses),
+            on_result_url=seen.add if seen is not None else None,
         )
     }
+    if seen is not None and selection.fetch_tool is not None:
+        from openexecutive.orchestrator.web_fetch import make_fetch_handler
+
+        handlers[WEB_FETCH_TOOL_NAME] = make_fetch_handler(
+            SearchBudget(max_uses=selection.fetch_max_uses), seen
+        )
+    return handlers
 
 
 def client_tool_rounds(selection: WebSearchSelection | None) -> int:

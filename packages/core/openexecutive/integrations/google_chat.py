@@ -311,6 +311,17 @@ async def _process_and_reply(
         episodic_context = format_for_prompt()
 
         chat_message = message_text
+        # What the sender wrote and the files' names, as Slack records it: any
+        # attachment text below goes into the prompt only.
+        file_note = (
+            f"(Attached files: {', '.join(map(_attachment_name, attachments))})"
+            if attachments else ""
+        )
+        # A file-only message already arrives as that note (the webhook).
+        own_words = (
+            message_text if message_text == file_note
+            else "\n\n".join(p for p in (message_text, file_note) if p)
+        )
         image_blocks: list[dict] = []
         if attachments and _sender_on_roster(sender_email):
             att_text, image_blocks = await _read_attachments(
@@ -333,6 +344,7 @@ async def _process_and_reply(
             episodic_context=episodic_context,
             channel_context_block=build_channel_context_block("google_chat"),
             attachment_blocks=image_blocks or None,
+            memory_text=own_words,
         )
         await asyncio.to_thread(
             send_reply, space_name, thread_name, response, service_account_file, service_account_email

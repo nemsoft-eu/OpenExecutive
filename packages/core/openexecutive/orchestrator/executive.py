@@ -156,7 +156,9 @@ from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
 )
+from openexecutive.orchestrator.web_fetch import SeenUrls
 from openexecutive.orchestrator.web_search_tool import (
+    WEB_FETCH_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
     WebSearchSelection,
     client_search_handlers,
@@ -730,6 +732,7 @@ def builtin_tool_names() -> frozenset[str]:
         tool_groups.OPEN_TOOLS,
         tool_groups.USE_TOOL,
         WEB_SEARCH_TOOL_NAME,
+        WEB_FETCH_TOOL_NAME,
     })
 
 
@@ -1253,7 +1256,10 @@ class Executive:
         attachment's extracted text): Honcho derives facts about the person
         from everything recorded under their peer, and a quote gate satisfied
         by the Executive's own words stores its recommendation as the
-        person's decision or open loop.
+        person's decision or open loop. It is also the only text whose URLs
+        the client ``web_fetch`` may open: ``None`` still uses
+        ``user_message`` for the passes above, but makes nothing in it
+        fetchable.
         """
         logger.info(
             "chat turn: %s",
@@ -1412,6 +1418,10 @@ class Executive:
                 workspace_mode=workspace_mode,
                 principal_role_tag=principal_role_context(principal_role),
                 inbox=inbox,
+                # Never the _speaker_text fallback: a caller that passes no
+                # memory_text may have packed attachment text, mail or another
+                # session's backstory into user_message.
+                seen_url_text=memory_text or "",
             ):
                 if isinstance(item, str) and item != self._THINKING:
                     full_response += item
@@ -1757,6 +1767,7 @@ class Executive:
             workspace_mode=workspace_mode,
             principal_role_tag=principal_role_context(principal_role),
             inbox=inbox,
+            seen_url_text=memory_text or "",  # as in stream_chat
         ):
             # Swallow draft text and the THINKING sentinel — the user sees
             # only the revised stream. Pass debug-event dicts through so the
@@ -2367,6 +2378,7 @@ class Executive:
         workspace_mode: str | None = None,
         principal_role_tag: str | None = None,
         inbox: TurnInbox | None = None,
+        seen_url_text: str = "",
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Tool-use loop that yields text deltas as they arrive.
 
@@ -2389,6 +2401,13 @@ class Executive:
         ``inbox`` holds messages the person sent while this turn runs (the
         web chat's POST /chat/add). Whatever has arrived is added after each
         round's tool results, and a ``message_added`` event names it.
+
+        ``seen_url_text`` is the speaker's own words for the turn (the
+        caller's ``memory_text``): the client ``web_fetch`` may open a URL
+        in it, in a message the inbox adds, or in a result of this turn's
+        ``web_search``, and nothing else. Never pass the prompt: callers
+        pack attachment text and inbound mail into it, and a URL there must
+        stay unfetchable.
         """
         if workspace_mode is None:
             workspace_mode = effective_workspace_mode(current_session.get())
@@ -2433,16 +2452,21 @@ class Executive:
         pinned_delegation = turn_delegation(current_session.get())
         ghostwrite_offered = pinned_delegation is not None and pinned_delegation.offered
         delegation_tools = DELEGATION_TOOLS if ghostwrite_offered else []
-        # The SearXNG client-search handlers join the canonical dispatch map
+        # The URLs the client web_fetch may open this turn; search results
+        # join through the search handler.
+        seen_urls = SeenUrls()
+        seen_urls.add_from_text(seen_url_text)
+        # The client search and fetch handlers join the canonical dispatch map
         # rather than sitting in a dict of their own: built once per turn (see
         # client_search_handlers on why the budget must not be rebuilt per
         # iteration), and folded in HERE so they inherit every later
         # transformation below — in particular take_the_lead.gated_handlers,
         # which a separate dict would silently bypass.
+        search_handlers = client_search_handlers(search, seen_urls)
         turn_handlers = (
-            {**_ALL_SKILL_HANDLERS, **DELEGATION_TOOL_HANDLERS, **client_search_handlers(search)}
+            {**_ALL_SKILL_HANDLERS, **DELEGATION_TOOL_HANDLERS, **search_handlers}
             if ghostwrite_offered
-            else {**_ALL_SKILL_HANDLERS, **client_search_handlers(search)}
+            else {**_ALL_SKILL_HANDLERS, **search_handlers}
         )
         # Always in the loop: recall_history joins the same way, only on a
         # turn whose speaker may read their own notes here (history_tools).
@@ -2542,10 +2566,13 @@ class Executive:
             # last one carries the cache_control marker. Anthropic server-side
             # tools (e.g. web_search) are appended after — they use a `type`
             # field instead of input_schema and cannot accept cache_control.
-            # The SearXNG search tool is an ordinary client tool and joins the
-            # sorted list; only the server variant is appended (below).
+            # The SearXNG search tool and the client web_fetch are ordinary
+            # client tools and join the sorted list; only the server variants
+            # are appended (below).
             extra_client_tools = (
-                [search.tool] if search is not None and search.kind == "client" else []
+                [t for t in (search.tool, search.fetch_tool) if t is not None]
+                if search is not None and search.kind == "client"
+                else []
             )
             # Solo withholds the team-only tools before the sort, so each mode
             # has its own stable, sorted tool prefix (as do an unattended run
@@ -2573,6 +2600,11 @@ class Executive:
             ]
             if search is not None and search.kind == "server":
                 tools_with_cache.append(search.tool)
+                # Offered on a private or mail-touched turn too, like the
+                # server web_search: dropping it would change the cached
+                # prefix (delegation.lockdown).
+                if search.fetch_tool is not None:
+                    tools_with_cache.append(search.fetch_tool)
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
                 max_tokens=8192,
@@ -2606,6 +2638,7 @@ class Executive:
             )
 
             web_search_queries: list[str] = []
+            web_fetch_urls: list[str] = []
             for block in final_msg.content:
                 if block.type == "text":
                     response_content.append({"type": "text", "text": block.text})
@@ -2615,15 +2648,22 @@ class Executive:
                         {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
                     )
                 elif block.type == "server_tool_use":
-                    # Anthropic resolves server tools (web_search) within the
-                    # same generation; we just echo the block back on the next
-                    # iteration so the model retains continuity. No handler runs.
+                    # Anthropic resolves server tools (web_search, web_fetch)
+                    # within the same generation; we just echo the block back
+                    # on the next iteration so the model retains continuity.
+                    # No handler runs.
                     response_content.append(block.model_dump(exclude_none=True))
                     if block.name == WEB_SEARCH_TOOL_NAME:
                         query = (block.input or {}).get("query", "")
                         if isinstance(query, str) and query:
                             web_search_queries.append(query)
-                elif block.type == "web_search_tool_result":
+                    elif block.name == WEB_FETCH_TOOL_NAME:
+                        url = (block.input or {}).get("url", "")
+                        if isinstance(url, str) and url:
+                            web_fetch_urls.append(url)
+                elif block.type in ("web_search_tool_result", "web_fetch_tool_result"):
+                    # Echoed with its server_tool_use: without the result the
+                    # next request carries an orphaned call.
                     response_content.append(block.model_dump(exclude_none=True))
                 elif (replay := reasoning_replay_block(block)) is not None:
                     # OpenRouter reasoning continuity across tool iterations
@@ -2660,6 +2700,26 @@ class Executive:
                             "active_prompt_blocks": _system_block_names(system_blocks),
                         },
                     )
+            # The client web_fetch audits through the skill dispatch below,
+            # as a client_tool; the server one is seen only here.
+            for url in web_fetch_urls:
+                audit_log(
+                    "tool_invocation",
+                    f"web_fetch: {url[:200]}",
+                    session_id=getattr(current_session.get(), "session_id", None),
+                    turn_id=turn_id,
+                    actor="executive",
+                    details={
+                        "tool": WEB_FETCH_TOOL_NAME,
+                        "kind": "server_tool",
+                        "iteration": iteration,
+                        "url": url[:500],
+                    },
+                    full={
+                        "url": url,
+                        "active_prompt_blocks": _system_block_names(system_blocks),
+                    },
+                )
 
             if final_msg.stop_reason != "tool_use":
                 return
@@ -3595,6 +3655,9 @@ class Executive:
             added = inbox.take() if inbox is not None else []
             if added:
                 tool_results.append({"type": "text", "text": render_added_messages(added)})
+                # The person's own words, as much as the turn's message.
+                for message in added:
+                    seen_urls.add_from_text(message.text)
                 # Audited by the inbox's owner (the web chat route), under
                 # the same privacy as the turn's own message.
                 yield {"type": "message_added", "ids": [m.id for m in added]}

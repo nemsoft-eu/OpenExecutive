@@ -11,9 +11,9 @@ a draft in their own mailbox until they send it themselves, facts and profile ed
 the speaker's words, and playbook changes wait for a person on the Playbooks
 tab. What is not fenced is a door to the open internet. So from the round it
 runs in until the turn ends, only that stays shut: no outside fetch (a URL
-can carry what the mail said anywhere: ``read_document``, research, the
-watchlist, ``load_mcp_server``, any gateway tool but
-``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can reach either),
+can carry what the mail said anywhere: ``read_document``, the client
+``web_fetch``, research, the watchlist, ``load_mcp_server``, any gateway
+tool but ``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can reach either),
 no workflow (it runs later, unattended, and may fetch or script), no post
 to everyone (broadcasts, department messages, alerts), and no change to who
 is on the roster or holds authority (archiving someone, a department head, a
@@ -34,8 +34,14 @@ without changing the offered tool list (the cached prefix stays the same all
 turn), and treats a round that calls any of them as already touched,
 because a round's tools run concurrently. The handlers that reach outside
 check again (``outside_reach_refusal``). The server-side ``web_search``
-stays, as on a turn private to the owner: it cannot be refused at dispatch
-without a cache miss. The lockdown lasts for the turn
+and ``web_fetch`` stay, as on a turn private to the owner: they run inside
+the provider's generation, never through this dispatch, and dropping them
+from the tool list would change the cached prefix. That leaves the server
+``web_fetch`` one opening: Anthropic opens only a URL already in the
+conversation, so a URL written in the mail can be fetched as it stands (a
+beacon to whoever wrote it), but nothing the turn read can be added to it.
+The client ``web_search`` and ``web_fetch`` (SearXNG, local models) are
+withheld like any other outside fetch. The lockdown lasts for the turn
 (``TurnDelegation.read_mail``) and no longer. A later turn of that
 conversation stays private to its owner (``touched_mail``), and its history
 carries only their words and the Executive's replies, never the mail a tool
@@ -112,8 +118,12 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
 })
 
 MAIL_TOUCHED_WITHHELD_TOOLS: frozenset[str] = frozenset({
-    # Fetches of an outside address: a URL can carry the mail anywhere.
+    # Fetches of an outside address: a URL can carry the mail anywhere. The
+    # client web_search and web_fetch (a search query carries text out too);
+    # the server-side tools of the same names are never dispatched here.
     "read_document",
+    "web_fetch",
+    "web_search",
     "load_mcp_server",
     "add_watchlist_entry",
     "tune_watchlist_entry",

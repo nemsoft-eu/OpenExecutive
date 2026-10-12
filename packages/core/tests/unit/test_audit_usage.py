@@ -26,13 +26,13 @@ def test_usage_counts_reads_tokens_cost_and_server_searches() -> None:
     msg = _message(
         input_tokens=120, output_tokens=30, cache_creation_input_tokens=10,
         cache_read_input_tokens=900, cost="0.04",
-        server_tool_use=SimpleNamespace(web_search_requests=3),
+        server_tool_use=SimpleNamespace(web_search_requests=3, web_fetch_requests=2),
     )
     counts = au.usage_counts(msg)
     assert counts == {
         "input_tokens": 120, "output_tokens": 30,
         "cache_creation_input_tokens": 10, "cache_read_input_tokens": 900,
-        "cost_usd": 0.04, "web_search_requests": 3,
+        "cost_usd": 0.04, "web_search_requests": 3, "web_fetch_requests": 2,
     }
 
 
@@ -112,7 +112,8 @@ def test_log_model_usage_returns_none_without_usage(audit: AuditLogger) -> None:
 
 def test_usage_rollup_sums_per_source() -> None:
     roll = au.UsageRollup()
-    roll.add("specialist_research", {"input_tokens": 10, "output_tokens": 2, "web_search_requests": 3})
+    roll.add("specialist_research", {"input_tokens": 10, "output_tokens": 2, "web_search_requests": 3,
+                                     "web_fetch_requests": 2})
     roll.add("specialist_research", {"input_tokens": 5, "output_tokens": 1, "web_search_requests": 1})
     roll.add("research_synthesis", {"input_tokens": 7, "cache_read_input_tokens": 100})
     roll.add("research_watchlist", None)  # a call without usage still counts as a call
@@ -124,6 +125,7 @@ def test_usage_rollup_sums_per_source() -> None:
     assert out["by_source"]["specialist_research"] == {
         "calls": 2, "input_tokens": 15, "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0, "output_tokens": 3, "web_search_requests": 4,
+        "web_fetch_requests": 2,
     }
     assert list(out["by_source"]) == ["research_synthesis", "research_watchlist", "specialist_research"]
 

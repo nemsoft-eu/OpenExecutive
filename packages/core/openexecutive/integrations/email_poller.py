@@ -965,7 +965,8 @@ async def _run_executive(
         person_id=person_id,
         co_present_person_ids=co_present_person_ids or None,
         # Only the sender's own words reach peer memory — see _email_memory_text.
-        # An unrostered sender has no peer to record into, so skip the parse.
+        # An unrostered sender has no peer to record into, so skip the parse;
+        # None also leaves web_fetch nothing to open from a stranger's mail.
         memory_text=_email_memory_text(raw_email) if person_id is not None else None,
     )
 

@@ -232,6 +232,42 @@ def test_a_page_without_a_title_is_named_by_its_site() -> None:
     assert sources.payload()["sources"][0]["title"] == "www.ft.com"
 
 
+def test_a_page_the_server_fetch_opened_is_recorded() -> None:
+    """Real SDK blocks: a WebFetchBlock names its page; an error block has no
+    URL and is skipped, as a failed search is."""
+    from anthropic.types import (
+        DocumentBlock,
+        PlainTextSource,
+        WebFetchBlock,
+        WebFetchToolResultBlock,
+        WebFetchToolResultErrorBlock,
+    )
+
+    def _fetched(url: str, title: str | None) -> WebFetchToolResultBlock:
+        document = DocumentBlock(
+            type="document", title=title,
+            source=PlainTextSource(type="text", media_type="text/plain", data="Opening hours"),
+        )
+        return WebFetchToolResultBlock(
+            type="web_fetch_tool_result", tool_use_id="srvtoolu_2",
+            content=WebFetchBlock(type="web_fetch_result", url=url, content=document),
+        )
+
+    sources = TurnSources()
+    record_web_sources(sources, [
+        _fetched("https://ciao.example/about", "About us"),
+        _fetched("https://untitled.example/page", None),
+        WebFetchToolResultBlock(
+            type="web_fetch_tool_result", tool_use_id="srvtoolu_3",
+            content=WebFetchToolResultErrorBlock(type="web_fetch_tool_result_error", error_code="url_not_accessible"),
+        ),
+    ])
+    assert sources.payload()["sources"] == [
+        {"kind": "web", "title": "About us", "url": "https://ciao.example/about"},
+        {"kind": "web", "title": "untitled.example", "url": "https://untitled.example/page"},
+    ]
+
+
 def test_odd_response_content_never_raises() -> None:
     sources = TurnSources()
     odd: list[Any] = [None, 42, _text("x", citations="not a list"), _search([None])]  # type: ignore[arg-type]

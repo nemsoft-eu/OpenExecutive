@@ -986,7 +986,8 @@ def _gateway() -> Any:
 
 
 def _run_loop(
-    session: Session | None, tool_uses: list[Any], mode: str = "team", gateway: Any = None
+    session: Session | None, tool_uses: list[Any], mode: str = "team", gateway: Any = None,
+    search: Any = None, seen_url_text: str = "",
 ) -> _ScriptedStreams:
     from openexecutive.orchestrator.executive import Executive
     from openexecutive.orchestrator.schedule_tools import set_session
@@ -1012,7 +1013,7 @@ def _run_loop(
             async for _item in Executive(mcp_gateway=gateway)._stream_agent_loop(
                 system_blocks=[], messages=[{"role": "user", "content": "x"}],
                 model="claude-test", workspace_mode=mode, principal_role_tag="",
-                turn_id="t-loop",
+                turn_id="t-loop", search=search, seen_url_text=seen_url_text,
             ):
                 pass
             provider.offered = offered
@@ -1031,11 +1032,13 @@ def test_every_withheld_name_is_a_real_tool() -> None:
     from openexecutive.orchestrator.executive import _ALL_SKILL_HANDLERS, _ALL_SKILL_TOOLS
     from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES
     from openexecutive.orchestrator.schedule_tools import PRIVATE_TURN_WITHHELD_TOOLS
+    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
     from openexecutive.workflows.step_script import LIST_SAVED_TOOLS_TOOL, RUN_SCRIPT_TOOL
 
     # run_script and list_saved_tools are dispatched beside the gateway's
-    # meta-tools (step_script).
-    gateway_side = MCP_TOOL_NAMES | {RUN_SCRIPT_TOOL, LIST_SAVED_TOOLS_TOOL}
+    # meta-tools (step_script); the client web_fetch handler is built per turn
+    # (web_search_tool.client_search_handlers).
+    gateway_side = MCP_TOOL_NAMES | {RUN_SCRIPT_TOOL, LIST_SAVED_TOOLS_TOOL, WEB_FETCH_TOOL["name"]}
     names = {t["name"] for t in _ALL_SKILL_TOOLS} | gateway_side
     assert names >= PRIVATE_TURN_WITHHELD_TOOLS
     assert set(_ALL_SKILL_HANDLERS) | gateway_side >= PRIVATE_TURN_WITHHELD_TOOLS
@@ -1090,6 +1093,35 @@ def test_a_private_turn_refuses_a_withheld_tool_the_model_emits_anyway(
     assert refusals[0].details["refused"] == "private_turn"
     # Every row of the private turn is private, the model-call rows included.
     assert all(e.private for e in _audit().query(limit=1000))
+
+
+def _client_search() -> Any:
+    from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL
+    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
+    from openexecutive.orchestrator.web_search_tool import WebSearchSelection
+
+    return WebSearchSelection("client", SEARXNG_WEB_SEARCH_TOOL, 2, WEB_FETCH_TOOL, 2)
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_a_private_turn_keeps_the_client_search_but_not_the_client_fetch(
+    roster: SimpleNamespace, private: bool
+) -> None:
+    """The client web_fetch opens a URL from inside our network, so a
+    contact's email must not steer it; it is withheld like read_document, and
+    refused if the model emits it anyway, even for a URL the turn has seen."""
+    from openexecutive.agents.tool_outcome import ToolOutcome
+
+    url = "https://example.com/pricing"
+    tool_use = SimpleNamespace(type="tool_use", id="tu-1", name="web_fetch", input={"url": url})
+    session = _private_turn(roster) if private else Session(session_id="email:t9")
+    run_fetch = AsyncMock(return_value=ToolOutcome('{"content": "page"}'))
+    with patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch):
+        provider = _run_loop(session, [tool_use], search=_client_search(), seen_url_text=url)
+    offered = _offered(provider)
+    assert "web_search" in offered
+    assert ("web_fetch" in offered) is not private
+    assert run_fetch.await_count == (0 if private else 1)
 
 
 def test_a_private_turn_refuses_a_withheld_tool_through_use_tool(roster: SimpleNamespace) -> None:
@@ -1423,8 +1455,9 @@ def test_a_normal_turn_offers_and_runs_them_unchanged(roster: SimpleNamespace) -
         provider = _run_loop(_teammate_web(roster), [tool_use], gateway=_gateway())
     handler.assert_awaited_once()
     offered = _offered(provider)
-    # A teammate's turn: everything but the principal-only tools.
-    assert set(offered) >= PRIVATE_TURN_WITHHELD_TOOLS - PRINCIPAL_ONLY_TOOLS
+    # A teammate's turn: everything but the principal-only tools (web_fetch
+    # comes only with a client search selection, which this turn has none of).
+    assert set(offered) >= PRIVATE_TURN_WITHHELD_TOOLS - PRINCIPAL_ONLY_TOOLS - {"web_fetch"}
     from openexecutive.workflows.step_script import (
         CHAT_TOOL_DEFINITION,
         LIST_SAVED_TOOLS_DEFINITION,

@@ -98,13 +98,16 @@ def test_chat_forwards_memory_text(
     assert captured[entry]["user_message"] == SEED
 
 
-def test_chat_without_memory_text_forwards_none(
+def test_chat_without_memory_text_forwards_the_typed_message(
     client: TestClient, captured: dict[str, Any]
 ) -> None:
+    """Typed in the box, the message is the person's own words: the
+    Executive opens URLs only in memory_text, so None would make a pasted
+    link unfetchable."""
     resp = client.post("/chat", json={"message": "hi"})
     assert resp.status_code == 200
     _ = resp.text
-    assert captured["stream_chat"]["memory_text"] is None
+    assert captured["stream_chat"]["memory_text"] == "hi"
 
 
 @pytest.mark.parametrize("bad", ["", "x" * 2001])

@@ -25,7 +25,9 @@ from openexecutive.orchestrator.history_tools import HISTORY_TOOLS
 from openexecutive.orchestrator.mcp_gateway import MCP_TOOLS
 from openexecutive.orchestrator.router import SPECIALIST_TOOLS
 from openexecutive.orchestrator.schedule_tools import PRIVATE_TURN_MCP_TOOLS, current_session
+from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL, SearchBudget
 from openexecutive.orchestrator.session import Session
+from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL, SeenUrls, make_fetch_handler
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.workflows import step_script
@@ -144,6 +146,8 @@ def test_every_tool_is_classified_once() -> None:
         for t in [
             *ex._ALL_SKILL_TOOLS, *SPECIALIST_TOOLS, *MCP_TOOLS, *DELEGATION_TOOLS, *HISTORY_TOOLS,
             step_script.CHAT_TOOL_DEFINITION, step_script.LIST_SAVED_TOOLS_DEFINITION,
+            # The client search tools a local model gets per turn.
+            SEARXNG_WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         ]
     }
     allowed, withheld = lockdown.MAIL_TOUCHED_ALLOWED_TOOLS, lockdown.MAIL_TOUCHED_WITHHELD_TOOLS
@@ -165,7 +169,8 @@ def test_call_tool_runs_only_reads_and_recipient_checked_sends() -> None:
 
 def test_only_links_scripts_workflows_posts_and_lasting_text_are_withheld() -> None:
     assert {
-        "read_document", "load_mcp_server", "add_watchlist_entry", "tune_watchlist_entry",
+        "read_document", "web_fetch", "web_search",
+        "load_mcp_server", "add_watchlist_entry", "tune_watchlist_entry",
         "run_executive_research", "run_script", "run_python_job",
         "suggest_workflow", "run_workflow", "save_workflow",
         "send_department_message", "send_company_broadcast", "create_alert",
@@ -469,19 +474,26 @@ def test_every_withheld_tool_is_refused_only_on_the_reading_turn(tool: str) -> N
     ("openexecutive.orchestrator.research_tools:handle_run_executive_research", "run_executive_research"),
     ("openexecutive.orchestrator.broadcast_tools:handle_send_department_message", "send_department_message"),
     ("openexecutive.orchestrator.broadcast_tools:handle_send_company_broadcast", "send_company_broadcast"),
+    # Built per turn (web_search_tool.client_search_handlers), so made here.
+    ("web_fetch", "web_fetch"),
 ])
 def test_link_workflow_and_broadcast_handlers_refuse_on_their_own(handler: str, tool: str) -> None:
     import importlib
 
-    module, name = handler.split(":")
-    fn = getattr(importlib.import_module(module), name)
+    from openexecutive.agents.tool_outcome import unwrap_tool_outcome
+
+    if handler == "web_fetch":
+        fn = make_fetch_handler(SearchBudget(max_uses=1), SeenUrls())
+    else:
+        module, name = handler.split(":")
+        fn = getattr(importlib.import_module(module), name)
     session = Session()
     token = current_session.set(session)
     try:
         session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
             offered=True, touched_mail=True, read_mail=True, session_id=session.session_id,
         )
-        result = json.loads(asyncio.run(fn({})))
+        result = json.loads(unwrap_tool_outcome(asyncio.run(fn({})))[0])
         assert "next message" in result["error"] and tool in result["error"]
     finally:
         current_session.reset(token)

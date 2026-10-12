@@ -319,9 +319,10 @@ def _trim_url(candidate: str) -> str:
 class SeenUrls:
     """The URLs one turn may fetch: the speaker's own and its search results.
 
-    Seed it from the speaker's own words only (``executive._speaker_text``),
-    never from a message a caller packed with attachment text, mail or
-    retrieved context: a URL inside any of those must stay unfetchable.
+    Seed it from the speaker's own words only (the chat entry points'
+    ``memory_text``), never from a message a caller packed with attachment
+    text, mail or retrieved context: a URL inside any of those must stay
+    unfetchable.
     Every method is synchronous, so the handlers of one ``asyncio.gather``
     round cannot interleave an update with a check.
     """

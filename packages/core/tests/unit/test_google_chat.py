@@ -420,6 +420,7 @@ def _run_with_attachments(
     download: Any,
     *,
     rostered: bool = True,
+    message_text: str = "What is this worth?",
 ) -> dict[str, Any]:
     from openexecutive.knowledge.pdf_reader import PdfReadResult
 
@@ -457,7 +458,7 @@ def _run_with_attachments(
     ):
         asyncio.run(
             _process_and_reply(
-                message_text="What is this worth?",
+                message_text=message_text,
                 sender_name="Bob",
                 space_name="spaces/AAA",
                 thread_name="spaces/AAA/threads/T1",
@@ -485,6 +486,20 @@ def test_uploaded_pdf_is_downloaded_and_read(monkeypatch: pytest.MonkeyPatch) ->
         "[Attached: scan.pdf] (converted from scanned pages)\nAPPRAISED VALUE 4.2M",
         source="attachment", author="scan.pdf",
     ) + "\n\nWhat is this worth?"
+    # The sender's words and the file's name, never the document's text: the
+    # Executive opens only URLs in memory_text.
+    assert captured["memory_text"] == "What is this worth?\n\n(Attached files: scan.pdf)"
+
+
+def test_a_file_only_message_names_its_file_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The webhook already stands the file note in for missing words."""
+    def download(*_a: Any) -> bytes:
+        return b"%PDF-scan"
+
+    captured = _run_with_attachments(
+        monkeypatch, [_UPLOADED], download, message_text="(Attached files: scan.pdf)"
+    )
+    assert captured["memory_text"] == "(Attached files: scan.pdf)"
 
 
 def test_drive_file_is_left_to_the_drive_tools(monkeypatch: pytest.MonkeyPatch) -> None:

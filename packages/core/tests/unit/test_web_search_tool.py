@@ -261,15 +261,50 @@ def test_executive_appends_web_search_after_cached_client_tools() -> None:
             asyncio.run(_run())
         assert captured_tools, "stream() was not invoked"
         tools = captured_tools[0]
-        # Web search must be present and must be last (so it stays out of the
-        # cache_control slot, which is reserved for client-side tools).
-        assert tools[-1]["name"] == "web_search"
-        assert tools[-1]["type"] == "web_search_20250305"
-        # The last client-side tool (second-to-last overall) is the one that
-        # carries cache_control. Web search must NOT carry cache_control.
-        assert "cache_control" not in tools[-1]
-        assert tools[-2].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+        # The server tools (search, then fetch) come last, so they stay out
+        # of the cache_control slot, which is reserved for client-side tools.
+        assert [t["name"] for t in tools[-2:]] == ["web_search", "web_fetch"]
+        assert tools[-2]["type"] == "web_search_20250305"
+        assert tools[-1]["type"] == "web_fetch_20260309"
+        # The last client-side tool is the one that carries cache_control.
+        # The server tools must NOT carry it.
+        assert all("cache_control" not in t for t in tools[-2:])
+        assert tools[-3].get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
     finally:
+        _reset_settings_cache()
+
+
+def test_executive_omits_the_server_fetch_when_its_budget_is_zero() -> None:
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    os.environ["WEB_FETCH_MAX_USES"] = "0"
+    try:
+        from openexecutive.orchestrator.executive import Executive
+        from openexecutive.orchestrator.session import Session
+
+        final_msg = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn",
+        )
+        captured_tools: list[list[dict]] = []
+
+        def fake_stream(**kwargs):
+            captured_tools.append(kwargs["tools"])
+            return _make_stream_cm(final_msg)
+
+        async def _run() -> None:
+            async for _ in Executive().stream_chat("hi", Session(session_id="t1b")):
+                pass
+
+        with patch(
+            "openexecutive.orchestrator.executive.get_provider",
+            return_value=SimpleNamespace(messages_stream=fake_stream),
+        ):
+            asyncio.run(_run())
+        names = [t.get("name") for t in captured_tools[0]]
+        assert names[-1] == "web_search"
+        assert "web_fetch" not in names
+    finally:
+        os.environ.pop("WEB_FETCH_MAX_USES", None)
         _reset_settings_cache()
 
 
@@ -303,6 +338,7 @@ def test_executive_omits_web_search_when_disabled() -> None:
         asyncio.run(_run())
     names = {t.get("name") for t in captured_tools[0]}
     assert "web_search" not in names
+    assert "web_fetch" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +423,153 @@ def test_server_tool_blocks_are_preserved_and_audited() -> None:
         assert ws_calls[0]["details"]["kind"] == "server_tool"
     finally:
         _reset_settings_cache()
+
+
+def test_server_fetch_blocks_are_echoed_and_audited() -> None:
+    """A web_fetch_tool_result dropped from the echo would leave the next
+    request with an orphaned server_tool_use, which the API rejects."""
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    try:
+        from anthropic.types import (
+            DocumentBlock,
+            PlainTextSource,
+            ServerToolUseBlock,
+            WebFetchBlock,
+            WebFetchToolResultBlock,
+        )
+
+        from openexecutive.orchestrator.executive import Executive
+        from openexecutive.orchestrator.session import Session
+
+        url = "https://ciao.example/about"
+        fetch_use = ServerToolUseBlock(
+            type="server_tool_use", id="srvtoolu_9", name="web_fetch", input={"url": url},
+        )
+        fetch_result = WebFetchToolResultBlock(
+            type="web_fetch_tool_result", tool_use_id="srvtoolu_9",
+            content=WebFetchBlock(
+                type="web_fetch_result", url=url,
+                content=DocumentBlock(
+                    type="document", title="About",
+                    source=PlainTextSource(type="text", media_type="text/plain", data="Since 1999"),
+                ),
+            ),
+        )
+        # A client tool call alongside, so the loop runs a second request.
+        client_call = SimpleNamespace(type="tool_use", id="tu_1", name="no_such_tool", input={})
+        finals = [
+            SimpleNamespace(content=[fetch_use, fetch_result, client_call], stop_reason="tool_use"),
+            SimpleNamespace(content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn"),
+        ]
+        captured: list[dict] = []
+
+        def fake_stream(**kwargs):
+            captured.append(kwargs)
+            return _make_stream_cm(finals[len(captured) - 1])
+
+        audit_calls: list[dict] = []
+
+        def _capture(event_type, summary, **kwargs):
+            audit_calls.append({"event_type": event_type, "summary": summary, **kwargs})
+
+        with (
+            patch(
+                "openexecutive.orchestrator.executive.get_provider",
+                return_value=SimpleNamespace(messages_stream=fake_stream),
+            ),
+            patch("openexecutive.orchestrator.executive.audit_log", side_effect=_capture),
+        ):
+            asyncio.run(Executive().chat("hi", Session(session_id="t4")))
+
+        echoed = next(
+            m["content"] for m in captured[1]["messages"]
+            if m["role"] == "assistant" and isinstance(m["content"], list)
+        )
+        types = [b["type"] for b in echoed]
+        assert types[:2] == ["server_tool_use", "web_fetch_tool_result"]
+        assert echoed[1]["tool_use_id"] == "srvtoolu_9"
+
+        fetch_rows = [c for c in audit_calls if c["event_type"] == "tool_invocation"
+                      and (c.get("details") or {}).get("tool") == "web_fetch"]
+        assert len(fetch_rows) == 1
+        assert fetch_rows[0]["details"]["kind"] == "server_tool"
+        assert fetch_rows[0]["details"]["url"] == url
+        assert not [c for c in audit_calls if (c.get("details") or {}).get("tool") == "web_search"]
+    finally:
+        _reset_settings_cache()
+
+
+# ---------------------------------------------------------------------------
+# client_search_handlers: which handlers a turn (or a research call) gets
+# ---------------------------------------------------------------------------
+
+
+def _client_selection(fetch: bool = True):
+    from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL
+    from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
+    from openexecutive.orchestrator.web_search_tool import WebSearchSelection
+
+    return WebSearchSelection(
+        "client", SEARXNG_WEB_SEARCH_TOOL, 2, WEB_FETCH_TOOL if fetch else None, 3 if fetch else 0,
+    )
+
+
+def test_client_handlers_without_a_seen_set_are_search_only() -> None:
+    """The research fan-out and standing queries pass no seen set: they keep
+    the one search handler they always had, fetch tool or not."""
+    from openexecutive.orchestrator.web_search_tool import client_search_handlers
+
+    assert set(client_search_handlers(_client_selection())) == {"web_search"}
+
+
+def test_client_handlers_with_a_seen_set_add_fetch_only_when_selected() -> None:
+    from openexecutive.orchestrator.web_fetch import SeenUrls
+    from openexecutive.orchestrator.web_search_tool import (
+        WebSearchSelection,
+        client_search_handlers,
+    )
+
+    assert set(client_search_handlers(_client_selection(), SeenUrls())) == {"web_search", "web_fetch"}
+    assert set(client_search_handlers(_client_selection(fetch=False), SeenUrls())) == {"web_search"}
+    server = WebSearchSelection("server", {"name": "web_search"}, 2, {"name": "web_fetch"}, 3)
+    assert client_search_handlers(server, SeenUrls()) == {}
+    assert client_search_handlers(None, SeenUrls()) == {}
+
+
+def test_search_results_join_the_seen_set_and_the_fetch_budget_is_its_own() -> None:
+    """A result URL becomes fetchable once the search returns it, and the two
+    tools spend separate budgets (searches: 2, fetches: 3)."""
+    import json
+
+    from openexecutive.agents.tool_outcome import ToolOutcome
+    from openexecutive.orchestrator.web_fetch import SeenUrls
+    from openexecutive.orchestrator.web_search_tool import client_search_handlers
+
+    os.environ["SEARXNG_URL"] = "http://searxng:8080"
+    seen = SeenUrls()
+    handlers = client_search_handlers(_client_selection(), seen)
+    payload = json.dumps({"results": [{"url": "https://r.example/a", "title": "A", "content": "s"}]})
+    run_fetch = AsyncMock(return_value=ToolOutcome('{"content": "page"}'))
+    try:
+        with (
+            patch(
+                "openexecutive.orchestrator.searxng_search._fetch_capped",
+                new=AsyncMock(return_value=payload.encode()),
+            ),
+            patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch),
+        ):
+            async def _go() -> list[ToolOutcome]:
+                before = await handlers["web_fetch"]({"url": "https://r.example/a"})
+                await handlers["web_search"]({"query": "ciao"})
+                after = [await handlers["web_fetch"]({"url": "https://r.example/a"}) for _ in range(4)]
+                return [before, *after]
+
+            outcomes = asyncio.run(_go())
+    finally:
+        os.environ.pop("SEARXNG_URL", None)
+    assert seen.allows("https://r.example/a")
+    assert outcomes[0].is_error and "has not appeared" in outcomes[0].content
+    assert [o.is_error for o in outcomes[1:]] == [False, False, False, True]
+    assert "budget" in outcomes[-1].content
+    assert run_fetch.await_count == 3

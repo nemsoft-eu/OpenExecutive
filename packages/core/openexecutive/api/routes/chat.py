@@ -766,8 +766,10 @@ async def _run_chat_turn(
     image content blocks; document text is expected to already be inlined in
     `message` by the caller. `memory_text`, when set, is what peer memory
     records as the caller's words instead of `message` (see
-    `Executive.stream_chat`). `turn_files` are the uploads as sent, which a
-    Python job may take by name for this turn (workflows/turn_files.py).
+    `Executive.stream_chat`); unset, `message` is handed over as their
+    words, and its URLs are the ones the Executive may open. `turn_files`
+    are the uploads as sent, which a Python job may take by name for this
+    turn (workflows/turn_files.py).
     """
     from openexecutive.config import get_settings
     from openexecutive.knowledge.retriever import retrieve
@@ -934,6 +936,10 @@ async def _run_chat_turn(
             # auditable next to the message it stood in for.
             full={"message": message, "memory_text": memory_text},
         )
+    # What the Executive reads as the person's own words. A message typed in
+    # the chat box is exactly that unless the client handed one over (a
+    # briefing card's), and the Executive opens only URLs in this text.
+    own_words = memory_text if memory_text is not None else message
 
     # Let the caller schedule to their own addresses. Runs per turn rather than
     # only on session creation so a newly-added address works without a fresh
@@ -1179,7 +1185,7 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
-                    memory_text=memory_text,
+                    memory_text=own_words,
                     turn_sources=turn_sources,
                     inbox=inbox,
                 ).__aiter__()
@@ -1196,7 +1202,7 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
-                    memory_text=memory_text,
+                    memory_text=own_words,
                     turn_sources=turn_sources,
                     inbox=inbox,
                 ).__aiter__()
