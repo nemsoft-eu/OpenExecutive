@@ -774,6 +774,10 @@ async def _run_executive(
     # through the decision extractor as the principal's own words
     # (`content_trust.principal_speaking`).
     session = Session(**session_kwargs, origin_channel="email")
+    # Whether session.email_authenticated already settles the sender: checked
+    # (one raw read per message, at most), or left unchecked on purpose
+    # because the principal lookup failed. Read again below otherwise.
+    sender_checked = False
     if from_addr:
         # Who the mail claims to be from, and whether Gmail authenticated it:
         # the fact tools let the principal's own authenticated mail ask for a
@@ -791,9 +795,10 @@ async def _run_executive(
         except Exception:  # noqa: BLE001 - optional step; must not lose the email.
             logger.warning("principal lookup failed; email turn left unauthenticated", exc_info=True)
             principal = ""
-        session.email_authenticated = bool(principal) and session.email_from == principal and (
-            await sender_authenticated(gateway, message_id, from_addr)
-        )
+            sender_checked = True
+        if principal and session.email_from == principal:
+            session.email_authenticated = await sender_authenticated(gateway, message_id, from_addr)
+            sender_checked = True
     if from_addr:
         # Only register the sender as a schedulable channel_ref if they
         # are in the People roster. Without this guard, an attacker who
@@ -959,13 +964,15 @@ async def _run_executive(
     # off-roster senders the gateway will not let us reply to anyway.
     # A From line proves nothing, so a rostered sender's links open only when
     # Gmail authenticated the mail (as the fact tools require of the
-    # principal); a forged teammate gets none opened. Never raises: a failed
-    # read is "not authenticated".
+    # principal); a forged teammate gets none opened. Read only when the
+    # principal check above did not settle it; never raises: a failed read is
+    # "not authenticated".
     from openexecutive.integrations.fact_confirmation import sender_authenticated
 
     fetch_own_urls = person_id is not None and bool(from_addr) and (
         session.email_authenticated
-        or await sender_authenticated(gateway, message_id, from_addr)
+        if sender_checked
+        else await sender_authenticated(gateway, message_id, from_addr)
     )
     await executive.chat(
         user_message=base_message,
