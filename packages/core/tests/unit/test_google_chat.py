@@ -573,3 +573,19 @@ def test_files_from_someone_off_the_roster_are_not_downloaded(
         "(Attached files, not read — files are read only from people on the team: scan.pdf)"
         "\n\nWhat is this worth?"
     )
+
+
+@pytest.mark.parametrize("rostered", [True, False])
+def test_only_a_team_members_pasted_link_can_be_opened(
+    monkeypatch: pytest.MonkeyPatch, rostered: bool
+) -> None:
+    """Checked with no file attached too: the link alone is enough."""
+    def download(*_a: Any) -> bytes:
+        raise AssertionError("no file to download")
+
+    text = "Read https://a.example/page"
+    captured = _run_with_attachments(
+        monkeypatch, [], download, message_text=text, rostered=rostered
+    )
+    assert captured["memory_text"] == text
+    assert captured["fetch_own_urls"] is rostered

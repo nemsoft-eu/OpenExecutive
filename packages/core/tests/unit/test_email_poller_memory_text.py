@@ -310,6 +310,7 @@ def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
     captured = _run(lambda addr, **_kw: sam if addr == "sam@example.com" else None)
     assert captured["person_id"] == 7
     assert captured["memory_text"] == _email_memory_text(REPLY)
+    assert captured["fetch_own_urls"] is True
     # The Executive still sees the whole email, framing included.
     assert "You have an inbound email" in captured["user_message"]
     assert "can you send me" in captured["user_message"]
@@ -323,6 +324,7 @@ def test_run_executive_skips_the_parse_for_an_unrostered_sender() -> None:
     captured = _run(lambda _addr, **_kw: None)
     assert captured["person_id"] is None
     assert captured["memory_text"] is None
+    assert captured["fetch_own_urls"] is False
 
 
 def test_memory_text_does_not_trip_the_open_loop_document_skip() -> None:

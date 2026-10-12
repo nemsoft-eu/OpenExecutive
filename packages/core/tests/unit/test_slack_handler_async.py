@@ -960,6 +960,7 @@ async def test_a_dm_hands_over_the_typed_words_not_the_hydrated_backstory() -> N
             kwargs = h.chat.await_args.kwargs
     assert kwargs["user_message"].startswith(backstory)
     assert kwargs["memory_text"] == DM_EVENT["text"]
+    assert kwargs["fetch_own_urls"] is True  # past the roster gate
 
 
 @pytest.mark.asyncio

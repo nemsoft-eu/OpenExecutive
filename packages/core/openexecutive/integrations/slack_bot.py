@@ -958,6 +958,7 @@ async def create_slack_app():
                     # names, never a document's text or a DM's hydrated
                     # backstory as their words; web_fetch opens only URLs in it.
                     memory_text=own_words,
+                    fetch_own_urls=True,  # past the roster gate above
                 )
 
                 # No unfurls: Slack would fetch a link in the reply on its own,

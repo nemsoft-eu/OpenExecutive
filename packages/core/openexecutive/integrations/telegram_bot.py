@@ -339,6 +339,8 @@ async def _process_and_reply(
                 channel_context_block=build_channel_context_block("telegram"),
                 person_id=person_id,
                 memory_text=own_words,
+                # a group chat can reach here from someone off the roster
+                fetch_own_urls=person_id is not None,
             )
             await send_message(token, chat_id, response)
         except Exception:

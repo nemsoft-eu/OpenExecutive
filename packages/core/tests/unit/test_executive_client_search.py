@@ -411,3 +411,33 @@ def test_both_chat_paths_seed_from_the_speakers_own_words(
 
     asyncio.run(_run())
     assert seen == [expected]
+
+
+@pytest.mark.parametrize("committee", [False, True])
+@pytest.mark.parametrize(("kwargs", "expected"), [
+    # A channel that does not vouch for its sender opens none of their links.
+    ({}, ""),
+    ({"fetch_own_urls": False}, ""),
+    ({"fetch_own_urls": True}, "see https://a.example"),
+])
+def test_chat_opens_a_senders_links_only_when_the_channel_vouches(
+    monkeypatch: pytest.MonkeyPatch, committee: bool, kwargs: dict[str, Any], expected: str
+) -> None:
+    """Executive.chat() is the channels' entry point; the web chat and the
+    CLI stream directly and keep their default (see the test above)."""
+    from openexecutive.orchestrator.executive import Executive
+    from openexecutive.orchestrator.session import Session
+
+    seen: list[str] = []
+
+    async def fake_loop(self: Any, *args: Any, **kw: Any) -> Any:
+        seen.append(kw["seen_url_text"])
+        if False:  # pragma: no cover
+            yield ""
+
+    monkeypatch.setattr(Executive, "_stream_agent_loop", fake_loop)
+    asyncio.run(Executive().chat(
+        "the prompt", Session(session_id="t-chat-seed"), committee_review=committee,
+        memory_text="see https://a.example", **kwargs,
+    ))
+    assert seen == [expected]

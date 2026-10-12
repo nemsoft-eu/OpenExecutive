@@ -981,6 +981,7 @@ async def _handle_message(
                 co_present_person_ids=co_present_person_ids or None,
                 # Never the attachment text or the DM hydration above.
                 memory_text=own_words if own_words is not None else text,
+                fetch_own_urls=True,  # past the roster gate above
             )
 
             # Late routing: for the @mention auto-thread path, the router

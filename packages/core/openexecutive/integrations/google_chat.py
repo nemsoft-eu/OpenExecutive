@@ -323,7 +323,11 @@ async def _process_and_reply(
             else "\n\n".join(p for p in (message_text, file_note) if p)
         )
         image_blocks: list[dict] = []
-        if attachments and _sender_on_roster(sender_email):
+        # The webhook authenticates Google, not the sender: anyone in a space
+        # with the bot reaches here, so only a team member's files are read
+        # and only their links can be opened.
+        on_roster = _sender_on_roster(sender_email)
+        if attachments and on_roster:
             att_text, image_blocks = await _read_attachments(
                 attachments, service_account_file, service_account_email
             )
@@ -345,6 +349,7 @@ async def _process_and_reply(
             channel_context_block=build_channel_context_block("google_chat"),
             attachment_blocks=image_blocks or None,
             memory_text=own_words,
+            fetch_own_urls=on_roster,
         )
         await asyncio.to_thread(
             send_reply, space_name, thread_name, response, service_account_file, service_account_email

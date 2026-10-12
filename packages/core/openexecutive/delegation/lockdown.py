@@ -50,6 +50,12 @@ relies on the dispatch guard). The lockdown lasts for the turn
 conversation stays private to its owner (``touched_mail``), and its history
 carries only their words and the Executive's replies, never the mail a tool
 returned: their next message is them asking again, having read the reply.
+The server ``web_fetch`` is offered again on that turn (only the email
+poller's sessions are private to the principal, not a chat that read mail).
+No tool result survives into it to carry the mail out, but a link the
+Executive wrote into its reply does. Whether Anthropic counts a URL in an
+assistant turn as already in the conversation is unverified; if it does, an
+injected link quoted in the reply could be opened on the next turn.
 """
 from __future__ import annotations
 

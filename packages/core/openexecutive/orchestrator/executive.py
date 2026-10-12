@@ -1220,6 +1220,7 @@ class Executive:
         turn_sources: TurnSources | None = None,
         standing_facts: str | None = None,
         inbox: TurnInbox | None = None,
+        fetch_own_urls: bool = True,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream a response from the Executive, routing to specialists as needed.
 
@@ -1259,7 +1260,9 @@ class Executive:
         person's decision or open loop. It is also the only text whose URLs
         the client ``web_fetch`` may open: ``None`` still uses
         ``user_message`` for the passes above, but makes nothing in it
-        fetchable.
+        fetchable. ``fetch_own_urls=False`` makes nothing in ``memory_text``
+        fetchable either, while it still feeds those passes: ``chat()``
+        passes it for a sender the channel matched to no one on the roster.
         """
         logger.info(
             "chat turn: %s",
@@ -1421,7 +1424,7 @@ class Executive:
                 # Never the _speaker_text fallback: a caller that passes no
                 # memory_text may have packed attachment text, mail or another
                 # session's backstory into user_message.
-                seen_url_text=memory_text or "",
+                seen_url_text=(memory_text or "") if fetch_own_urls else "",
             ):
                 if isinstance(item, str) and item != self._THINKING:
                     full_response += item
@@ -1588,6 +1591,7 @@ class Executive:
         turn_sources: TurnSources | None = None,
         standing_facts: str | None = None,
         inbox: TurnInbox | None = None,
+        fetch_own_urls: bool = True,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Committee-reviewed variant of stream_chat.
 
@@ -1767,7 +1771,7 @@ class Executive:
             workspace_mode=workspace_mode,
             principal_role_tag=principal_role_context(principal_role),
             inbox=inbox,
-            seen_url_text=memory_text or "",  # as in stream_chat
+            seen_url_text=(memory_text or "") if fetch_own_urls else "",  # as in stream_chat
         ):
             # Swallow draft text and the THINKING sentinel — the user sees
             # only the revised stream. Pass debug-event dicts through so the
@@ -2600,7 +2604,8 @@ class Executive:
             ]
             if search is not None and search.kind == "server":
                 tools_with_cache.append(search.tool)
-                # Never on a private or mail-touched turn: Anthropic opens any
+                # Never on a private turn, nor after a mail read on this turn
+                # (a later turn gets it back; see delegation.lockdown): Anthropic opens any
                 # URL in a client tool result, and an allowed tool can echo one
                 # the model wrote (a ghostwrite_email preview), so the turn's
                 # mail could leave in a query string. A private turn knows at
@@ -3697,6 +3702,7 @@ class Executive:
         channel_context_block: str = "",
         memory_text: str | None = None,
         standing_facts: str | None = None,
+        fetch_own_urls: bool = False,
     ) -> str:
         """Non-streaming chat — collects and returns the full response.
 
@@ -3718,6 +3724,12 @@ class Executive:
         for the streaming path, ``"medium"`` for the committee path).
         ``memory_text`` is the person's own words for the post-turn passes
         (see ``stream_chat``).
+
+        ``fetch_own_urls`` lets ``web_fetch`` open the URLs in
+        ``memory_text``. It is off unless the caller turns it on, and a
+        channel turns it on only for a sender it matched to someone on the
+        roster: anyone else who can message the bot gets no page opened
+        from a link they pasted (search results stay openable).
         """
         # Build the kwargs dict so we can conditionally include the
         # reasoning_level only when caller specified one — otherwise
@@ -3735,6 +3747,7 @@ class Executive:
             "briefing_context": briefing_context,
             "channel_context_block": channel_context_block,
             "memory_text": memory_text,
+            "fetch_own_urls": fetch_own_urls,
         }
         if peer_memory_reasoning_level is not None:
             common_kwargs["peer_memory_reasoning_level"] = peer_memory_reasoning_level

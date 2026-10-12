@@ -1188,7 +1188,14 @@ routing:
     handler returns (`make_search_handler(on_result_url=)`). A caller that
     passes no `memory_text` (unrostered email, the scheduler, evals, MCP)
     makes nothing in its message fetchable, only that turn's search
-    results: fail closed. Earlier turns are never seeded
+    results: fail closed. The channels enter through `Executive.chat()`,
+    whose `fetch_own_urls` (default False) seeds `memory_text` only when
+    the adapter vouches for the sender: Slack and Discord always (past
+    their roster gate), Telegram for a chat matched to a person, Google
+    Chat for `_sender_on_roster`, email for a rostered sender. A stranger
+    in a Telegram group or a shared Chat space gets no pasted link opened.
+    The web chat and the CLI call `stream_chat`, where it defaults True.
+    Earlier turns are never seeded
     (history rows hold the packed prompt), so the refusal asks the model to
     have the person paste the link again. URLs are matched exactly after
     normalising (scheme and host lowercased, IDNA host, default port and
@@ -3241,7 +3248,10 @@ peer_memory:
       pass it only with files), Telegram, Discord (``_handle_message(own_words=)``),
       Google Chat (each the typed text plus ``(Attached files: …)``) and the
       CLI. A rostered email sender's is ``_email_memory_text``; an
-      unrostered sender, the scheduler, the evals and MCP pass none. ``co_present_person_ids``
+      unrostered sender, the scheduler, the evals and MCP pass none. Its
+      URLs open only for a sender on the roster
+      (``Executive.chat(fetch_own_urls=)``, see routing.web_search); peer
+      memory and the own-words gates read it either way. ``co_present_person_ids``
       enumerates other humans in the conversation context (Discord
       thread members, Slack thread participants, email To+Cc) so
       Honcho can store them as session peers — the data shape that

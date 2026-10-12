@@ -968,6 +968,7 @@ async def _run_executive(
         # An unrostered sender has no peer to record into, so skip the parse;
         # None also leaves web_fetch nothing to open from a stranger's mail.
         memory_text=_email_memory_text(raw_email) if person_id is not None else None,
+        fetch_own_urls=person_id is not None,
     )
 
 

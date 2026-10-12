@@ -106,6 +106,26 @@ def test_telegram_without_files_records_the_typed_words() -> None:
     assert captured["memory_text"] == "Any news?"
 
 
+@pytest.mark.parametrize("rostered", [True, False])
+def test_telegram_opens_pasted_links_only_for_someone_on_the_roster(rostered: bool) -> None:
+    """A group chat reaches the Executive from anyone in it, roster or not."""
+    from openexecutive.integrations import telegram_bot
+
+    person = SimpleNamespace(id=7) if rostered else None
+    captured: dict[str, Any] = {}
+    with (
+        _adapter_stubs(captured),
+        patch("openexecutive.people.store.find_person_by_telegram_chat_id", return_value=person),
+        patch.object(telegram_bot, "send_message", new=AsyncMock(return_value=None)),
+    ):
+        asyncio.run(telegram_bot._process_and_reply(
+            message_text=f"Read {PLANTED}", sender_name="Ben", chat_id=5002, message_id=1,
+            token="t",
+        ))
+    assert captured["memory_text"] == f"Read {PLANTED}"
+    assert captured["fetch_own_urls"] is rostered
+
+
 @pytest.mark.parametrize(("own_words", "expected"), [
     ("Summarise this\n\n(Attached files: notes.pdf)", "Summarise this\n\n(Attached files: notes.pdf)"),
     (None, "Summarise this"),  # a slash command or replay: the text is all theirs
@@ -131,3 +151,4 @@ def test_discord_hands_over_own_words_never_the_hydrated_prompt(
         ))
     assert BACKSTORY in captured["user_message"]
     assert captured["memory_text"] == expected
+    assert captured["fetch_own_urls"] is True  # past the roster gate
