@@ -188,6 +188,8 @@ def test_translator_drops_a_stray_server_fetch_tool() -> None:
         "64:ff9b::a00:1",  # NAT64 around 10.0.0.1
         "::7f00:1",  # IPv4-compatible around 127.0.0.1
         "::a00:1",  # IPv4-compatible around 10.0.0.1
+        "::ffff:0:a9fe:a9fe",  # IPv4-translated (SIIT) around 169.254.169.254
+        "fec0::1",  # deprecated site-local, which Python calls global
         "not-an-ip",
     ],
 )

@@ -957,6 +957,16 @@ async def _run_executive(
     # deeper Honcho prefetch) is a per-request opt-in on /chat only; it
     # was previously forced on here for every inbound email, including
     # off-roster senders the gateway will not let us reply to anyway.
+    # A From line proves nothing, so a rostered sender's links open only when
+    # Gmail authenticated the mail (as the fact tools require of the
+    # principal); a forged teammate gets none opened. Never raises: a failed
+    # read is "not authenticated".
+    from openexecutive.integrations.fact_confirmation import sender_authenticated
+
+    fetch_own_urls = person_id is not None and bool(from_addr) and (
+        session.email_authenticated
+        or await sender_authenticated(gateway, message_id, from_addr)
+    )
     await executive.chat(
         user_message=base_message,
         session=session,
@@ -968,7 +978,7 @@ async def _run_executive(
         # An unrostered sender has no peer to record into, so skip the parse;
         # None also leaves web_fetch nothing to open from a stranger's mail.
         memory_text=_email_memory_text(raw_email) if person_id is not None else None,
-        fetch_own_urls=person_id is not None,
+        fetch_own_urls=fetch_own_urls,
     )
 
 

@@ -246,7 +246,7 @@ def _settings() -> Any:
     return SimpleNamespace(exec_email_address=EXEC, email_poll_interval_seconds=60)
 
 
-def _run(find_person: Any) -> dict[str, Any]:
+def _run(find_person: Any, *, authenticated: bool = True) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
     class _Exec:
@@ -267,6 +267,10 @@ def _run(find_person: Any) -> dict[str, Any]:
         patch("openexecutive.memory.episodic.format_for_prompt", new=lambda: ""),
         patch("openexecutive.people.identity.resolve_email_sender", new=find_person),
         patch.object(poller, "get_settings", return_value=_settings()),
+        patch(
+            "openexecutive.integrations.fact_confirmation.sender_authenticated",
+            new=AsyncMock(return_value=authenticated),
+        ),
     ):
         asyncio.run(
             poller._run_executive(
@@ -314,6 +318,17 @@ def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
     # The Executive still sees the whole email, framing included.
     assert "You have an inbound email" in captured["user_message"]
     assert "can you send me" in captured["user_message"]
+
+
+def test_a_rostered_sender_gmail_did_not_authenticate_gets_no_link_opened() -> None:
+    """A From line proves nothing: anyone can claim to be a teammate."""
+    sam = SimpleNamespace(id=7)
+    captured = _run(
+        lambda addr, **_kw: sam if addr == "sam@example.com" else None, authenticated=False
+    )
+    assert captured["person_id"] == 7
+    assert captured["memory_text"] == _email_memory_text(REPLY)
+    assert captured["fetch_own_urls"] is False
 
 
 def test_run_executive_skips_the_parse_for_an_unrostered_sender() -> None:

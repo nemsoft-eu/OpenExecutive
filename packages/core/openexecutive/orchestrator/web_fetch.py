@@ -119,15 +119,21 @@ WEB_FETCH_TOOL: dict[str, Any] = {
 # tests can stand in for DNS; production uses the event loop's getaddrinfo.
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 
-# NAT64 prefixes (RFC 6052 well-known, RFC 8215 local-use) and the deprecated
+# NAT64 prefixes (RFC 6052 well-known, RFC 8215 local-use), SIIT's
+# IPv4-translated ``::ffff:0:a.b.c.d`` (RFC 6145) and the deprecated
 # IPv4-compatible ``::a.b.c.d`` (as knowledge.confluence_client checks). The
 # last 32 bits are an IPv4 address a gateway or tunnel may deliver to, and
-# Python reports ``64:ff9b::7f00:1`` and ``::7f00:1`` (127.0.0.1) as global.
+# Python reports ``64:ff9b::7f00:1``, ``::ffff:0:7f00:1`` and ``::7f00:1``
+# (127.0.0.1) as global.
 _NAT64_PREFIXES = (
     ipaddress.IPv6Network("64:ff9b::/96"),
     ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("::ffff:0:0:0/96"),  # not ::ffff:0:0/96, the mapped form
     ipaddress.IPv6Network("::/96"),
 )
+# Deprecated site-local space (RFC 3879): Python counts it as global, but a
+# network that still routes it routes it internally.
+_SITE_LOCAL = ipaddress.IPv6Network("fec0::/10")
 
 
 class BlockedAddressError(httpcore.ConnectError):
@@ -168,6 +174,8 @@ def is_public_address(raw: str) -> bool:
         return False
     candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
     if isinstance(ip, ipaddress.IPv6Address):
+        if ip in _SITE_LOCAL:
+            return False
         candidates.extend(_embedded_ipv4(ip))
     return all(c.is_global and not c.is_multicast for c in candidates)
 

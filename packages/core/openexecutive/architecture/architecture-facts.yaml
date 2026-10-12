@@ -1192,7 +1192,10 @@ routing:
     whose `fetch_own_urls` (default False) seeds `memory_text` only when
     the adapter vouches for the sender: Slack and Discord always (past
     their roster gate), Telegram for a chat matched to a person, Google
-    Chat for `_sender_on_roster`, email for a rostered sender. A stranger
+    Chat for `_sender_on_roster`, email for a rostered sender whose mail Gmail
+    authenticated (`fact_confirmation.sender_authenticated`; a From line
+    proves nothing, and Outlook mail is never authenticated, so it opens
+    none). A stranger
     in a Telegram group or a shared Chat space gets no pasted link opened.
     The web chat and the CLI call `stream_chat`, where it defaults True.
     Earlier turns are never seeded
@@ -1209,9 +1212,10 @@ routing:
     userinfo, no C0 control or DEL), the domain lists, the budget, then
     the fetch. The fetch is SSRF-safe by construction: `_PinnedBackend`
     wraps httpcore's AnyIO backend, resolves the host once, refuses unless
-    every address is global (IPv4-mapped, IPv4-compatible, 6to4, Teredo and
-    the NAT64 prefixes unwrapped first — Python reports `64:ff9b::7f00:1`
-    as global) and connects to the checked addresses, each in resolver
+    every address is global (IPv4-mapped, IPv4-translated, IPv4-compatible,
+    6to4, Teredo and the NAT64 prefixes unwrapped first — Python reports
+    `64:ff9b::7f00:1` as global — and deprecated site-local `fec0::/10`
+    refused, which Python also calls global) and connects to the checked addresses, each in resolver
     order until one answers, while TLS verifies the hostname,
     so there is no DNS-rebinding window (the gap
     `monitoring.sources._http.validate_target_url` documents). The
