@@ -3,12 +3,13 @@
 Shared by every client that connects only to public addresses: the chat's
 ``web_fetch`` (``orchestrator.web_fetch``) and the Confluence sync under
 ``CONFLUENCE_SYNC_PUBLIC_HOSTS_ONLY`` (``knowledge.confluence_client``). Each
-used to keep its own copy, and the copies drifted. The Confluence one unwrapped
-the local-use NAT64 prefix by its last 32 bits, which is not where RFC 6052
-puts the IPv4 address for a /48; it checked only the Teredo client address,
-not the server's; and it knew neither the IPv4-translated form nor deprecated
-site-local space, both of which Python calls global. The policy here is the
-union of the two: an address either copy refused is refused.
+used to keep its own copy, and the copies drifted. The Confluence one let
+through the IPv4-translated form and deprecated site-local space, both of
+which Python calls global, and unwrapped the local-use NAT64 prefix by its
+last 32 bits, which is not where RFC 6052 puts the IPv4 address for a /48
+(current Python releases call that whole prefix non-global, which is all that
+kept it refused). The policy here is the union of the two: an address either
+copy refused is refused.
 """
 from __future__ import annotations
 

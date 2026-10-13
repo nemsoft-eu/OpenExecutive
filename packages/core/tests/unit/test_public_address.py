@@ -16,11 +16,14 @@ _NON_PUBLIC = [
     "100.100.1.1",  # CGNAT / Tailscale
     "0.0.0.0",
     "224.0.0.1",  # multicast
+    "ff02::1",  # IPv6 multicast, which Python calls global
+    "ff0e::1",
     "::1",
     "fe80::1%eth0",
     "fd00::1",
     "::ffff:127.0.0.1",  # IPv4-mapped
     "2002:7f00:1::",  # 6to4 around 127.0.0.1
+    "2001:0:4136:e378:8000:63bf:f5ff:fffe",  # Teredo, client 10.0.0.1
     "64:ff9b::7f00:1",  # NAT64 around 127.0.0.1
     "64:ff9b::a00:1",  # NAT64 around 10.0.0.1
     "::7f00:1",  # IPv4-compatible around 127.0.0.1
@@ -36,10 +39,18 @@ _NON_PUBLIC = [
     # public address.
     "64:ff9b:1:7f00:0:100:5db8:d822",
 ]
-_PUBLIC = ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "64:ff9b::5db8:d822"]
+_PUBLIC = [
+    "93.184.216.34",
+    "2606:2800:220:1:248:1893:25c8:1946",
+    "2606:2800:220:1:248:1893:25c8:1946%eth0",  # the zone id is dropped
+    # Each embedded-IPv4 form around a public address is let through.
+    "64:ff9b::5db8:d822",  # NAT64
+    "::ffff:93.184.216.34",  # IPv4-mapped
+    "::ffff:0:5db8:d822",  # IPv4-translated (SIIT)
+]
 
 
-@pytest.mark.parametrize("addr", [*_NON_PUBLIC, "not-an-ip"])
+@pytest.mark.parametrize("addr", [*_NON_PUBLIC, "not-an-ip", "", "%", "1.2.3"])
 def test_non_public_addresses_are_refused(addr: str) -> None:
     assert not is_public_address(addr)
 
@@ -50,8 +61,8 @@ def test_public_addresses_are_allowed(addr: str) -> None:
 
 
 @pytest.mark.parametrize("addr", [*_NON_PUBLIC, *_PUBLIC])
-def test_a_parsed_address_gets_the_same_answer(addr: str) -> None:
+def test_a_parsed_address_is_judged_alike(addr: str) -> None:
     """The Confluence client parses each address itself and asks
-    ``is_public_ip``; it must agree with the string form the fetch uses."""
+    ``is_public_ip``, so check that entry point against the same lists."""
     parsed = ipaddress.ip_address(addr.split("%", 1)[0])
-    assert is_public_ip(parsed) is is_public_address(addr)
+    assert is_public_ip(parsed) is (addr in _PUBLIC)
