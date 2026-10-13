@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import time
@@ -939,6 +940,240 @@ async def test_the_declared_charset_decodes_the_page(
     assert json.loads(outcome.content)["content"] == expected
     assert expected in outcome.content  # not \u-escaped: it counts once against the cap
     outcome.content.encode("utf-8")  # what a provider's JSON request body needs
+
+
+# --- the page's own charset (meta prescan) ----------------------------------
+
+_KOI8_PRIVET = "\u041f\u0440\u0438\u0432\u0435\u0442"  # Cyrillic "privet"
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (b'<meta charset="koi8-r">', "koi8-r"),
+        (b"<meta charset='koi8-r'>", "koi8-r"),
+        (b"<meta charset=koi8-r>", "koi8-r"),
+        (b"<META CHARSET = 'KOI8-R' >", "koi8-r"),
+        (b'<meta charset=" koi8-r ">', "koi8-r"),
+        (b"<meta/charset=koi8-r>", "koi8-r"),
+        (b"<!DOCTYPE html><html><head><title>t</title><meta charset=koi8-r>", "koi8-r"),
+        (b'<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">', "koi8-r"),
+        (b"<meta content='text/html;charset = \"koi8-r\"' http-equiv=CONTENT-TYPE>", "koi8-r"),
+        # content counts only beside http-equiv=Content-Type
+        (b'<meta content="text/html; charset=koi8-r">', None),
+        (b'<meta http-equiv="refresh" content="0; charset=koi8-r">', None),
+        # charset wins over content, and the first of a repeated attribute counts
+        (b'<meta http-equiv=content-type content="charset=cp1251" charset=koi8-r>', "koi8-r"),
+        (b"<meta charset=koi8-r charset=windows-1251>", "koi8-r"),
+        # the first usable tag wins; a refused one does not stop the scan
+        (b"<meta charset=koi8-r><meta charset=windows-1251>", "koi8-r"),
+        (b"<meta charset=utf-7><meta charset=koi8-r>", "koi8-r"),
+        (b"<meta charset=no-such-codec><meta charset=koi8-r>", "koi8-r"),
+        # browsers' label table: these decode with the wider codec
+        (b"<meta charset=iso-8859-1>", "cp1252"),
+        (b"<meta charset=latin1>", "cp1252"),
+        (b"<meta charset=us-ascii>", "cp1252"),
+        (b"<meta charset=windows-1252>", "cp1252"),
+        (b"<meta charset=iso-8859-9>", "cp1254"),
+        (b"<meta charset=gb2312>", "gb18030"),
+        (b"<meta charset=GBK>", "gb18030"),
+        (b"<meta charset=euc-kr>", "cp949"),
+        (b"<meta charset=shift_jis>", "shift_jis"),
+        # a tag readable as ASCII proves the page is not UTF-16
+        (b"<meta charset=utf-16>", "utf-8"),
+        (b"<meta charset=UTF-16LE>", "utf-8"),
+        (b"<meta charset=utf-16be>", "utf-8"),
+        # a commented-out tag does not count; "<!-->" closes its comment
+        (b"<!-- <meta charset=koi8-r> --><meta charset=windows-1251>", "cp1251"),
+        (b"<!--><meta charset=koi8-r>", "koi8-r"),
+        (b"<!-- <meta charset=koi8-r>", None),
+        # a "<meta" inside another tag's attribute value is not a tag
+        (b"<div title='<meta charset=koi8-r>'><meta charset=windows-1251>", "cp1251"),
+        # the prescan knows no script element, in browsers either
+        (b"<script>s = '<meta charset=koi8-r>'</script><meta charset=cp1251>", "koi8-r"),
+        (b"</meta charset=koi8-r>", None),
+        (b"<metadata charset=koi8-r>", None),
+        (b"<p>no declaration</p>", None),
+        (b"", None),
+    ],
+)
+def test_the_prescan_reads_a_meta_charset(page: bytes, expected: str | None) -> None:
+    assert web_fetch._sniffed_charset(page) == expected
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        # not text encodings at all
+        "rot13", "rot_13", "base64", "base_64", "hex", "zlib", "bz2", "uu", "quopri",
+        # text codecs that are no page's charset
+        "utf-7", "UTF-7", "utf_7", "unicode_escape", "unicode-escape",
+        "raw_unicode_escape", "idna", "punycode", "undefined", "iso-2022-kr",
+        # codecs that do not read ASCII as ASCII
+        "cp500", "cp037", "utf-32", "utf-32le", "hz",
+        # not the shape of a label (codecs.lookup would take the long one as
+        # iso-8859-1, and "koi8 r" as koi8-r)
+        "koi8-r,x", "koi8 r", "iso" + "-" * 40 + "8859-1", "koi8-r\x00", "\u0138oi8-r", "",
+        # unknown
+        "no-such-codec",
+    ],
+)
+def test_a_dangerous_or_unknown_meta_charset_is_refused(label: str) -> None:
+    raw = label.encode("utf-8")
+    assert web_fetch._codec_for_label(raw) is None
+    assert web_fetch._sniffed_charset(b'<meta charset="' + raw + b'">') is None
+    assert web_fetch._sniffed_charset(
+        b'<meta http-equiv=content-type content="text/html; charset=' + raw + b'">'
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "label", ["utf-7", "unicode_escape", "raw_unicode_escape", "base64", "rot13"]
+)
+async def test_a_refused_meta_charset_leaves_the_page_utf_8(
+    label: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each of these would turn the ASCII below into other characters."""
+    page = (
+        b'<meta charset="' + label.encode() + b'">'
+        b"<p>+AGE- \\u0041 aGk= caf\xc3\xa9</p>"
+    )
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == "+AGE- \\u0041 aGk= caf\u00e9"
+
+
+def test_the_prescan_reads_only_the_first_1024_bytes() -> None:
+    tag = b"<meta charset=koi8-r>"
+    filler = b"<p>" + b"x" * (1024 - len(tag) - 7) + b"</p>"
+    assert len(filler + tag) == 1024
+    assert web_fetch._sniffed_charset(filler + tag) == "koi8-r"
+    # One byte later the tag's ">" is past the prescan, so the tag is not
+    # read, rather than read cut short.
+    assert web_fetch._sniffed_charset(b" " + filler + tag) is None
+    assert web_fetch._sniffed_charset(filler + b"<meta charset=koi8-r >") is None
+    assert web_fetch._sniffed_charset(b"<p>" + b"x" * 2000 + b"</p>" + tag) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "codec", "text"),
+    [
+        (
+            codecs.BOM_UTF8 + b"<meta charset=koi8-r><p>caf\xc3\xa9</p>",
+            "utf-8-sig",
+            "<meta charset=koi8-r><p>caf\u00e9</p>",
+        ),
+        (codecs.BOM_UTF16_LE + "<p>caf\u00e9</p>".encode("utf-16-le"), "utf-16", "<p>caf\u00e9</p>"),
+        (codecs.BOM_UTF16_BE + "<p>caf\u00e9</p>".encode("utf-16-be"), "utf-16", "<p>caf\u00e9</p>"),
+    ],
+)
+def test_a_byte_order_mark_comes_before_the_meta_tag(
+    body: bytes, codec: str, text: str
+) -> None:
+    """The mark decides the codec and is dropped from the text."""
+    assert web_fetch._sniffed_charset(body) == codec
+    assert web_fetch._decode(body, codec) == text
+
+
+@pytest.mark.parametrize(
+    ("head", "text", "expected"),
+    [
+        (b'<meta charset="iso-8859-1">', b"Caf\xe9", "Caf\u00e9"),
+        # iso-8859-1 is read as windows-1252, so the smart quotes survive
+        (b"<meta charset=iso-8859-1>", b"\x93hi\x94", "\u201chi\u201d"),
+        (b"<meta charset=windows-1252>", b"\x93quoted\x94 \x80", "\u201cquoted\u201d \u20ac"),
+        (b"<meta charset=shift_jis>", "\u65e5\u672c\u8a9e".encode("shift_jis"), "\u65e5\u672c\u8a9e"),
+        (b"<meta charset=gbk>", "\u4e2d\u6587".encode("gbk"), "\u4e2d\u6587"),
+        (b"<meta charset=gb2312>", "\u4e2d\u6587".encode("gb2312"), "\u4e2d\u6587"),
+        (b"<meta charset=euc-kr>", "\ud55c\uad6d\uc5b4".encode("euc-kr"), "\ud55c\uad6d\uc5b4"),
+        (b"<meta charset=koi8-r>", _KOI8_PRIVET.encode("koi8-r"), _KOI8_PRIVET),
+        (
+            b'<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">',
+            _KOI8_PRIVET.encode("koi8-r"),
+            _KOI8_PRIVET,
+        ),
+        # declared utf-16, read as utf-8
+        (b"<meta charset=utf-16>", "caf\u00e9".encode(), "caf\u00e9"),
+        # nothing declared: utf-8, as before
+        (b"<style>p{}</style>", "caf\u00e9".encode(), "caf\u00e9"),
+        (b"<meta charset=no-such-codec>", "caf\u00e9".encode(), "caf\u00e9"),
+    ],
+)
+async def test_a_page_without_a_header_charset_is_decoded_by_its_meta_tag(
+    head: bytes, text: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = b"<html><head>" + head + b"</head><body><p>" + text + b"</p></body></html>"
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == expected
+    outcome.content.encode("utf-8")
+
+
+async def test_an_xhtml_page_is_decoded_by_its_meta_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = b"<meta charset=koi8-r><p>" + _KOI8_PRIVET.encode("koi8-r") + b"</p>"
+    headers = {"content-type": "application/xhtml+xml"}
+    _serve(monkeypatch, {"https://a.example/": (200, headers, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == _KOI8_PRIVET
+
+
+@pytest.mark.parametrize(
+    ("header_charset", "text", "expected"),
+    [
+        ("utf-8", _KOI8_PRIVET.encode(), _KOI8_PRIVET),
+        ("iso-8859-1", b"Caf\xe9", "Caf\u00e9"),
+        # a header naming an unknown charset still decides: utf-8, as before
+        ("no-such-codec", "caf\u00e9".encode(), "caf\u00e9"),
+    ],
+)
+async def test_the_header_charset_wins_over_the_meta_tag(
+    header_charset: str, text: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = b"<meta charset=shift_jis><p>" + text + b"</p>"
+    _serve(monkeypatch, {"https://a.example/": (200, _html(header_charset), page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == expected
+
+
+async def test_plain_text_ignores_a_meta_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"<meta charset=koi8-r>" + _KOI8_PRIVET.encode("koi8-r")
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/plain"}, body)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == body.decode("utf-8", errors="replace")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<meta " * 40_000,
+        b'<meta charset="' + b"a" * 200_000,
+        b"<meta charset=" + b"a" * 200_000 + b">",
+        b"<a " + b"x=" * 100_000,
+        b"<a " + b" " * 200_000 + b">",
+        b'<meta http-equiv=content-type content="' + b'charset="' * 25_000,
+        b'<meta http-equiv=content-type content="' + b"charset " * 25_000 + b'">',
+        b"<!--" * 50_000,
+        b"<" * 200_000,
+        b"<!" * 100_000,
+    ],
+    ids=[
+        "meta-repeats", "unclosed-quote", "long-bare-value", "bare-equals",
+        "whitespace-run", "content-unclosed-quotes", "content-no-equals",
+        "comment-openers", "lone-lt", "bang-run",
+    ],
+)
+def test_the_prescan_stays_fast_on_a_hostile_page(body: bytes) -> None:
+    """Only the first 1,024 bytes are scanned, and each scan is linear."""
+    started = time.perf_counter()
+    web_fetch._decode(body, web_fetch._sniffed_charset(body))
+    assert time.perf_counter() - started < 1.0
 
 
 @pytest.mark.parametrize(

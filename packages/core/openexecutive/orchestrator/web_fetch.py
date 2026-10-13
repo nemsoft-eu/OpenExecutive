@@ -24,6 +24,7 @@ an SSRF surface. Two rules bound it:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import functools
 import json
 import logging
@@ -588,7 +589,12 @@ async def _run_fetch(url: str, settings: Settings) -> ToolOutcome:
         logger.warning("web_fetch: request failed for host %s", host, exc_info=True)
         return ToolOutcome("The site could not be reached.", is_error=True)
 
-    text = _decode(page.body, page.charset)
+    charset = page.charset
+    if not charset and page.media_type in _HTML_TYPES:
+        # Only when the header names none: in browsers the header's charset
+        # wins over the page's own declaration.
+        charset = _sniffed_charset(page.body)
+    text = _decode(page.body, charset)
     if page.media_type in _HTML_TYPES:
         # Off the event loop: a 2 MB page takes 100+ ms to reduce, and the
         # turn's other streams would wait on it.
@@ -678,7 +684,7 @@ async def _read_page(url: str, response: httpx.Response) -> _Page:
 
 
 def _decode(body: bytes, charset: str | None) -> str:
-    """The body as text: the declared charset, else utf-8, never raising.
+    """The body as text: the given charset, else utf-8, never raising.
 
     An unknown or non-text codec name (``rot13``, ``base64``) raises
     LookupError; a few real codecs (``idna``, ``punycode``, ``undefined``)
@@ -698,3 +704,167 @@ def _decode(body: bytes, charset: str | None) -> str:
             # provider call after this tool result would raise.
             return text.encode("utf-8", errors="replace").decode("utf-8")
     return body.decode("utf-8", errors="replace")
+
+
+def _sniffed_charset(body: bytes) -> str | None:
+    """The codec an HTML page declares for itself, as a browser finds it.
+
+    A byte-order mark first, then the WHATWG prescan: the first 1,024 bytes
+    read as ASCII for a ``<meta charset>`` or a ``<meta http-equiv=
+    "Content-Type" content="...; charset=...">``. Only the decoding follows
+    from it; the tag stays in the body like any other markup.
+    """
+    if body.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return "utf-16"  # reads the mark for the byte order, then drops it
+    return _prescan(body[:_PRESCAN_BYTES])
+
+
+# How far a browser's prescan reads (WHATWG "prescan a byte stream").
+_PRESCAN_BYTES = 1024
+# A start or end tag's name. "<!", "<?" and "</" not followed by a letter are
+# skipped to the next ">", and any other "<" is text.
+_TAG_NAME_RE = re.compile(rb"</?([A-Za-z][^\s/>]*)")
+# One attribute, the way the prescan reads it: "/" separates like whitespace,
+# a name runs to "=", whitespace, "/" or ">", and a value is quoted or runs to
+# whitespace or ">". An unclosed quote runs to the end of the bytes, which
+# ends the scan, rather than failing and being rescanned unquoted. Each match
+# consumes at least the name's first byte and no two adjacent parts match the
+# same byte, so a tag scans in linear time.
+_ATTRIBUTE_RE = re.compile(
+    rb"[\s/]*(?P<name>[^\s/>][^\s/>=]*)"
+    rb"(?:\s*=\s*(?:\"(?P<dq>[^\"]*)\"?|'(?P<sq>[^']*)'?|(?P<bare>[^\s>]*)))?"
+)
+_TAG_CLOSE_RE = re.compile(rb"[\s/]*>")
+# The charset in an http-equiv content value ("text/html; charset=koi8-r").
+# An unclosed quote fails here and the search moves on; the value is at most
+# _PRESCAN_BYTES long, which bounds that rescanning.
+_CONTENT_CHARSET_RE = re.compile(
+    rb"charset\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s;\"']+))", re.IGNORECASE
+)
+
+
+def _prescan(head: bytes) -> str | None:
+    """The first usable charset a ``<meta>`` tag in ``head`` declares.
+
+    Comments are skipped, as browsers skip them, so a commented-out tag does
+    not count. A tag the bytes end inside is not read, rather than read cut
+    short (``iso-8859-15`` cut to ``iso-8859-1``). A declaration whose label
+    is refused does not stop the scan: as in a browser, a later one may
+    still name a usable charset.
+    """
+    pos = 0
+    while (pos := head.find(b"<", pos)) != -1:
+        if head.startswith(b"<!--", pos):
+            # "<!-->" closes the comment it opens, as in the prescan.
+            end = head.find(b"-->", pos + 2)
+            if end == -1:
+                return None
+            pos = end + 3
+            continue
+        tag = _TAG_NAME_RE.match(head, pos)
+        if tag is None:
+            if head[pos + 1:pos + 2] in (b"!", b"/", b"?"):
+                end = head.find(b">", pos)
+                if end == -1:
+                    return None
+                pos = end + 1
+            else:
+                pos += 1
+            continue
+        # Every tag's attributes are read, not only a meta's, so a "<meta"
+        # inside another tag's attribute value is not taken for a tag.
+        attributes: dict[bytes, bytes] = {}
+        pos = tag.end()
+        while (attribute := _ATTRIBUTE_RE.match(head, pos)) is not None:
+            pos = attribute.end()
+            value = next(
+                (v for v in attribute.group("dq", "sq", "bare") if v is not None), b""
+            )
+            # A repeated attribute is ignored: the first one counts.
+            attributes.setdefault(attribute["name"].lower(), value)
+        # The attributes stop only at a ">" or at the end of the bytes.
+        if (close := _TAG_CLOSE_RE.match(head, pos)) is None:
+            return None
+        pos = close.end()
+        if (
+            not tag[0].startswith(b"</")
+            and tag[1].lower() == b"meta"
+            and (codec := _meta_codec(attributes)) is not None
+        ):
+            return codec
+    return None
+
+
+def _meta_codec(attributes: dict[bytes, bytes]) -> str | None:
+    """The codec one meta tag declares, by the prescan's rules.
+
+    A ``charset`` attribute wins over ``content``, and ``content`` counts
+    only beside ``http-equiv="Content-Type"``.
+    """
+    if (label := attributes.get(b"charset")) is not None:
+        return _codec_for_label(label)
+    if attributes.get(b"http-equiv", b"").lower() != b"content-type":
+        return None
+    found = _CONTENT_CHARSET_RE.search(attributes.get(b"content", b""))
+    if found is None:
+        return None
+    return _codec_for_label(next(g for g in found.groups() if g is not None))
+
+
+# The page's own text names the label, so it is held to the shape of a real
+# encoding name before any codec lookup sees it.
+_LABEL_RE = re.compile(rb"[A-Za-z0-9._:-]{1,40}")
+# Text codecs that are not a page's character set: escape codecs that turn
+# ASCII the page holds into other characters (UTF-7 is the old XSS trap), IDN
+# codecs, a codec that only raises, and ISO-2022-KR, which browsers do not
+# decode at all (WHATWG maps it to the "replacement" encoding).
+_REFUSED_CODECS = frozenset({
+    "utf-7", "unicode-escape", "raw-unicode-escape", "idna", "punycode",
+    "undefined", "iso2022_kr",
+})
+# A meta tag readable as ASCII proves the page is not UTF-16, so browsers
+# read a page that declares it as utf-8.
+_WIDE_CODECS = frozenset({"utf-16", "utf-16-le", "utf-16-be"})
+# Where a browser decodes a label with a wider codec than the one Python's
+# lookup names (WHATWG's label table): iso-8859-1 and ascii as windows-1252,
+# iso-8859-9 as windows-1254, both differing only in bytes 0x80-0x9F, where a
+# page means smart quotes and the euro sign rather than C1 controls; gb2312
+# and gbk as gb18030, euc-kr as windows-949, extensions of the named codec.
+_BROWSER_CODECS = {
+    "iso8859-1": "cp1252",
+    "ascii": "cp1252",
+    "iso8859-9": "cp1254",
+    "gb2312": "gb18030",
+    "gbk": "gb18030",
+    "euc_kr": "cp949",
+}
+# Printable ASCII and its whitespace, which a page's charset must read
+# unchanged: the meta tag naming it was just read as ASCII.
+_ASCII_PROBE = bytes(range(0x20, 0x7F)) + b"\t\n\r"
+
+
+def _codec_for_label(label: bytes) -> str | None:
+    """The Python codec to decode with for a charset label, or None."""
+    label = label.strip()
+    if not _LABEL_RE.fullmatch(label):
+        return None
+    try:
+        info = codecs.lookup(label.decode("ascii"))
+    except (LookupError, ValueError):  # ValueError: a NUL, refused above too
+        return None
+    if info.name in _WIDE_CODECS:
+        return "utf-8"
+    # A bytes-to-bytes or str-to-str codec (base64, zlib, rot13) is no charset.
+    if not info._is_text_encoding or info.name in _REFUSED_CODECS:
+        return None
+    codec = _BROWSER_CODECS.get(info.name, info.name)
+    # EBCDIC (cp500), utf-32 and HZ, among others, do not read ASCII as
+    # ASCII, so a tag read as ASCII cannot have named the page's charset.
+    try:
+        if _ASCII_PROBE.decode(codec) != _ASCII_PROBE.decode("ascii"):
+            return None
+    except (LookupError, ValueError):  # the same failures _decode guards
+        return None
+    return codec
