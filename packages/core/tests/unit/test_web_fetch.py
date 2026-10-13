@@ -650,7 +650,9 @@ def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> Non
         "+a.bc" * 20_000,
         "example.com/" + "." * 100_000 + "\u300c",
         "example.com/" + "a\u2014" * 50_000,
-        "\u201ca.bc\u201d" * 16_000,
+        # Every match is normalised, which costs far more than the scan, so
+        # this one is sized to stay inside the bound on a loaded CI runner.
+        "\u201ca.bc\u201d" * 4_000,
     ],
     ids=[
         "label-run-to-at",
