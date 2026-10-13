@@ -108,11 +108,14 @@ _WIDE_DELIMITERS = (
 # also matches "ſ" and the Kelvin sign. At least one dot and an alphabetic
 # final label of two or more letters, so "1.2.3", "v2.0", "e.g." and an IPv4
 # address never match. The optional port, path, query or fragment runs to
-# _URL_RE's delimiters or one of _WIDE_DELIMITERS, so `“example.com/page”`
-# and "see—example.com/page—please" seed https://example.com/page. The ASCII
-# marks that bound a link but a URL may hold ("(", ")", "{", "}", "'", "*",
-# ",", ";", "!", "?") stay in the path, as in a link with a scheme, and
-# _trim_url drops the sentence punctuation or unbalanced ")" it ends on.
+# _URL_RE's delimiters, a brace or one of _WIDE_DELIMITERS, so
+# `“example.com/page”`, "see—example.com/page—please" and
+# "{example.com/page}" seed https://example.com/page. A brace is not a URL
+# character (a link with a scheme percent-encodes it), which is why it stops
+# the path here and nowhere else. The ASCII marks that bound a link but a URL
+# may hold ("(", ")", "'", "*", ",", ";", "!", "?") stay in the path, as in a
+# link with a scheme, and _trim_url drops the sentence punctuation or
+# unbalanced ")" it ends on.
 #
 # Both ends must be a boundary the text has, listed rather than taken as
 # "any character a host cannot hold": that let a zero-width space, a soft
@@ -139,13 +142,14 @@ _WIDE_DELIMITERS = (
 # that ends a link ("jane.doe!x@…") may still seed its dotted prefix, which
 # is harmless for the reason add_from_text gives.
 _BARE_URL_START = r"(?:^|(?<=[\s(\[<{\"'`>,;!?*|" + _WIDE_DELIMITERS + r"]))"
-_BARE_URL_END = r"(?=[.:]*(?:$|[\s)\]}>\"'`,;!?*|<\[" + _WIDE_DELIMITERS + r"]))"
+_BARE_URL_END = r"(?=[.:]*(?:$|[\s)\]{}>\"'`,;!?*|<\[" + _WIDE_DELIMITERS + r"]))"
 _BARE_URL_RE = re.compile(
     _BARE_URL_START
     + r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
     + r"(?::[0-9]{1,5})?"
     + r"(?:[/?#][^"
     + _URL_STOPS
+    + "{}"
     + _WIDE_DELIMITERS
     + r"]*)?"
     + _BARE_URL_END

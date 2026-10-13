@@ -1236,10 +1236,13 @@ routing:
     `see—example.com/page—please` seed `https://example.com/page`). One
     set serves all three because a mark that stopped the path without
     ending a link would seed nothing and make the end check backtrack
-    quadratically. The ASCII marks a URL may hold (`(`, `)`, `{`, `}`,
-    `'`, `*`, `,`, `;`, `!`, `?`) stay in the path, as with a scheme, and
-    `_trim_url` drops the sentence punctuation or unbalanced `)` it ends
-    on. A link with a scheme keeps its own delimiters, so
+    quadratically. A brace is no URL character either (a link with a
+    scheme percent-encodes it), so it stops the path of a scheme-less link
+    (`{example.com/page}` seeds `https://example.com/page`). The ASCII
+    marks a URL may hold (`(`, `)`, `'`, `*`, `,`, `;`, `!`, `?`) stay in
+    the path, as with a scheme, and `_trim_url` drops the sentence
+    punctuation or unbalanced `)` it ends on. A link with a scheme keeps
+    its own delimiters, so
     `“https://example.com/page”` still takes the closing quote into its
     path. An internationalised host needs its scheme. A word that only looks like a
     host (`report.pdf`) is seeded too and is harmless: it is still in the

@@ -543,6 +543,14 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         ("example.com/page", {"https://example.com/page"}),
         # Seeded, and pointless: the speaker's own text, under every check.
         ("open report.pdf", {"https://report.pdf/"}),
+        # A brace is no URL character, so it ends a scheme-less link ({ only
+        # opens one, } only closes one) and never reaches the path as %7D.
+        ("{example.com/page}", {"https://example.com/page"}),
+        ("{{example.com/a}}", {"https://example.com/a"}),
+        ("example.com?x=1}", {"https://example.com/?x=1"}),
+        ("example.com/p{q", {"https://example.com/p"}),
+        # A link with a scheme keeps its braces, percent-encoded, as on main.
+        ("https://e.com/x{y}", {"https://e.com/x%7By%7D"}),
     ],
 )
 def test_what_a_scheme_less_pass_seeds(text: str, expected: set[str]) -> None:
