@@ -342,6 +342,101 @@ def test_research_beside_a_server_search_offers_no_fetch(
     assert captured["max_client_tool_rounds"] == 1
 
 
+@pytest.mark.parametrize(
+    ("search_on", "searxng"),
+    [(True, False), (False, True)],
+    ids=["local-model-without-searxng", "web-search-off"],
+)
+def test_research_with_no_search_is_a_single_call_with_no_fetch(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch, search_on: bool, searxng: bool
+) -> None:
+    """No search for the research model (a local slug without SEARXNG_URL, or
+    ENABLE_WEB_SEARCH=false) leaves the call as it was: the emit tool alone,
+    no handlers, one generation, whatever the research fetch cap says."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db, RESEARCH_WEB_FETCH_MAX_USES="2")
+    use_local_model(monkeypatch, searxng=searxng)
+    monkeypatch.setenv("ENABLE_WEB_SEARCH", "true" if search_on else "false")
+    captured, agent = _capture_call()
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    assert [t["name"] for t in captured["tools"]] == ["emit_research_findings"]
+    assert captured["client_tool_handlers"] == {}
+    assert captured["max_client_tool_rounds"] == 1
+
+
+def test_research_fetches_when_the_chat_fetch_knob_is_zero(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WEB_FETCH_MAX_USES is chat's: setting it to 0 leaves the research
+    fan-out's own cap (default 1) in force."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db)
+    monkeypatch.setenv("WEB_FETCH_MAX_USES", "0")
+    captured, agent = _capture_call()
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    assert [t["name"] for t in captured["tools"]] == ["emit_research_findings", "web_search", "web_fetch"]
+    assert set(captured["client_tool_handlers"]) == {"web_search", "web_fetch"}
+
+
+def test_research_seen_set_and_fetch_budget_are_per_specialist_call(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two specialists running at once, as the fan-out's gather runs them,
+    on the same agent object. The second may not open the first's result
+    before its own search returns it, and the first's spent read (the cap
+    is 1) leaves the second's budget whole."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db)  # the default: one read
+    first_has_fetched = asyncio.Event()
+    outcomes: dict[str, list[ToolOutcome]] = {}
+    handler_maps: dict[str, dict] = {}
+
+    async def fake_analyze_with_tools(user_content: str, **kwargs: Any) -> object:
+        handlers = kwargs["client_tool_handlers"]
+        handler_maps[user_content] = handlers
+        if user_content == "FIRST":
+            await handlers["web_search"]({"query": "acme"})
+            outcomes["FIRST"] = [await handlers["web_fetch"]({"url": _RESULT_URL})]
+            first_has_fetched.set()
+        else:
+            await first_has_fetched.wait()
+            before = await handlers["web_fetch"]({"url": _RESULT_URL})
+            await handlers["web_search"]({"query": "acme"})
+            outcomes["SECOND"] = [before, await handlers["web_fetch"]({"url": _RESULT_URL})]
+        return SimpleNamespace(content=[])
+
+    agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
+    run_fetch = _page_fetch()
+
+    async def fan_out() -> None:
+        await asyncio.gather(
+            sr.research_one_specialist("cso", agent, "FIRST"),
+            sr.research_one_specialist("cfo", agent, "SECOND"),
+        )
+
+    with (
+        patch(
+            "openexecutive.orchestrator.searxng_search._fetch_capped",
+            new=AsyncMock(return_value=_searxng_payload()),
+        ),
+        patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch),
+    ):
+        asyncio.run(fan_out())
+
+    (first,) = outcomes["FIRST"]
+    before, after = outcomes["SECOND"]
+    assert not first.is_error
+    assert before.is_error and "has not appeared" in before.content
+    assert not after.is_error
+    assert run_fetch.await_count == 2
+    assert handler_maps["FIRST"]["web_fetch"] is not handler_maps["SECOND"]["web_fetch"]
+
+
 class _ResearchAgent(BaseAgent):
     name = "research_test_agent"
     domain = "test"

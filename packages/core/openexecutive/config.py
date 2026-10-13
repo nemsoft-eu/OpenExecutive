@@ -995,8 +995,9 @@ class Settings(BaseSettings):
 
     # Page reads per chat turn through web_fetch, the client-side tool every
     # model gets beside its search (orchestrator/web_fetch.py). 0 turns
-    # fetching off; it is also off whenever ENABLE_WEB_SEARCH is. Shares the
-    # domain lists above.
+    # chat's fetching off (the research fan-out has its own cap,
+    # RESEARCH_WEB_FETCH_MAX_USES); every fetch is also off whenever
+    # ENABLE_WEB_SEARCH is. Shares the domain lists above.
     web_fetch_max_uses: int = Field(3, alias="WEB_FETCH_MAX_USES")
     # Whole-exchange deadline for one client-side fetch, redirects included.
     web_fetch_timeout_s: float = Field(15.0, alias="WEB_FETCH_TIMEOUT_S")

@@ -54,14 +54,19 @@ def test_research_search_cap_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> No
         get_settings()
 
 
-@pytest.mark.parametrize(("value", "ok"), [("-1", False), ("0", True), ("2", True)])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("-1", None), ("abc", None), ("0", 0), ("2", 2), ("", 1)],
+)
 def test_research_fetch_cap_rejects_negative_and_allows_zero(
-    monkeypatch: pytest.MonkeyPatch, value: str, ok: bool
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: int | None
 ) -> None:
-    """0 turns the research fetch off; below that is a typo, not a setting."""
+    """0 turns the research fetch off; below that, or not a number, is a
+    typo, not a setting. An empty value is the default, as for every
+    setting (env_ignore_empty)."""
     monkeypatch.setenv("RESEARCH_WEB_FETCH_MAX_USES", value)
-    if ok:
-        assert get_settings().research_web_fetch_max_uses == int(value)
+    if expected is not None:
+        assert get_settings().research_web_fetch_max_uses == expected
     else:
         with pytest.raises(ValueError, match="RESEARCH_WEB_FETCH_MAX_USES"):
             get_settings()

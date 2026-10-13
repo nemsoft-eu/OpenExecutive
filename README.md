@@ -458,8 +458,8 @@ See [.env.example](.env.example) for the full list.
 > `WEB_SEARCH_BLOCKED_DOMAINS` scope where it may look (set at most one).
 > The same switch and lists govern `web_fetch`, which opens a page in full.
 > It is a client-side fetch on every model that has search: it opens only a URL
-> the person wrote in their message or one a search returned that turn (not on
-> OpenRouter, whose search results never reach the backend; paste a link again
+> the person wrote in their message or one a search returned that turn (on
+> OpenRouter, a result it reports as a citation; paste a link again
 > to use it in a later message), reaches only public addresses, and
 > returns the page's text. `WEB_FETCH_MAX_USES` (default 3 per turn, `0` for
 > off) and `WEB_FETCH_TIMEOUT_S` tune it. The research run's specialists may
