@@ -1216,9 +1216,12 @@ routing:
     `fec0::/10` and the local-use NAT64 prefix `64:ff9b:1::/48` refused
     whole, since the first is global to Python and the second embeds its
     IPv4 at a length-dependent offset) and connects to the checked
-    addresses, each in resolver order until one answers, with an equal
-    share of the connect timeout each (so a silently dropping first
-    address leaves time for the next), while TLS verifies the hostname,
+    addresses, each in resolver order until one answers, each attempt
+    with an equal share of the deadline still left, at least 3 s
+    (`_MIN_CONNECT_ATTEMPT_S`, one lost SYN's retries) or all that is
+    left (so a silently dropping first address leaves time for the next,
+    and many records do not cut every attempt short), while TLS verifies
+    the hostname,
     so there is no DNS-rebinding window (the gap
     `monitoring.sources._http.validate_target_url` documents). The
     transport subclasses `httpx.AsyncHTTPTransport` and swaps its private

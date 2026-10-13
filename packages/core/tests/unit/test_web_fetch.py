@@ -258,13 +258,12 @@ async def test_pinned_transport_falls_back_to_the_next_checked_address(
     assert len(heads) == 1
 
 
-async def test_pinned_transport_leaves_time_for_the_next_address(
-    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A first address that drops packets silently runs out its own share of
-    the connect timeout, not the whole deadline, so the next one still
-    loads inside it."""
-    port, heads = local_server
+def _scripted_transport(
+    monkeypatch: pytest.MonkeyPatch, addresses: list[str]
+) -> tuple[PinnedTransport, list[tuple[str, float | None]]]:
+    """A pinned transport over ``addresses`` that records each attempt's
+    timeout. 192.0.2.x addresses drop packets (wait out their timeout),
+    127.0.0.2 refuses at once, and anything else really connects."""
     monkeypatch.setattr(web_fetch, "is_public_address", lambda _a: True)
     transport = PinnedTransport()
     backend = transport._pool._network_backend
@@ -275,22 +274,74 @@ async def test_pinned_transport_leaves_time_for_the_next_address(
         host: str, port: int, timeout: float | None = None, **kwargs: Any
     ) -> Any:
         attempts.append((host, timeout))
-        if host == "192.0.2.1":  # blackholed: waits out its timeout
+        if host.startswith("192.0.2."):
             await asyncio.sleep(timeout or 0)
             raise web_fetch.httpcore.ConnectTimeout("no answer")
+        if host == "127.0.0.2":
+            raise web_fetch.httpcore.ConnectError("refused")
         return await real_connect(host, port, timeout=timeout, **kwargs)
 
     async def resolver(host: str, _port: int) -> list[str]:
-        return ["192.0.2.1", "127.0.0.1"]
+        return addresses
 
     monkeypatch.setattr(backend, "_resolver", resolver)
     monkeypatch.setattr(backend._inner, "connect_tcp", connect_tcp)
+    return transport, attempts
+
+
+async def test_pinned_transport_leaves_time_for_the_next_address(
+    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first address that drops packets silently runs out its own share of
+    the connect timeout, not the whole deadline, so the next one still
+    loads inside it."""
+    port, heads = local_server
+    monkeypatch.setattr(web_fetch, "_MIN_CONNECT_ATTEMPT_S", 0.0)
+    transport, attempts = _scripted_transport(monkeypatch, ["192.0.2.1", "127.0.0.1"])
     async with httpx.AsyncClient(transport=transport, timeout=0.4) as client:
         async with asyncio.timeout(0.4):
             response = await client.get(f"http://pinned.invalid:{port}/page")
     assert response.text == "hello"
-    assert attempts == [("192.0.2.1", 0.2), ("127.0.0.1", 0.2)]
+    assert [host for host, _ in attempts] == ["192.0.2.1", "127.0.0.1"]
+    assert attempts[0][1] == pytest.approx(0.2, abs=0.02)
     assert len(heads) == 1
+
+
+async def test_pinned_transport_passes_on_time_an_instant_refusal_left(
+    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address that refuses at once uses none of its share, so the next
+    gets half of all that is left rather than its own third."""
+    port, _heads = local_server
+    monkeypatch.setattr(web_fetch, "_MIN_CONNECT_ATTEMPT_S", 0.0)
+    transport, attempts = _scripted_transport(
+        monkeypatch, ["127.0.0.2", "192.0.2.1", "127.0.0.1"]
+    )
+    async with httpx.AsyncClient(transport=transport, timeout=0.6) as client:
+        response = await client.get(f"http://pinned.invalid:{port}/page")
+    assert response.text == "hello"
+    assert attempts[0][1] == pytest.approx(0.2, abs=0.02)
+    assert attempts[1][1] == pytest.approx(0.3, abs=0.02)
+
+
+async def test_pinned_transport_gives_each_attempt_at_least_the_floor(
+    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many records do not cut an attempt below one SYN retry: with 16
+    addresses and 15 s the first still gets 3 s, not 0.94 s, and when less
+    than the floor is left, an attempt gets all of it."""
+    port, _heads = local_server
+    addresses = [f"127.0.0.{n}" for n in range(2, 17)] + ["127.0.0.1"]
+    transport, attempts = _scripted_transport(monkeypatch, addresses)
+    async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
+        response = await client.get(f"http://pinned.invalid:{port}/page")
+    assert response.text == "hello"
+    assert attempts[0][1] == pytest.approx(3.0, abs=0.02)
+
+    transport, attempts = _scripted_transport(monkeypatch, ["127.0.0.2", "127.0.0.1"])
+    async with httpx.AsyncClient(transport=transport, timeout=1.0) as client:
+        await client.get(f"http://pinned.invalid:{port}/page")
+    assert attempts[0][1] == pytest.approx(1.0, abs=0.02)
 
 
 def test_pinned_transport_still_owns_the_httpx_pool() -> None:

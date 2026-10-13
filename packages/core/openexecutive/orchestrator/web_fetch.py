@@ -61,6 +61,9 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_PAGE_CHARS = 12_000
 
 _MAX_REDIRECTS = 3
+# The least time one address gets to connect before the next is tried:
+# Linux resends a lost SYN after 1 s and again 2 s later.
+_MIN_CONNECT_ATTEMPT_S = 3.0
 
 _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 _READABLE_TYPES = _HTML_TYPES | {"text/plain"}
@@ -229,13 +232,24 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
             raise BlockedAddressError(f"{host} resolves to a non-public address")
         # Each checked address in resolver order, as a browser falls back: a
         # site whose first address is down (or IPv6 this host cannot route)
-        # still loads. The connect timeout is the fetch's whole deadline, so
-        # each attempt gets an equal share of it: a first address that drops
-        # packets silently would otherwise use it all before the next is tried.
+        # still loads. _fetch_page sets the connect timeout to the fetch's
+        # whole deadline, so one attempt may not take all of it: a first
+        # address that drops packets silently would leave nothing for the
+        # next. Each attempt gets an equal share of what is left, so time an
+        # instant refusal did not use passes on, but never less than
+        # _MIN_CONNECT_ATTEMPT_S (or what is left, if less): a host with many
+        # records must not cut every attempt below one lost SYN's retry.
         unique = list(dict.fromkeys(addresses))
-        attempt_timeout = None if timeout is None else timeout / len(unique)
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         failure: Exception | None = None
-        for address in unique:
+        for index, address in enumerate(unique):
+            attempt_timeout = None
+            if deadline is not None:
+                left = max(deadline - loop.time(), 0.0)
+                attempt_timeout = max(
+                    left / (len(unique) - index), min(left, _MIN_CONNECT_ATTEMPT_S)
+                )
             try:
                 return await self._inner.connect_tcp(
                     address, port, timeout=attempt_timeout,
