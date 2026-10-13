@@ -148,7 +148,7 @@ system:
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
     - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. `web_fetch` is the client-side tool on every model that has a search tool (beside the server web_search on Anthropic direct and OpenRouter, beside SearXNG on a local slug); Anthropic's web_fetch server tool is never sent. Callers do NOT need to know which model they're routing to.
-    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail; the offered tool list never changes mid-turn, and the server web_search stays. Anthropic's server web_fetch is not used because it opens any URL a client tool result echoes, even text the model wrote, so an injected instruction could have the turn's data leave in a query string.
+    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results (in the person's own words, a link written without a scheme counts as its https:// form) — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail; the offered tool list never changes mid-turn, and the server web_search stays. Anthropic's server web_fetch is not used because it opens any URL a client tool result echoes, even text the model wrote, so an injected instruction could have the turn's data leave in a query string.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -1168,7 +1168,8 @@ routing:
         echoing text Claude produced, so an injected instruction could
         have a specialist's answer quote a URL carrying the turn's data and
         the fetch would send it out. The client tool opens only URLs the
-        person wrote or a search returned.
+        person wrote (one without a scheme as https://) or a search
+        returned.
 
     The client fetch keeps a seen-URL rule in our code.
     `_stream_agent_loop(seen_url_text=)` seeds a per-turn `SeenUrls` from
@@ -1203,6 +1204,24 @@ routing:
     fragment dropped, empty path as `/`, path and query in httpx's wire
     form); the URL regex stops at Slack's `<url|label>` delimiters, and a
     host whose IDNA 2003 and 2008 forms differ (`straße.de`) is never seen.
+    A link the speaker wrote without a scheme (`example.com/page`) is seen
+    as its `https://` form only, never `http://`: `SeenUrls.add_from_text`
+    blanks the links with a scheme first (so `other.example` in
+    `https://example.com/?next=other.example` is not a link of its own),
+    then matches `_BARE_URL_RE`: ASCII labels, at least one dot, an
+    alphabetic final label of two or more letters (no `1.2.3`, `v2.0`,
+    `e.g.` or IPv4 address), not after an `@` nor in a local part of
+    letters, digits and `._+-` (a common email address seeds neither its
+    domain nor its local part; a rarer local part such as `jane.doe=x@…`
+    may seed its dotted prefix), an optional port and path. An
+    internationalised host needs its scheme. A word that only looks like a
+    host (`report.pdf`) is seeded too and is harmless: it is still in the
+    text the caller vouched for (`memory_text`, which also carries the
+    attached files' names, so a dotted filename seeds a host with no
+    path), and seeding only widens the set — the domain
+    lists, the public-address pin and the per-hop redirect check judge it
+    like any other URL (`127.0.0.1.nip.io/x` is seeded and refused at the
+    connect).
 
     The handler (`make_fetch_handler`) never raises. In order: the
     mail-touched refusal (`outside_reach_refusal`), the input shape, the

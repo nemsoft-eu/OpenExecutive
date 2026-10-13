@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -409,6 +410,67 @@ def test_urls_in_the_forms_people_paste_are_seen(text: str, url: str) -> None:
     assert seen.allows(url)
 
 
+@pytest.mark.parametrize(
+    ("text", "url"),
+    [
+        ("what does example.com/page say?", "https://example.com/page"),
+        ("see www.example.com today", "https://www.example.com/"),
+        ("what does ciao-construct.be? say", "https://ciao-construct.be/"),
+        ("(see example.com/x), then", "https://example.com/x"),
+        ("admin at example.com:8443/a", "https://example.com:8443/a"),
+        # The host is case-blind, the path is not.
+        ("Example.COM/Caps", "https://example.com/Caps"),
+        ("read example.com.", "https://example.com/"),
+        ("example.com's homepage", "https://example.com/"),
+        ("example.com?ref=x", "https://example.com/?ref=x"),
+        ("medium.com/@user", "https://medium.com/@user"),
+        ("example.com/?a=1&amp;b=2", "https://example.com/?a=1&b=2"),
+        # Slack's <url|label>: the link keeps its own scheme.
+        ("<http://a.example|a.example>", "http://a.example/"),
+    ],
+)
+def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -> None:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    assert seen.allows(url)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("version 1.2.3", set()),
+        ("e.g. this, i.e. that", set()),
+        ("upgrade to v2.0", set()),
+        ("an IPv4 address: 10.0.0.1/x", set()),
+        ("localhost/admin", set()),
+        ("see docs/example.com", set()),
+        # A common email address seeds neither its domain nor its local part.
+        ("mail name@example.com", set()),
+        ("mail jane.doe.smith@example.com", set()),
+        ("mail first.last+tag@example.com", set()),
+        # IDNA 2003 and 2008 disagree on "ß" (see test_normalise_url), and a
+        # scheme-less host is ASCII only, so no part of it is seen.
+        ("straße.de/x", set()),
+        ("bücher.example/x", set()),
+        # The host-like text inside a link with a scheme is not a link.
+        ("https://example.com/foo.bar/x", {"https://example.com/foo.bar/x"}),
+        ("https://example.com/?u=a.b", {"https://example.com/?u=a.b"}),
+        (
+            "https://example.com/?next=other.example/x",
+            {"https://example.com/?next=other.example/x"},
+        ),
+        # Only the https form of a scheme-less link.
+        ("example.com/page", {"https://example.com/page"}),
+        # Seeded, and pointless: the speaker's own text, under every check.
+        ("open report.pdf", {"https://report.pdf/"}),
+    ],
+)
+def test_what_a_scheme_less_pass_seeds(text: str, expected: set[str]) -> None:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    assert seen._urls == expected
+
+
 def test_a_huge_character_reference_in_a_pasted_url_does_not_raise() -> None:
     """html.unescape raises past 4,300 digits; seeding runs before the
     turn's first model call, so a raise there would end the turn."""
@@ -436,6 +498,25 @@ def test_a_url_outside_the_speakers_own_words_stays_unseen() -> None:
     seen.add_from_text(_speaker_text(typed, prompt))
     assert seen.allows("https://ciao-construct.be/")
     assert not seen.allows("https://attacker.example/x")
+
+
+def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> None:
+    from openexecutive.orchestrator.executive import _speaker_text
+
+    typed = "What does ciao-construct.be say about the date?"
+    prompt = f"{typed}\n\n<attachment>see attacker.example/x</attachment>"
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(_speaker_text(typed, prompt))
+    assert seen._urls == {"https://ciao-construct.be/"}
+
+
+def test_the_email_check_stays_linear_on_a_long_run_of_labels() -> None:
+    """Unbounded, the look-ahead for an "@" rescans the rest of the run from
+    every place a host could end: about 15 s for this text."""
+    seen = web_fetch.SeenUrls()
+    started = time.perf_counter()
+    seen.add_from_text("aa." * 40_000 + "@")
+    assert time.perf_counter() - started < 1.0
 
 
 # --- the handler ------------------------------------------------------------
@@ -638,6 +719,43 @@ async def test_an_unseen_url_is_refused_before_any_request(
     assert requested == [] and budget.used == 0
 
 
+def _fetcher_from_text(text: str) -> tuple[Any, SearchBudget]:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    budget = SearchBudget(max_uses=3)
+    return web_fetch.make_fetch_handler(budget, seen), budget
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Only the model wrote these: the speaker wrote example.com/page.
+        "https://other.example/",
+        "https://example.com/page?q=the+turn's+data",
+        "http://example.com/page",
+        # Never seeded: no dot, or a numeric final label.
+        "https://localhost/admin",
+        "https://10.0.0.1/x",
+    ],
+)
+async def test_a_scheme_less_link_does_not_let_the_model_widen_the_set(
+    url: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = _serve(monkeypatch, {})
+    handle, budget = _fetcher_from_text("summarise example.com/page, localhost/admin, 10.0.0.1/x")
+    outcome = await handle({"url": url})
+    assert outcome.is_error and "has not appeared in this conversation" in outcome.content
+    assert requested == [] and budget.used == 0
+
+
+async def test_a_scheme_less_link_opens_as_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    url = "https://example.com/page"
+    requested = _serve(monkeypatch, {url: (200, _html(), b"<p>ok</p>")})
+    handle, _ = _fetcher_from_text("summarise example.com/page")
+    outcome = await handle({"url": url})
+    assert not outcome.is_error and requested == [url]
+
+
 async def test_a_seen_url_that_is_not_plain_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -672,6 +790,17 @@ async def test_the_domain_lists_apply(
     else:
         assert outcome.is_error and refusal in outcome.content
         assert requested == [] and budget.used == 0
+
+
+async def test_the_domain_lists_apply_to_a_scheme_less_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "example.com")
+    requested = _serve(monkeypatch, {})
+    handle, budget = _fetcher_from_text("summarise example.com/page")
+    outcome = await handle({"url": "https://example.com/page"})
+    assert outcome.is_error and "list of blocked domains" in outcome.content
+    assert requested == [] and budget.used == 0
 
 
 async def test_the_handler_refuses_on_a_turn_that_read_mail(
@@ -827,6 +956,17 @@ async def test_a_redirect_is_checked_like_the_first_url(
     assert requested == ["https://a.example/"]
 
 
+async def test_a_redirect_from_a_scheme_less_link_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "blocked.example")
+    requested = _serve(monkeypatch, {"https://a.example/": _redirect("https://blocked.example/x")})
+    handle, _ = _fetcher_from_text("what is on a.example")
+    outcome = await handle({"url": "https://a.example/"})
+    assert outcome.is_error and "redirected to an address" in outcome.content
+    assert requested == ["https://a.example/"]
+
+
 # --- the pinned connect, through the handler ----------------------------------
 
 
@@ -865,6 +1005,18 @@ async def test_a_non_public_resolution_is_refused(
     outcome = await handle({"url": url})
     assert outcome.is_error and "private or internal address" in outcome.content
     assert heads == []
+
+
+async def test_a_scheme_less_link_to_a_private_address_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """127.0.0.1.nip.io has an alphabetic final label, so it is seeded; the
+    pinned connect still refuses the loopback address it resolves to."""
+    lookups = _pin(monkeypatch, {"127.0.0.1.nip.io": ["127.0.0.1"]})
+    handle, budget = _fetcher_from_text("open 127.0.0.1.nip.io/x")
+    outcome = await handle({"url": "https://127.0.0.1.nip.io/x"})
+    assert outcome.is_error and "private or internal address" in outcome.content
+    assert lookups == ["127.0.0.1.nip.io"] and budget.used == 1
 
 
 async def test_a_redirect_to_a_private_address_is_refused(
