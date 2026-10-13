@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from openexecutive.agents.tool_outcome import ToolOutcome
+from openexecutive.orchestrator import searxng_search
 from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
@@ -562,7 +563,7 @@ def test_a_sharp_s_entry_names_only_its_own_domain(
     assert urls == kept
 
 
-def test_bare_hosts_drops_unencodable(caplog: pytest.LogCaptureFixture) -> None:
+def test_bare_hosts_drops_unencodable(monkeypatch: pytest.MonkeyPatch) -> None:
     """An entry neither IDNA 2008 nor UTS #46 encodes names no host httpx
     can reach. IDNA 2003 deleted a joiner, so such an entry used to name
     some other domain."""
@@ -573,10 +574,17 @@ def test_bare_hosts_drops_unencodable(caplog: pytest.LogCaptureFixture) -> None:
         "bücher.example",
         "example.com",
     ]
-    with caplog.at_level("WARNING", logger="openexecutive.orchestrator.searxng_search"):
-        hosts = _bare_hosts(entries)
+    # Recorded on the module's own logger rather than read back through
+    # caplog: another test in the same worker can reconfigure logging, and
+    # a record that never reaches the root logger is then never captured.
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        searxng_search.logger,
+        "warning",
+        lambda msg, *args, **kwargs: warnings.append(msg % args),
+    )
+    hosts = _bare_hosts(entries)
     assert hosts == ["blocked.com", "xn--bcher-kva.example", "example.com"]
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 2
     assert all("does not encode as a domain name" in w for w in warnings)
 
