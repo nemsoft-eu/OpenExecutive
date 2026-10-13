@@ -712,7 +712,9 @@ def _sniffed_charset(body: bytes) -> str | None:
     A byte-order mark first, then the WHATWG prescan: the first 1,024 bytes
     read as ASCII for a ``<meta charset>`` or a ``<meta http-equiv=
     "Content-Type" content="...; charset=...">``. Only the decoding follows
-    from it; the tag stays in the body like any other markup.
+    from it; the tag stays in the body like any other markup. An XHTML page
+    is read the same way, though a browser's XML parser would read its
+    ``<?xml encoding?>`` instead and ignore the tag.
     """
     if body.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
@@ -723,9 +725,13 @@ def _sniffed_charset(body: bytes) -> str | None:
 
 # How far a browser's prescan reads (WHATWG "prescan a byte stream").
 _PRESCAN_BYTES = 1024
-# A start or end tag's name. "<!", "<?" and "</" not followed by a letter are
-# skipped to the next ">", and any other "<" is text.
-_TAG_NAME_RE = re.compile(rb"</?([A-Za-z][^\s/>]*)")
+# Whitespace below is the prescan's: tab, LF, FF, CR and space. A regex's \s
+# adds the vertical tab, which a browser reads as part of a name or value.
+# A meta tag starts "<meta" and whitespace or "/". Any other start or end
+# tag's name runs to whitespace or ">", "/" included. "<!", "<?" and "</" not
+# followed by a letter are skipped to the next ">", and any other "<" is text.
+_META_START_RE = re.compile(rb"<meta[\t\n\f\r /]", re.IGNORECASE)
+_TAG_NAME_RE = re.compile(rb"</?[A-Za-z][^\t\n\f\r >]*")
 # One attribute, the way the prescan reads it: "/" separates like whitespace,
 # a name runs to "=", whitespace, "/" or ">", and a value is quoted or runs to
 # whitespace or ">". An unclosed quote runs to the end of the bytes, which
@@ -733,15 +739,19 @@ _TAG_NAME_RE = re.compile(rb"</?([A-Za-z][^\s/>]*)")
 # consumes at least the name's first byte and no two adjacent parts match the
 # same byte, so a tag scans in linear time.
 _ATTRIBUTE_RE = re.compile(
-    rb"[\s/]*(?P<name>[^\s/>][^\s/>=]*)"
-    rb"(?:\s*=\s*(?:\"(?P<dq>[^\"]*)\"?|'(?P<sq>[^']*)'?|(?P<bare>[^\s>]*)))?"
+    rb"[\t\n\f\r /]*(?P<name>[^\t\n\f\r />][^\t\n\f\r />=]*)"
+    rb"(?:[\t\n\f\r ]*=[\t\n\f\r ]*"
+    rb"(?:\"(?P<dq>[^\"]*)\"?|'(?P<sq>[^']*)'?|(?P<bare>[^\t\n\f\r >]*)))?"
 )
-_TAG_CLOSE_RE = re.compile(rb"[\s/]*>")
-# The charset in an http-equiv content value ("text/html; charset=koi8-r").
-# An unclosed quote fails here and the search moves on; the value is at most
-# _PRESCAN_BYTES long, which bounds that rescanning.
+_TAG_CLOSE_RE = re.compile(rb"[\t\n\f\r /]*>")
+# The charset in an http-equiv content value ("text/html; charset=koi8-r"):
+# the first "charset" followed by "=" decides. A value is quoted or runs to
+# whitespace or ";"; an unclosed quote, or no value, leaves no charset (the
+# group does not match) rather than moving on to a later "charset".
 _CONTENT_CHARSET_RE = re.compile(
-    rb"charset\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s;\"']+))", re.IGNORECASE
+    rb"charset[\t\n\f\r ]*=[\t\n\f\r ]*"
+    rb"(?:\"([^\"]*)\"|'([^']*)'|([^\t\n\f\r ;\"'][^\t\n\f\r ;]*))?",
+    re.IGNORECASE,
 )
 
 
@@ -763,36 +773,32 @@ def _prescan(head: bytes) -> str | None:
                 return None
             pos = end + 3
             continue
-        tag = _TAG_NAME_RE.match(head, pos)
-        if tag is None:
-            if head[pos + 1:pos + 2] in (b"!", b"/", b"?"):
-                end = head.find(b">", pos)
-                if end == -1:
-                    return None
-                pos = end + 1
-            else:
-                pos += 1
+        is_meta = _META_START_RE.match(head, pos) is not None
+        if is_meta:
+            pos += len(b"<meta")
+        elif (tag := _TAG_NAME_RE.match(head, pos)) is not None:
+            pos = tag.end()
+        elif head[pos + 1:pos + 2] in (b"!", b"/", b"?"):
+            if (end := head.find(b">", pos)) == -1:
+                return None
+            pos = end + 1
+            continue
+        else:
+            pos += 1
             continue
         # Every tag's attributes are read, not only a meta's, so a "<meta"
         # inside another tag's attribute value is not taken for a tag.
         attributes: dict[bytes, bytes] = {}
-        pos = tag.end()
         while (attribute := _ATTRIBUTE_RE.match(head, pos)) is not None:
             pos = attribute.end()
-            value = next(
-                (v for v in attribute.group("dq", "sq", "bare") if v is not None), b""
-            )
+            value = attribute["dq"] or attribute["sq"] or attribute["bare"] or b""
             # A repeated attribute is ignored: the first one counts.
             attributes.setdefault(attribute["name"].lower(), value)
         # The attributes stop only at a ">" or at the end of the bytes.
         if (close := _TAG_CLOSE_RE.match(head, pos)) is None:
             return None
         pos = close.end()
-        if (
-            not tag[0].startswith(b"</")
-            and tag[1].lower() == b"meta"
-            and (codec := _meta_codec(attributes)) is not None
-        ):
+        if is_meta and (codec := _meta_codec(attributes)) is not None:
             return codec
     return None
 
@@ -808,9 +814,9 @@ def _meta_codec(attributes: dict[bytes, bytes]) -> str | None:
     if attributes.get(b"http-equiv", b"").lower() != b"content-type":
         return None
     found = _CONTENT_CHARSET_RE.search(attributes.get(b"content", b""))
-    if found is None:
+    if found is None or not (label := found[1] or found[2] or found[3]):
         return None
-    return _codec_for_label(next(g for g in found.groups() if g is not None))
+    return _codec_for_label(label)
 
 
 # The page's own text names the label, so it is held to the shape of a real

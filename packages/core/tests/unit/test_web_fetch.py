@@ -956,9 +956,49 @@ _KOI8_PRIVET = "\u041f\u0440\u0438\u0432\u0435\u0442"  # Cyrillic "privet"
         (b"<META CHARSET = 'KOI8-R' >", "koi8-r"),
         (b'<meta charset=" koi8-r ">', "koi8-r"),
         (b"<meta/charset=koi8-r>", "koi8-r"),
+        (b"<meta\tcharset\n=\x0ckoi8-r\r>", "koi8-r"),
+        (b"<meta charset=koi8-r />", "koi8-r"),
+        # a quoted value ends at its quote; a bare one runs to whitespace or
+        # ">", so "koi8-r/" is the label and names no charset, in browsers too
+        (b'<meta charset="koi8-r"x>', "koi8-r"),
+        (b"<meta charset=koi8-r/>", None),
+        # the vertical tab is no separator in the prescan
+        (b"<meta\x0bcharset=koi8-r>", None),
+        (b"<meta charset=koi8-r\x0bx>", None),
+        # an empty or unusable charset attribute decides the tag: no charset
+        (b"<meta charset>", None),
+        (b"<meta charset http-equiv=content-type content='charset=koi8-r'>", None),
+        (b"<meta charset=bogus http-equiv=content-type content='charset=koi8-r'>", None),
+        # a name may start with "=", so this attribute is "=charset"
+        (b"<meta =charset=koi8-r>", None),
+        (b"<meta>", None),
+        # no head element in the prescan: the tag counts wherever it is
         (b"<!DOCTYPE html><html><head><title>t</title><meta charset=koi8-r>", "koi8-r"),
+        (b"<html><head></head><body><meta charset=koi8-r>", "koi8-r"),
+        (b"<noscript><meta charset=koi8-r></noscript>", "koi8-r"),
+        # a tag name runs to whitespace or ">", "/" included, so this quote
+        # opens no attribute value
+        (b"<a/x='><meta charset=koi8-r>'>", "koi8-r"),
+        # an XML declaration is skipped like any "<?" (its encoding unread)
+        (b"<?xml version='1.0' encoding='koi8-r'?><p>", None),
+        (b"<?xml version='1.0' encoding='koi8-r'?><meta charset=windows-1251>", "cp1251"),
+        # bytes that end before the tag does, or that are not text at all
+        (b"<meta", None),
+        (b"<me", None),
+        (b"<meta charset='koi8-r", None),
+        (b"\x00\xff<meta charset=koi8-r>\xfe", "koi8-r"),
+        (bytes(range(256)) * 4, None),
         (b'<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">', "koi8-r"),
         (b"<meta content='text/html;charset = \"koi8-r\"' http-equiv=CONTENT-TYPE>", "koi8-r"),
+        (b"<meta http-equiv=content-type content='text/html;charset=cp1251;x=y'>", "cp1251"),
+        # in content, a "charset" without "=" is passed over, but the first
+        # "charset=" decides: a bare value runs to whitespace or ";", and an
+        # unclosed quote or no value leaves no charset
+        (b"<meta http-equiv=content-type content='charset koi8-r; charset=cp1251'>", "cp1251"),
+        (b"<meta http-equiv=content-type content='charset=koi8-r\"; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset=\"koi8-r; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset=; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset='>", None),
         # content counts only beside http-equiv=Content-Type
         (b'<meta content="text/html; charset=koi8-r">', None),
         (b'<meta http-equiv="refresh" content="0; charset=koi8-r">', None),
@@ -1095,6 +1135,11 @@ def test_a_byte_order_mark_comes_before_the_meta_tag(
         ),
         # declared utf-16, read as utf-8
         (b"<meta charset=utf-16>", "caf\u00e9".encode(), "caf\u00e9"),
+        # the declaration decides even when it is wrong, as in a browser:
+        # utf-8 bytes under an iso-8859-1 tag read as windows-1252 ...
+        (b"<meta charset=iso-8859-1>", b"caf\xc3\xa9", "caf\u00c3\u00a9"),
+        # ... and bytes that are not utf-8 under a utf-8 tag are replaced
+        (b"<meta charset=utf-8>", b"caf\xe9", "caf\ufffd"),
         # nothing declared: utf-8, as before
         (b"<style>p{}</style>", "caf\u00e9".encode(), "caf\u00e9"),
         (b"<meta charset=no-such-codec>", "caf\u00e9".encode(), "caf\u00e9"),
@@ -1111,15 +1156,41 @@ async def test_a_page_without_a_header_charset_is_decoded_by_its_meta_tag(
     outcome.content.encode("utf-8")
 
 
-async def test_an_xhtml_page_is_decoded_by_its_meta_tag(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/xhtml+xml",
+        "TEXT/HTML",
+        "text/html;profile=x",
+        # an empty charset parameter names none
+        "text/html; charset=",
+        'text/html; charset=""',
+    ],
+)
+async def test_an_html_type_without_a_header_charset_reads_its_meta_tag(
+    content_type: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     page = b"<meta charset=koi8-r><p>" + _KOI8_PRIVET.encode("koi8-r") + b"</p>"
-    headers = {"content-type": "application/xhtml+xml"}
+    headers = {"content-type": content_type}
     _serve(monkeypatch, {"https://a.example/": (200, headers, page)})
     handle, _ = _fetcher("https://a.example/")
     outcome = await handle({"url": "https://a.example/"})
     assert json.loads(outcome.content)["content"] == _KOI8_PRIVET
+
+
+async def test_the_meta_tag_decodes_the_page_past_the_prescan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the first 1,024 bytes are scanned; the codec found there decodes
+    the whole page."""
+    page = (
+        b"<meta charset=koi8-r><p>" + b"x" * 5_000 + b" "
+        + _KOI8_PRIVET.encode("koi8-r") + b"</p>"
+    )
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"].endswith(" " + _KOI8_PRIVET)
 
 
 @pytest.mark.parametrize(

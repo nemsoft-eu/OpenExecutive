@@ -1308,11 +1308,13 @@ routing:
     through `utils.html_tags.visible_text`, text/plain is decoded as is,
     anything else is refused; the header's charset is used. When the header
     names none, an HTML or XHTML page's own declaration is read as browsers
-    read it (`_sniffed_charset`): a byte-order mark, else the WHATWG prescan
-    of the first 1,024 bytes for `<meta charset>` or an http-equiv
-    Content-Type `content`, skipping comments, first usable tag winning,
-    utf-16 read as utf-8, and iso-8859-1/ascii as windows-1252, gb2312/gbk as
-    gb18030, euc-kr as windows-949. The label is page content, so it must be
+    read an HTML page's (`_sniffed_charset`; a browser's XML parser would
+    read an XHTML page's `<?xml encoding?>` instead, which is not read): a
+    byte-order mark, else the WHATWG prescan of the first 1,024 bytes for
+    `<meta charset>` or an http-equiv Content-Type `content`, skipping
+    comments, first usable tag winning, utf-16 read as utf-8, and
+    iso-8859-1/ascii as windows-1252, gb2312/gbk as gb18030, euc-kr as
+    windows-949. The label is page content, so it must be
     1-40 of `[A-Za-z0-9._:-]`, and a codec that is no page's charset is
     refused (non-text, escape and IDN codecs such as utf-7 and
     unicode_escape, iso-2022-kr, and any that does not read ASCII as ASCII).
