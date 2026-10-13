@@ -358,6 +358,9 @@ def test_every_fetch_goes_through_the_pinned_transport() -> None:
         ("https://xn--strae-oqa.de/x", "https://xn--strae-oqa.de/x"),
         # A host ending in an ideographic full stop is the same domain.
         ("https://bücher.example\u3002/x", "https://xn--bcher-kva.example/x"),
+        # httpx sends this host as a%5Eb.example while host_of reads it as
+        # written: the two readings differ, so it has no comparison form.
+        ("https://a^b.example/", None),
         ("https:///nohost", None),
         ("not a url", None),
     ],
@@ -1661,6 +1664,7 @@ async def test_the_domain_lists_apply_to_a_scheme_less_link(
         # request to the listed one through.
         ("WEB_SEARCH_BLOCKED_DOMAINS", "https://xn--strae-oqa.de/", True),
         ("WEB_SEARCH_BLOCKED_DOMAINS", "https://straße.de/", True),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "https://sub.xn--strae-oqa.de/", True),
         ("WEB_SEARCH_BLOCKED_DOMAINS", "https://strasse.de/", False),
         ("WEB_SEARCH_ALLOWED_DOMAINS", "https://xn--strae-oqa.de/", False),
         ("WEB_SEARCH_ALLOWED_DOMAINS", "https://strasse.de/", True),
@@ -1732,7 +1736,9 @@ def test_host_of_reads_every_host_as_httpx_connects_to_it() -> None:
             wire = httpx.URL(url).raw_host.decode("ascii").lower().rstrip(".")
         except (ValueError, httpx.InvalidURL):
             continue
-        # Every host httpx accepts is one host_of encodes, to the same name.
+        # Every host from these pools that httpx accepts is one host_of
+        # encodes, to the same name. The pools hold no ASCII character httpx
+        # percent-encodes, a drift test_normalise_url pins separately.
         assert host_of(url) == wire, (host, wire)
         compared += 1
     # Enough hosts survive httpx for the comparison to mean something.
@@ -1889,6 +1895,22 @@ async def test_a_redirect_is_checked_like_the_first_url(
     handle, _ = _fetcher("https://a.example/")
     outcome = await handle({"url": "https://a.example/"})
     assert outcome.is_error and "redirected to an address" in outcome.content
+    assert requested == ["https://a.example/"]
+
+
+@pytest.mark.parametrize(
+    "location", ["https://xn--strae-oqa.de/x", "https://sub.xn--strae-oqa.de/x"]
+)
+async def test_a_redirect_to_a_blocked_internationalised_domain_is_refused(
+    location: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hop's host is read as httpx connects to it, so an entry for
+    straße.de stops a redirect to its IDNA 2008 form and its subdomains."""
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "straße.de")
+    requested = _serve(monkeypatch, {"https://a.example/": _redirect(location)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert outcome.is_error and "list of blocked domains" in outcome.content
     assert requested == ["https://a.example/"]
 
 

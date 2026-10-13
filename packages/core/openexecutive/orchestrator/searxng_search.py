@@ -361,8 +361,9 @@ def _normalise_host(host: str) -> str:
             # so a host ending in one still encodes with a trailing ".".
             return idna.encode(host, uts46=uts46).decode("ascii").rstrip(".")
         except ValueError:
-            # ValueError covers IDNAError and the bare ValueError idna
-            # raises for a codepoint without a name.
+            # ValueError covers IDNAError and the bare ValueError older idna
+            # releases (3.7 among them) let out for a codepoint without a
+            # name.
             continue
     # Not encodable either way (an over-long label, a joiner out of context,
     # a symbol neither standard allows). Compare verbatim: it stays

@@ -1133,9 +1133,11 @@ routing:
     rejects is retried with the UTS #46 mapping browsers apply, so a
     fullwidth or circled letter, a long s or a soft hyphen reads as the
     domain it stands for; httpx refuses such a host, so this changes no
-    fetch, only how an entry and a search result are read. An entry neither
-    encodes (a joiner out of context, a symbol) is ignored with a warning,
-    and an allowlist whose every entry was ignored still allows nothing. It is a post-filter: the query still
+    fetch, only how an entry and a search result are read. An entry that
+    encodes neither way (a joiner out of context, a symbol) is ignored with
+    a warning, and an allowlist whose every entry was ignored, as unparseable
+    or unencodable, still allows nothing; an empty one is no allowlist. It
+    is a post-filter: the query still
     reaches every configured engine, so this is enforcement, not privacy.
     Results are trimmed to SEARXNG_MAX_RESULTS and wrapped with a constant
     notice marking them as untrusted third-party text, never instructions —
@@ -1278,7 +1280,8 @@ routing:
     form); the URL regex stops at Slack's `<url|label>` delimiters, and
     `https://straße.de/x` is seen as `https://xn--strae-oqa.de/x`. A URL
     whose host httpx rejects, or that `host_of` cannot encode, is never
-    seen; `normalise_url` still compares the two readings as a drift check.
+    seen, nor is one on which the two readings differ (`normalise_url`
+    compares them; an ASCII host httpx percent-encodes, `a^b.example`).
     A link the speaker wrote without a scheme (`example.com/page`) is seen
     as its `https://` form only, never `http://`: `SeenUrls.add_from_text`
     matches both forms in one left-to-right pass (`_LINK_RE`), so a link

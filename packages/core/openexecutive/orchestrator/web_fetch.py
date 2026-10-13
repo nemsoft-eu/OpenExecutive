@@ -349,15 +349,16 @@ def normalise_url(url: str) -> str | None:
     are kept exactly: ``/page`` and ``/page/`` stay different URLs. A URL
     carrying credentials is never fetchable, so it has no comparison form.
 
-    The host must also be the one httpx connects to. ``host_of`` reads it
-    the way httpx does (an ASCII host lowercased, any other through IDNA
-    2008), so the two agree for every host httpx accepts: a fuzz of 100,000
-    random Unicode hosts found none where they differ. A URL httpx rejects
-    (including one ``host_of`` reads only through its UTS #46 fallback), or
-    whose host ``host_of`` cannot read or encode, is refused; the
-    comparison itself stays as a drift check that would refuse any URL on
-    which the two readings ever come apart, so the seen-URL check and the
-    domain lists always judge the host the request goes to.
+    The host must also be the one httpx connects to. ``host_of`` reads an
+    internationalised host the way httpx does (through IDNA 2008), so the
+    two agree on every such host httpx accepts: a fuzz of 200,000 random
+    hosts found none where they differ. It takes an ASCII host as written,
+    while httpx percent-encodes a few characters in one (``a^b.example``
+    goes out as ``a%5Eb.example``). A URL on which the two readings differ,
+    one httpx rejects (including one ``host_of`` reads only through its
+    UTS #46 fallback), or one whose host ``host_of`` cannot read or encode
+    is refused, so the seen-URL check and the domain lists always judge the
+    host the request goes to.
     """
     url = url.strip()
     try:

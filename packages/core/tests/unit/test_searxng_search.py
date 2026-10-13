@@ -607,12 +607,19 @@ def test_blocklist_reads_compatibility_forms_as_their_domain(
     assert urls == ["https://other.example/b"]
 
 
-def test_an_allowlist_of_unencodable_entries_still_allows_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "a\u200db.example",  # does not encode
+        "http://",  # does not parse
+    ],
+)
+def test_an_allowlist_of_ignored_entries_still_allows_nothing(
+    entry: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ignoring every entry must not turn the allowlist off."""
     monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
-    monkeypatch.setenv("WEB_SEARCH_ALLOWED_DOMAINS", "a\u200db.example")
+    monkeypatch.setenv("WEB_SEARCH_ALLOWED_DOMAINS", entry)
     patcher, _ = _patch_http(_response(_results(
         "https://ab.example/a", "https://other.example/b",
     )))
@@ -620,6 +627,31 @@ def test_an_allowlist_of_unencodable_entries_still_allows_nothing(
     with patcher:
         outcome = asyncio.run(handler({"query": "q"}))
     assert json.loads(outcome.content)["results"] == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        # Settings drop blank entries, so this is no allowlist at all, not
+        # an allowlist of ignored entries.
+        ("WEB_SEARCH_ALLOWED_DOMAINS", " , "),
+        # A blocklist whose every entry was ignored blocks nothing.
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "a\u200db.example"),
+    ],
+)
+def test_a_list_with_no_usable_entry_filters_nothing(
+    key: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv(key, value)
+    patcher, _ = _patch_http(_response(_results(
+        "https://ab.example/a", "https://other.example/b",
+    )))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert urls == ["https://ab.example/a", "https://other.example/b"]
 
 
 @pytest.mark.parametrize(
@@ -666,6 +698,9 @@ def test_host_matches(host: str, domain: str, expected: bool) -> None:
         ("\u24b7locked.com", "blocked.com"),
         ("\u017fecret.com", "secret.com"),
         ("blocked.com\u00ad", "blocked.com"),
+        # IDNA 2008 wants NFC; a decomposed "\u00fc" (as macOS can type it) is
+        # composed by the fallback.
+        ("bu\u0308cher.example", "xn--bcher-kva.example"),
         # Neither standard encodes a zero-width joiner out of context or a
         # symbol: compared verbatim. IDNA 2003 deleted the joiner, which
         # turned the entry into another domain.
