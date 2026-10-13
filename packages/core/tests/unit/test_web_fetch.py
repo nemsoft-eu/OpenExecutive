@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -409,6 +410,199 @@ def test_urls_in_the_forms_people_paste_are_seen(text: str, url: str) -> None:
     assert seen.allows(url)
 
 
+@pytest.mark.parametrize(
+    ("text", "url"),
+    [
+        ("what does example.com/page say?", "https://example.com/page"),
+        ("see www.example.com today", "https://www.example.com/"),
+        ("what does ciao-construct.be? say", "https://ciao-construct.be/"),
+        ("(see example.com/x), then", "https://example.com/x"),
+        ("admin at example.com:8443/a", "https://example.com:8443/a"),
+        # The host is case-blind, the path is not.
+        ("Example.COM/Caps", "https://example.com/Caps"),
+        ("read example.com.", "https://example.com/"),
+        ("example.com's homepage", "https://example.com/"),
+        ("example.com?ref=x", "https://example.com/?ref=x"),
+        ("medium.com/@user", "https://medium.com/@user"),
+        ("example.com/?a=1&amp;b=2", "https://example.com/?a=1&b=2"),
+        # Slack's <url|label>: the link keeps its own scheme.
+        ("<http://a.example|a.example>", "http://a.example/"),
+    ],
+)
+def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -> None:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    assert seen.allows(url)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("version 1.2.3", set()),
+        ("e.g. this, i.e. that", set()),
+        ("upgrade to v2.0", set()),
+        ("an IPv4 address: 10.0.0.1/x", set()),
+        ("localhost/admin", set()),
+        ("see docs/example.com", set()),
+        # A common email address seeds neither its domain nor its local part.
+        ("mail name@example.com", set()),
+        ("mail jane.doe.smith@example.com", set()),
+        ("mail first.last+tag@example.com", set()),
+        ("mail jane.doe=x@example.com", set()),
+        # A local part holding a character that ends a link seeds its dotted
+        # prefix, never the domain: harmless, see add_from_text.
+        ("mail jane.doe!x@example.com", {"https://jane.doe/"}),
+        # IDNA 2003 and 2008 disagree on "ß" (see test_normalise_url), and a
+        # scheme-less host is ASCII only, so no part of it is seen.
+        ("straße.de/x", set()),
+        ("bücher.example/x", set()),
+        # The host-like text inside a link with a scheme is not a link.
+        ("https://example.com/foo.bar/x", {"https://example.com/foo.bar/x"}),
+        (
+            "https://example.com/?next=other.example/x",
+            {"https://example.com/?next=other.example/x"},
+        ),
+        # A link with a scheme inside a scheme-less one's path leaves the
+        # scheme-less link whole, and is seen as written too.
+        (
+            "web.archive.org/web/2024/https://example.com/page",
+            {
+                "https://web.archive.org/web/2024/https://example.com/page",
+                "https://example.com/page",
+            },
+        ),
+        # The forms people paste: Markdown, Slack's <url>, a Slack auto-link
+        # (its label seeds the https form), Slack's mailto link, a list.
+        ("[x](example.com/a)", {"https://example.com/a"}),
+        ("<example.com/a>", {"https://example.com/a"}),
+        ("<http://a.example|a.example>", {"http://a.example/", "https://a.example/"}),
+        ("<mailto:jane.doe@example.com|jane.doe@example.com>", set()),
+        ("a.example,b.example", {"https://a.example/", "https://b.example/"}),
+        ("**example.com**", {"https://example.com/"}),
+        ("'example.com'", {"https://example.com/"}),
+        ("(see example.com/x), then", {"https://example.com/x"}),
+        ("read example.com.", {"https://example.com/"}),
+        ("example.com: nice", {"https://example.com/"}),
+        ("\u89c1 example.com\u3002", {"https://example.com/"}),
+        # Curly quotes, an em dash, an ellipsis, CJK brackets and commas.
+        ("\u201cexample.com\u201d", {"https://example.com/"}),
+        ("\u2018example.com\u2019", {"https://example.com/"}),
+        ("\u201eexample.com\u201c", {"https://example.com/"}),
+        ("\u00abexample.com\u00bb", {"https://example.com/"}),
+        ("example.com\u2019s homepage", {"https://example.com/"}),
+        ("see\u2014example.com\u2014really", {"https://example.com/"}),
+        ("example.com\u2026", {"https://example.com/"}),
+        ("\u300cexample.com\u300d", {"https://example.com/"}),
+        ("\uff08example.com\uff09", {"https://example.com/"}),
+        ("a.example\u3001b.example", {"https://a.example/", "https://b.example/"}),
+        # Those marks end a path, query or fragment too, never join it.
+        ("\u201cexample.com/page\u201d", {"https://example.com/page"}),
+        ("see\u2014example.com/page\u2014please", {"https://example.com/page"}),
+        ("\u300cexample.com/page\u300d", {"https://example.com/page"}),
+        ("\uff08example.com/page\uff09", {"https://example.com/page"}),
+        ("example.com/page\u2026", {"https://example.com/page"}),
+        ("example.com?x=1\u3001", {"https://example.com/?x=1"}),
+        ("example.com/a?q=b\u00bb", {"https://example.com/a?q=b"}),
+        # Percent-encoded, the same mark is the path's.
+        ("example.com/a%E2%80%9Db", {"https://example.com/a%E2%80%9Db"}),
+        # Otherwise a path runs to _URL_RE's delimiters, so text joined to it,
+        # a CJK letter included, is path.
+        ("example.com/x\u89c1", {"https://example.com/x%E8%A7%81"}),
+        ("example.com/\u9875", {"https://example.com/%E9%A1%B5"}),
+        # A port past 65535 makes no URL, so nothing is seen.
+        ("example.com:99999/x", set()),
+        ("example.com:8443/a", {"https://example.com:8443/a"}),
+        # A ":" that starts no port: the person wrote no root URL, and the
+        # host cannot back off to a shorter one ("a.example").
+        ("example.com:abc/path", set()),
+        ("example.com:100000/path", set()),
+        ("example.com:abc", set()),
+        ("a.example.com:abc", set()),
+        ("example.com:/x", set()),
+        ("example.com./x", set()),
+        # Nor does a ":" start a link: this is not "abc.example/x".
+        ("example.com:abc.example/x", set()),
+        ("site:example.com", set()),
+        # A letter, a zero-width space, a soft hyphen, "+", "=" or "/" right
+        # before the host does not start a match, so the token's suffix is
+        # not seeded.
+        ("foo\u200bexample.com/x", set()),
+        ("foo\u00adexample.com/x", set()),
+        ("foo+example.com/x", set()),
+        ("foo=example.com", set()),
+        ("x/example.com", set()),
+        ("\u89c1example.com", set()),
+        # Nor ends mid-word.
+        ("example.com\u89c1", set()),
+        ("example.com-x", set()),
+        # A letter from another script in the host (U+0430, the Cyrillic "a")
+        # leaves no ASCII part of it seen.
+        ("ex\u0430mple.com", set()),
+        ("example.com\u0430", set()),
+        # Only the https form of a scheme-less link.
+        ("example.com/page", {"https://example.com/page"}),
+        # Seeded, and pointless: the speaker's own text, under every check.
+        ("open report.pdf", {"https://report.pdf/"}),
+        # A brace is no URL character, so it ends a scheme-less link ({ only
+        # opens one, } only closes one) and never reaches the path as %7D.
+        ("{example.com/page}", {"https://example.com/page"}),
+        ("{{example.com/a}}", {"https://example.com/a"}),
+        ("example.com?x=1}", {"https://example.com/?x=1"}),
+        ("example.com/p{q", {"https://example.com/p"}),
+        # A link with a scheme keeps its braces, percent-encoded, as on main.
+        ("https://e.com/x{y}", {"https://e.com/x%7By%7D"}),
+    ],
+)
+def test_what_a_scheme_less_pass_seeds(text: str, expected: set[str]) -> None:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    assert seen._urls == expected
+
+
+# CJK full stop and commas, curly quotes and guillemets, CJK corner brackets
+# and fullwidth parentheses, the em dash and the ellipsis.
+_WIDE_MARKS = [
+    "\u3002", "\uff0c", "\u3001",
+    "\u201c", "\u201d", "\u2018", "\u2019", "\u201e", "\u00ab", "\u00bb",
+    "\u300c", "\u300d", "\uff08", "\uff09",
+    "\u2014", "\u2026",
+]
+
+
+def test_the_wide_marks_are_the_ones_the_pattern_uses() -> None:
+    assert set(web_fetch._WIDE_DELIMITERS) == set(_WIDE_MARKS)
+
+
+@pytest.mark.parametrize("mark", _WIDE_MARKS, ids=[f"U+{ord(m):04X}" for m in _WIDE_MARKS])
+def test_a_wide_mark_starts_ends_and_stops_a_scheme_less_link(mark: str) -> None:
+    """Each mark is a boundary on either side and is never path: a link
+    stopped at a mark that could not end one would seed nothing."""
+    cases = {
+        f"example.com/p{mark}q": {"https://example.com/p"},
+        f"{mark}example.com/p{mark}": {"https://example.com/p"},
+        f"{mark}example.com{mark}": {"https://example.com/"},
+        f"example.com?x=1{mark}": {"https://example.com/?x=1"},
+        f"a.example{mark}b.example": {"https://a.example/", "https://b.example/"},
+    }
+    for text, expected in cases.items():
+        seen = web_fetch.SeenUrls()
+        seen.add_from_text(text)
+        assert seen._urls == expected, ascii(text)
+
+
+def test_a_dotted_file_name_seeds_its_host_and_nothing_the_model_can_extend() -> None:
+    """``memory_text`` carries the attached files' names, and a third party may
+    have chosen one. It seeds the host alone: a path, query, port or scheme
+    the model adds is a different URL and stays refused."""
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text("(Attached files: x.attacker.example)")
+    assert seen.allows("https://x.attacker.example/")
+    assert not seen.allows("https://x.attacker.example/exfil")
+    assert not seen.allows("https://x.attacker.example/?q=1")
+    assert not seen.allows("https://x.attacker.example:8443/")
+    assert not seen.allows("http://x.attacker.example/")
+
+
 def test_a_huge_character_reference_in_a_pasted_url_does_not_raise() -> None:
     """html.unescape raises past 4,300 digits; seeding runs before the
     turn's first model call, so a raise there would end the turn."""
@@ -436,6 +630,48 @@ def test_a_url_outside_the_speakers_own_words_stays_unseen() -> None:
     seen.add_from_text(_speaker_text(typed, prompt))
     assert seen.allows("https://ciao-construct.be/")
     assert not seen.allows("https://attacker.example/x")
+
+
+def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> None:
+    from openexecutive.orchestrator.executive import _speaker_text
+
+    typed = "What does ciao-construct.be say about the date?"
+    prompt = f"{typed}\n\n<attachment>see attacker.example/x</attachment>"
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(_speaker_text(typed, prompt))
+    assert seen._urls == {"https://ciao-construct.be/"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "aa." * 40_000 + "@",
+        " a.bc" + "." * 100_000 + "x",
+        "+a.bc" * 20_000,
+        "example.com/" + "." * 100_000 + "\u300c",
+        "example.com/" + "a\u2014" * 50_000,
+        # Every match is normalised, which costs far more than the scan, so
+        # this one is sized to stay inside the bound on a loaded CI runner.
+        "\u201ca.bc\u201d" * 4_000,
+    ],
+    ids=[
+        "label-run-to-at",
+        "dot-run-after-host",
+        "joined-hosts",
+        "dot-run-path-to-wide-mark",
+        "path-of-wide-marks",
+        "curly-quoted-hosts",
+    ],
+)
+def test_the_scheme_less_pass_stays_linear(text: str) -> None:
+    """A look-ahead that rescans the rest of a run of labels from every place
+    a host could end (an earlier check for an email "@") took several
+    seconds on the first text. The end check scans only the "." and ":" run
+    after a host end, and a match is tried only where a link may start."""
+    seen = web_fetch.SeenUrls()
+    started = time.perf_counter()
+    seen.add_from_text(text)
+    assert time.perf_counter() - started < 1.0
 
 
 # --- the handler ------------------------------------------------------------
@@ -638,6 +874,43 @@ async def test_an_unseen_url_is_refused_before_any_request(
     assert requested == [] and budget.used == 0
 
 
+def _fetcher_from_text(text: str) -> tuple[Any, SearchBudget]:
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text(text)
+    budget = SearchBudget(max_uses=3)
+    return web_fetch.make_fetch_handler(budget, seen), budget
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Only the model wrote these: the speaker wrote example.com/page.
+        "https://other.example/",
+        "https://example.com/page?q=the+turn's+data",
+        "http://example.com/page",
+        # Never seeded: no dot, or a numeric final label.
+        "https://localhost/admin",
+        "https://10.0.0.1/x",
+    ],
+)
+async def test_a_scheme_less_link_does_not_let_the_model_widen_the_set(
+    url: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = _serve(monkeypatch, {})
+    handle, budget = _fetcher_from_text("summarise example.com/page, localhost/admin, 10.0.0.1/x")
+    outcome = await handle({"url": url})
+    assert outcome.is_error and "has not appeared in this conversation" in outcome.content
+    assert requested == [] and budget.used == 0
+
+
+async def test_a_scheme_less_link_opens_as_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    url = "https://example.com/page"
+    requested = _serve(monkeypatch, {url: (200, _html(), b"<p>ok</p>")})
+    handle, _ = _fetcher_from_text("summarise example.com/page")
+    outcome = await handle({"url": url})
+    assert not outcome.is_error and requested == [url]
+
+
 async def test_a_seen_url_that_is_not_plain_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -672,6 +945,17 @@ async def test_the_domain_lists_apply(
     else:
         assert outcome.is_error and refusal in outcome.content
         assert requested == [] and budget.used == 0
+
+
+async def test_the_domain_lists_apply_to_a_scheme_less_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "example.com")
+    requested = _serve(monkeypatch, {})
+    handle, budget = _fetcher_from_text("summarise example.com/page")
+    outcome = await handle({"url": "https://example.com/page"})
+    assert outcome.is_error and "list of blocked domains" in outcome.content
+    assert requested == [] and budget.used == 0
 
 
 async def test_the_handler_refuses_on_a_turn_that_read_mail(
@@ -827,6 +1111,17 @@ async def test_a_redirect_is_checked_like_the_first_url(
     assert requested == ["https://a.example/"]
 
 
+async def test_a_redirect_from_a_scheme_less_link_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "blocked.example")
+    requested = _serve(monkeypatch, {"https://a.example/": _redirect("https://blocked.example/x")})
+    handle, _ = _fetcher_from_text("what is on a.example")
+    outcome = await handle({"url": "https://a.example/"})
+    assert outcome.is_error and "redirected to an address" in outcome.content
+    assert requested == ["https://a.example/"]
+
+
 # --- the pinned connect, through the handler ----------------------------------
 
 
@@ -865,6 +1160,18 @@ async def test_a_non_public_resolution_is_refused(
     outcome = await handle({"url": url})
     assert outcome.is_error and "private or internal address" in outcome.content
     assert heads == []
+
+
+async def test_a_scheme_less_link_to_a_private_address_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """127.0.0.1.nip.io has an alphabetic final label, so it is seeded; the
+    pinned connect still refuses the loopback address it resolves to."""
+    lookups = _pin(monkeypatch, {"127.0.0.1.nip.io": ["127.0.0.1"]})
+    handle, budget = _fetcher_from_text("open 127.0.0.1.nip.io/x")
+    outcome = await handle({"url": "https://127.0.0.1.nip.io/x"})
+    assert outcome.is_error and "private or internal address" in outcome.content
+    assert lookups == ["127.0.0.1.nip.io"] and budget.used == 1
 
 
 async def test_a_redirect_to_a_private_address_is_refused(
