@@ -26,12 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import encodings
-import encodings.aliases
 import functools
 import json
 import logging
-import pkgutil
 import re
 import socket
 import ssl
@@ -714,18 +711,30 @@ def _decode(body: bytes, charset: str | None) -> str:
 def _sniffed_charset(body: bytes) -> str | None:
     """The codec an HTML page declares for itself, as a browser finds it.
 
-    A byte-order mark first, then the WHATWG prescan: the first 1,024 bytes
-    read as ASCII for a ``<meta charset>`` or a ``<meta http-equiv=
-    "Content-Type" content="...; charset=...">``. Only the decoding follows
-    from it; the tag stays in the body like any other markup. An XHTML page
-    is read the same way, though a browser's XML parser would read its
-    ``<?xml encoding?>`` instead and ignore the tag.
+    A byte-order mark first, then the WHATWG prescan of the first 1,024
+    bytes: an XML declaration written in UTF-16, then a ``<meta charset>``
+    or a ``<meta http-equiv="Content-Type" content="...; charset=...">`` read
+    as ASCII, and when no tag names a usable charset, an ASCII XML
+    declaration (``<?xml ... encoding="..."?>``) at the very start. Only the
+    decoding follows from it; the tag stays in the body like any other
+    markup. An XHTML page is read the same way, though a browser's XML
+    parser reads only its XML declaration, so where a page's tag and
+    declaration disagree, the tag wins here.
     """
     if body.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
     if body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         return "utf-16"  # reads the mark for the byte order, then drops it
-    return _prescan(body[:_PRESCAN_BYTES])
+    head = body[:_PRESCAN_BYTES]
+    # The prescan's first step: "<?x" in UTF-16, which no ASCII scan reads.
+    # As in browsers, the declaration's own encoding name is not checked.
+    if head.startswith(b"<\x00?\x00x\x00"):
+        return "utf-16-le"
+    if head.startswith(b"\x00<\x00?\x00x"):
+        return "utf-16-be"
+    # A prescan that ends without a charset, by reaching the end of the
+    # bytes or stopping inside a tag, falls back to an XML declaration.
+    return _prescan(head) or _xml_declaration_codec(head)
 
 
 # How far a browser's prescan reads (WHATWG "prescan a byte stream").
@@ -767,7 +776,9 @@ def _prescan(head: bytes) -> str | None:
     not count. A tag the bytes end inside is not read, rather than read cut
     short (``iso-8859-15`` cut to ``iso-8859-1``). A declaration whose label
     is refused does not stop the scan: as in a browser, a later one may
-    still name a usable charset.
+    still name a usable charset. A browser does stop at a label of the
+    "replacement" encoding (``iso-2022-kr``) and shows the page as one
+    U+FFFD; here that label is refused like any other.
     """
     pos = 0
     while (pos := head.find(b"<", pos)) != -1:
@@ -824,86 +835,215 @@ def _meta_codec(attributes: dict[bytes, bytes]) -> str | None:
     return _codec_for_label(label)
 
 
+# After "encoding" in an XML declaration: "=", then a quoted value, with any
+# bytes up to 0x20 around the "=". A value holding such a byte, or with no
+# closing quote within the prescanned bytes, names no charset.
+_XML_ENCODING_VALUE_RE = re.compile(
+    rb"[\x00-\x20]*=[\x00-\x20]*(?:\"([^\"\x00-\x20]*)\"|'([^'\x00-\x20]*)')"
+)
+
+
+def _xml_declaration_codec(head: bytes) -> str | None:
+    """The codec an XML declaration at the very start of ``head`` names.
+
+    The HTML prescan's fallback ("get an XML encoding"): ``<?xml`` at byte
+    0, then the first ``encoding`` before the first ``>``. If that one is not
+    followed by ``=`` and a quoted value, there is no charset, rather than a
+    later ``encoding`` being tried.
+    """
+    if not head.startswith(b"<?xml"):
+        return None
+    if (end := head.find(b">")) == -1:
+        return None
+    if (pos := head.find(b"encoding", 0, end)) == -1:
+        return None
+    found = _XML_ENCODING_VALUE_RE.match(head, pos + len(b"encoding"))
+    if found is None:
+        return None
+    return _codec_for_label(found[1] if found[1] is not None else found[2])
+
+
 # The page's own text names the label, so it is held to the shape of a real
-# encoding name before any codec lookup sees it.
+# encoding name before the table sees it.
 _LABEL_RE = re.compile(rb"[A-Za-z0-9._:-]{1,40}")
-# Text codecs that are not a page's character set: escape codecs that turn
-# ASCII the page holds into other characters (UTF-7 is the old XSS trap), IDN
-# codecs, a codec that only raises, and ISO-2022-KR, which browsers do not
-# decode at all (WHATWG maps it to the "replacement" encoding).
+# What the Encoding Standard strips from a label: ASCII whitespace. Not the
+# vertical tab, which bytes.strip() would also take.
+_ASCII_WHITESPACE = b"\t\n\f\r "
+# The WHATWG Encoding Standard's names and labels
+# (https://encoding.spec.whatwg.org/#names-and-labels, generated from its
+# encodings.json): each encoding, the Python codec whose decoding is closest
+# to a browser's, and every label a page may name it by. A label is matched
+# whole after stripping and lowercasing, so "latin-1", "utf_8" or "cp437",
+# which Python's own lookup would take, name no charset here, as in browsers.
+# Measured against the standard's index files, byte for byte:
+# - Single-byte: identical, except that the bytes in 0x80-0x9F the
+#   windows-125x and windows-874 tables give to C1 controls, and
+#   windows-1255's 0xCA (U+05BA), are unassigned in Python's codecs and read
+#   as U+FFFD, and that koi8-u reads 0xAE and 0xBE as box drawing
+#   where browsers read KOI8-RU's U+045E and U+040E. iso-8859-1, ascii and
+#   iso-8859-9 read as windows-1252 and windows-1254, as in browsers, so a
+#   page's smart quotes and euro sign in 0x80-0x9F survive.
+# - Shift_JIS as cp932 (Windows-31J): identical for every two-byte sequence
+#   the standard assigns, NEC and IBM extensions included; the stray single
+#   bytes 0xA0 and 0xFD-0xFF read as private-use characters where browsers
+#   show U+FFFD. Python's shift_jis is plain JIS X 0208: it reads 0x8160 as
+#   U+301C where browsers read U+FF5E, and none of the extensions.
+# - EUC-KR as cp949 (Windows-949): identical for every assigned sequence.
+#   GBK and gb18030 as gb18030: 20 two-byte sequences (0xA3A0, 0xA6D9 and
+#   0xA8BC among them) read as private-use characters where browsers read
+#   assigned ones, the four-byte 0x8135F437 reads as U+1E3F rather than
+#   U+E7C7, and a lone 0x80 is U+FFFD rather than the euro sign.
+# - In these multi-byte codecs an unassigned or broken sequence can recover
+#   differently: two U+FFFD where a browser shows one, or a cp932 trail byte
+#   read again as half-width katakana (0x81AD).
+# - Big5 as big5hkscs, as browsers read HKSCS: 11 sequences differ (0xA145
+#   is U+2022 rather than U+2027, for one) and 192 read as U+FFFD.
+# - EUC-JP as euc_jp and ISO-2022-JP as iso2022_jp_ext (which, as browsers
+#   do, reads half-width katakana after ESC ( I): six JIS X 0208 characters
+#   differ as in shift_jis (0xA1C1 is U+301C rather than U+FF5E), as does
+#   EUC-JP's JIS X 0212 0x8FA2B7, and the NEC and IBM rows read as U+FFFD;
+#   ISO-2022-JP's JIS X 0212, which browsers do not read, is decoded.
+# UTF-16BE and UTF-16LE read as utf-8: a label read as ASCII proves the
+# page is not UTF-16, and browsers make the same switch. A meta tag's
+# x-user-defined reads as windows-1252, as the prescan has it; an XML
+# declaration's would read 0x80-0xFF as private-use characters in a browser.
+# Not here, so refused: the labels of the "replacement" encoding, which a
+# browser shows as one U+FFFD rather than decode (csiso2022kr, hz-gb-2312,
+# iso-2022-cn, iso-2022-cn-ext, iso-2022-kr, replacement).
+_WHATWG_ENCODINGS: tuple[tuple[str, str, str], ...] = (
+    ("UTF-8", "utf-8", (
+        "unicode-1-1-utf-8 unicode11utf8 unicode20utf8 utf-8 utf8 "
+        "x-unicode20utf8"
+    )),
+    ("IBM866", "cp866", "866 cp866 csibm866 ibm866"),
+    ("ISO-8859-2", "iso8859-2", (
+        "csisolatin2 iso-8859-2 iso-ir-101 iso8859-2 iso88592 iso_8859-2 "
+        "iso_8859-2:1987 l2 latin2"
+    )),
+    ("ISO-8859-3", "iso8859-3", (
+        "csisolatin3 iso-8859-3 iso-ir-109 iso8859-3 iso88593 iso_8859-3 "
+        "iso_8859-3:1988 l3 latin3"
+    )),
+    ("ISO-8859-4", "iso8859-4", (
+        "csisolatin4 iso-8859-4 iso-ir-110 iso8859-4 iso88594 iso_8859-4 "
+        "iso_8859-4:1988 l4 latin4"
+    )),
+    ("ISO-8859-5", "iso8859-5", (
+        "csisolatincyrillic cyrillic iso-8859-5 iso-ir-144 iso8859-5 iso88595 "
+        "iso_8859-5 iso_8859-5:1988"
+    )),
+    ("ISO-8859-6", "iso8859-6", (
+        "arabic asmo-708 csiso88596e csiso88596i csisolatinarabic ecma-114 "
+        "iso-8859-6 iso-8859-6-e iso-8859-6-i iso-ir-127 iso8859-6 iso88596 "
+        "iso_8859-6 iso_8859-6:1987"
+    )),
+    ("ISO-8859-7", "iso8859-7", (
+        "csisolatingreek ecma-118 elot_928 greek greek8 iso-8859-7 iso-ir-126 "
+        "iso8859-7 iso88597 iso_8859-7 iso_8859-7:1987 sun_eu_greek"
+    )),
+    ("ISO-8859-8", "iso8859-8", (
+        "csiso88598e csisolatinhebrew hebrew iso-8859-8 iso-8859-8-e iso-ir-138 "
+        "iso8859-8 iso88598 iso_8859-8 iso_8859-8:1988 visual"
+    )),
+    # Logical rather than visual order changes no character.
+    ("ISO-8859-8-I", "iso8859-8", "csiso88598i iso-8859-8-i logical"),
+    ("ISO-8859-10", "iso8859-10", (
+        "csisolatin6 iso-8859-10 iso-ir-157 iso8859-10 iso885910 l6 latin6"
+    )),
+    ("ISO-8859-13", "iso8859-13", "iso-8859-13 iso8859-13 iso885913"),
+    ("ISO-8859-14", "iso8859-14", "iso-8859-14 iso8859-14 iso885914"),
+    ("ISO-8859-15", "iso8859-15", (
+        "csisolatin9 iso-8859-15 iso8859-15 iso885915 iso_8859-15 l9"
+    )),
+    ("ISO-8859-16", "iso8859-16", "iso-8859-16"),
+    ("KOI8-R", "koi8-r", "cskoi8r koi koi8 koi8-r koi8_r"),
+    ("KOI8-U", "koi8-u", "koi8-ru koi8-u"),
+    ("macintosh", "mac-roman", "csmacintosh mac macintosh x-mac-roman"),
+    ("windows-874", "cp874", (
+        "dos-874 iso-8859-11 iso8859-11 iso885911 tis-620 windows-874"
+    )),
+    ("windows-1250", "cp1250", "cp1250 windows-1250 x-cp1250"),
+    ("windows-1251", "cp1251", "cp1251 windows-1251 x-cp1251"),
+    ("windows-1252", "cp1252", (
+        "ansi_x3.4-1968 ascii cp1252 cp819 csisolatin1 ibm819 iso-8859-1 "
+        "iso-ir-100 iso8859-1 iso88591 iso_8859-1 iso_8859-1:1987 l1 latin1 "
+        "us-ascii windows-1252 x-cp1252"
+    )),
+    ("windows-1253", "cp1253", "cp1253 windows-1253 x-cp1253"),
+    ("windows-1254", "cp1254", (
+        "cp1254 csisolatin5 iso-8859-9 iso-ir-148 iso8859-9 iso88599 iso_8859-9 "
+        "iso_8859-9:1989 l5 latin5 windows-1254 x-cp1254"
+    )),
+    ("windows-1255", "cp1255", "cp1255 windows-1255 x-cp1255"),
+    ("windows-1256", "cp1256", "cp1256 windows-1256 x-cp1256"),
+    ("windows-1257", "cp1257", "cp1257 windows-1257 x-cp1257"),
+    ("windows-1258", "cp1258", "cp1258 windows-1258 x-cp1258"),
+    ("x-mac-cyrillic", "mac-cyrillic", "x-mac-cyrillic x-mac-ukrainian"),
+    ("GBK", "gb18030", (
+        "chinese csgb2312 csiso58gb231280 gb2312 gb_2312 gb_2312-80 gbk "
+        "iso-ir-58 x-gbk"
+    )),
+    ("gb18030", "gb18030", "gb18030"),
+    ("Big5", "big5hkscs", "big5 big5-hkscs cn-big5 csbig5 x-x-big5"),
+    ("EUC-JP", "euc_jp", "cseucpkdfmtjapanese euc-jp x-euc-jp"),
+    ("ISO-2022-JP", "iso2022_jp_ext", "csiso2022jp iso-2022-jp"),
+    ("Shift_JIS", "cp932", (
+        "csshiftjis ms932 ms_kanji shift-jis shift_jis sjis windows-31j x-sjis"
+    )),
+    ("EUC-KR", "cp949", (
+        "cseuckr csksc56011987 euc-kr iso-ir-149 korean ks_c_5601-1987 "
+        "ks_c_5601-1989 ksc5601 ksc_5601 windows-949"
+    )),
+    ("UTF-16BE", "utf-8", "unicodefffe utf-16be"),
+    ("UTF-16LE", "utf-8", (
+        "csunicode iso-10646-ucs-2 ucs-2 unicode unicodefeff utf-16 utf-16le"
+    )),
+    ("x-user-defined", "cp1252", "x-user-defined"),
+)
+# Label to codec. The codecs above are the only names that ever reach
+# codecs.lookup: CPython caches every name its codec search fails to resolve
+# and never evicts it, so a page naming fresh labels must not reach it.
+_LABEL_CODECS: dict[str, str] = {
+    label: codec
+    for _, codec, labels in _WHATWG_ENCODINGS
+    for label in labels.split()
+}
+# Text codecs that are not a page's character set, refused even if the table
+# above named one: escape codecs that turn ASCII the page holds into other
+# characters (UTF-7 is the old XSS trap), IDN codecs, a codec that only
+# raises, and ISO-2022-KR, a "replacement" encoding browsers do not decode.
 _REFUSED_CODECS = frozenset({
     "utf-7", "unicode-escape", "raw-unicode-escape", "idna", "punycode",
     "undefined", "iso2022_kr",
 })
-# A meta tag readable as ASCII proves the page is not UTF-16, so browsers
-# read a page that declares it as utf-8.
-_WIDE_CODECS = frozenset({"utf-16", "utf-16-le", "utf-16-be"})
-# Where a browser decodes a label with a wider codec than the one Python's
-# lookup names (WHATWG's label table): iso-8859-1 and ascii as windows-1252,
-# iso-8859-9 as windows-1254, both differing only in bytes 0x80-0x9F, where a
-# page means smart quotes and the euro sign rather than C1 controls; gb2312
-# and gbk as gb18030, euc-kr as windows-949, extensions of the named codec.
-_BROWSER_CODECS = {
-    "iso8859-1": "cp1252",
-    "ascii": "cp1252",
-    "iso8859-9": "cp1254",
-    "gb2312": "gb18030",
-    "gbk": "gb18030",
-    "euc_kr": "cp949",
-}
 # Printable ASCII and its whitespace, which a page's charset must read
-# unchanged: the meta tag naming it was just read as ASCII.
+# unchanged: the declaration naming it was just read as ASCII.
 _ASCII_PROBE = bytes(range(0x20, 0x7F)) + b"\t\n\r"
 
 
-def _lookup_key(name: str) -> str:
-    """A codec name as ``codecs.lookup`` hands it to the stdlib's search:
-    lowercased, and each run of characters other than letters, digits and
-    "." made one "_", with none at either end."""
-    return encodings.normalize_encoding(name.lower())
-
-
-# Every name the stdlib's codec search can resolve, as lookup keys. CPython
-# caches each name that search fails to resolve in ``encodings._cache`` and
-# never evicts it, so a page naming fresh labels would grow that cache on
-# every fetch: a label outside this set never reaches ``codecs.lookup``. Some
-# names that pass still fail the lookup (a module that is no codec,
-# "aliases"; a Windows-only codec, "mbcs"; a dotted spelling of a module
-# name, "latin.1"), but they are a fixed hundred or so, each cached once. A
-# name only a third-party search function knows ("idna2008") is refused, and
-# none is a page's charset.
-_KNOWN_CODEC_NAMES = frozenset(
-    _lookup_key(name)
-    for name in (
-        *encodings.aliases.aliases,
-        *encodings.aliases.aliases.values(),
-        *(module.name for module in pkgutil.iter_modules(encodings.__path__)),
-    )
-)
-
-
 def _codec_for_label(label: bytes) -> str | None:
-    """The Python codec to decode with for a charset label, or None."""
-    label = label.strip()
+    """The Python codec to decode with for a charset label, or None.
+
+    As the Encoding Standard's "get an encoding": ASCII whitespace stripped,
+    ASCII lowercased, and looked up in its label table; any other label
+    names no charset.
+    """
+    label = label.strip(_ASCII_WHITESPACE).lower()
     if not _LABEL_RE.fullmatch(label):
         return None
-    name = label.decode("ascii")
-    key = _lookup_key(name)
-    # The search also tries an alias with each "." read as "_" ("latin.1").
-    if key not in _KNOWN_CODEC_NAMES and key.replace(".", "_") not in _KNOWN_CODEC_NAMES:
+    codec = _LABEL_CODECS.get(label.decode("ascii"))
+    if codec is None:
         return None
     try:
-        info = codecs.lookup(name)
-    except (LookupError, ValueError):  # ValueError: a NUL, refused above too
+        info = codecs.lookup(codec)
+    except LookupError:
         return None
-    if info.name in _WIDE_CODECS:
-        return "utf-8"
     # A bytes-to-bytes or str-to-str codec (base64, zlib, rot13) is no charset.
     if not info._is_text_encoding or info.name in _REFUSED_CODECS:
         return None
-    codec = _BROWSER_CODECS.get(info.name, info.name)
     # EBCDIC (cp500), utf-32 and HZ, among others, do not read ASCII as
-    # ASCII, so a tag read as ASCII cannot have named the page's charset.
+    # ASCII, so a declaration read as ASCII cannot have named the page's
+    # charset.
     try:
         if _ASCII_PROBE.decode(codec) != _ASCII_PROBE.decode("ascii"):
             return None
