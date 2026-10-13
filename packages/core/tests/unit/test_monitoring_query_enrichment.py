@@ -287,6 +287,9 @@ async def test_query_polls_on_a_local_model_when_searxng_is_configured(
     assert "input_schema" in web[0], "expected the client tool, not the server one"
     assert set(kwargs["client_tool_handlers"]) == {"web_search"}
     assert kwargs["terminal_tool_names"] == {"emit_query_results"}
+    # No web_fetch, though the selection carries one (the chat knob): a poll
+    # is unattended and a page read would only shape its summary.
+    assert [t["name"] for t in kwargs["tools"]] == ["emit_query_results", "web_search"]
     # One round per search (WEB_SEARCH_MAX_USES=2) plus the emit round.
     assert kwargs["max_client_tool_rounds"] == 3
 

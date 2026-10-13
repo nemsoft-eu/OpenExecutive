@@ -20,6 +20,7 @@ from openexecutive.monitoring.research.prompts import (
 from openexecutive.monitoring.research.tools import (
     EMIT_RESEARCH_FINDINGS_TOOL,
 )
+from openexecutive.orchestrator.web_fetch import SeenUrls
 from openexecutive.orchestrator.web_search_tool import (
     client_search_handlers,
     client_tool_rounds,
@@ -51,17 +52,35 @@ async def research_one_specialist(
     )
 
     tools: list[dict[str, Any]] = [EMIT_RESEARCH_FINDINGS_TOOL]
-    # The research fan-out has its own search cap (each specialist gets
-    # this many searches; the chat knob stays with chat and standing queries).
+    # The research fan-out has its own search and fetch caps, per specialist
+    # (the chat search knob stays with chat and standing queries).
     # Selection is against the RESEARCH model, not the specialist's chat
     # default — that is the model the call is actually made with below.
+    settings = get_settings()
     research_model = get_research_model()
     search = select_web_search_tool(
         research_model,
-        max_uses=get_settings().research_web_search_max_uses,
+        max_uses=settings.research_web_search_max_uses,
+        fetch_max_uses=settings.research_web_fetch_max_uses,
     )
+    # web_fetch only beside the client search. Beside a server search the
+    # call is a single generation with no handler loop, and a loop added for
+    # the fetch would neither read the server's result blocks into the set
+    # nor replay them (agents.base._replay_assistant_turn). The seen-URL
+    # set starts empty and only this call's own search results join it
+    # (client_search_handlers), never research_context or the note in it:
+    # those hold text other people and the model wrote, so a URL there could
+    # be one chosen to carry data out in its path or query. The
+    # mail lockdown is the fetch handler's own check (delegation.lockdown):
+    # a run a chat turn starts inherits that turn's context, so it reads the
+    # same pin object and sees a mail read the turn records after the run
+    # began; a scheduled run binds no session, so there is no pin to read.
+    seen: SeenUrls | None = None
     if search is not None:
         tools.append(search.tool)
+        if search.kind == "client" and search.fetch_tool is not None:
+            tools.append(search.fetch_tool)
+            seen = SeenUrls()
 
     # The research-mode turn is retrieve-from-web-search + summarize, not
     # deep strategic reasoning. Its model + deep-reasoning are controlled by
@@ -79,9 +98,11 @@ async def research_one_specialist(
             timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
             model_override=research_model,
             deep_reasoning_override=get_research_use_deep_reasoning(),
-            client_tool_handlers=client_search_handlers(search),
+            client_tool_handlers=client_search_handlers(search, seen),
             terminal_tool_names={"emit_research_findings"},
-            max_client_tool_rounds=client_tool_rounds(search),
+            max_client_tool_rounds=client_tool_rounds(
+                search, with_fetch=seen is not None
+            ),
         )
     except Exception:
         logger.exception(

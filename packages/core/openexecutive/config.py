@@ -957,6 +957,15 @@ class Settings(BaseSettings):
     research_web_search_max_uses: int = Field(
         3, alias="RESEARCH_WEB_SEARCH_MAX_USES"
     )
+    # Page reads per specialist in the same fan-out, through the client-side
+    # web_fetch. Only beside the SearXNG search (a local research model): the
+    # server search runs in a single call with no loop to run a fetch in.
+    # Each read adds up to 12,000 characters that the specialist's later
+    # rounds re-read, times seven specialists, so the default is one; 0 turns
+    # it off. Standing queries get none (monitoring/sources/query.py).
+    research_web_fetch_max_uses: int = Field(
+        1, alias="RESEARCH_WEB_FETCH_MAX_USES"
+    )
     # Which specialists the research fan-out runs (comma-separated slugs
     # from cso, cfo, cmo, coo, chro, cpo, gc). Empty = all seven. Unknown
     # slugs are logged and skipped.
@@ -1040,6 +1049,8 @@ class Settings(BaseSettings):
             raise ValueError("WEB_SEARCH_MAX_USES must be >= 1")
         if self.research_web_search_max_uses < 1:
             raise ValueError("RESEARCH_WEB_SEARCH_MAX_USES must be >= 1")
+        if self.research_web_fetch_max_uses < 0:
+            raise ValueError("RESEARCH_WEB_FETCH_MAX_USES must be >= 0")
         if self.searxng_timeout_s <= 0:
             raise ValueError("SEARXNG_TIMEOUT_S must be > 0")
         if self.searxng_max_results < 1:

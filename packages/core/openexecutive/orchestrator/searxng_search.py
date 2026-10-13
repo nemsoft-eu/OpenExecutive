@@ -128,7 +128,8 @@ def make_search_handler(
 
     ``on_result_url`` is called with each result URL a search returns, as
     the model sees it (after the domain filter and the length cap); the chat
-    loop passes its ``web_fetch.SeenUrls.add`` so a result can be opened.
+    loop and the research fan-out pass their ``web_fetch.SeenUrls.add`` so a
+    result can be opened.
 
     Callers go through ``web_search_tool.client_search_handlers``, which
     explains when a fresh budget must — and must not — be created.
