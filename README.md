@@ -456,6 +456,11 @@ See [.env.example](.env.example) for the full list.
 > use a self-hosted SearXNG instance instead — see [Running on Local
 > Models](#running-on-local-models). `WEB_SEARCH_ALLOWED_DOMAINS` /
 > `WEB_SEARCH_BLOCKED_DOMAINS` scope where it may look (set at most one).
+> Where the install applies them itself (the SearXNG filter, and `web_fetch`
+> below),
+> an entry names the domain the connection goes to: an internationalised one
+> means its IDNA 2008 form (`straße.de` is `xn--strae-oqa.de`, not
+> `strasse.de`), and one that does not encode is ignored with a warning.
 > The same switch and lists govern `web_fetch`, which opens a page in full.
 > It is a client-side fetch on every model that has search: it opens only a URL
 > the person wrote in their message or one a search returned that turn (on

@@ -29,6 +29,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
+import idna
 
 from openexecutive.agents.tool_outcome import ToolOutcome
 from openexecutive.config import Settings, get_settings
@@ -336,14 +337,38 @@ def _normalise_host(host: str) -> str:
     shared encoding the two never compare equal, and a blocklist entry for
     an internationalised domain silently blocks nothing. Both sides of every
     comparison go through here.
+
+    The encoding is the one httpx connects with: an ASCII host is only
+    lowercased, any other goes through IDNA 2008 (``idna.encode``). Python's
+    own ``"idna"`` codec is IDNA 2003, which maps "ß" to "ss" and "ς" to "σ",
+    so an entry for ``straße.de`` would block ``strasse.de`` and let the
+    request to ``xn--strae-oqa.de`` through.
+
+    A host IDNA 2008 rejects is tried once more with the UTS #46 mapping
+    browsers apply, which folds a fullwidth or circled letter, a long s or
+    a soft hyphen to the domain it stands for (``blocked.com`` typed with
+    a fullwidth "b" is ``blocked.com``). httpx refuses such a host, so this
+    never changes which host a fetch reaches; it keeps an entry an operator
+    typed that way working, and judges a search result linking to such a
+    host by the domain a browser would open.
     """
     host = host.strip().lower().rstrip(".")
-    try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:
-        # Not encodable (e.g. an over-long label). Compare verbatim: it can
-        # still match an identical entry, and it can never match by accident.
+    if host.isascii():
         return host
+    for uts46 in (False, True):
+        try:
+            # idna also splits on the ideographic and fullwidth full stops,
+            # so a host ending in one still encodes with a trailing ".".
+            return idna.encode(host, uts46=uts46).decode("ascii").rstrip(".")
+        except ValueError:
+            # ValueError covers IDNAError and the bare ValueError idna
+            # raises for a codepoint without a name.
+            continue
+    # Not encodable either way (an over-long label, a joiner out of context,
+    # a symbol neither standard allows). Compare verbatim: it stays
+    # non-ASCII, so it can never equal an encoded host, and httpx refuses
+    # to connect to it anyway.
+    return host
 
 
 def host_of(url: str) -> str:
@@ -360,7 +385,11 @@ def domain_refusal(host: str, settings: Settings) -> Literal["not_allowed", "blo
     WEB_SEARCH_BLOCKED_DOMAINS, or None. Search results and every
     ``web_fetch`` hop share it, so the two cannot disagree on a site."""
     allowed = _bare_hosts(settings.web_search_allowed_domains)
-    if allowed and not any(host_matches(host, d) for d in allowed):
+    # Keyed on the configured list, not the parsed one: an allowlist whose
+    # every entry was ignored must still allow nothing, not everything.
+    if settings.web_search_allowed_domains and not any(
+        host_matches(host, d) for d in allowed
+    ):
         return "not_allowed"
     blocked = _bare_hosts(settings.web_search_blocked_domains)
     if blocked and any(host_matches(host, d) for d in blocked):
@@ -388,10 +417,19 @@ def _bare_hosts(entries: list[str]) -> list[str]:
             host = urlparse(raw if "://" in raw else f"//{raw}").hostname
         except ValueError:
             host = None
-        if host:
-            hosts.append(_normalise_host(host))
-        else:
+        if not host:
             logger.warning("searxng: ignoring unparseable domain entry %r", raw)
+            continue
+        bare = _normalise_host(host)
+        if not bare.isascii():
+            # Neither IDNA 2008 nor UTS #46 encodes it, so httpx can never
+            # connect to that name and no fetched host can match it: kept, it
+            # would only look like a working entry. Say so instead of failing
+            # settings load.
+            logger.warning("searxng: ignoring domain entry %r that does not "
+                           "encode as a domain name", raw)
+            continue
+        hosts.append(bare)
     return hosts
 
 

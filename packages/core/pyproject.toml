@@ -35,6 +35,10 @@ dependencies = [
     # uv honours sources for direct dependencies, not transitive ones.
     "torch>=2.0",
     "httpx>=0.27.0",
+    # The web search domain lists encode hosts with it (searxng_search.py) so
+    # they read a host exactly as httpx, which uses it, connects to it. 3.7
+    # fixes the quadratic-time encode of CVE-2024-3651.
+    "idna>=3.7",
     "aiofiles>=23.2.0",
     "python-multipart>=0.0.9",
     "aiohttp>=3.9.0",
