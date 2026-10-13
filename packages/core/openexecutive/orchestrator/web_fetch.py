@@ -377,8 +377,9 @@ class SeenUrls:
         added too. That is harmless: the rule exists so the model cannot
         reach an address of its own choosing, and this one is still in the
         text the caller vouched for (what the speaker typed, and in
-        ``memory_text`` the names of the files they attached), opened with
-        no path or query the model added and under the same domain and
+        ``memory_text`` the names of the files they attached; a third party
+        may have chosen such a name, so a dotted one seeds its host), opened
+        with no path or query the model added and under the same domain and
         address checks as any other.
         """
         # The links with a scheme are blanked before the scheme-less pass, so

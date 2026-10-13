@@ -471,6 +471,19 @@ def test_what_a_scheme_less_pass_seeds(text: str, expected: set[str]) -> None:
     assert seen._urls == expected
 
 
+def test_a_dotted_file_name_seeds_its_host_and_nothing_the_model_can_extend() -> None:
+    """``memory_text`` carries the attached files' names, and a third party may
+    have chosen one. It seeds the host alone: a path, query, port or scheme
+    the model adds is a different URL and stays refused."""
+    seen = web_fetch.SeenUrls()
+    seen.add_from_text("(Attached files: x.attacker.example)")
+    assert seen.allows("https://x.attacker.example/")
+    assert not seen.allows("https://x.attacker.example/exfil")
+    assert not seen.allows("https://x.attacker.example/?q=1")
+    assert not seen.allows("https://x.attacker.example:8443/")
+    assert not seen.allows("http://x.attacker.example/")
+
+
 def test_a_huge_character_reference_in_a_pasted_url_does_not_raise() -> None:
     """html.unescape raises past 4,300 digits; seeding runs before the
     turn's first model call, so a raise there would end the turn."""
