@@ -1324,6 +1324,63 @@ def test_stream_accumulator_ignores_malformed_streamed_annotations() -> None:
     assert [blk.type for blk in acc.finalize().content] == ["text"]
 
 
+def test_response_with_tool_calls_keeps_the_citations_after_them() -> None:
+    body = {"choices": [{"message": {
+        "content": "Opening it.",
+        "annotations": [_citation("https://a.example/1")],
+        "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "web_fetch", "arguments": json.dumps({"url": "https://a.example/1"})}}],
+        "reasoning_details": [{"type": "reasoning.text", "text": "why"}],
+    }, "finish_reason": "tool_calls"}]}
+    msg = from_openai_response(body)
+    assert [b.type for b in msg.content] == [
+        "text", "tool_use", OPENROUTER_CITATIONS_BLOCK, OPENROUTER_REASONING_BLOCK,
+    ]
+    assert msg.stop_reason == "tool_use"
+
+
+def test_response_with_citations_and_no_text_has_only_the_citations_block() -> None:
+    body = {"choices": [{"message": {
+        "content": None, "annotations": [_citation("https://a.example/1")],
+    }, "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [["https://a.example/1"]]
+
+
+def test_many_citations_keep_first_arrival_order_and_fold_exact_duplicates() -> None:
+    """Only an identical string is a duplicate here: a fragment or case
+    variant is a different string, and SeenUrls folds it later."""
+    urls = [f"https://a.example/{i}" for i in range(10_000)]
+    variants = ["https://a.example/0#frag", "HTTPS://A.EXAMPLE/0"]
+    annotations = [_citation(u) for u in [*urls, *reversed(urls), *variants]]
+    body = {"choices": [{"message": {"content": "x", "annotations": annotations},
+                         "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [[*urls, *variants]]
+
+
+def test_stream_accumulator_reads_citations_wherever_they_arrive() -> None:
+    """Before any text, repeated in every chunk, in a final chunk with only a
+    ``message``, and after finish_reason: each URL once, in first-arrival
+    order, behind the text and the tool call. A chunk with no choices (the
+    usage chunk) carries none and costs nothing."""
+    a, b, c = "https://a.example/1", "https://b.example/2", "https://c.example/3"
+    acc = StreamAccumulator()
+    acc.feed({"choices": [{"delta": {"annotations": [_citation(a)]}, "finish_reason": None}]})
+    acc.feed({"choices": [{"delta": {"content": "Read it.", "annotations": [_citation(a)]},
+                           "finish_reason": None}]})
+    acc.feed({"choices": [{"delta": {"annotations": [_citation(a), _citation(b)], "tool_calls": [
+        {"index": 0, "id": "c1", "type": "function",
+         "function": {"name": "web_fetch", "arguments": json.dumps({"url": a})}}]},
+        "finish_reason": "tool_calls"}]})
+    acc.feed({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    acc.feed({"choices": [{"message": {"annotations": [_citation(b), _citation(c)]},
+                           "finish_reason": None}]})
+    msg = acc.finalize()
+    assert [blk.type for blk in msg.content] == ["text", "tool_use", OPENROUTER_CITATIONS_BLOCK]
+    assert msg.content[0].text == "Read it."
+    assert msg.content[2].urls == [a, b, c]
+    assert msg.stop_reason == "tool_use"
+
+
 # --------------------------------------------------------------------------
 # tool_result cache_control — the agent loop's intra-turn breakpoint
 # --------------------------------------------------------------------------

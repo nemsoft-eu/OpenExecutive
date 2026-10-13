@@ -465,11 +465,13 @@ def server_search_result_urls(block: Any) -> list[str]:
     still drops what is not a plain, credential-free http(s) address."""
     if getattr(block, "type", None) == OPENROUTER_CITATIONS_BLOCK:
         urls = getattr(block, "urls", None)
-        return [url for url in urls if isinstance(url, str) and url] if isinstance(urls, list) else []
-    results = getattr(block, "content", None)
-    if not isinstance(results, list):  # a WebSearchToolResultError
-        return []
-    urls = (getattr(result, "url", None) for result in results)
+        if not isinstance(urls, list):
+            return []
+    else:
+        results = getattr(block, "content", None)
+        if not isinstance(results, list):  # a WebSearchToolResultError
+            return []
+        urls = [getattr(result, "url", None) for result in results]
     return [url for url in urls if isinstance(url, str) and url]
 
 

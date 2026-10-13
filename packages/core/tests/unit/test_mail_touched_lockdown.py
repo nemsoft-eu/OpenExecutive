@@ -499,6 +499,42 @@ def test_link_workflow_and_broadcast_handlers_refuse_on_their_own(handler: str, 
         current_session.reset(token)
 
 
+@pytest.mark.parametrize("read_mail", [False, True])
+def test_web_fetch_refuses_an_openrouter_cited_url_after_reading_mail(read_mail: bool) -> None:
+    """A URL OpenRouter's search cited is seen, and still not opened once the
+    turn has read mail: the lockdown runs before the seen-URL check."""
+    from unittest.mock import AsyncMock
+
+    from openexecutive.agents.tool_outcome import ToolOutcome
+    from openexecutive.orchestrator.web_fetch import server_search_result_urls
+    from openexecutive.providers.translator import from_openai_response
+
+    url = "https://cited.example/a"
+    seen = SeenUrls()
+    msg = from_openai_response({"choices": [{"message": {"content": "x", "annotations": [
+        {"type": "url_citation", "url_citation": {"url": url}},
+    ]}, "finish_reason": "stop"}]})
+    for block in msg.content:
+        for cited in server_search_result_urls(block):
+            seen.add(cited)
+    assert seen.allows(url)
+    fn = make_fetch_handler(SearchBudget(max_uses=1), seen)
+    session = Session()
+    token = current_session.set(session)
+    run_fetch = AsyncMock(return_value=ToolOutcome('{"content": "page"}'))
+    try:
+        if read_mail:
+            session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
+                offered=True, touched_mail=True, read_mail=True, session_id=session.session_id,
+            )
+        with patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch):
+            outcome = asyncio.run(fn({"url": url}))
+    finally:
+        current_session.reset(token)
+    assert run_fetch.await_count == (0 if read_mail else 1)
+    assert outcome.is_error is read_mail
+
+
 @pytest.mark.parametrize("reads_mail", [False, True])
 def test_a_contact_the_speaker_names_is_added_after_reading_mail(
     monkeypatch: pytest.MonkeyPatch, reads_mail: bool

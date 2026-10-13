@@ -712,19 +712,21 @@ def _url_citation_urls(annotations: Any) -> list[str]:
     a non-list or a non-dict entry, contributes nothing."""
     if not isinstance(annotations, list):
         return []
-    urls: list[str] = []
+    # A dict as an ordered set, so folding duplicates among thousands of
+    # citations stays linear.
+    urls: dict[str, None] = {}
     for entry in annotations:
         if not isinstance(entry, dict) or entry.get("type") != "url_citation":
             continue
         nested = entry.get("url_citation")
         url = nested.get("url") if isinstance(nested, dict) else entry.get("url")
-        if isinstance(url, str) and url and url not in urls:
-            urls.append(url)
-    return urls
+        if isinstance(url, str) and url:
+            urls[url] = None
+    return list(urls)
 
 
 def _citations_block(urls: list[str]) -> SimpleNamespace | None:
-    return _block(OPENROUTER_CITATIONS_BLOCK, urls=list(urls)) if urls else None
+    return _block(OPENROUTER_CITATIONS_BLOCK, urls=urls) if urls else None
 
 
 def _stop_reason_from_openai(reason: str | None) -> str:
@@ -1019,8 +1021,9 @@ class StreamAccumulator:
         # verbatim and re-emitted as one block at finalize().
         self._reasoning_details: list[Any] = []
         # Result URLs of OpenRouter's search (see OPENROUTER_CITATIONS_BLOCK),
-        # in arrival order, each once.
-        self._citation_urls: list[str] = []
+        # in arrival order, each once: a dict as an ordered set, since a
+        # stream may repeat the whole list in every chunk.
+        self._citation_urls: dict[str, None] = {}
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] = {}
         self._model: str = ""
@@ -1088,9 +1091,7 @@ class StreamAccumulator:
             delta.get("annotations"),
             message.get("annotations") if isinstance(message, dict) else None,
         ):
-            for url in _url_citation_urls(streamed):
-                if url not in self._citation_urls:
-                    self._citation_urls.append(url)
+            self._citation_urls.update(dict.fromkeys(_url_citation_urls(streamed)))
 
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
@@ -1155,7 +1156,7 @@ class StreamAccumulator:
                 )
             )
         # Citations, then reasoning, last — see from_openai_response for why.
-        citations_block = _citations_block(self._citation_urls)
+        citations_block = _citations_block(list(self._citation_urls))
         if citations_block is not None:
             content_blocks.append(citations_block)
         reasoning_block = _reasoning_details_block(self._reasoning_details)
