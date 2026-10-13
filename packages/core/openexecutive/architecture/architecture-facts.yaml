@@ -1216,9 +1216,9 @@ routing:
     `e.g.` or IPv4 address), an optional port and path. Both ends are a
     listed boundary, never "any character a host cannot hold": it starts
     at the start of the text, after whitespace, or after punctuation that
-    opens or separates a link (`(`, `[`, `<`, `|`, straight and curly
-    quotes, `*`, `,` …), and ends at the end of the text, whitespace or
-    closing punctuation, after any run of `.` and `:`. So a letter, a
+    opens or separates a link (`(`, `[`, `<`, `|`, straight quotes, `*`,
+    `,` …), and ends at the end of the text, whitespace or closing
+    punctuation, after any run of `.` and `:`. So a letter, a
     zero-width space, soft hyphen, `+`, `=`, `/`, `:` or `@` right before
     the host seeds nothing (`foo+example.com/x` once seeded
     `example.com/x`), and a malformed port seeds nothing
@@ -1228,7 +1228,20 @@ routing:
     `reilly.com`), which is text the person wrote all the same. A common
     email address seeds neither its domain nor its local part; a local
     part holding a character that ends a link (`jane.doe!x@…`) may seed
-    its dotted prefix. An internationalised host needs its scheme. A word that only looks like a
+    its dotted prefix. The non-ASCII marks (`_WIDE_DELIMITERS`: CJK full
+    stop and commas, curly quotes and guillemets, CJK brackets, fullwidth
+    parentheses, the em dash and the ellipsis) are one set that starts,
+    ends and stops the link: a URL carries them only percent-encoded, so
+    the path and query stop at one (`“example.com/page”` and
+    `see—example.com/page—please` seed `https://example.com/page`). One
+    set serves all three because a mark that stopped the path without
+    ending a link would seed nothing and make the end check backtrack
+    quadratically. The ASCII marks a URL may hold (`(`, `)`, `{`, `}`,
+    `'`, `*`, `,`, `;`, `!`, `?`) stay in the path, as with a scheme, and
+    `_trim_url` drops the sentence punctuation or unbalanced `)` it ends
+    on. A link with a scheme keeps its own delimiters, so
+    `“https://example.com/page”` still takes the closing quote into its
+    path. An internationalised host needs its scheme. A word that only looks like a
     host (`report.pdf`) is seeded too and is harmless: it is still in the
     text the caller vouched for (`memory_text`, which also carries the
     attached files' names, so a dotted filename seeds a host with no

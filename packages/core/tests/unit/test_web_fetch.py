@@ -495,8 +495,20 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         ("\u300cexample.com\u300d", {"https://example.com/"}),
         ("\uff08example.com\uff09", {"https://example.com/"}),
         ("a.example\u3001b.example", {"https://a.example/", "https://b.example/"}),
-        # A path runs to _URL_RE's delimiters, so text joined to it is path.
+        # Those marks end a path, query or fragment too, never join it.
+        ("\u201cexample.com/page\u201d", {"https://example.com/page"}),
+        ("see\u2014example.com/page\u2014please", {"https://example.com/page"}),
+        ("\u300cexample.com/page\u300d", {"https://example.com/page"}),
+        ("\uff08example.com/page\uff09", {"https://example.com/page"}),
+        ("example.com/page\u2026", {"https://example.com/page"}),
+        ("example.com?x=1\u3001", {"https://example.com/?x=1"}),
+        ("example.com/a?q=b\u00bb", {"https://example.com/a?q=b"}),
+        # Percent-encoded, the same mark is the path's.
+        ("example.com/a%E2%80%9Db", {"https://example.com/a%E2%80%9Db"}),
+        # Otherwise a path runs to _URL_RE's delimiters, so text joined to it,
+        # a CJK letter included, is path.
         ("example.com/x\u89c1", {"https://example.com/x%E8%A7%81"}),
+        ("example.com/\u9875", {"https://example.com/%E9%A1%B5"}),
         # A port past 65535 makes no URL, so nothing is seen.
         ("example.com:99999/x", set()),
         ("example.com:8443/a", {"https://example.com:8443/a"}),
@@ -537,6 +549,37 @@ def test_what_a_scheme_less_pass_seeds(text: str, expected: set[str]) -> None:
     seen = web_fetch.SeenUrls()
     seen.add_from_text(text)
     assert seen._urls == expected
+
+
+# CJK full stop and commas, curly quotes and guillemets, CJK corner brackets
+# and fullwidth parentheses, the em dash and the ellipsis.
+_WIDE_MARKS = [
+    "\u3002", "\uff0c", "\u3001",
+    "\u201c", "\u201d", "\u2018", "\u2019", "\u201e", "\u00ab", "\u00bb",
+    "\u300c", "\u300d", "\uff08", "\uff09",
+    "\u2014", "\u2026",
+]
+
+
+def test_the_wide_marks_are_the_ones_the_pattern_uses() -> None:
+    assert set(web_fetch._WIDE_DELIMITERS) == set(_WIDE_MARKS)
+
+
+@pytest.mark.parametrize("mark", _WIDE_MARKS, ids=[f"U+{ord(m):04X}" for m in _WIDE_MARKS])
+def test_a_wide_mark_starts_ends_and_stops_a_scheme_less_link(mark: str) -> None:
+    """Each mark is a boundary on either side and is never path: a link
+    stopped at a mark that could not end one would seed nothing."""
+    cases = {
+        f"example.com/p{mark}q": {"https://example.com/p"},
+        f"{mark}example.com/p{mark}": {"https://example.com/p"},
+        f"{mark}example.com{mark}": {"https://example.com/"},
+        f"example.com?x=1{mark}": {"https://example.com/?x=1"},
+        f"a.example{mark}b.example": {"https://a.example/", "https://b.example/"},
+    }
+    for text, expected in cases.items():
+        seen = web_fetch.SeenUrls()
+        seen.add_from_text(text)
+        assert seen._urls == expected, ascii(text)
 
 
 def test_a_dotted_file_name_seeds_its_host_and_nothing_the_model_can_extend() -> None:
@@ -597,8 +640,18 @@ def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> Non
         "aa." * 40_000 + "@",
         " a.bc" + "." * 100_000 + "x",
         "+a.bc" * 20_000,
+        "example.com/" + "." * 100_000 + "\u300c",
+        "example.com/" + "a\u2014" * 50_000,
+        "\u201ca.bc\u201d" * 16_000,
     ],
-    ids=["label-run-to-at", "dot-run-after-host", "joined-hosts"],
+    ids=[
+        "label-run-to-at",
+        "dot-run-after-host",
+        "joined-hosts",
+        "dot-run-path-to-wide-mark",
+        "path-of-wide-marks",
+        "curly-quoted-hosts",
+    ],
 )
 def test_the_scheme_less_pass_stays_linear(text: str) -> None:
     """A look-ahead that rescans the rest of a run of labels from every place

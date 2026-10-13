@@ -85,14 +85,34 @@ UNTRUSTED_PAGE_NOTICE = (
 # only when it is unbalanced, so a Wikipedia-style /Foo_(bar) survives. A
 # single quote and "*" are kept too (/Schindler's_List) and trimmed only at
 # the end, where they close a 'quoted' or **bold** URL.
-_URL_CHARS = r"[^\s<>|\[\]\"`]"
+_URL_STOPS = r"\s<>|\[\]\"`"
+_URL_CHARS = rf"[^{_URL_STOPS}]"
 _URL_RE = re.compile(rf"(?i:https?)://{_URL_CHARS}+")
+# Non-ASCII punctuation that opens, separates or closes a link in prose:
+# CJK full stop and commas, curly quotes and guillemets, CJK corner brackets
+# and fullwidth parentheses, the em dash and the ellipsis. A URL holds none
+# of them raw (it carries one percent-encoded, as %E2%80%9D), so each one
+# starts, ends and stops a scheme-less link alike. One set serves all three
+# so they cannot drift apart: a mark that stopped the path but did not end a
+# link would leave a link whose path runs up to it matching nothing, and the
+# end check would backtrack through the whole path, rescanning a run of dots
+# at every step, which is quadratic. A link with a scheme keeps _URL_CHARS.
+_WIDE_DELIMITERS = (
+    "\u3002\uff0c\u3001"
+    "\u201c\u201d\u2018\u2019\u201e\u00ab\u00bb"
+    "\u300c\u300d\uff08\uff09"
+    "\u2014\u2026"
+)
 # A link written without a scheme ("example.com/page"), opened as https://.
 # ASCII labels only, spelled out rather than [a-z] with re.IGNORECASE, which
 # also matches "ſ" and the Kelvin sign. At least one dot and an alphabetic
 # final label of two or more letters, so "1.2.3", "v2.0", "e.g." and an IPv4
-# address never match. The optional port, path, query or fragment uses
-# _URL_RE's delimiters.
+# address never match. The optional port, path, query or fragment runs to
+# _URL_RE's delimiters or one of _WIDE_DELIMITERS, so `“example.com/page”`
+# and "see—example.com/page—please" seed https://example.com/page. The ASCII
+# marks that bound a link but a URL may hold ("(", ")", "{", "}", "'", "*",
+# ",", ";", "!", "?") stay in the path, as in a link with a scheme, and
+# _trim_url drops the sentence punctuation or unbalanced ")" it ends on.
 #
 # Both ends must be a boundary the text has, listed rather than taken as
 # "any character a host cannot hold": that let a zero-width space, a soft
@@ -101,36 +121,33 @@ _URL_RE = re.compile(rf"(?i:https?)://{_URL_CHARS}+")
 # ("example.com:abc/path" seeded https://example.com/). A link starts at the
 # start of the text, after whitespace, or after punctuation that opens or
 # separates one in the forms people paste: Markdown's [label](url), Slack's
-# <url> and <url|label>, straight and curly quotes, **bold**, a list, an
-# em dash, and CJK brackets, commas and full stop. Nothing else, so never
-# after a letter ("straße.de", or "example.com" spelled with a Cyrillic
-# "a"), "@" (an email address's domain), "/", "=", "+", a zero-width space
-# or soft hyphen, or ":" (a port or a scheme: "example.com:abc.example/x"
-# would seed "abc.example/x"). A punctuation mark in the set still starts a match
-# after a word ("o'reilly.com" seeds reilly.com), which gives no one a URL
-# they could not have written as a word of its own. A link ends at the end
-# of the text, whitespace or closing punctuation, after any run of "." and
-# ":" ("read example.com.", "example.com: nice"). Anything else after the
-# host, such as a letter, "-", "+", "@" or a port that is not one, leaves no
-# match, and the host cannot shrink to a shorter one: that would end before
-# a letter, a digit or "-", or before a "." followed by one. So a common
-# email address ("jane.doe@…", "first.last+tag@…", "jane.doe=x@…") seeds
+# <url> and <url|label>, straight quotes, **bold**, a list, and any of
+# _WIDE_DELIMITERS. Nothing else, so never after a letter ("straße.de", or
+# "example.com" spelled with a Cyrillic "a"), "@" (an email address's
+# domain), "/", "=", "+", a zero-width space or soft hyphen, or ":" (a port
+# or a scheme: "example.com:abc.example/x" would seed "abc.example/x"). A
+# punctuation mark in the set still starts a match after a word
+# ("o'reilly.com" seeds reilly.com), which gives no one a URL they could not
+# have written as a word of its own. A link ends at the end of the text,
+# whitespace, closing or separating ASCII punctuation, or any of
+# _WIDE_DELIMITERS, after any run of "." and ":" ("read example.com.",
+# "example.com: nice"). Anything else after the host, such as a letter,
+# "-", "+", "@" or a port that is not one, leaves no match, and the host
+# cannot shrink to a shorter one: that would end before a letter, a digit
+# or "-", or before a "." followed by one. So a common email address ("jane.doe@…", "first.last+tag@…", "jane.doe=x@…") seeds
 # neither its domain nor its local part; a local part holding a character
 # that ends a link ("jane.doe!x@…") may still seed its dotted prefix, which
 # is harmless for the reason add_from_text gives.
-_BARE_URL_START = (
-    r"(?:^|(?<=[\s(\[<{\"'`>,;!?*|\u3002\uff0c"
-    r"\u201c\u2018\u201e\u00ab\u300c\uff08\u3001\u2014]))"
-)
-_BARE_URL_END = (
-    r"(?=[.:]*(?:$|[\s)\]}>\"'`,;!?*|<\[\u3002\uff0c"
-    r"\u201d\u2019\u201c\u00bb\u300d\uff09\u3001\u2014\u2026]))"
-)
+_BARE_URL_START = r"(?:^|(?<=[\s(\[<{\"'`>,;!?*|" + _WIDE_DELIMITERS + r"]))"
+_BARE_URL_END = r"(?=[.:]*(?:$|[\s)\]}>\"'`,;!?*|<\[" + _WIDE_DELIMITERS + r"]))"
 _BARE_URL_RE = re.compile(
     _BARE_URL_START
     + r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
     + r"(?::[0-9]{1,5})?"
-    + rf"(?:[/?#]{_URL_CHARS}*)?"
+    + r"(?:[/?#][^"
+    + _URL_STOPS
+    + _WIDE_DELIMITERS
+    + r"]*)?"
     + _BARE_URL_END
 )
 # Both forms in one left-to-right pass, the scheme-less one in group 1. A
