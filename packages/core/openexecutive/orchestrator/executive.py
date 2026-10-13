@@ -174,7 +174,10 @@ from openexecutive.orchestrator.workflow_run_tools import (
 )
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
-from openexecutive.providers.translator import reasoning_replay_block
+from openexecutive.providers.translator import (
+    OPENROUTER_CITATIONS_BLOCK,
+    reasoning_replay_block,
+)
 from openexecutive.workflows import python_job, step_script
 from openexecutive.workflows.action_step import looks_like_error
 from openexecutive.workflows.python_job import PYTHON_JOB_TOOL_HANDLERS, PYTHON_JOB_TOOLS
@@ -2665,6 +2668,14 @@ class Executive:
                     response_content.append(block.model_dump(exclude_none=True))
                     # Its result URLs may be opened, as the client search's are
                     # (searxng_search's on_result_url).
+                    for url in server_search_result_urls(block):
+                        seen_urls.add(url)
+                elif block.type == OPENROUTER_CITATIONS_BLOCK:
+                    # OpenRouter's search returns its results as citations,
+                    # which may be opened likewise. Not added to
+                    # response_content: it holds nothing the model needs on
+                    # the next round, and the translator would drop it from
+                    # that request anyway.
                     for url in server_search_result_urls(block):
                         seen_urls.add(url)
                 elif (replay := reasoning_replay_block(block)) is not None:

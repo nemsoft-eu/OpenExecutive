@@ -462,7 +462,9 @@ caching:
     surfaced as ``server_tool_use`` so the usage rows record searches on
     this path too. The searches themselves never appear as ``tool_calls``;
     their results come back as ``annotations`` (url_citation) on the
-    message. The engine is left on OpenRouter's ``auto`` (native
+    message, whose URLs the translator carries in a synthetic
+    ``openrouter_url_citations`` block so `web_fetch` may open them (see
+    the seen-URL rule under web search). The engine is left on OpenRouter's ``auto`` (native
     provider search for Claude / GPT / Gemini / Grok, Exa otherwise).
     OpenRouter search's ``<cite>`` markup is stripped from tool-call
     arguments before they are parsed, so a citation inside an
@@ -570,7 +572,12 @@ providers:
     ``server_tool_use`` / ``web_search_tool_result`` blocks back into the
     next step's history, the OpenRouter path carries only the model's own
     text forward, so across a multi-step chat turn it may search again for
-    what it already found. OpenRouter search makes the model cite sources
+    what it already found. The search's result URLs (the ``url_citation``
+    annotations, read from ``message.annotations`` and, when streaming,
+    from ``delta.annotations`` or a final chunk's ``message``) become an
+    ``openrouter_url_citations`` block placed after the text and tool_use
+    blocks and before the reasoning block; it only seeds the turn's
+    seen-URL set and is never replayed. OpenRouter search makes the model cite sources
     with inline ``<cite index="...">…</cite>`` markup; the response path
     strips those wrapper tags from both text and tool-call arguments so they
     don't leak into findings / chat replies. Streaming SSE chunks
@@ -1180,8 +1187,22 @@ routing:
     searches: the SearXNG handler's (`make_search_handler(on_result_url=)`)
     and the server search's, read from each `web_search_tool_result` block
     in the Executive's block parser (`web_fetch.server_search_result_urls`;
-    an error block has none). OpenRouter returns no result blocks, so on
-    that path only the person's own links open. A caller that
+    an error block has none). OpenRouter's search returns no result
+    blocks; its results arrive as ``url_citation`` annotations, which the
+    translator carries in an ``openrouter_url_citations`` block and the
+    same parser reads (that block is not replayed in the next request).
+    Only each annotation's ``url`` is read, never its title, excerpt or
+    offsets: OpenRouter builds the annotations from the search engine's
+    results, and the model, which writes only ``content`` and
+    ``tool_calls``, has no way to add one, so a URL it (or a page it read)
+    writes cannot become openable by being echoed. The residual risk, a
+    page an attacker got indexed turning up in a search, is the same as
+    for Anthropic's and SearXNG's result URLs. The chat-completions
+    reference does not document where a stream carries annotations; the
+    translator reads ``delta.annotations`` and a final chunk's
+    ``message.annotations``, to be confirmed against a live stream after
+    deploy. If neither arrives, no result URL is seeded and a search
+    result is refused as before. A caller that
     passes no `memory_text` (unrostered email, the scheduler, evals)
     makes nothing in its message fetchable, only that turn's search
     results: fail closed. MCP `ask_executive` passes its `message` and

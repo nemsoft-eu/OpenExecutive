@@ -28,9 +28,9 @@ What we DO NOT translate:
   thinking, ``{"max_tokens": N}`` for a legacy ``budget_tokens`` request).
   OpenRouter maps that onto each vendor's native form (Anthropic budget /
   effort, OpenAI reasoning effort, Gemini thinkingLevel, …). The
-  ``reasoning`` / ``reasoning_details`` fields OpenRouter adds to the
-  response are ignored by the response path — only ``content`` and
-  ``tool_calls`` are read. See
+  ``reasoning`` text OpenRouter adds to the response is ignored by the
+  response path; ``reasoning_details`` is carried only so it can be
+  replayed (``OPENROUTER_REASONING_BLOCK``). See
   https://openrouter.ai/docs/guides/best-practices/reasoning-tokens.
 * Web-search server tools — feature_gate strips these only for the local
   OpenAI-compatible backend. For every OpenRouter model the Anthropic
@@ -42,7 +42,10 @@ What we DO NOT translate:
   https://openrouter.ai/docs/guides/features/server-tools/web-search.
   OpenRouter's search makes the model cite results with
   ``(cite index="...">…</cite>`` markup; the response path strips that
-  markup so it doesn't leak into findings / chat text.
+  markup so it doesn't leak into findings / chat text. The search's result
+  URLs, which OpenRouter reports as ``url_citation`` annotations, are
+  carried in an ``OPENROUTER_CITATIONS_BLOCK`` so ``web_fetch`` may open
+  them.
 """
 from __future__ import annotations
 
@@ -681,6 +684,49 @@ def _reasoning_details_block(details: Any) -> SimpleNamespace | None:
     return None
 
 
+# Synthetic content-block type carrying the result URLs of OpenRouter's web
+# search, so the Executive can let ``web_fetch`` open them as it does an
+# Anthropic ``web_search_tool_result``'s. OpenRouter runs the search inside
+# the generation and returns no result blocks: it reports the results as
+# ``message.annotations`` entries of type ``url_citation``, which it builds
+# from the search engine's result set. The model writes only ``content``
+# and ``tool_calls`` and has no channel into ``annotations``, so a URL the
+# model (or a page it read) writes cannot become a citation by being echoed.
+# Only the URL is kept; the title, excerpt and character offsets are not
+# needed and are not trusted. The self-hosted OpenAI-compatible backend
+# shares this parser but is sent no server search, so its server returns
+# annotations only if the operator set it up to, and is trusted the same
+# way as its other output. Never replayed: the agent loops drop it when
+# they rebuild the assistant turn, as ``_assistant_content_to_openai`` would.
+# https://openrouter.ai/docs/guides/features/plugins/web-search
+OPENROUTER_CITATIONS_BLOCK = "openrouter_url_citations"
+
+
+def _url_citation_urls(annotations: Any) -> list[str]:
+    """The URLs of the ``url_citation`` entries in ``annotations``, in order,
+    each once.
+
+    Chat completions nests the fields under ``url_citation`` (the OpenAI
+    message schema OpenRouter documents); the flat form, with ``url`` beside
+    ``type`` as in the Responses API, is read too. Anything else, including
+    a non-list or a non-dict entry, contributes nothing."""
+    if not isinstance(annotations, list):
+        return []
+    urls: list[str] = []
+    for entry in annotations:
+        if not isinstance(entry, dict) or entry.get("type") != "url_citation":
+            continue
+        nested = entry.get("url_citation")
+        url = nested.get("url") if isinstance(nested, dict) else entry.get("url")
+        if isinstance(url, str) and url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _citations_block(urls: list[str]) -> SimpleNamespace | None:
+    return _block(OPENROUTER_CITATIONS_BLOCK, urls=list(urls)) if urls else None
+
+
 def _stop_reason_from_openai(reason: str | None) -> str:
     """Map OpenAI ``finish_reason`` to Anthropic ``stop_reason``."""
     if reason == "tool_calls" or reason == "function_call":
@@ -849,6 +895,12 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
         # to run, so the turn is complete, not waiting on tool results.
         stop_reason = "end_turn"
 
+    # Search citations after the text and tool calls, for the same reason as
+    # the reasoning block below: content[0] stays what it was.
+    citations_block = _citations_block(_url_citation_urls(msg.get("annotations")))
+    if citations_block is not None:
+        content_blocks.append(citations_block)
+
     # Reasoning LAST. Several callers read ``content[0].text`` (the SDK
     # itself only ever emits text first for those prompts), so the synthetic
     # block must never displace the text block. Order carries no meaning on
@@ -966,6 +1018,9 @@ class StreamAccumulator:
         # OpenRouter streams ``delta.reasoning_details`` chunks; collected
         # verbatim and re-emitted as one block at finalize().
         self._reasoning_details: list[Any] = []
+        # Result URLs of OpenRouter's search (see OPENROUTER_CITATIONS_BLOCK),
+        # in arrival order, each once.
+        self._citation_urls: list[str] = []
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] = {}
         self._model: str = ""
@@ -1020,6 +1075,22 @@ class StreamAccumulator:
         details = delta.get("reasoning_details")
         if isinstance(details, list):
             self._reasoning_details.extend(details)
+
+        # Where a streamed response carries the annotations is not in
+        # OpenRouter's reference: its ``delta`` lists content, role and
+        # tool_calls only. ``delta.annotations`` is the OpenAI convention,
+        # and a final chunk may carry a whole ``message``, so read both. To
+        # be confirmed against a live stream after deploy; if neither
+        # arrives, no URL is seeded and web_fetch refuses search results
+        # as it did before.
+        message = choice.get("message")
+        for streamed in (
+            delta.get("annotations"),
+            message.get("annotations") if isinstance(message, dict) else None,
+        ):
+            for url in _url_citation_urls(streamed):
+                if url not in self._citation_urls:
+                    self._citation_urls.append(url)
 
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
@@ -1083,7 +1154,10 @@ class StreamAccumulator:
                     input=_strip_cite_in_value(parsed),
                 )
             )
-        # Reasoning last — see from_openai_response for why.
+        # Citations, then reasoning, last — see from_openai_response for why.
+        citations_block = _citations_block(self._citation_urls)
+        if citations_block is not None:
+            content_blocks.append(citations_block)
         reasoning_block = _reasoning_details_block(self._reasoning_details)
         if reasoning_block is not None:
             content_blocks.append(reasoning_block)
