@@ -1215,7 +1215,9 @@ routing:
     reports `64:ff9b::7f00:1` as global — and deprecated site-local
     `fec0::/10` and the local-use NAT64 prefix `64:ff9b:1::/48` refused
     whole, since the first is global to Python and the second embeds its
-    IPv4 at a length-dependent offset) and connects to the checked
+    IPv4 at a length-dependent offset; the classifier is
+    `utils.public_address`, shared with the Confluence sync's
+    CONFLUENCE_SYNC_PUBLIC_HOSTS_ONLY check) and connects to the checked
     addresses, each in resolver order until one answers, each attempt
     with an equal share of the deadline still left, at least 3 s
     (`_MIN_CONNECT_ATTEMPT_S`, one lost SYN's retries) or all that is
@@ -2279,7 +2281,10 @@ knowledge:
         where whoever sets CONFLUENCE_URL must not reach the backend's own
         network: each request resolves the host, refuses it when any address
         is not global (loopback, RFC 1918, link-local, CGNAT, ULA, and the
-        IPv4 inside IPv4-mapped, NAT64, 6to4 and Teredo forms), with a 10 s
+        IPv4 inside IPv4-mapped, IPv4-translated, IPv4-compatible,
+        well-known NAT64, 6to4 and Teredo forms, with deprecated site-local
+        and the local-use NAT64 prefix refused whole; `utils.public_address`,
+        the same classifier as the chat's web_fetch), with a 10 s
         resolver timeout, and connects to the checked address with the Host
         header and TLS server name kept as the site's name, so a re-pointed
         name cannot slip between check and connect. Those requests skip any

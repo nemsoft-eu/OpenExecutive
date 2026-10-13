@@ -17,9 +17,9 @@ from openexecutive.orchestrator.web_fetch import (
     WEB_FETCH_TOOL,
     BlockedAddressError,
     PinnedTransport,
-    is_public_address,
 )
 from openexecutive.orchestrator.web_search_tool import select_web_search_tool
+from openexecutive.utils import public_address
 
 from ._search_helpers import clear_search_env, use_local_model
 
@@ -111,46 +111,12 @@ def test_config_rejects_bad_fetch_bounds(
 
 
 # --- address policy -------------------------------------------------------
+# The classifier itself is tested in test_public_address.py; this checks only
+# that the fetch uses it.
 
 
-@pytest.mark.parametrize(
-    "addr",
-    [
-        "127.0.0.1",
-        "10.1.2.3",
-        "172.16.0.1",
-        "192.168.1.1",
-        "169.254.169.254",  # cloud metadata
-        "100.100.1.1",  # CGNAT / Tailscale
-        "0.0.0.0",
-        "224.0.0.1",  # multicast
-        "::1",
-        "fe80::1%eth0",
-        "fd00::1",
-        "::ffff:127.0.0.1",  # IPv4-mapped
-        "2002:7f00:1::",  # 6to4 around 127.0.0.1
-        "64:ff9b::7f00:1",  # NAT64 around 127.0.0.1
-        "64:ff9b::a00:1",  # NAT64 around 10.0.0.1
-        "::7f00:1",  # IPv4-compatible around 127.0.0.1
-        "::a00:1",  # IPv4-compatible around 10.0.0.1
-        "::ffff:0:a9fe:a9fe",  # IPv4-translated (SIIT) around 169.254.169.254
-        "fec0::1",  # deprecated site-local, which Python calls global
-        # Local-use NAT64 (RFC 8215), refused whole: the /48 form of
-        # 127.0.0.1 (bits 48-63 and 72-87), and a public-looking tail.
-        "64:ff9b:1:7f00:0:100::",
-        "64:ff9b:1::5db8:d822",
-        "not-an-ip",
-    ],
-)
-def test_non_public_addresses_are_refused(addr: str) -> None:
-    assert not is_public_address(addr)
-
-
-@pytest.mark.parametrize(
-    "addr", ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "64:ff9b::5db8:d822"]
-)
-def test_public_addresses_are_allowed(addr: str) -> None:
-    assert is_public_address(addr)
+def test_the_fetch_uses_the_shared_classifier() -> None:
+    assert web_fetch.is_public_address is public_address.is_public_address
 
 
 # --- pinned transport ------------------------------------------------------

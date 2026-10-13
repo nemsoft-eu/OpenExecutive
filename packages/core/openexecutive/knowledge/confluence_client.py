@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 
 from openexecutive.config import Settings
+from openexecutive.utils.public_address import is_public_ip
 
 logger = logging.getLogger(__name__)
 
@@ -116,34 +117,15 @@ class ConfluenceHostNotPublic(Exception):
     a loopback, private, link-local or otherwise non-public address."""
 
 
-# IPv6 forms that carry an IPv4 address a translator or tunnel may deliver
-# to: NAT64 (RFC 6052 well-known and local-use prefixes) and the deprecated
-# IPv4-compatible ``::a.b.c.d``. The embedded address is what gets checked.
-_EMBEDS_IPV4 = (
-    ipaddress.IPv6Network("64:ff9b::/96"),
-    ipaddress.IPv6Network("64:ff9b:1::/48"),
-    ipaddress.IPv6Network("::/96"),
-)
 _RESOLVE_TIMEOUT_S = 10.0
-
-
-def _is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if isinstance(ip, ipaddress.IPv6Address):
-        embedded: ipaddress.IPv4Address | None = ip.ipv4_mapped or ip.sixtofour
-        if embedded is None and ip.teredo is not None:
-            embedded = ip.teredo[1]
-        if embedded is None and any(ip in net for net in _EMBEDS_IPV4):
-            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-        if embedded is not None and not _is_public(embedded):
-            return False
-    return ip.is_global and not ip.is_multicast
 
 
 async def resolve_public_address(host: str, port: int) -> str:
     """One address ``host`` resolves to, refusing the lot when ANY of them is
-    not a public address (a name that also resolves inward is not trusted).
-    A resolver that does not answer within ``_RESOLVE_TIMEOUT_S`` fails the
-    request like an unreachable site."""
+    not a public address (a name that also resolves inward is not trusted),
+    judged by ``utils.public_address``, the classifier the chat's
+    ``web_fetch`` uses too. A resolver that does not answer within
+    ``_RESOLVE_TIMEOUT_S`` fails the request like an unreachable site."""
     try:
         infos = await asyncio.wait_for(
             asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM),
@@ -157,7 +139,7 @@ async def resolve_public_address(host: str, port: int) -> str:
             ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         except ValueError as exc:
             raise ConfluenceHostNotPublic(host) from exc
-        if not _is_public(ip):
+        if not is_public_ip(ip):
             raise ConfluenceHostNotPublic(host)
         addresses.append(str(ip))
     if not addresses:
