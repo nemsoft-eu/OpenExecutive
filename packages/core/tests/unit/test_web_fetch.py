@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import encodings
+import encodings.aliases
 import json
 import logging
+import pkgutil
 import time
+import uuid
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -1065,6 +1069,75 @@ def test_a_dangerous_or_unknown_meta_charset_is_refused(label: str) -> None:
     assert web_fetch._sniffed_charset(
         b'<meta http-equiv=content-type content="text/html; charset=' + raw + b'">'
     ) is None
+
+
+def test_an_unknown_meta_charset_does_not_grow_the_codec_cache() -> None:
+    """CPython keeps every name its codec search fails to resolve in
+    ``encodings._cache`` for good, so a page naming fresh labels must not
+    reach ``codecs.lookup``."""
+    cache: dict[str, Any] = encodings._cache  # type: ignore[attr-defined]
+    # Fresh per run, so a repeated run still names labels nothing has cached.
+    run = uuid.uuid4().hex[:3].encode("ascii")
+    # The sensor works: a failed lookup of a fresh name is cached under the
+    # key the check computes.
+    probe = f"Zq--{uuid.uuid4().hex}.Probe:Name"
+    before = len(cache)
+    with pytest.raises(LookupError):
+        codecs.lookup(probe)
+    assert len(cache) == before + 1
+    assert web_fetch._lookup_key(probe) in cache
+
+    before = len(cache)
+    for page_number in range(50):
+        page = b"".join(
+            b"<meta charset=%s%02x%02x>" % (run, page_number, n) for n in range(46)
+        )
+        assert len(page) <= web_fetch._PRESCAN_BYTES
+        assert web_fetch._sniffed_charset(page) is None
+    assert len(cache) == before
+
+
+@pytest.mark.parametrize(
+    ("label", "codec"),
+    [
+        ("KOI8_R", "koi8-r"),
+        ("Shift-JIS", "shift_jis"),
+        ("UTF:8", "utf-8"),
+        ("-utf-8-", "utf-8"),
+        ("Windows--1251", "cp1251"),
+        ("ISO.8859.15", "iso8859-15"),
+        # an alias with a "." is found as is, and with each "." read as "_"
+        ("ANSI_X3.4-1968", "cp1252"),
+        ("ansi.x3.4.1968", "cp1252"),
+    ],
+)
+def test_a_known_meta_charset_still_resolves(label: str, codec: str) -> None:
+    assert web_fetch._codec_for_label(label.encode("ascii")) == codec
+
+
+def test_every_codec_name_the_stdlib_resolves_passes_the_known_name_check() -> None:
+    names = {
+        *encodings.aliases.aliases,
+        *encodings.aliases.aliases.values(),
+        *(module.name for module in pkgutil.iter_modules(encodings.__path__)),
+    }
+    resolved = set()
+    for name in names:
+        try:
+            codecs.lookup(name)
+        except LookupError:
+            continue
+        resolved.add(name)
+    assert len(resolved) > 300
+    missing = {
+        name for name in resolved
+        if web_fetch._lookup_key(name) not in web_fetch._KNOWN_CODEC_NAMES
+    }
+    assert not missing
+    assert all(
+        web_fetch._lookup_key(name) in web_fetch._KNOWN_CODEC_NAMES
+        for name in encodings.aliases.aliases
+    )
 
 
 @pytest.mark.parametrize(

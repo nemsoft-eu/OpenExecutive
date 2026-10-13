@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import encodings
+import encodings.aliases
 import functools
 import json
 import logging
+import pkgutil
 import re
 import socket
 import ssl
@@ -853,13 +856,44 @@ _BROWSER_CODECS = {
 _ASCII_PROBE = bytes(range(0x20, 0x7F)) + b"\t\n\r"
 
 
+def _lookup_key(name: str) -> str:
+    """A codec name as ``codecs.lookup`` hands it to the stdlib's search:
+    lowercased, and each run of characters other than letters, digits and
+    "." made one "_", with none at either end."""
+    return encodings.normalize_encoding(name.lower())
+
+
+# Every name the stdlib's codec search can resolve, as lookup keys. CPython
+# caches each name that search fails to resolve in ``encodings._cache`` and
+# never evicts it, so a page naming fresh labels would grow that cache on
+# every fetch: a label outside this set never reaches ``codecs.lookup``. Some
+# names that pass still fail the lookup (a module that is no codec,
+# "aliases"; a Windows-only codec, "mbcs"; a dotted spelling of a module
+# name, "latin.1"), but they are a fixed hundred or so, each cached once. A
+# name only a third-party search function knows ("idna2008") is refused, and
+# none is a page's charset.
+_KNOWN_CODEC_NAMES = frozenset(
+    _lookup_key(name)
+    for name in (
+        *encodings.aliases.aliases,
+        *encodings.aliases.aliases.values(),
+        *(module.name for module in pkgutil.iter_modules(encodings.__path__)),
+    )
+)
+
+
 def _codec_for_label(label: bytes) -> str | None:
     """The Python codec to decode with for a charset label, or None."""
     label = label.strip()
     if not _LABEL_RE.fullmatch(label):
         return None
+    name = label.decode("ascii")
+    key = _lookup_key(name)
+    # The search also tries an alias with each "." read as "_" ("latin.1").
+    if key not in _KNOWN_CODEC_NAMES and key.replace(".", "_") not in _KNOWN_CODEC_NAMES:
+        return None
     try:
-        info = codecs.lookup(label.decode("ascii"))
+        info = codecs.lookup(name)
     except (LookupError, ValueError):  # ValueError: a NUL, refused above too
         return None
     if info.name in _WIDE_CODECS:
