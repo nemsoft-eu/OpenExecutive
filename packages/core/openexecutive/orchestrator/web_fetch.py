@@ -86,7 +86,7 @@ UNTRUSTED_PAGE_NOTICE = (
 # single quote and "*" are kept too (/Schindler's_List) and trimmed only at
 # the end, where they close a 'quoted' or **bold** URL.
 _URL_CHARS = r"[^\s<>|\[\]\"`]"
-_URL_RE = re.compile(rf"https?://{_URL_CHARS}+", re.IGNORECASE)
+_URL_RE = re.compile(rf"(?i:https?)://{_URL_CHARS}+")
 # A link written without a scheme ("example.com/page"), opened as https://.
 # ASCII labels only, spelled out rather than [a-z] with re.IGNORECASE, which
 # also matches "ſ" and the Kelvin sign; \w stays Unicode, so a match cannot
@@ -98,8 +98,8 @@ _URL_RE = re.compile(rf"https?://{_URL_CHARS}+", re.IGNORECASE)
 # A rarer local part ("jane.doe=x@…") may still seed its dotted prefix,
 # which is harmless for the reason add_from_text gives. 64 characters is
 # the longest local part, and the bound keeps that check linear on a long
-# run of labels. The
-# optional port, path, query or fragment uses _URL_RE's delimiters.
+# run of labels. The optional port, path, query or fragment uses _URL_RE's
+# delimiters.
 _BARE_URL_RE = re.compile(
     r"(?<![\w@./-])"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
@@ -108,6 +108,14 @@ _BARE_URL_RE = re.compile(
     rf"(?:[/?#]{_URL_CHARS}*)?"
     r"(?![\w@-])"
 )
+# Both forms in one left-to-right pass, the scheme-less one in group 1. A
+# link with a scheme is consumed whole, so the host-like text in its path or
+# query ("https://a.example/?u=b.example") is never a link of its own, while
+# a scheme-less link keeps a link with a scheme in its own path
+# ("web.archive.org/web/2024/https://example.com/"). _URL_RE is case-blind
+# through an inline flag on its scheme alone, so re.IGNORECASE never reaches
+# the ASCII classes of the scheme-less form.
+_LINK_RE = re.compile(rf"{_URL_RE.pattern}|({_BARE_URL_RE.pattern})")
 _TRAILING_PUNCT = ".,;:!?'*。，"
 
 _UNSEEN_REFUSAL = (
@@ -382,12 +390,10 @@ class SeenUrls:
         with no path or query the model added and under the same domain and
         address checks as any other.
         """
-        # The links with a scheme are blanked before the scheme-less pass, so
-        # the host-like text in their paths and queries
-        # ("https://a.example/?u=b.example") is never seen as a link of its own.
-        stripped = _URL_RE.sub(" ", text)
+        # _URL_RE also finds a link with a scheme inside a scheme-less one's
+        # path, which _LINK_RE consumes as part of it.
         urls = [match.group() for match in _URL_RE.finditer(text)]
-        urls += ["https://" + match.group() for match in _BARE_URL_RE.finditer(stripped)]
+        urls += ["https://" + match[1] for match in _LINK_RE.finditer(text) if match[1]]
         for candidate in urls:
             url = _trim_url(candidate)
             self.add(url)

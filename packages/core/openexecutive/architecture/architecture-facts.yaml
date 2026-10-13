@@ -1206,9 +1206,12 @@ routing:
     host whose IDNA 2003 and 2008 forms differ (`straße.de`) is never seen.
     A link the speaker wrote without a scheme (`example.com/page`) is seen
     as its `https://` form only, never `http://`: `SeenUrls.add_from_text`
-    blanks the links with a scheme first (so `other.example` in
-    `https://example.com/?next=other.example` is not a link of its own),
-    then matches `_BARE_URL_RE`: ASCII labels, at least one dot, an
+    matches both forms in one left-to-right pass (`_LINK_RE`), so a link
+    with a scheme is consumed whole (`other.example` in
+    `https://example.com/?next=other.example` is not a link of its own)
+    while a scheme-less link keeps one in its path
+    (`web.archive.org/web/2024/https://example.com/`). The scheme-less form
+    is `_BARE_URL_RE`: ASCII labels, at least one dot, an
     alphabetic final label of two or more letters (no `1.2.3`, `v2.0`,
     `e.g.` or IPv4 address), not after an `@` nor in a local part of
     letters, digits and `._+-` (a common email address seeds neither its
@@ -1218,8 +1221,8 @@ routing:
     host (`report.pdf`) is seeded too and is harmless: it is still in the
     text the caller vouched for (`memory_text`, which also carries the
     attached files' names, so a dotted filename seeds a host with no
-    path), and seeding only widens the set — the domain
-    lists, the public-address pin and the per-hop redirect check judge it
+    path), and seeding only widens the set — the domain lists, the
+    public-address pin and the per-hop redirect check judge it
     like any other URL (`127.0.0.1.nip.io/x` is seeded and refused at the
     connect).
 

@@ -454,11 +454,32 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         ("bücher.example/x", set()),
         # The host-like text inside a link with a scheme is not a link.
         ("https://example.com/foo.bar/x", {"https://example.com/foo.bar/x"}),
-        ("https://example.com/?u=a.b", {"https://example.com/?u=a.b"}),
         (
             "https://example.com/?next=other.example/x",
             {"https://example.com/?next=other.example/x"},
         ),
+        # A link with a scheme inside a scheme-less one's path leaves the
+        # scheme-less link whole, and is seen as written too.
+        (
+            "web.archive.org/web/2024/https://example.com/page",
+            {
+                "https://web.archive.org/web/2024/https://example.com/page",
+                "https://example.com/page",
+            },
+        ),
+        # The forms people paste: Markdown, Slack's <url>, a Slack auto-link
+        # (its label seeds the https form), Slack's mailto link, a list.
+        ("[x](example.com/a)", {"https://example.com/a"}),
+        ("<example.com/a>", {"https://example.com/a"}),
+        ("<http://a.example|a.example>", {"http://a.example/", "https://a.example/"}),
+        ("<mailto:jane.doe@example.com|jane.doe@example.com>", set()),
+        ("a.example,b.example", {"https://a.example/", "https://b.example/"}),
+        # A port past 65535 makes no URL, so nothing is seen.
+        ("example.com:99999/x", set()),
+        # A letter from another script in the host (U+0430, the Cyrillic "a")
+        # leaves no ASCII part of it seen.
+        ("ex\u0430mple.com", set()),
+        ("example.com\u0430", set()),
         # Only the https form of a scheme-less link.
         ("example.com/page", {"https://example.com/page"}),
         # Seeded, and pointless: the speaker's own text, under every check.
@@ -525,7 +546,7 @@ def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> Non
 
 def test_the_email_check_stays_linear_on_a_long_run_of_labels() -> None:
     """Unbounded, the look-ahead for an "@" rescans the rest of the run from
-    every place a host could end: about 15 s for this text."""
+    every place a host could end: several seconds for this text."""
     seen = web_fetch.SeenUrls()
     started = time.perf_counter()
     seen.add_from_text("aa." * 40_000 + "@")
