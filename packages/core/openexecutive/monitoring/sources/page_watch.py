@@ -34,9 +34,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import html
 import logging
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -57,7 +55,7 @@ from openexecutive.monitoring.sources._http import (
     fetch_bounded,
     validate_target_url,
 )
-from openexecutive.utils.html_tags import strip_tags
+from openexecutive.utils.html_tags import visible_text
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +76,6 @@ _MAX_DIFF_WORDS = 8_000
 # Bounds on the change summary written into the alert / persisted payload.
 _SUMMARY_SNIPPET_CHARS = 160
 _ADDED_TEXT_CHARS = 1_000
-
-# <script>/<style>/<noscript> blocks: drop content, not just tags, so inline
-# JS/CSS never counts as "visible text". Removed by a linear scan
-# (_strip_blocks), not a lazy `.*?` regex: on a page full of unterminated
-# openers such a regex is quadratic, and a page the server sends is the
-# attacker's to shape. The remaining tags go the same way, through
-# utils.html_tags.strip_tags rather than `<[^>]+>`, which rescans to the end
-# of the page from every "<" that nothing closes.
-_DROP_BLOCK_TAGS = ("script", "style", "noscript")
-_WS_RE = re.compile(r"\s+")
 
 
 class PageWatchSource:
@@ -243,61 +231,19 @@ def html_to_text(body: bytes) -> str:
     Markup-insensitive on purpose: strips <script>/<style>/<noscript> blocks
     and comments, removes remaining tags, unescapes entities, and collapses
     all whitespace — so a re-minified or re-ordered-attribute page that reads
-    the same does NOT register as a change.
+    the same does NOT register as a change. The reduction itself is
+    ``utils.html_tags.visible_text``, shared with the chat's ``web_fetch``:
+    one forward pass end to end, never a backtracking regex, because a page
+    the server sends is the attacker's to shape.
     """
     try:
         markup = body.decode("utf-8", errors="replace")
     except Exception:
         return ""
-    markup = _strip_blocks(markup)
-    markup = strip_tags(markup, repl=" ")
-    text = html.unescape(markup)
     # Full normalized text — NOT truncated. The fetch is already byte-capped
     # (~2MB), and hashing the whole thing means detection has no blind spot;
     # snapshot/diff length is bounded separately at the call site.
-    return _WS_RE.sub(" ", text).strip()
-
-
-def _strip_blocks(markup: str) -> str:
-    """Drop HTML comments and <script>/<style>/<noscript> blocks (content
-    included) in one pass that is linear in the page length. An unterminated
-    comment or block runs to the end of the page: a truncated script is not
-    visible text either."""
-    lower = markup.lower()
-    n = len(markup)
-    out: list[str] = []
-    i = 0
-    while i < n:
-        j = lower.find("<", i)
-        if j == -1:
-            out.append(markup[i:])
-            break
-        out.append(markup[i:j])
-        if lower.startswith("<!--", j):
-            end = lower.find("-->", j + 4)
-            i = n if end == -1 else end + 3
-            out.append(" ")
-            continue
-        tag = next(
-            (
-                t for t in _DROP_BLOCK_TAGS
-                if lower.startswith("<" + t, j)
-                and (j + 1 + len(t) >= n or not (lower[j + 1 + len(t)].isalnum() or lower[j + 1 + len(t)] == "_"))
-            ),
-            None,
-        )
-        if tag is None:
-            out.append("<")
-            i = j + 1
-            continue
-        close = lower.find("</" + tag, j)
-        if close == -1:
-            i = n
-        else:
-            gt = lower.find(">", close)
-            i = n if gt == -1 else gt + 1
-        out.append(" ")
-    return "".join(out)
+    return visible_text(markup)
 
 
 def _diff(old: str, new: str) -> tuple[int, str]:

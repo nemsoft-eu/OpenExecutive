@@ -11,10 +11,11 @@ a draft in their own mailbox until they send it themselves, facts and profile ed
 the speaker's words, and a workflow drafted in chat is saved only once a
 person confirms it. What is not fenced is a door to the open internet. So from the round it
 runs in until the turn ends, only that stays shut: no outside fetch (a URL
-can carry what the mail said anywhere: ``read_document``, research, the
-watchlist, ``load_mcp_server``, any gateway tool but
-``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can reach either),
-no workflow (it runs later, unattended, and may fetch or script), no post
+can carry what the mail said anywhere: ``read_document``, the client
+``web_fetch``, research, the watchlist, ``load_mcp_server``, any gateway
+tool but ``PRIVATE_TURN_MCP_TOOLS``), no script or library job (it can
+reach either), no workflow (it runs later, unattended, and may fetch or
+script), no post
 to everyone (broadcasts, department messages, alerts), and no change to who
 is on the roster or holds authority (archiving someone, a department head, a
 roster request), since every send and approval check trusts it.
@@ -34,8 +35,16 @@ without changing the offered tool list (the cached prefix stays the same all
 turn), and treats a round that calls any of them as already touched,
 because a round's tools run concurrently. The handlers that reach outside
 check again (``outside_reach_refusal``). The server-side ``web_search``
-stays, as on a turn private to the owner: it cannot be refused at dispatch
-without a cache miss. The lockdown lasts for the turn
+stays, as on a turn private to the owner: it runs inside the provider's
+generation, never through this dispatch, and dropping it would change the
+cached prefix. The client ``web_search`` (SearXNG, local models) and
+``web_fetch`` are withheld like any other outside fetch (the fetch handler
+also checks again; the search handler relies on the dispatch guard).
+``web_fetch`` is always that client tool, never Anthropic's server one,
+which opens any URL a client tool result echoes — and an allowed tool here
+can echo one the model wrote (``ghostwrite_email`` returns the draft's
+text), so the mail could leave in a query string
+(``orchestrator.web_search_tool``). The lockdown lasts for the turn
 (``TurnDelegation.read_mail``) and no longer. A later turn of that
 conversation stays private to its owner (``touched_mail``), and its history
 carries only their words and the Executive's replies, never the mail a tool
@@ -109,8 +118,12 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
 })
 
 MAIL_TOUCHED_WITHHELD_TOOLS: frozenset[str] = frozenset({
-    # Fetches of an outside address: a URL can carry the mail anywhere.
+    # Fetches of an outside address: a URL can carry the mail anywhere. The
+    # client web_search and web_fetch (a search query carries text out too);
+    # the server-side web_search is never dispatched here.
     "read_document",
+    "web_fetch",
+    "web_search",
     "load_mcp_server",
     "add_watchlist_entry",
     "tune_watchlist_entry",

@@ -258,6 +258,9 @@ async def test_ask_executive_resolves_principal_and_calls_chat() -> None:
         out = await mcp_server.ask_executive("What's our top risk?")
     assert out == "Executive answer"
     assert chat.await_args.kwargs["person_id"] == 42
+    # A resolved caller's message is their own words, so its links open.
+    assert chat.await_args.kwargs["memory_text"] == "What's our top risk?"
+    assert chat.await_args.kwargs["fetch_own_urls"] is True
 
 
 # ---------------------------------------------------------------------------

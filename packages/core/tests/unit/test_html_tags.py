@@ -1,4 +1,5 @@
-"""The shared tag strip (utils.html_tags): the regex it replaced, in one pass."""
+"""The shared tag strip (utils.html_tags): the regex it replaced, in one pass,
+and the visible-text reduction built on it."""
 from __future__ import annotations
 
 import itertools
@@ -6,7 +7,7 @@ import re
 
 import pytest
 
-from openexecutive.utils.html_tags import strip_tags
+from openexecutive.utils.html_tags import strip_tags, visible_text
 
 # What page_watch and delegation.gmail stripped tags with before: quadratic on
 # text with many "<" and no ">".
@@ -29,3 +30,24 @@ _SAMPLES = [
 def test_strip_tags_matches_the_regex_it_replaced(repl: str) -> None:
     for text in _SAMPLES:
         assert strip_tags(text, repl=repl) == _OLD_TAG_RE.sub(repl, text), repr(text)
+
+
+@pytest.mark.parametrize(
+    ("markup", "expected"),
+    [
+        ("<p>Hello &amp;\n\n <b>world</b></p>", "Hello & world"),
+        ("a<script>x()</script>b<style>p{}</style>c<noscript>n</noscript>d", "a b c d"),
+        ("a<!-- hidden -->b", "a b"),
+        ("<scripts>kept</scripts>", "kept"),  # not a <script> block
+        ("before<script>never closed", "before"),
+        ("before<!-- never closed", "before"),
+        # "İ".lower() is two code points; the scan must not drift past it.
+        ("İİİ<SCRIPT>leak()</SCRIPT>after", "İİİ after"),
+        # Non-ASCII that lower() keeps the same length takes the fast path.
+        ("Café ÉTÉ<SCRIPT>leak()</SCRIPT>after", "Café ÉTÉ after"),
+        # html.unescape raises on a decimal reference past 4,300 digits.
+        ("a&#" + "1" * 5000 + ";b", "a�b"),
+    ],
+)
+def test_visible_text(markup: str, expected: str) -> None:
+    assert visible_text(markup) == expected

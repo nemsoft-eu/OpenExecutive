@@ -26,6 +26,7 @@ from openexecutive.api.models import (
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit import principal_turn_rows, rows_for_person
 from openexecutive.integrations.attachments import build_attachment_output
+from openexecutive.integrations.attachments import own_words as sender_words_with_files
 from openexecutive.orchestrator.answer_sources import TurnSources
 from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.orchestrator.turn_inbox import TurnInbox
@@ -769,8 +770,10 @@ async def _run_chat_turn(
     image content blocks; document text is expected to already be inlined in
     `message` by the caller. `memory_text`, when set, is what peer memory
     records as the caller's words instead of `message` (see
-    `Executive.stream_chat`). `turn_files` are the uploads as sent, which a
-    Python job may take by name for this turn (workflows/turn_files.py).
+    `Executive.stream_chat`); unset, `message` is handed over as their
+    words, and its URLs are the ones the Executive may open. `turn_files`
+    are the uploads as sent, which a Python job may take by name for this
+    turn (workflows/turn_files.py).
     """
     from openexecutive.config import get_settings
     from openexecutive.knowledge.retriever import retrieve
@@ -937,6 +940,10 @@ async def _run_chat_turn(
             # auditable next to the message it stood in for.
             full={"message": message, "memory_text": memory_text},
         )
+    # What the Executive reads as the person's own words. A message typed in
+    # the chat box is exactly that unless the client handed one over (a
+    # briefing card's), and the Executive opens only URLs in this text.
+    own_words = memory_text if memory_text is not None else message
 
     # Let the caller schedule to their own addresses. Runs per turn rather than
     # only on session creation so a newly-added address works without a fresh
@@ -1182,7 +1189,7 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
-                    memory_text=memory_text,
+                    memory_text=own_words,
                     turn_sources=turn_sources,
                     inbox=inbox,
                 ).__aiter__()
@@ -1199,7 +1206,7 @@ async def _run_chat_turn(
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
                     turn_id=turn_id,
-                    memory_text=memory_text,
+                    memory_text=own_words,
                     turn_sources=turn_sources,
                     inbox=inbox,
                 ).__aiter__()
@@ -1781,7 +1788,7 @@ async def chat_upload(
         # caller's: recorded in peer memory it becomes facts about the caller.
         # "(Attached files: …)", not the "[Attached: …]" label that marks
         # inlined document text — the open-loop pass skips turns carrying that.
-        memory_text=f"{message}\n\n(Attached files: {', '.join(filenames)})",
+        memory_text=sender_words_with_files(message, filenames),
         turn_files=turn_files.collect(uploads),
     )
 

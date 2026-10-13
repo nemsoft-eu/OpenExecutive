@@ -24,8 +24,8 @@ from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
     SearchBudget,
-    _host_matches,
     _normalise_host,
+    host_matches,
     make_search_handler,
 )
 from openexecutive.orchestrator.web_search_tool import (
@@ -373,6 +373,8 @@ def test_malformed_entries_are_skipped_and_fields_truncated(
     patcher, _ = _patch_http(_response({"results": [
         "not a dict",
         {"url": "https://ok.example/\nsplit", "title": "t", "content": "c"},
+        {"url": "https://ok.example/\x00nul", "title": "t", "content": "c"},
+        {"url": "https://ok.example/\x7fdel", "title": "t", "content": "c"},
         {"url": "https://ok.example/long", "title": "T" * 1000,
          "content": "S" * 5000},
     ]}))
@@ -380,7 +382,7 @@ def test_malformed_entries_are_skipped_and_fields_truncated(
     with patcher:
         outcome = asyncio.run(handler({"query": "q"}))
     results = json.loads(outcome.content)["results"]
-    # The string entry and the control-character URL are both dropped.
+    # The string entry and the control-character URLs are all dropped.
     assert [r["url"] for r in results] == ["https://ok.example/long"]
     assert len(results[0]["title"]) == 200
     assert len(results[0]["snippet"]) == 400
@@ -452,6 +454,39 @@ def test_non_http_and_credentialed_urls_are_dropped(
     assert urls == ["https://ok.example/y"]
 
 
+def test_only_the_results_the_model_sees_reach_on_result_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chat loop makes these fetchable, so a dropped result must not be."""
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "blocked.example")
+    monkeypatch.setenv("SEARXNG_MAX_RESULTS", "2")
+    patcher, _ = _patch_http(_response(_results(
+        "https://blocked.example/a",
+        "javascript:alert(1)",
+        "https://user:pw@a.example/x",
+        "https://ok.example/1",
+        "https://ok.example/2",
+        "https://ok.example/3",  # past the cap
+    )))
+    seen: list[str] = []
+    handler = make_search_handler(SearchBudget(max_uses=1), on_result_url=seen.append)
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert seen == urls == ["https://ok.example/1", "https://ok.example/2"]
+
+
+def test_a_failed_search_reports_no_result_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    patcher, _ = _patch_http(_response(_results("https://ok.example/1"), status=500))
+    seen: list[str] = []
+    handler = make_search_handler(SearchBudget(max_uses=1), on_result_url=seen.append)
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert outcome.is_error and seen == []
+
+
 @pytest.mark.parametrize(
     "entry",
     ["example.com", "https://example.com", "example.com:443",
@@ -512,7 +547,7 @@ def test_blocklist_matches_internationalised_domains_in_either_form(
 )
 def test_host_matches(host: str, domain: str, expected: bool) -> None:
     """Boundary logic only; both inputs arrive pre-normalised."""
-    assert _host_matches(host, domain) is expected
+    assert host_matches(host, domain) is expected
 
 
 @pytest.mark.parametrize(

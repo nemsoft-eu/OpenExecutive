@@ -217,6 +217,14 @@ async def _process_and_reply(
     except Exception:
         logger.exception("Telegram: failed to schedule alert evaluation")
 
+    # What the sender wrote and the files' names, as Slack records it: the
+    # attachment text and the DM hydration below go into the prompt only.
+    from openexecutive.integrations.attachments import own_words as _own_words
+
+    own_words = _own_words(
+        message_text, (name for _id, name, _type in attachment_file_ids or ())
+    )
+
     # Process file / photo attachments before entering the chat lock so that
     # slow downloads don't hold the lock while the chat serialises.
     att_image_blocks: list[dict] = []
@@ -336,6 +344,9 @@ async def _process_and_reply(
                 briefing_context=briefing_context,
                 channel_context_block=build_channel_context_block("telegram"),
                 person_id=person_id,
+                memory_text=own_words,
+                # a group chat can reach here from someone off the roster
+                fetch_own_urls=person_id is not None,
             )
             await send_message(token, chat_id, response)
         except Exception:

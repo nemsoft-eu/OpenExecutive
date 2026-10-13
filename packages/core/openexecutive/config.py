@@ -984,6 +984,14 @@ class Settings(BaseSettings):
     # constraint, so this is deliberately smaller than a browser's page 1.
     searxng_max_results: int = Field(5, alias="SEARXNG_MAX_RESULTS")
 
+    # Page reads per chat turn through web_fetch, the client-side tool every
+    # model gets beside its search (orchestrator/web_fetch.py). 0 turns
+    # fetching off; it is also off whenever ENABLE_WEB_SEARCH is. Shares the
+    # domain lists above.
+    web_fetch_max_uses: int = Field(3, alias="WEB_FETCH_MAX_USES")
+    # Whole-exchange deadline for one client-side fetch, redirects included.
+    web_fetch_timeout_s: float = Field(15.0, alias="WEB_FETCH_TIMEOUT_S")
+
     @field_validator("searxng_url")
     @classmethod
     def _validate_searxng_url(cls, v: str) -> str:
@@ -1036,6 +1044,10 @@ class Settings(BaseSettings):
             raise ValueError("SEARXNG_TIMEOUT_S must be > 0")
         if self.searxng_max_results < 1:
             raise ValueError("SEARXNG_MAX_RESULTS must be >= 1")
+        if self.web_fetch_max_uses < 0:
+            raise ValueError("WEB_FETCH_MAX_USES must be >= 0")
+        if self.web_fetch_timeout_s <= 0:
+            raise ValueError("WEB_FETCH_TIMEOUT_S must be > 0")
         return self
 
     # Base URL of the UI, used when the Executive composes deep links

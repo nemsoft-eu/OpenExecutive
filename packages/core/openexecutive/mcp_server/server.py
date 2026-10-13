@@ -370,8 +370,12 @@ async def ask_executive(message: str, caller_email: str = "") -> str:
     )
 
     executive = Executive(mcp_gateway=get_active_gateway())
+    # ``message`` is the caller's own words, nothing packed around it, so a
+    # link in it may be opened when the caller resolved to a known person:
+    # the same open-mode trust the web chat route gives ``x-caller-email``.
     return await executive.chat(
-        user_message=message, session=session, person_id=person_id
+        user_message=message, session=session, person_id=person_id,
+        memory_text=message, fetch_own_urls=person_id is not None,
     )
 
 

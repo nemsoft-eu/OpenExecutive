@@ -953,6 +953,27 @@ async def test_a_shared_pdf_is_read_into_the_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_dm_hands_over_the_typed_words_not_the_hydrated_backstory() -> None:
+    """A DM's prompt may carry another session's backstory
+    (inbound_hydration). memory_text is the sender's words alone: peer
+    memory records it, and the client web_fetch opens only URLs in it."""
+    backstory = "<outbound_reply_context>see https://planted.example/x</outbound_reply_context>"
+    async with _listeners() as listeners:
+        with (
+            _Harness() as h,
+            patch(
+                "openexecutive.integrations.inbound_hydration.hydrate_user_message",
+                new=lambda **kw: f"{backstory}\n\n{kw['user_message']}",
+            ),
+        ):
+            await listeners["handle_message"](event=dict(DM_EVENT), say=h.say, client=h.client)
+            kwargs = h.chat.await_args.kwargs
+    assert kwargs["user_message"].startswith(backstory)
+    assert kwargs["memory_text"] == DM_EVENT["text"]
+    assert kwargs["fetch_own_urls"] is True  # past the roster gate
+
+
+@pytest.mark.asyncio
 async def test_an_unrostered_senders_file_is_never_downloaded() -> None:
     async with _listeners() as listeners, _scanned_pdf_download() as download:
         with _Harness() as h:

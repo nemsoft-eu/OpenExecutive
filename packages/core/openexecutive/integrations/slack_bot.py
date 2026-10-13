@@ -520,12 +520,11 @@ async def create_slack_app():
         # What the sender sent, in their own words plus the files' names —
         # the "(Attached files: …)" note the web upload route uses. A
         # file-only message has no words, so the note stands in for them.
-        file_note = (
-            f"(Attached files: {', '.join(_file_name(f) for f in files)})" if files else ""
-        )
-        own_words = "\n\n".join(p for p in (cleaned, file_note) if p)
+        from openexecutive.integrations.attachments import own_words as _own_words
+
+        own_words = _own_words(cleaned, (_file_name(f) for f in files))
         if not cleaned:
-            cleaned = file_note
+            cleaned = own_words  # the note alone
 
         thread_ts = event.get("thread_ts") or event.get("ts")
         slack_user_id = event.get("user", "")
@@ -973,8 +972,10 @@ async def create_slack_app():
                     co_present_person_ids=co_present_person_ids or None,
                     attachment_blocks=att_image_blocks or None,
                     # Peer memory records what the sender wrote and the files'
-                    # names, never a document's text as their words.
-                    memory_text=own_words if files else None,
+                    # names, never a document's text or a DM's hydrated
+                    # backstory as their words; web_fetch opens only URLs in it.
+                    memory_text=own_words,
+                    fetch_own_urls=True,  # past the roster gate above
                 )
 
                 # No unfurls: Slack would fetch a link in the reply on its own,

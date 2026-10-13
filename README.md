@@ -438,6 +438,8 @@ the app refuses to start.
 | `HONCHO_BASE_URL` | No | — | Self-hosted Honcho endpoint |
 | `ENABLE_WEB_SEARCH` | No | `true`² | Let the Executive and specialists answer with live web results (news, market data, competitor moves) alongside your uploaded documents |
 | `WEB_SEARCH_MAX_USES` | No | `2` | Max billed searches per agent per turn |
+| `WEB_FETCH_MAX_USES` | No | `3` | Max pages the Executive may open per turn; `0` turns fetching off |
+| `WEB_FETCH_TIMEOUT_S` | No | `15.0` | Time limit for one page fetch, redirects included |
 
 See [.env.example](.env.example) for the full list.
 
@@ -453,6 +455,13 @@ See [.env.example](.env.example) for the full list.
 > use a self-hosted SearXNG instance instead — see [Running on Local
 > Models](#running-on-local-models). `WEB_SEARCH_ALLOWED_DOMAINS` /
 > `WEB_SEARCH_BLOCKED_DOMAINS` scope where it may look (set at most one).
+> The same switch and lists govern `web_fetch`, which opens a page in full.
+> It is a client-side fetch on every model that has search: it opens only a URL
+> the person wrote in their message or one a search returned that turn (not on
+> OpenRouter, whose search results never reach the backend; paste a link again
+> to use it in a later message), reaches only public addresses, and
+> returns the page's text. `WEB_FETCH_MAX_USES` (default 3 per turn, `0` for
+> off) and `WEB_FETCH_TIMEOUT_S` tune it.
 
 ## Running on Local Models
 
@@ -497,6 +506,9 @@ Leave `SEARXNG_URL` unset and local models simply have no search — and are no
 longer told they do, so they stop claiming to have looked things up.
 `WEB_SEARCH_MAX_USES` caps searches per turn as it does on the hosted paths,
 and the domain lists apply as a filter on the results.
+
+With SearXNG set, local models also get `web_fetch`, the same client-side page
+reader the hosted models use (see the web search note above).
 
 **Caveats.** Anthropic prompt caching and extended thinking have no local
 equivalent and are automatically disabled for local models. Thinking models

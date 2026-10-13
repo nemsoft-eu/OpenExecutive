@@ -50,6 +50,8 @@ async def _ask(question: str) -> None:
         session=session,
         retrieved_context=retrieved,
         episodic_context=episodic,
+        # Typed by the operator, so all their own words (and fetchable URLs).
+        memory_text=question,
     ):
         if isinstance(chunk, str) and chunk != Executive._THINKING:
             response += chunk
@@ -109,6 +111,7 @@ async def _chat() -> None:
             session=session,
             retrieved_context=retrieved,
             episodic_context=episodic,
+            memory_text=user_input,  # typed by the operator, as above
         ):
             if isinstance(chunk, str) and chunk != Executive._THINKING:
                 console.print(chunk, end="", highlight=False)

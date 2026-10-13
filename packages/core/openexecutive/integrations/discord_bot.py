@@ -696,6 +696,7 @@ async def _handle_message(
     attachment_count: int = 0,
     co_present_discord_user_ids: list[str] | None = None,
     response_router: Callable[[str], Awaitable[MentionRouteResult]] | None = None,
+    own_words: str | None = None,
 ) -> None:
     """Core handler shared by on_message and slash commands.
 
@@ -712,6 +713,10 @@ async def _handle_message(
     audit row. It is passed separately from `attachment_blocks` because the
     caller skips attachment processing for an unrostered sender — that is
     exactly the case where /audit should still show a file was sent.
+
+    `own_words` is what the sender wrote and the files' names, for a caller
+    that put attachment text in `text`; None means `text` is all theirs. It
+    is the Executive's `memory_text`.
 
     `response_router`, if provided, is awaited with the full reply text
     AFTER ``executive.chat`` returns and BEFORE the chunked send loop.
@@ -992,6 +997,9 @@ async def _handle_message(
                 channel_context_block=build_channel_context_block("discord"),
                 person_id=person_id,
                 co_present_person_ids=co_present_person_ids or None,
+                # Never the attachment text or the DM hydration above.
+                memory_text=own_words if own_words is not None else text,
+                fetch_own_urls=True,  # past the roster gate above
             )
 
             # Late routing: for the @mention auto-thread path, the router
@@ -1502,6 +1510,11 @@ def create_discord_bot():
         # appeared in it. Not extracting an unrostered sender's file is the
         # point, and `attachments` below records that one was sent.
         att_image_blocks: list[dict] = []
+        # What the sender wrote and the files' names (as Slack records it),
+        # taken before attachment text is put in front of `cleaned`.
+        from openexecutive.integrations.attachments import own_words as _own_words
+
+        own_words = _own_words(cleaned, (a.filename for a in message.attachments))
         if message.attachments and _is_rostered(discord_user_id):
             try:
                 from openexecutive.integrations.attachments import (
@@ -1574,6 +1587,7 @@ def create_discord_bot():
         # replies that arrive in the same DM or thread channel.
         await _handle_message(
             text=cleaned,
+            own_words=own_words,
             attachment_count=len(message.attachments or []),
             discord_user_id=discord_user_id,
             discord_channel=discord_channel,

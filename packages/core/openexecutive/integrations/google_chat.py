@@ -311,8 +311,23 @@ async def _process_and_reply(
         episodic_context = format_for_prompt()
 
         chat_message = message_text
+        # What the sender wrote and the files' names, as Slack records it: any
+        # attachment text below goes into the prompt only.
+        from openexecutive.integrations.attachments import attached_files_note
+        from openexecutive.integrations.attachments import own_words as _own_words
+
+        names = [_attachment_name(a) for a in attachments or ()]
+        # A file-only message already arrives as that note (the webhook).
+        own_words = (
+            message_text if message_text == attached_files_note(names)
+            else _own_words(message_text, names)
+        )
         image_blocks: list[dict] = []
-        if attachments and _sender_on_roster(sender_email):
+        # The webhook authenticates Google, not the sender: anyone in a space
+        # with the bot reaches here, so only a team member's files are read
+        # and only their links can be opened.
+        on_roster = _sender_on_roster(sender_email)
+        if attachments and on_roster:
             att_text, image_blocks = await _read_attachments(
                 attachments, service_account_file, service_account_email
             )
@@ -320,10 +335,9 @@ async def _process_and_reply(
                 # Before the words, as the other chat channels inline it.
                 chat_message = f"{att_text}\n\n{message_text}"
         elif attachments:
-            names = ", ".join(map(_attachment_name, attachments))
             chat_message = (
                 f"(Attached files, not read — files are read only from people on "
-                f"the team: {names})\n\n{message_text}"
+                f"the team: {', '.join(names)})\n\n{message_text}"
             )
 
         response = await Executive(mcp_gateway=get_active_gateway()).chat(
@@ -333,6 +347,8 @@ async def _process_and_reply(
             episodic_context=episodic_context,
             channel_context_block=build_channel_context_block("google_chat"),
             attachment_blocks=image_blocks or None,
+            memory_text=own_words,
+            fetch_own_urls=on_roster,
         )
         await asyncio.to_thread(
             send_reply, space_name, thread_name, response, service_account_file, service_account_email
@@ -396,7 +412,9 @@ async def google_chat_webhook(request: Request, background_tasks: BackgroundTask
     if not cleaned:
         # A file-only message: its names stand in for the words, as the web
         # upload route records one.
-        cleaned = f"(Attached files: {', '.join(map(_attachment_name, attachments))})"
+        from openexecutive.integrations.attachments import attached_files_note
+
+        cleaned = attached_files_note(map(_attachment_name, attachments))
 
     background_tasks.add_task(
         _process_and_reply,
