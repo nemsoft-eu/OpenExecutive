@@ -6,6 +6,7 @@ import codecs
 import encodings
 import json
 import logging
+import random
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -17,7 +18,7 @@ import pytest
 
 from openexecutive.config import get_settings
 from openexecutive.orchestrator import web_fetch
-from openexecutive.orchestrator.searxng_search import SearchBudget
+from openexecutive.orchestrator.searxng_search import SearchBudget, host_of
 from openexecutive.orchestrator.web_fetch import (
     WEB_FETCH_TOOL,
     BlockedAddressError,
@@ -349,11 +350,17 @@ def test_every_fetch_goes_through_the_pinned_transport() -> None:
         ("https://user:pw@example.com/", None),
         ("https://@example.com/", None),
         ("https://example.com:99999/", None),
-        # IDNA 2003 would compare these as strasse.de / σ, but httpx (IDNA
-        # 2008) connects to a different, registrable domain.
-        ("https://straße.de/x", None),
-        ("https://ς.gr/", None),
+        # host_of reads an internationalised host with IDNA 2008, as httpx
+        # connects to it, so "ß" and final "ς" keep their own domain instead
+        # of IDNA 2003's strasse.de / σ, and the two readings agree.
+        ("https://straße.de/x", "https://xn--strae-oqa.de/x"),
+        ("https://ς.gr/", "https://xn--3xa.gr/"),
         ("https://xn--strae-oqa.de/x", "https://xn--strae-oqa.de/x"),
+        # A host ending in an ideographic full stop is the same domain.
+        ("https://bücher.example\u3002/x", "https://xn--bcher-kva.example/x"),
+        # httpx sends this host as a%5Eb.example while host_of reads it as
+        # written: the two readings differ, so it has no comparison form.
+        ("https://a^b.example/", None),
         ("https:///nohost", None),
         ("not a url", None),
     ],
@@ -457,8 +464,8 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         # A local part holding a character that ends a link seeds its dotted
         # prefix, never the domain: harmless, see add_from_text.
         ("mail jane.doe!x@example.com", {"https://jane.doe/"}),
-        # IDNA 2003 and 2008 disagree on "ß" (see test_normalise_url), and a
-        # scheme-less host is ASCII only, so no part of it is seen.
+        # A scheme-less host is ASCII only and never starts after a letter,
+        # so no part of an internationalised one is seen: it needs a scheme.
         ("straße.de/x", set()),
         ("bücher.example/x", set()),
         # The host-like text inside a link with a scheme is not a link.
@@ -1648,6 +1655,96 @@ async def test_the_domain_lists_apply_to_a_scheme_less_link(
     assert requested == [] and budget.used == 0
 
 
+@pytest.mark.parametrize(
+    ("key", "url", "refused"),
+    [
+        # httpx connects to xn--strae-oqa.de for straße.de (IDNA 2008), so
+        # that is the host an entry for straße.de names. IDNA 2003 read the
+        # entry as strasse.de: it blocked an unrelated domain and let the
+        # request to the listed one through.
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "https://xn--strae-oqa.de/", True),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "https://straße.de/", True),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "https://sub.xn--strae-oqa.de/", True),
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "https://strasse.de/", False),
+        ("WEB_SEARCH_ALLOWED_DOMAINS", "https://xn--strae-oqa.de/", False),
+        ("WEB_SEARCH_ALLOWED_DOMAINS", "https://strasse.de/", True),
+    ],
+)
+def test_a_domain_entry_names_the_host_httpx_connects_to(
+    key: str, url: str, refused: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(key, "straße.de")
+    assert (web_fetch._target_problem(url, get_settings()) is not None) is refused
+
+
+def test_a_blocked_host_ending_in_an_ideographic_full_stop_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """idna splits on the ideographic full stop as on ".", so the request
+    goes to the listed domain; a trailing one must not leave a "." that
+    defeats the match."""
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "bücher.example")
+    problem = web_fetch._target_problem("https://bücher.example\u3002/", get_settings())
+    assert problem is not None and "blocked domains" in problem
+
+
+async def test_a_blocked_internationalised_domain_is_never_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "straße.de")
+    url = "https://xn--strae-oqa.de/page"
+    requested = _serve(monkeypatch, {url: (200, _html(), b"<p>ok</p>")})
+    handle, budget = _fetcher(url)
+    outcome = await handle({"url": url})
+    assert outcome.is_error and "list of blocked domains" in outcome.content
+    assert requested == [] and budget.used == 0
+
+
+def test_host_of_reads_every_host_as_httpx_connects_to_it() -> None:
+    """Seeded fuzz: the domain lists judge the host the request goes to.
+
+    A host httpx rejects is never fetched, so it is skipped.
+    """
+    rng = random.Random(56)
+    pools = [
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+        "äöüßÄÖÜéçñåøæÆÉ",
+        "αβγδεζηθικλμνξοπρσςτυφχψωΣΟΥΈ",
+        "абвгдеёжзийклмнопрстуфхАБВ",
+        "中文日本語한국어",
+        # zero-width joiner and non-joiner, soft hyphen, zero-width space,
+        # combining acute and diaeresis, Devanagari virama
+        "\u200d\u200c\u00ad\u200b\u0301\u0308\u094d",
+        # fullwidth A, B, a, 0; ideographic, fullwidth and halfwidth stops
+        "\uff21\uff22\uff41\uff10\u3002\uff0e\uff61",
+        # Kelvin sign, dotted and dotless I, long s, capital sharp s, micro
+        "\u212a\u0130\u0131\u017f\u1e9e\u00b5",
+        "..-_%~",
+    ]
+    compared = 0
+    for _ in range(2000):
+        labels = [
+            "".join(
+                rng.choice(pools[0] if rng.random() < 0.5 else rng.choice(pools))
+                for _ in range(rng.randint(1, 10))
+            )
+            for _ in range(rng.randint(1, 3))
+        ]
+        host = ".".join(labels) + ("." if rng.random() < 0.1 else "")
+        url = f"https://{host}/"
+        try:
+            wire = httpx.URL(url).raw_host.decode("ascii").lower().rstrip(".")
+        except (ValueError, httpx.InvalidURL):
+            continue
+        # Every host from these pools that httpx accepts is one host_of
+        # encodes, to the same name. The pools hold no ASCII character httpx
+        # percent-encodes, a drift test_normalise_url pins separately.
+        assert host_of(url) == wire, (host, wire)
+        compared += 1
+    # Enough hosts survive httpx for the comparison to mean something.
+    assert compared > 300
+
+
 async def test_the_handler_refuses_on_a_turn_that_read_mail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1798,6 +1895,22 @@ async def test_a_redirect_is_checked_like_the_first_url(
     handle, _ = _fetcher("https://a.example/")
     outcome = await handle({"url": "https://a.example/"})
     assert outcome.is_error and "redirected to an address" in outcome.content
+    assert requested == ["https://a.example/"]
+
+
+@pytest.mark.parametrize(
+    "location", ["https://xn--strae-oqa.de/x", "https://sub.xn--strae-oqa.de/x"]
+)
+async def test_a_redirect_to_a_blocked_internationalised_domain_is_refused(
+    location: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hop's host is read as httpx connects to it, so an entry for
+    straße.de stops a redirect to its IDNA 2008 form and its subdomains."""
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", "straße.de")
+    requested = _serve(monkeypatch, {"https://a.example/": _redirect(location)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert outcome.is_error and "list of blocked domains" in outcome.content
     assert requested == ["https://a.example/"]
 
 

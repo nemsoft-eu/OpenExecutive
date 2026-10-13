@@ -20,10 +20,12 @@ import httpx
 import pytest
 
 from openexecutive.agents.tool_outcome import ToolOutcome
+from openexecutive.orchestrator import searxng_search
 from openexecutive.orchestrator.searxng_search import (
     SEARXNG_WEB_SEARCH_TOOL,
     UNTRUSTED_RESULTS_NOTICE,
     SearchBudget,
+    _bare_hosts,
     _normalise_host,
     host_matches,
     make_search_handler,
@@ -517,6 +519,9 @@ def test_blocklist_entry_forms_all_block_the_host(
         ("xn--bcher-kva.example", "https://bücher.example/page"),
         # Subdomain of an internationalised domain.
         ("bücher.example", "https://shop.xn--bcher-kva.example/page"),
+        # "ß" is its own letter in IDNA 2008, which httpx connects with.
+        ("straße.de", "https://xn--strae-oqa.de/page"),
+        ("xn--strae-oqa.de", "https://straße.de/page"),
     ],
 )
 def test_blocklist_matches_internationalised_domains_in_either_form(
@@ -532,6 +537,129 @@ def test_blocklist_matches_internationalised_domains_in_either_form(
         outcome = asyncio.run(handler({"query": "q"}))
     urls = [r["url"] for r in json.loads(outcome.content)["results"]]
     assert urls == ["https://other.example/b"]
+
+
+@pytest.mark.parametrize(
+    ("key", "kept"),
+    [
+        # IDNA 2003 read straße.de as strasse.de, a different domain: the
+        # blocklist dropped it and the allowlist kept it.
+        ("WEB_SEARCH_BLOCKED_DOMAINS", ["https://strasse.de/b", "https://other.example/c"]),
+        ("WEB_SEARCH_ALLOWED_DOMAINS", ["https://xn--strae-oqa.de/a"]),
+    ],
+)
+def test_a_sharp_s_entry_names_only_its_own_domain(
+    key: str, kept: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv(key, "straße.de")
+    patcher, _ = _patch_http(_response(_results(
+        "https://xn--strae-oqa.de/a", "https://strasse.de/b", "https://other.example/c",
+    )))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert urls == kept
+
+
+def test_bare_hosts_drops_unencodable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An entry neither IDNA 2008 nor UTS #46 encodes names no host httpx
+    can reach. IDNA 2003 deleted a joiner, so such an entry used to name
+    some other domain."""
+    entries = [
+        "a\u200db.example",  # a zero-width joiner between two Latin letters
+        "\u2603.example",  # a snowman, a symbol neither standard allows
+        "\uff42locked.com",  # a fullwidth "b": UTS #46 reads blocked.com
+        "bücher.example",
+        "example.com",
+    ]
+    # Recorded on the module's own logger rather than read back through
+    # caplog: another test in the same worker can reconfigure logging, and
+    # a record that never reaches the root logger is then never captured.
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        searxng_search.logger,
+        "warning",
+        lambda msg, *args, **kwargs: warnings.append(msg % args),
+    )
+    hosts = _bare_hosts(entries)
+    assert hosts == ["blocked.com", "xn--bcher-kva.example", "example.com"]
+    assert len(warnings) == 2
+    assert all("does not encode as a domain name" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    ("entry", "result_url"),
+    [
+        # An entry typed with a fullwidth letter still blocks its domain.
+        ("\uff42locked.com", "https://blocked.com/a"),
+        # A result whose host a browser opens as the blocked domain is
+        # dropped too, though httpx itself would refuse to fetch it.
+        ("blocked.com", "https://\uff42locked.com/a"),
+        ("blocked.com", "https://blocked.com\u00ad/a"),
+    ],
+)
+def test_blocklist_reads_compatibility_forms_as_their_domain(
+    entry: str, result_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv("WEB_SEARCH_BLOCKED_DOMAINS", entry)
+    patcher, _ = _patch_http(_response(_results(
+        result_url, "https://other.example/b",
+    )))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert urls == ["https://other.example/b"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "a\u200db.example",  # does not encode
+        "http://",  # does not parse
+    ],
+)
+def test_an_allowlist_of_ignored_entries_still_allows_nothing(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignoring every entry must not turn the allowlist off."""
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv("WEB_SEARCH_ALLOWED_DOMAINS", entry)
+    patcher, _ = _patch_http(_response(_results(
+        "https://ab.example/a", "https://other.example/b",
+    )))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    assert json.loads(outcome.content)["results"] == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        # Settings drop blank entries, so this is no allowlist at all, not
+        # an allowlist of ignored entries.
+        ("WEB_SEARCH_ALLOWED_DOMAINS", " , "),
+        # A blocklist whose every entry was ignored blocks nothing.
+        ("WEB_SEARCH_BLOCKED_DOMAINS", "a\u200db.example"),
+    ],
+)
+def test_a_list_with_no_usable_entry_filters_nothing(
+    key: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setenv(key, value)
+    patcher, _ = _patch_http(_response(_results(
+        "https://ab.example/a", "https://other.example/b",
+    )))
+    handler = make_search_handler(SearchBudget(max_uses=1))
+    with patcher:
+        outcome = asyncio.run(handler({"query": "q"}))
+    urls = [r["url"] for r in json.loads(outcome.content)["results"]]
+    assert urls == ["https://ab.example/a", "https://other.example/b"]
 
 
 @pytest.mark.parametrize(
@@ -558,8 +686,34 @@ def test_host_matches(host: str, domain: str, expected: bool) -> None:
         (" example.com ", "example.com"),
         ("bücher.example", "xn--bcher-kva.example"),
         ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+        # IDNA 2008, as httpx connects: IDNA 2003 gave strasse.de, xn--4xa.gr
+        # (σ) and xn--hxarabk1e.gr (the final ς as σ).
+        ("straße.de", "xn--strae-oqa.de"),
+        ("ς.gr", "xn--3xa.gr"),
+        ("ΟΔΥΣΣΕΎΣ.gr", "xn--pxac2arabk1e.gr"),
+        ("Bücher.De", "xn--bcher-kva.de"),
+        ("xn--Bcher-kva.de", "xn--bcher-kva.de"),
+        ("bücher.de.", "xn--bcher-kva.de"),
+        # idna splits on the ideographic full stop too.
+        ("bücher.de\u3002", "xn--bcher-kva.de"),
+        ("plain-host.example", "plain-host.example"),
         # A label over 63 chars cannot be IDNA-encoded: compared verbatim.
         ("ü" + "a" * 70 + ".example", "ü" + "a" * 70 + ".example"),
+        # IDNA 2008 rejects a fullwidth or circled letter, a long s and a
+        # soft hyphen; the UTS #46 fallback reads the domain they stand for,
+        # as IDNA 2003 did and as a browser does.
+        ("\uff45xample.com", "example.com"),
+        ("\u24b7locked.com", "blocked.com"),
+        ("\u017fecret.com", "secret.com"),
+        ("blocked.com\u00ad", "blocked.com"),
+        # IDNA 2008 wants NFC; a decomposed "\u00fc" (as macOS can type it) is
+        # composed by the fallback.
+        ("bu\u0308cher.example", "xn--bcher-kva.example"),
+        # Neither standard encodes a zero-width joiner out of context or a
+        # symbol: compared verbatim. IDNA 2003 deleted the joiner, which
+        # turned the entry into another domain.
+        ("a\u200db.example", "a\u200db.example"),
+        ("\u2603.example", "\u2603.example"),
     ],
 )
 def test_normalise_host(raw: str, expected: str) -> None:
