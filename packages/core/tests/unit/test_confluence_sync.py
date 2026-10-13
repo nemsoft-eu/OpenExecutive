@@ -435,6 +435,14 @@ def _resolves_to(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> None:
     ("fdaa::3",), ("::ffff:10.0.0.5",), ("93.184.216.34", "192.168.1.2"),
     ("64:ff9b::a9fe:a9fe",), ("64:ff9b:1::a00:1",), ("::a00:1",), ("2002:a00:1::",),
     ("2001:0:4136:e378:8000:63bf:f5ff:fffe",), ("0.0.0.0",),
+    # Python calls these two global, and this client's own copy of the address
+    # check let them through before it shared web_fetch's: deprecated
+    # site-local, and IPv4-translated (SIIT) around 169.254.169.254.
+    ("fec0::1",), ("::ffff:0:a9fe:a9fe",),
+    # Local-use NAT64 is refused whole. The first is the /48 form of 127.0.0.1
+    # (bits 48-63 and 72-87) with 93.184.216.34 in the last 32 bits, where the
+    # old copy looked; the second only looks public there.
+    ("64:ff9b:1:7f00:0:100:5db8:d822",), ("64:ff9b:1::5db8:d822",),
 ])
 async def test_public_hosts_only_refuses_inward_addresses(
     monkeypatch: pytest.MonkeyPatch, addresses: tuple[str, ...]

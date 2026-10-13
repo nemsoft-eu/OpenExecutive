@@ -100,10 +100,13 @@ certificate is still checked against the site's name. These requests
 connect directly, not through `HTTPS_PROXY`, and ignore `SSL_CERT_FILE` /
 `SSL_CERT_DIR`: give a private certificate authority through
 `CONFLUENCE_SSL_VERIFY` instead. IPv6 addresses that carry an IPv4 one
-(NAT64's `64:ff9b::/96`, 6to4, Teredo) are judged by the IPv4 address inside;
-a NAT64 gateway on a network-specific prefix can't be recognised, so block
-inward traffic at that gateway too. A refused host shows as the sync's last
-error.
+(NAT64's `64:ff9b::/96`, IPv4-mapped, -translated and -compatible, 6to4,
+Teredo) are judged
+by the IPv4 address inside, and deprecated site-local `fec0::/10` and the
+local-use NAT64 prefix `64:ff9b:1::/48` are refused whole: the same check the
+chat's web page fetch makes. Any other NAT64 gateway on a network-specific
+prefix can't be recognised, so block inward traffic at that gateway too. A
+refused host shows as the sync's last error.
 
 Restart the backend. The first sync runs about a minute after startup and
 then every `CONFLUENCE_SYNC_INTERVAL_MINUTES`. To run one immediately:
