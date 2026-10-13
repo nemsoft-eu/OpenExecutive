@@ -1,6 +1,7 @@
 """The research addendum honors a Council research_focus override but keeps
 the shared contract fixed; the research path passes the resolved knobs and
-offers its web tools (search, and web_fetch beside the client search)."""
+offers its web tools (search, and web_fetch beside the client search, with a
+note saying which pages it may open)."""
 from __future__ import annotations
 
 import asyncio
@@ -364,6 +365,94 @@ def test_research_with_no_search_is_a_single_call_with_no_fetch(
     assert [t["name"] for t in captured["tools"]] == ["emit_research_findings"]
     assert captured["client_tool_handlers"] == {}
     assert captured["max_client_tool_rounds"] == 1
+
+
+def test_research_fetch_note_follows_the_addendum_when_fetch_is_offered(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared addendum names web_search only, so a call that offers
+    web_fetch also says when and what it may open, after the addendum."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db)  # the default: one read
+    captured, agent = _capture_call()
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    assert "web_fetch" in [t["name"] for t in captured["tools"]]
+    assert captured["system_addendum"] == (
+        rp.research_addendum_for("cso") + rp.RESEARCH_FETCH_ADDENDUM
+    )
+
+
+def test_research_fetch_note_survives_a_council_focus_override(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The override replaces only the focus tail; the note is not part of it."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db)
+    ov_mod.set_override(
+        "cso",
+        research_focus="\n\nCUSTOM FOCUS: only watch acme.com filings.",
+        research_focus_set=True,
+        db_path=isolated_db,
+    )
+    ov_mod.invalidate_cache()
+    captured, agent = _capture_call()
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    addendum = captured["system_addendum"]
+    assert "Chief Strategy Officer" not in addendum
+    assert addendum.endswith(
+        "CUSTOM FOCUS: only watch acme.com filings." + rp.RESEARCH_FETCH_ADDENDUM
+    )
+
+
+@pytest.mark.parametrize(
+    ("setup", "tool_names"),
+    [
+        ("fetch-cap-zero", ["emit_research_findings", "web_search"]),
+        ("server-search", ["emit_research_findings", "web_search"]),
+        ("no-search", ["emit_research_findings"]),
+    ],
+)
+def test_research_fetch_note_is_absent_when_fetch_is_not_offered(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch, setup: str, tool_names: list[str]
+) -> None:
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    _route_research_to_local(monkeypatch, isolated_db, RESEARCH_WEB_FETCH_MAX_USES="1")
+    if setup == "fetch-cap-zero":
+        monkeypatch.setenv("RESEARCH_WEB_FETCH_MAX_USES", "0")
+    elif setup == "server-search":
+        ov_mod.set_override(
+            "research", model="claude-sonnet-5-5", model_set=True, db_path=isolated_db
+        )
+        ov_mod.invalidate_cache()
+    else:
+        monkeypatch.setenv("ENABLE_WEB_SEARCH", "false")
+    captured, agent = _capture_call()
+    asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
+
+    assert [t["name"] for t in captured["tools"]] == tool_names
+    assert captured["system_addendum"] == rp.research_addendum_for("cso")
+    assert "web_fetch" not in captured["system_addendum"]
+
+
+def test_research_fetch_note_states_the_seed_rule() -> None:
+    """The note's load-bearing phrases: which URLs open, that any other is
+    refused, and that emitting from the snippets is fine. The addendum other
+    callers get stays search-only."""
+    note = rp.RESEARCH_FETCH_ADDENDUM
+    for phrase in (
+        "web_fetch",
+        "a web_search returned in this run",
+        "copied exactly",
+        "refused",
+        "from the snippets",
+    ):
+        assert phrase in note
+    assert "web_fetch" not in rp.shared_research_addendum()
 
 
 def test_research_fetches_when_the_chat_fetch_knob_is_zero(

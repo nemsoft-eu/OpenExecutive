@@ -721,7 +721,9 @@ providers:
     default in monitoring.research.prompts._RESEARCH_FOCUS; the SHARED research
     contract (shared_research_addendum — output schema + grounding/recency/
     actionability bars) is NEVER overridable and stays code-only so a bad edit
-    can't break the output contract. The override is static config, so it does
+    can't break the output contract. RESEARCH_FETCH_ADDENDUM, appended after
+    the focus tail only on a call that offers web_fetch, is code-only too and
+    outside the override. The override is static config, so it does
     not break the cached system block (just re-warms on edit). Surfaced on
     AgentDetail as research_focus + research_focus_default (null for agents with
     no research scope, e.g. executive / utility knobs).
@@ -1168,7 +1170,16 @@ routing:
         web_fetch]` every round; the final round withdraws both handled
         tools (agents.base `_run_client_tool_loop`), and the rounds are
         `client_tool_rounds(search, with_fetch=True)`: searches + page
-        reads + the emit round. Beside a server search it gets no fetch:
+        reads + the emit round. That is a bound, not a reservation: a
+        refused open (an unseen URL, a site the domain lists refuse) spends
+        a round and no budget, and the rounds are not extended for it, since they
+        cap the call's generations. The shared addendum names web_search
+        only, so this call's system addendum is `research_addendum_for(slug)
+        + RESEARCH_FETCH_ADDENDUM` (monitoring.research.prompts, a constant):
+        only a URL a web_search returned in this run, copied exactly, opens;
+        any other is refused and costs a step; with no page worth opening,
+        emit from the snippets. Without the fetch the addendum is unchanged.
+        Beside a server search it gets no fetch:
         that call is one generation with no handler loop, and a loop would
         neither read nor replay the server's result blocks
         (`_replay_assistant_turn`). The fetch handler's own

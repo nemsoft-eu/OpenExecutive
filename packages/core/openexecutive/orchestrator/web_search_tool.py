@@ -207,6 +207,18 @@ def client_tool_rounds(
     with ``with_fetch`` (the caller built the fetch handler) one per page
     read too. A server or absent selection needs no loop: the single call
     is the answer.
+
+    The count is a bound, not a reservation. A round that runs no search
+    and reads no page still spends a round: a refused open (a URL the run
+    has not seen, a site the domain lists refuse), a call over its budget,
+    an unknown tool. So a specialist that wastes one with every search already used
+    reaches the final round, where the handled tools are withdrawn, without
+    having read a page. The rounds are not extended for that: the bound is
+    what caps a call's generations, and so its cost and its share of the
+    timeout, and a refusal is only an error tool_result to the loop, the
+    same as a fetch that ran and failed. The research call tells the model
+    which URLs it can open instead
+    (``monitoring.research.prompts.RESEARCH_FETCH_ADDENDUM``).
     """
     if selection is None or selection.kind != "client":
         return 1

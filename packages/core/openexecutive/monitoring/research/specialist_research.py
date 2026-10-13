@@ -15,6 +15,7 @@ from openexecutive.config import get_settings
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.research.prompts import (
     PER_SPECIALIST_FINDING_CAP,
+    RESEARCH_FETCH_ADDENDUM,
     research_addendum_for,
 )
 from openexecutive.monitoring.research.tools import (
@@ -76,11 +77,16 @@ async def research_one_specialist(
     # same pin object and sees a mail read the turn records after the run
     # began; a scheduled run binds no session, so there is no pin to read.
     seen: SeenUrls | None = None
+    addendum = research_addendum_for(specialist_slug)
     if search is not None:
         tools.append(search.tool)
         if search.kind == "client" and search.fetch_tool is not None:
             tools.append(search.fetch_tool)
             seen = SeenUrls()
+            # The shared addendum names web_search only, and a local research
+            # model that follows it closely may emit from snippets without
+            # ever opening a page; this note says when and what it can open.
+            addendum += RESEARCH_FETCH_ADDENDUM
 
     # The research-mode turn is retrieve-from-web-search + summarize, not
     # deep strategic reasoning. Its model + deep-reasoning are controlled by
@@ -94,7 +100,7 @@ async def research_one_specialist(
             research_context,
             actor="specialist_research",
             tools=tools,
-            system_addendum=research_addendum_for(specialist_slug),
+            system_addendum=addendum,
             timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
             model_override=research_model,
             deep_reasoning_override=get_research_use_deep_reasoning(),
