@@ -448,6 +448,10 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         ("mail name@example.com", set()),
         ("mail jane.doe.smith@example.com", set()),
         ("mail first.last+tag@example.com", set()),
+        ("mail jane.doe=x@example.com", set()),
+        # A local part holding a character that ends a link seeds its dotted
+        # prefix, never the domain: harmless, see add_from_text.
+        ("mail jane.doe!x@example.com", {"https://jane.doe/"}),
         # IDNA 2003 and 2008 disagree on "ß" (see test_normalise_url), and a
         # scheme-less host is ASCII only, so no part of it is seen.
         ("straße.de/x", set()),
@@ -474,8 +478,51 @@ def test_a_link_written_without_a_scheme_is_seen_as_https(text: str, url: str) -
         ("<http://a.example|a.example>", {"http://a.example/", "https://a.example/"}),
         ("<mailto:jane.doe@example.com|jane.doe@example.com>", set()),
         ("a.example,b.example", {"https://a.example/", "https://b.example/"}),
+        ("**example.com**", {"https://example.com/"}),
+        ("'example.com'", {"https://example.com/"}),
+        ("(see example.com/x), then", {"https://example.com/x"}),
+        ("read example.com.", {"https://example.com/"}),
+        ("example.com: nice", {"https://example.com/"}),
+        ("\u89c1 example.com\u3002", {"https://example.com/"}),
+        # Curly quotes, an em dash, an ellipsis, CJK brackets and commas.
+        ("\u201cexample.com\u201d", {"https://example.com/"}),
+        ("\u2018example.com\u2019", {"https://example.com/"}),
+        ("\u201eexample.com\u201c", {"https://example.com/"}),
+        ("\u00abexample.com\u00bb", {"https://example.com/"}),
+        ("example.com\u2019s homepage", {"https://example.com/"}),
+        ("see\u2014example.com\u2014really", {"https://example.com/"}),
+        ("example.com\u2026", {"https://example.com/"}),
+        ("\u300cexample.com\u300d", {"https://example.com/"}),
+        ("\uff08example.com\uff09", {"https://example.com/"}),
+        ("a.example\u3001b.example", {"https://a.example/", "https://b.example/"}),
+        # A path runs to _URL_RE's delimiters, so text joined to it is path.
+        ("example.com/x\u89c1", {"https://example.com/x%E8%A7%81"}),
         # A port past 65535 makes no URL, so nothing is seen.
         ("example.com:99999/x", set()),
+        ("example.com:8443/a", {"https://example.com:8443/a"}),
+        # A ":" that starts no port: the person wrote no root URL, and the
+        # host cannot back off to a shorter one ("a.example").
+        ("example.com:abc/path", set()),
+        ("example.com:100000/path", set()),
+        ("example.com:abc", set()),
+        ("a.example.com:abc", set()),
+        ("example.com:/x", set()),
+        ("example.com./x", set()),
+        # Nor does a ":" start a link: this is not "abc.example/x".
+        ("example.com:abc.example/x", set()),
+        ("site:example.com", set()),
+        # A letter, a zero-width space, a soft hyphen, "+", "=" or "/" right
+        # before the host does not start a match, so the token's suffix is
+        # not seeded.
+        ("foo\u200bexample.com/x", set()),
+        ("foo\u00adexample.com/x", set()),
+        ("foo+example.com/x", set()),
+        ("foo=example.com", set()),
+        ("x/example.com", set()),
+        ("\u89c1example.com", set()),
+        # Nor ends mid-word.
+        ("example.com\u89c1", set()),
+        ("example.com-x", set()),
         # A letter from another script in the host (U+0430, the Cyrillic "a")
         # leaves no ASCII part of it seen.
         ("ex\u0430mple.com", set()),
@@ -544,12 +591,23 @@ def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> Non
     assert seen._urls == {"https://ciao-construct.be/"}
 
 
-def test_the_email_check_stays_linear_on_a_long_run_of_labels() -> None:
-    """Unbounded, the look-ahead for an "@" rescans the rest of the run from
-    every place a host could end: several seconds for this text."""
+@pytest.mark.parametrize(
+    "text",
+    [
+        "aa." * 40_000 + "@",
+        " a.bc" + "." * 100_000 + "x",
+        "+a.bc" * 20_000,
+    ],
+    ids=["label-run-to-at", "dot-run-after-host", "joined-hosts"],
+)
+def test_the_scheme_less_pass_stays_linear(text: str) -> None:
+    """A look-ahead that rescans the rest of a run of labels from every place
+    a host could end (an earlier check for an email "@") took several
+    seconds on the first text. The end check scans only the "." and ":" run
+    after a host end, and a match is tried only where a link may start."""
     seen = web_fetch.SeenUrls()
     started = time.perf_counter()
-    seen.add_from_text("aa." * 40_000 + "@")
+    seen.add_from_text(text)
     assert time.perf_counter() - started < 1.0
 
 

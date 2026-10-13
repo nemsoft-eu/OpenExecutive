@@ -1213,11 +1213,22 @@ routing:
     (`web.archive.org/web/2024/https://example.com/`). The scheme-less form
     is `_BARE_URL_RE`: ASCII labels, at least one dot, an
     alphabetic final label of two or more letters (no `1.2.3`, `v2.0`,
-    `e.g.` or IPv4 address), not after an `@` nor in a local part of
-    letters, digits and `._+-` (a common email address seeds neither its
-    domain nor its local part; a rarer local part such as `jane.doe=x@…`
-    may seed its dotted prefix), an optional port and path. An
-    internationalised host needs its scheme. A word that only looks like a
+    `e.g.` or IPv4 address), an optional port and path. Both ends are a
+    listed boundary, never "any character a host cannot hold": it starts
+    at the start of the text, after whitespace, or after punctuation that
+    opens or separates a link (`(`, `[`, `<`, `|`, straight and curly
+    quotes, `*`, `,` …), and ends at the end of the text, whitespace or
+    closing punctuation, after any run of `.` and `:`. So a letter, a
+    zero-width space, soft hyphen, `+`, `=`, `/`, `:` or `@` right before
+    the host seeds nothing (`foo+example.com/x` once seeded
+    `example.com/x`), and a malformed port seeds nothing
+    (`example.com:abc/path` once seeded the root); the host cannot
+    shrink to a shorter one either. A punctuation mark in the start set
+    still starts a match after a word (`o'reilly.com` seeds
+    `reilly.com`), which is text the person wrote all the same. A common
+    email address seeds neither its domain nor its local part; a local
+    part holding a character that ends a link (`jane.doe!x@…`) may seed
+    its dotted prefix. An internationalised host needs its scheme. A word that only looks like a
     host (`report.pdf`) is seeded too and is harmless: it is still in the
     text the caller vouched for (`memory_text`, which also carries the
     attached files' names, so a dotted filename seeds a host with no
