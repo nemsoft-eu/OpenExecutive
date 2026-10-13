@@ -11,7 +11,8 @@ an SSRF surface. Two rules bound it:
   * **Only a URL the conversation has already seen.** ``SeenUrls`` holds the
     URLs in the speaker's own words this turn (one written without a scheme
     as its https:// form) and the result URLs this turn's ``web_search``
-    returned; anything else is refused. Text injected
+    returned (a research specialist's call has no speaker, so only its own
+    search results); anything else is refused. Text injected
     into a page or a snippet therefore cannot make the model send data to an
     address of its choosing. This is the rule Anthropic applies to its own
     server-side fetch.
@@ -405,7 +406,8 @@ class SeenUrls:
     Seed it from the speaker's own words only (the chat entry points'
     ``memory_text``), never from a message a caller packed with attachment
     text, mail or retrieved context: a URL inside any of those must stay
-    unfetchable.
+    unfetchable. The research fan-out seeds it from nothing at all, so its
+    search results are all a specialist may open.
 
     A link the speaker wrote without a scheme ("example.com/page") is seen
     as its ``https://`` form only, never ``http://``. Its host must be

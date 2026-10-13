@@ -1,4 +1,4 @@
-"""Unit tests for the research run's own controls: its web-search cap,
+"""Unit tests for the research run's own controls: its web-search and fetch caps,
 the specialist filter, the withheld workflow-start tool, and the periodic
 cadence default."""
 from __future__ import annotations
@@ -15,6 +15,7 @@ _ENV = (
     "ENABLE_WEB_SEARCH",
     "WEB_SEARCH_MAX_USES",
     "RESEARCH_WEB_SEARCH_MAX_USES",
+    "RESEARCH_WEB_FETCH_MAX_USES",
     "RESEARCH_SPECIALISTS",
     "WATCHLIST_RESEARCH_INTERVAL_MINUTES",
 )
@@ -29,6 +30,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_defaults_are_reasonable() -> None:
     s = get_settings()
     assert s.research_web_search_max_uses == 3
+    assert s.research_web_fetch_max_uses == 1
     assert s.research_specialists == []
     assert s.watchlist_research_interval_minutes == 360
 
@@ -50,6 +52,24 @@ def test_research_search_cap_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("RESEARCH_WEB_SEARCH_MAX_USES", "0")
     with pytest.raises(ValueError):
         get_settings()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("-1", None), ("abc", None), ("0", 0), ("2", 2), ("", 1)],
+)
+def test_research_fetch_cap_rejects_negative_and_allows_zero(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: int | None
+) -> None:
+    """0 turns the research fetch off; below that, or not a number, is a
+    typo, not a setting. An empty value is the default, as for every
+    setting (env_ignore_empty)."""
+    monkeypatch.setenv("RESEARCH_WEB_FETCH_MAX_USES", value)
+    if expected is not None:
+        assert get_settings().research_web_fetch_max_uses == expected
+    else:
+        with pytest.raises(ValueError, match="RESEARCH_WEB_FETCH_MAX_USES"):
+            get_settings()
 
 
 def test_specialist_filter_parses_and_keeps_registry_order(
@@ -82,7 +102,7 @@ def test_env_example_documents_the_controls() -> None:
     root = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
     with open(os.path.join(root, ".env.example"), encoding="utf-8") as fh:
         text = fh.read()
-    for key in ("RESEARCH_WEB_SEARCH_MAX_USES", "RESEARCH_SPECIALISTS", "WATCHLIST_RESEARCH_INTERVAL_MINUTES"):
+    for key in ("RESEARCH_WEB_SEARCH_MAX_USES", "RESEARCH_WEB_FETCH_MAX_USES", "RESEARCH_SPECIALISTS", "WATCHLIST_RESEARCH_INTERVAL_MINUTES"):
         assert key in text
 
 

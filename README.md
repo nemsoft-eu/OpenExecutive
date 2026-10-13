@@ -440,6 +440,7 @@ the app refuses to start.
 | `WEB_SEARCH_MAX_USES` | No | `2` | Max billed searches per agent per turn |
 | `WEB_FETCH_MAX_USES` | No | `3` | Max pages the Executive may open per turn; `0` turns fetching off |
 | `WEB_FETCH_TIMEOUT_S` | No | `15.0` | Time limit for one page fetch, redirects included |
+| `RESEARCH_WEB_FETCH_MAX_USES` | No | `1` | Max pages each specialist may open per research run, on a local research model with SearXNG; `0` turns it off |
 
 See [.env.example](.env.example) for the full list.
 
@@ -457,11 +458,14 @@ See [.env.example](.env.example) for the full list.
 > `WEB_SEARCH_BLOCKED_DOMAINS` scope where it may look (set at most one).
 > The same switch and lists govern `web_fetch`, which opens a page in full.
 > It is a client-side fetch on every model that has search: it opens only a URL
-> the person wrote in their message or one a search returned that turn (not on
-> OpenRouter, whose search results never reach the backend; paste a link again
+> the person wrote in their message or one a search returned that turn (on
+> OpenRouter, a result it reports as a citation; paste a link again
 > to use it in a later message), reaches only public addresses, and
 > returns the page's text. `WEB_FETCH_MAX_USES` (default 3 per turn, `0` for
-> off) and `WEB_FETCH_TIMEOUT_S` tune it.
+> off) and `WEB_FETCH_TIMEOUT_S` tune it. The research run's specialists may
+> open a page too, but only on a local research model with SearXNG and only a
+> URL their own searches returned (`RESEARCH_WEB_FETCH_MAX_USES`, default 1
+> per specialist); standing queries never open one.
 
 ## Running on Local Models
 

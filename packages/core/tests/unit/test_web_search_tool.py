@@ -684,8 +684,9 @@ def _client_selection(fetch: bool = True):
 
 
 def test_client_handlers_without_a_seen_set_are_search_only() -> None:
-    """The research fan-out and standing queries pass no seen set: they keep
-    the one search handler they always had, fetch tool or not."""
+    """Standing queries pass no seen set (nor does research beside a server
+    search): they keep the one search handler they always had, fetch tool
+    or not."""
     from openexecutive.orchestrator.web_search_tool import client_search_handlers
 
     assert set(client_search_handlers(_client_selection())) == {"web_search"}
@@ -741,3 +742,39 @@ def test_search_results_join_the_seen_set_and_the_fetch_budget_is_its_own() -> N
     assert [o.is_error for o in outcomes[1:]] == [False, False, False, True]
     assert "budget" in outcomes[-1].content
     assert run_fetch.await_count == 3
+
+
+def test_selector_takes_the_callers_fetch_cap_over_the_chat_knob() -> None:
+    """The research fan-out passes RESEARCH_WEB_FETCH_MAX_USES; 0 leaves the
+    selection with no fetch tool, and no override keeps the chat knob."""
+    from openexecutive.orchestrator.web_search_tool import select_web_search_tool
+
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    os.environ["WEB_FETCH_MAX_USES"] = "3"
+    try:
+        chat = select_web_search_tool("claude-sonnet-5")
+        own = select_web_search_tool("claude-sonnet-5", fetch_max_uses=2)
+        off = select_web_search_tool("claude-sonnet-5", fetch_max_uses=0)
+    finally:
+        _reset_settings_cache()
+    assert chat is not None and chat.fetch_tool is not None and chat.fetch_max_uses == 3
+    assert own is not None and own.fetch_tool is not None and own.fetch_max_uses == 2
+    assert off is not None and off.fetch_tool is None and off.fetch_max_uses == 0
+
+
+def test_client_tool_rounds_adds_the_fetches_only_for_a_caller_that_offers_them() -> None:
+    """Standing queries call it as before and get no fetch rounds; research
+    with the fetch handler gets one round per page read on top."""
+    from openexecutive.orchestrator.web_search_tool import (
+        WebSearchSelection,
+        client_tool_rounds,
+    )
+
+    # Searches: 2, fetches: 3.
+    assert client_tool_rounds(_client_selection()) == 3
+    assert client_tool_rounds(_client_selection(), with_fetch=True) == 6
+    assert client_tool_rounds(_client_selection(fetch=False), with_fetch=True) == 3
+    server = WebSearchSelection("server", {"name": "web_search"}, 2, {"name": "web_fetch"}, 3)
+    assert client_tool_rounds(server, with_fetch=True) == 1
+    assert client_tool_rounds(None, with_fetch=True) == 1

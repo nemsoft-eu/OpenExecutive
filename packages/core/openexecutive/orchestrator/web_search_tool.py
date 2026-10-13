@@ -77,11 +77,14 @@ class WebSearchSelection:
     budget with the same number it puts on the server tool.
 
     ``fetch_tool`` is the client-side ``web_fetch`` tool, whatever the
-    search kind, or None with ``WEB_FETCH_MAX_USES=0``. It is a function
-    tool, so it always joins the sorted client list. Only the chat loop
-    offers it today: the research fan-out and standing queries read
-    ``tool`` alone and build their handlers without a seen-URL set, which
-    leaves the fetch handler out.
+    search kind, or None when its cap (``WEB_FETCH_MAX_USES``, or the
+    caller's ``fetch_max_uses``) is 0. It is a function tool, so it always
+    joins the sorted client list. Carrying it does not offer it: a caller
+    offers it by listing it and passing a seen-URL set to
+    ``client_search_handlers``. The chat loop does, whatever the search
+    kind; the research fan-out does beside the client search only
+    (``monitoring.research.specialist_research``); standing queries never
+    do (``monitoring.sources.query``).
     """
 
     kind: Literal["server", "client"]
@@ -92,7 +95,10 @@ class WebSearchSelection:
 
 
 def select_web_search_tool(
-    model: str, *, max_uses: int | None = None
+    model: str,
+    *,
+    max_uses: int | None = None,
+    fetch_max_uses: int | None = None,
 ) -> WebSearchSelection | None:
     """Pick the search implementation for ``model``, or None when there is none.
 
@@ -105,6 +111,11 @@ def select_web_search_tool(
     the Council override or the research model, not an agent's default.
     Selecting against a different model than the call uses is how a request
     ends up carrying a tool its provider will strip or reject.
+
+    ``max_uses`` and ``fetch_max_uses`` override the chat knobs
+    (``WEB_SEARCH_MAX_USES``, ``WEB_FETCH_MAX_USES``) for a caller with its
+    own caps: the research fan-out passes ``RESEARCH_WEB_SEARCH_MAX_USES``
+    and ``RESEARCH_WEB_FETCH_MAX_USES``.
     """
     settings = get_settings()
     if not settings.enable_web_search:
@@ -121,7 +132,9 @@ def select_web_search_tool(
     from openexecutive.orchestrator.web_fetch import WEB_FETCH_TOOL
     from openexecutive.providers.registry import supports_server_web_search
 
-    fetch_max = settings.web_fetch_max_uses
+    fetch_max = (
+        fetch_max_uses if fetch_max_uses is not None else settings.web_fetch_max_uses
+    )
     fetch_tool = WEB_FETCH_TOOL if fetch_max > 0 else None
 
     if supports_server_web_search(model):
@@ -154,12 +167,14 @@ def client_search_handlers(
     where a new budget per iteration would reset on every model round trip
     and multiply the cap.
 
-    With ``seen`` (the chat loop's turn), a selection carrying a fetch tool
-    also gets the ``web_fetch`` handler, with its own budget, whatever the
-    search kind, and every client search result URL joins ``seen`` so it
-    can be opened (the chat loop adds the server search's results itself).
-    Without it (the research fan-out, standing queries) only the client
-    search handler is built.
+    With ``seen``, a selection carrying a fetch tool also gets the
+    ``web_fetch`` handler, with its own budget, whatever the search kind,
+    and every client search result URL joins ``seen`` so it can be opened.
+    The chat loop passes its turn's set (and adds the server search's
+    results itself); the research fan-out passes an empty one beside the
+    client search, so only its own results become openable. Without it
+    (standing queries, and research beside a server search) only the
+    client search handler is built, if the search is the client one.
     """
     if selection is None:
         return {}
@@ -183,12 +198,33 @@ def client_search_handlers(
     return handlers
 
 
-def client_tool_rounds(selection: WebSearchSelection | None) -> int:
+def client_tool_rounds(
+    selection: WebSearchSelection | None, *, with_fetch: bool = False
+) -> int:
     """Generations a client-tool loop may take for ``selection``.
 
-    One round per search plus the round that emits the caller's output. A
-    server or absent selection needs no loop: the single call is the answer.
+    One round per search plus the round that emits the caller's output, and
+    with ``with_fetch`` (the caller built the fetch handler) one per page
+    read too. A server or absent selection needs no loop: the single call
+    is the answer.
+
+    The count is a bound, not a reservation. A round that runs no search
+    and reads no page still spends a round: a refused open (a URL the run
+    has not seen, a site the domain lists refuse), a call over its budget,
+    an unknown tool. So a specialist that wastes one with every search already used
+    reaches the final round, where the handled tools are withdrawn, without
+    having read a page. The rounds are not extended for that: the bound is
+    what caps a call's generations, and so its cost and its share of the
+    timeout, and a refusal is only an error tool_result to the loop, the
+    same as a fetch that ran and failed. The research call tells the model
+    which URLs it can open instead
+    (``monitoring.research.prompts.RESEARCH_FETCH_ADDENDUM``).
     """
     if selection is None or selection.kind != "client":
         return 1
-    return selection.max_uses + 1
+    fetches = (
+        selection.fetch_max_uses
+        if with_fetch and selection.fetch_tool is not None
+        else 0
+    )
+    return selection.max_uses + fetches + 1

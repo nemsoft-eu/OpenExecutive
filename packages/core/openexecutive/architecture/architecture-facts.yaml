@@ -148,7 +148,7 @@ system:
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
     - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. Local-model reasoning is controlled only by the deployment-wide LOCAL_REASONING_EFFORT, sent as the flat `reasoning_effort` field; the Council's per-agent Deep reasoning toggle has no effect on local slugs. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin — those slugs get the client-side SearXNG tool instead when SEARXNG_URL is set. `web_fetch` is the client-side tool on every model that has a search tool (beside the server web_search on Anthropic direct and OpenRouter, beside SearXNG on a local slug); Anthropic's web_fetch server tool is never sent. Callers do NOT need to know which model they're routing to.
-    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results (in the person's own words, a link written without a scheme counts as its https:// form) — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail; the offered tool list never changes mid-turn, and the server web_search stays. Anthropic's server web_fetch is not used because it opens any URL a client tool result echoes, even text the model wrote, so an injected instruction could have the turn's data leave in a query string.
+    - The client-side web_fetch opens only a URL the turn has seen — in the caller's `memory_text` (the speaker's own words; none passed leaves only the turn's search results), in a message added mid-turn, or among this turn's search results (in the person's own words, a link written without a scheme counts as its https:// form) — and only a public address, with the connection pinned to the address that was checked. It is withheld on a turn private to the principal and refused after the turn reads the speaker's mail; the offered tool list never changes mid-turn, and the server web_search stays. Outside chat only the research fan-out offers it, beside the client (SearXNG) search, seeded from nothing but that specialist call's own search results; standing queries never do. Anthropic's server web_fetch is not used because it opens any URL a client tool result echoes, even text the model wrote, so an injected instruction could have the turn's data leave in a query string.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -721,7 +721,9 @@ providers:
     default in monitoring.research.prompts._RESEARCH_FOCUS; the SHARED research
     contract (shared_research_addendum — output schema + grounding/recency/
     actionability bars) is NEVER overridable and stays code-only so a bad edit
-    can't break the output contract. The override is static config, so it does
+    can't break the output contract. RESEARCH_FETCH_ADDENDUM, appended after
+    the focus tail only on a call that offers web_fetch, is code-only too and
+    outside the override. The override is static config, so it does
     not break the cached system block (just re-warms on edit). Surfaced on
     AgentDetail as research_focus + research_focus_default (null for agents with
     no research scope, e.g. executive / utility knobs).
@@ -1154,9 +1156,47 @@ routing:
     `web_fetch` rides with search in the same selection
     (`WebSearchSelection.fetch_tool` / `fetch_max_uses`), so the Executive
     can read a page whose address it has instead of reasoning from a
-    snippet. It is in the chat loop only: the research fan-out and
-    standing queries read `selection.tool` alone and build their handlers
-    without a seen-URL set, which leaves fetch out.
+    snippet. Carrying it does not offer it: a caller lists the tool and
+    passes a seen-URL set to `client_search_handlers`. Three callers:
+      - The chat loop, whatever the search kind (below).
+      - The research fan-out (`specialist_research.research_one_specialist`),
+        beside the CLIENT search only, with its own cap:
+        `select_web_search_tool(model, max_uses=RESEARCH_WEB_SEARCH_MAX_USES,
+        fetch_max_uses=RESEARCH_WEB_FETCH_MAX_USES)` (default 1, 0 omits
+        the tool and the handler). Each specialist call starts an empty
+        `SeenUrls` that only its own SearXNG results join (the search
+        handler's `on_result_url`), never `research_context` or the note in
+        it. Its tool list is `[emit_research_findings, web_search,
+        web_fetch]` every round; the final round withdraws both handled
+        tools (agents.base `_run_client_tool_loop`), and the rounds are
+        `client_tool_rounds(search, with_fetch=True)`: searches + page
+        reads + the emit round. That is a bound, not a reservation: a
+        refused open (an unseen URL, a site the domain lists refuse) spends
+        a round and no budget, and the rounds are not extended for it, since they
+        cap the call's generations. The shared addendum names web_search
+        only, so this call's system addendum is `research_addendum_for(slug)
+        + RESEARCH_FETCH_ADDENDUM` (monitoring.research.prompts, a constant):
+        only a URL a web_search returned in this run, copied exactly, opens;
+        any other is refused and costs a step; with no page worth opening,
+        emit from the snippets. Without the fetch the addendum is unchanged.
+        Beside a server search it gets no fetch:
+        that call is one generation with no handler loop, and a loop would
+        neither read nor replay the server's result blocks
+        (`_replay_assistant_turn`). The fetch handler's own
+        `outside_reach_refusal` is the mail lockdown here: a chat-fired run
+        executes in tasks that copy the chat turn's context (the handler's
+        gather, the workflow's producer task, the fan-out's gather), each
+        holding the same TurnDelegation object, so a mail read the turn
+        records is seen (the dispatch guard
+        already withholds `run_executive_research` once the turn has read
+        mail); the scheduler binds no session, so there is no pin to read.
+      - Standing queries (`monitoring.sources.query`) never: their list is
+        `[emit_query_results, search.tool]` and their handlers are built
+        without a seen set. A poll is unattended and billed, and its
+        product is a title, a URL and a sentence per result; a fetch would
+        let whoever ranks a page shape that sentence with up to 12,000
+        characters nobody reads. Exact-match seeding means it could carry
+        no data out, so all it would add is a beacon to the page's owner.
 
       - Every selection, server or client, carries the CLIENT-side
         `web_fetch` (`orchestrator.web_fetch.WEB_FETCH_TOOL`): beside
@@ -1168,8 +1208,10 @@ routing:
         is appended after it. Its own
         `SearchBudget(max_uses=fetch_max_uses)` is built once per turn by
         `client_search_handlers(search, seen)`, whatever the search kind.
-      - WEB_FETCH_MAX_USES=0, or ENABLE_WEB_SEARCH=false → no fetch on any
-        path. Fetch shares WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS.
+      - WEB_FETCH_MAX_USES=0 → no fetch in chat (the research fan-out's
+        is RESEARCH_WEB_FETCH_MAX_USES=0); ENABLE_WEB_SEARCH=false → no
+        fetch on any path. Fetch shares WEB_SEARCH_ALLOWED_DOMAINS /
+        BLOCKED_DOMAINS.
       - Anthropic's `web_fetch` server tool is never sent. Anthropic's
         docs say it may open any URL in a client tool result, even one
         echoing text Claude produced, so an injected instruction could
@@ -6056,7 +6098,10 @@ external_monitoring:
          Controls: the fan-out's web_search tool takes its `max_uses` from
          `RESEARCH_WEB_SEARCH_MAX_USES` (default 3) — separate from the
          chat / query knob `WEB_SEARCH_MAX_USES`, because here it is
-         multiplied by the number of specialists; `RESEARCH_SPECIALISTS`
+         multiplied by the number of specialists; beside the client
+         (SearXNG) search each specialist may also open
+         `RESEARCH_WEB_FETCH_MAX_USES` pages (default 1, 0 = off; see
+         `routing.web_search`); `RESEARCH_SPECIALISTS`
          (comma-separated slugs, empty = all seven) filters the fan-out via
          `active_research_specialists` (unknown slugs are logged and
          dropped; an all-unknown value runs every specialist). The tool is

@@ -14,6 +14,15 @@ it issues an LLM call plus web searches per poll. The cost governors are:
   - ``max_results`` per row (caps emitted Signals),
   - and the pipeline's global ``external_monitor_max_signals_per_scan``.
 
+No ``web_fetch``, unlike the research fan-out: the tool list is the emit
+tool and the search alone, and the handlers are built without a seen-URL
+set. A poll runs unattended and billed, and what it produces is a title, a
+URL and a sentence per result, which the search already gives. A fetch would
+let whoever ranks a page in the results shape that sentence with up to
+12,000 characters of page text nobody reads. It could not carry data out
+(only a result URL, matched exactly, is ever opened), so all it would add
+is a beacon: a request telling that page's owner the query ran.
+
 Watchlist row shape:
 
   - ``signal_type``: ``"query"``
