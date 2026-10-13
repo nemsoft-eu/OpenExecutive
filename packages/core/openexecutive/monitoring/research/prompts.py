@@ -10,6 +10,9 @@ addendum that:
       data, which is stale by construction), and
   (d) explicitly clarifies the Executive — not the specialist — does
       the routing, so they don't try to send messages themselves.
+
+``RESEARCH_FETCH_ADDENDUM`` follows it only on a call that offers
+``web_fetch`` (``specialist_research.research_one_specialist``).
 """
 from __future__ import annotations
 
@@ -241,8 +244,30 @@ def research_addendum_for(specialist_slug: str) -> str:
     return shared_research_addendum() + focus
 
 
+# Appended after ``research_addendum_for`` only when the call offers
+# web_fetch, so it is not part of the Council-overridable focus tail. The
+# shared addendum names web_search alone, and a local research model that
+# follows it closely may never open a page unless told it can. A refused open
+# still spends a round of the loop (``client_tool_rounds``), so the note
+# names the one source of openable URLs. A constant, so the cached system
+# block stays static: with the note or without it, as the configured
+# research model, search and fetch cap decide.
+RESEARCH_FETCH_ADDENDUM = (
+    "\n\n## READING A RESULT PAGE\n"
+    "\n"
+    "web_fetch opens a page whose URL a web_search returned in this run, "
+    "copied exactly. Use it when a snippet is not enough to verify a date, "
+    "figure or name that your finding depends on. You can read only a few "
+    "pages, so open the one that decides the question. Do not try a URL "
+    "from anywhere else, such as the company context or a page you read: "
+    "it is refused and costs a step. If no page is worth opening, emit "
+    "your findings from the snippets."
+)
+
+
 __all__ = [
     "PER_SPECIALIST_FINDING_CAP",
+    "RESEARCH_FETCH_ADDENDUM",
     "default_research_focus",
     "research_addendum_for",
     "shared_research_addendum",
