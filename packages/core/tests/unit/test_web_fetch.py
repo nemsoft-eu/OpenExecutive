@@ -135,6 +135,10 @@ def test_config_rejects_bad_fetch_bounds(
         "::a00:1",  # IPv4-compatible around 10.0.0.1
         "::ffff:0:a9fe:a9fe",  # IPv4-translated (SIIT) around 169.254.169.254
         "fec0::1",  # deprecated site-local, which Python calls global
+        # Local-use NAT64 (RFC 8215), refused whole: the /48 form of
+        # 127.0.0.1 (bits 48-63 and 72-87), and a public-looking tail.
+        "64:ff9b:1:7f00:0:100::",
+        "64:ff9b:1::5db8:d822",
         "not-an-ip",
     ],
 )
@@ -251,6 +255,41 @@ async def test_pinned_transport_falls_back_to_the_next_checked_address(
     async with httpx.AsyncClient(transport=PinnedTransport(resolver)) as client:
         response = await client.get(f"http://pinned.invalid:{port}/page")
     assert response.text == "hello"
+    assert len(heads) == 1
+
+
+async def test_pinned_transport_leaves_time_for_the_next_address(
+    local_server: tuple[int, list[bytes]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first address that drops packets silently runs out its own share of
+    the connect timeout, not the whole deadline, so the next one still
+    loads inside it."""
+    port, heads = local_server
+    monkeypatch.setattr(web_fetch, "is_public_address", lambda _a: True)
+    transport = PinnedTransport()
+    backend = transport._pool._network_backend
+    real_connect = backend._inner.connect_tcp
+    attempts: list[tuple[str, float | None]] = []
+
+    async def connect_tcp(
+        host: str, port: int, timeout: float | None = None, **kwargs: Any
+    ) -> Any:
+        attempts.append((host, timeout))
+        if host == "192.0.2.1":  # blackholed: waits out its timeout
+            await asyncio.sleep(timeout or 0)
+            raise web_fetch.httpcore.ConnectTimeout("no answer")
+        return await real_connect(host, port, timeout=timeout, **kwargs)
+
+    async def resolver(host: str, _port: int) -> list[str]:
+        return ["192.0.2.1", "127.0.0.1"]
+
+    monkeypatch.setattr(backend, "_resolver", resolver)
+    monkeypatch.setattr(backend._inner, "connect_tcp", connect_tcp)
+    async with httpx.AsyncClient(transport=transport, timeout=0.4) as client:
+        async with asyncio.timeout(0.4):
+            response = await client.get(f"http://pinned.invalid:{port}/page")
+    assert response.text == "hello"
+    assert attempts == [("192.0.2.1", 0.2), ("127.0.0.1", 0.2)]
     assert len(heads) == 1
 
 

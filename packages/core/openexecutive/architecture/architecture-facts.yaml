@@ -1181,9 +1181,12 @@ routing:
     in the Executive's block parser (`web_fetch.server_search_result_urls`;
     an error block has none). OpenRouter returns no result blocks, so on
     that path only the person's own links open. A caller that
-    passes no `memory_text` (unrostered email, the scheduler, evals, MCP)
+    passes no `memory_text` (unrostered email, the scheduler, evals)
     makes nothing in its message fetchable, only that turn's search
-    results: fail closed. The channels enter through `Executive.chat()`,
+    results: fail closed. MCP `ask_executive` passes its `message` and
+    opens its links only when the caller resolved to a person, which
+    happens in open mode alone (signed callers ask as no one): the same
+    trust the web chat route gives `x-caller-email`. The channels enter through `Executive.chat()`,
     whose `fetch_own_urls` (default False) seeds `memory_text` only when
     the adapter vouches for the sender: Slack and Discord always (past
     their roster gate), Telegram for a chat matched to a person, Google
@@ -1208,10 +1211,14 @@ routing:
     the fetch. The fetch is SSRF-safe by construction: `_PinnedBackend`
     wraps httpcore's AnyIO backend, resolves the host once, refuses unless
     every address is global (IPv4-mapped, IPv4-translated, IPv4-compatible,
-    6to4, Teredo and the NAT64 prefixes unwrapped first — Python reports
-    `64:ff9b::7f00:1` as global — and deprecated site-local `fec0::/10`
-    refused, which Python also calls global) and connects to the checked addresses, each in resolver
-    order until one answers, while TLS verifies the hostname,
+    6to4, Teredo and the well-known NAT64 prefix unwrapped first — Python
+    reports `64:ff9b::7f00:1` as global — and deprecated site-local
+    `fec0::/10` and the local-use NAT64 prefix `64:ff9b:1::/48` refused
+    whole, since the first is global to Python and the second embeds its
+    IPv4 at a length-dependent offset) and connects to the checked
+    addresses, each in resolver order until one answers, with an equal
+    share of the connect timeout each (so a silently dropping first
+    address leaves time for the next), while TLS verifies the hostname,
     so there is no DNS-rebinding window (the gap
     `monitoring.sources._http.validate_target_url` documents). The
     transport subclasses `httpx.AsyncHTTPTransport` and swaps its private

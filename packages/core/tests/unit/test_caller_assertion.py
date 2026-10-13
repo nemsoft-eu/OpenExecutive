@@ -410,11 +410,15 @@ async def test_mcp_asks_as_no_one_once_callers_are_signed(monkeypatch: pytest.Mo
         monkeypatch.delenv("CALLER_ASSERTION_PUBLIC_KEYS", raising=False)
         await mcp_server.ask_executive("hi", caller_email=OWNER)
         assert chat.await_args.kwargs["person_id"] == 42
+        assert chat.await_args.kwargs["fetch_own_urls"] is True
         monkeypatch.setenv("CALLER_ASSERTION_PUBLIC_KEYS", VECTORS["public_keys"])
         await mcp_server.ask_executive("hi", caller_email=OWNER)
         assert chat.await_args.kwargs["person_id"] is None
+        # Asking as no one also opens none of the message's links.
+        assert chat.await_args.kwargs["fetch_own_urls"] is False
         await mcp_server.ask_executive("hi")
         assert chat.await_args.kwargs["person_id"] is None
+        assert chat.await_args.kwargs["fetch_own_urls"] is False
 
 
 def test_make_key_pair_names_a_random_key_and_refuses_a_bad_id() -> None:

@@ -119,21 +119,28 @@ WEB_FETCH_TOOL: dict[str, Any] = {
 # tests can stand in for DNS; production uses the event loop's getaddrinfo.
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 
-# NAT64 prefixes (RFC 6052 well-known, RFC 8215 local-use), SIIT's
-# IPv4-translated ``::ffff:0:a.b.c.d`` (RFC 6145) and the deprecated
-# IPv4-compatible ``::a.b.c.d`` (as knowledge.confluence_client checks). The
-# last 32 bits are an IPv4 address a gateway or tunnel may deliver to, and
-# Python reports ``64:ff9b::7f00:1``, ``::ffff:0:7f00:1`` and ``::7f00:1``
-# (127.0.0.1) as global.
+# The well-known NAT64 prefix (RFC 6052), SIIT's IPv4-translated
+# ``::ffff:0:a.b.c.d`` (RFC 6145) and the deprecated IPv4-compatible
+# ``::a.b.c.d`` (as knowledge.confluence_client checks). All three are /96,
+# so the last 32 bits are an IPv4 address a gateway or tunnel may deliver
+# to, and Python reports ``64:ff9b::7f00:1``, ``::ffff:0:7f00:1`` and
+# ``::7f00:1`` (127.0.0.1) as global.
 _NAT64_PREFIXES = (
     ipaddress.IPv6Network("64:ff9b::/96"),
-    ipaddress.IPv6Network("64:ff9b:1::/48"),
     ipaddress.IPv6Network("::ffff:0:0:0/96"),  # not ::ffff:0:0/96, the mapped form
     ipaddress.IPv6Network("::/96"),
 )
-# Deprecated site-local space (RFC 3879): Python counts it as global, but a
-# network that still routes it routes it internally.
-_SITE_LOCAL = ipaddress.IPv6Network("fec0::/10")
+# Refused whole, whatever Python's version calls global:
+# - deprecated site-local space (RFC 3879), which a network that still routes
+#   it routes internally;
+# - the local-use NAT64 prefix (RFC 8215), which an operator subdivides at a
+#   length of their choosing, so the embedded IPv4 sits at bits RFC 6052
+#   places differently per length (/48 puts it at bits 48-63 and 72-87), not
+#   reliably in the last 32. Local use means no public site lives there.
+_REFUSED_V6 = (
+    ipaddress.IPv6Network("fec0::/10"),
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+)
 
 
 class BlockedAddressError(httpcore.ConnectError):
@@ -174,7 +181,7 @@ def is_public_address(raw: str) -> bool:
         return False
     candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
     if isinstance(ip, ipaddress.IPv6Address):
-        if ip in _SITE_LOCAL:
+        if any(ip in net for net in _REFUSED_V6):
             return False
         candidates.extend(_embedded_ipv4(ip))
     return all(c.is_global and not c.is_multicast for c in candidates)
@@ -222,13 +229,17 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
             raise BlockedAddressError(f"{host} resolves to a non-public address")
         # Each checked address in resolver order, as a browser falls back: a
         # site whose first address is down (or IPv6 this host cannot route)
-        # still loads. The fetch's outer deadline bounds the attempts.
+        # still loads. The connect timeout is the fetch's whole deadline, so
+        # each attempt gets an equal share of it: a first address that drops
+        # packets silently would otherwise use it all before the next is tried.
+        unique = list(dict.fromkeys(addresses))
+        attempt_timeout = None if timeout is None else timeout / len(unique)
         failure: Exception | None = None
-        for address in dict.fromkeys(addresses):
+        for address in unique:
             try:
                 return await self._inner.connect_tcp(
-                    address, port, timeout=timeout, local_address=local_address,
-                    socket_options=socket_options,
+                    address, port, timeout=attempt_timeout,
+                    local_address=local_address, socket_options=socket_options,
                 )
             except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 failure = exc
