@@ -47,6 +47,7 @@ from openexecutive.orchestrator.searxng_search import (
     is_usable_url,
 )
 from openexecutive.orchestrator.web_search_tool import WEB_FETCH_TOOL_NAME
+from openexecutive.providers.translator import OPENROUTER_CITATIONS_BLOCK
 from openexecutive.utils.html_tags import unescape, visible_text
 from openexecutive.utils.public_address import is_public_address
 
@@ -453,12 +454,24 @@ class SeenUrls:
 
 
 def server_search_result_urls(block: Any) -> list[str]:
-    """The result URLs of an Anthropic ``web_search_tool_result`` block, which
-    a turn may open as it may the client search's; none for an error block."""
-    results = getattr(block, "content", None)
-    if not isinstance(results, list):  # a WebSearchToolResultError
-        return []
-    urls = (getattr(result, "url", None) for result in results)
+    """The result URLs of a server search, which a turn may open as it may
+    the client search's: those of an Anthropic ``web_search_tool_result``
+    block (none for an error block), or of the translator's OpenRouter
+    citations block.
+
+    The OpenRouter URLs are the ``url_citation`` annotations OpenRouter
+    builds from the search engine's results, never text the model wrote
+    (``translator.OPENROUTER_CITATIONS_BLOCK``). Either way ``SeenUrls.add``
+    still drops what is not a plain, credential-free http(s) address."""
+    if getattr(block, "type", None) == OPENROUTER_CITATIONS_BLOCK:
+        urls = getattr(block, "urls", None)
+        if not isinstance(urls, list):
+            return []
+    else:
+        results = getattr(block, "content", None)
+        if not isinstance(results, list):  # a WebSearchToolResultError
+            return []
+        urls = [getattr(result, "url", None) for result in results]
     return [url for url in urls if isinstance(url, str) and url]
 
 

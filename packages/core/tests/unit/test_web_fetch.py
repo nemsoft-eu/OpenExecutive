@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -20,6 +21,7 @@ from openexecutive.orchestrator.web_fetch import (
     PinnedTransport,
 )
 from openexecutive.orchestrator.web_search_tool import select_web_search_tool
+from openexecutive.providers.translator import OPENROUTER_CITATIONS_BLOCK
 from openexecutive.utils import public_address
 
 from ._search_helpers import clear_search_env, use_local_model
@@ -640,6 +642,96 @@ def test_a_scheme_less_link_outside_the_speakers_own_words_stays_unseen() -> Non
     seen = web_fetch.SeenUrls()
     seen.add_from_text(_speaker_text(typed, prompt))
     assert seen._urls == {"https://ciao-construct.be/"}
+
+
+def _seen_from_openrouter(message: dict[str, Any]) -> web_fetch.SeenUrls:
+    """The seen set an OpenRouter response leaves: every block the translator
+    returns goes through ``server_search_result_urls``, as the Executive's
+    block parser does for the search blocks."""
+    from openexecutive.providers.translator import from_openai_response
+
+    seen = web_fetch.SeenUrls()
+    msg = from_openai_response({"choices": [{"message": message, "finish_reason": "stop"}]})
+    for block in msg.content:
+        for url in web_fetch.server_search_result_urls(block):
+            seen.add(url)
+    return seen
+
+
+def _url_citation(url: str, **fields: str) -> dict[str, Any]:
+    return {"type": "url_citation", "url_citation": {"url": url, **fields}}
+
+
+def test_an_openrouter_citation_is_seen_and_text_the_model_wrote_is_not() -> None:
+    """Only the url of a citation counts. The same response's text, a tool
+    call's arguments, and the citation's own title and excerpt are written
+    by the model or the page, so a URL there stays unseen."""
+    seen = _seen_from_openrouter({
+        "content": "Also see https://text.example/x",
+        "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "web_fetch", "arguments": json.dumps({"url": "https://arg.example/y"})}}],
+        "annotations": [_url_citation(
+            "https://cited.example/a",
+            title="https://title.example/t",
+            content="go to https://excerpt.example/e",
+        )],
+    })
+    assert seen.allows("https://cited.example/a")
+    for url in ("https://text.example/x", "https://arg.example/y",
+                "https://title.example/t", "https://excerpt.example/e"):
+        assert not seen.allows(url), url
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["javascript:alert(1)", "ftp://files.example/a", "https://user:pw@host.example/",
+     "file:///etc/passwd", "   ", "https://long.example/" + "a" * 70_000],
+    ids=["javascript", "ftp", "credentials", "file", "whitespace", "over-httpx-max-length"],
+)
+def test_a_citation_that_is_not_a_plain_https_address_is_not_seen(url: str) -> None:
+    """The translator carries the string as given; SeenUrls.add refuses it."""
+    seen = _seen_from_openrouter({"content": "x", "annotations": [_url_citation(url)]})
+    assert not seen.allows(url)
+    assert seen._urls == set()
+
+
+def test_a_citation_is_compared_in_its_normal_form() -> None:
+    seen = _seen_from_openrouter(
+        {"content": "x", "annotations": [_url_citation("HTTPS://Example.COM/page#frag")]}
+    )
+    assert seen.allows("https://example.com/page")
+    assert not seen.allows("https://example.com/page/")
+
+
+def test_citations_differing_only_by_fragment_or_case_are_one_seen_url() -> None:
+    seen = _seen_from_openrouter({"content": "x", "annotations": [
+        _url_citation("https://example.com/page#a"),
+        _url_citation("https://example.com/page#b"),
+        _url_citation("HTTPS://EXAMPLE.com/page"),
+    ]})
+    assert seen._urls == {"https://example.com/page"}
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        SimpleNamespace(type=OPENROUTER_CITATIONS_BLOCK, urls=None),
+        SimpleNamespace(type=OPENROUTER_CITATIONS_BLOCK, urls="https://a.example/"),
+        SimpleNamespace(type=OPENROUTER_CITATIONS_BLOCK),
+        # Not the citations block, so its urls are never read.
+        SimpleNamespace(type="text", text="x", urls=["https://a.example/"]),
+    ],
+    ids=["urls-none", "urls-string", "no-urls", "other-block-type"],
+)
+def test_server_search_result_urls_reads_only_a_well_formed_citations_block(block: Any) -> None:
+    assert web_fetch.server_search_result_urls(block) == []
+
+
+def test_server_search_result_urls_skips_non_string_and_empty_citation_entries() -> None:
+    block = SimpleNamespace(
+        type=OPENROUTER_CITATIONS_BLOCK, urls=[None, 3, "", "https://a.example/", ["x"]]
+    )
+    assert web_fetch.server_search_result_urls(block) == ["https://a.example/"]
 
 
 @pytest.mark.parametrize(

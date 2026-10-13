@@ -584,6 +584,90 @@ def test_a_server_search_result_can_be_fetched_and_nothing_else_can() -> None:
         _reset_settings_cache()
 
 
+def test_an_openrouter_search_citation_can_be_fetched_and_nothing_else_can() -> None:
+    """OpenRouter's search returns no result blocks; its results arrive as
+    url_citation annotations, which the translator carries in a citations
+    block. A cited URL becomes openable in the same round. A sibling path, a
+    URL only the model's text names, and one only in the citation's title
+    stay refused, and the block reaches neither the next request nor an
+    audit row."""
+    import json
+
+    _reset_settings_cache()
+    os.environ["ENABLE_WEB_SEARCH"] = "true"
+    try:
+        from openexecutive.agents.tool_outcome import ToolOutcome
+        from openexecutive.orchestrator.executive import Executive
+        from openexecutive.orchestrator.session import Session
+        from openexecutive.providers.translator import (
+            OPENROUTER_CITATIONS_BLOCK,
+            from_openai_response,
+        )
+
+        cited = "https://r.example/a"
+        in_text = "https://text.example/x"
+        in_title = "https://title.example/y"
+        asked = [cited, "https://r.example/a/", in_text, in_title]
+        searched = from_openai_response({"id": "g1", "model": "m", "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": f"Found it. Also {in_text}",
+                "annotations": [{"type": "url_citation", "url_citation": {
+                    "url": cited, "title": in_title, "content": in_title,
+                }}],
+                "tool_calls": [
+                    {"id": f"tu_{i}", "type": "function", "function": {
+                        "name": "web_fetch", "arguments": json.dumps({"url": url}),
+                    }}
+                    for i, url in enumerate(asked, start=1)
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }]})
+        assert OPENROUTER_CITATIONS_BLOCK in [b.type for b in searched.content]
+        finals = [
+            searched,
+            SimpleNamespace(content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn"),
+        ]
+        captured: list[dict] = []
+
+        def fake_stream(**kwargs):
+            captured.append(kwargs)
+            return _make_stream_cm(finals[len(captured) - 1])
+
+        audit_calls: list[tuple] = []
+        run_fetch = AsyncMock(return_value=ToolOutcome('{"content": "page"}'))
+        with (
+            patch(
+                "openexecutive.orchestrator.executive.get_provider",
+                return_value=SimpleNamespace(messages_stream=fake_stream),
+            ),
+            patch(
+                "openexecutive.orchestrator.executive.audit_log",
+                side_effect=lambda *a, **kw: audit_calls.append((a, kw)),
+            ),
+            patch("openexecutive.orchestrator.web_fetch._run_fetch", new=run_fetch),
+        ):
+            asyncio.run(Executive().chat("hi", Session(session_id="t-or-cite")))
+
+        assert [c.args[0] for c in run_fetch.await_args_list] == [cited]
+        results = {
+            b["tool_use_id"]: b for m in captured[1]["messages"] if m["role"] == "user"
+            and isinstance(m["content"], list) for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        }
+        assert not results["tu_1"].get("is_error")
+        for refused in ("tu_2", "tu_3", "tu_4"):
+            assert results[refused].get("is_error"), refused
+            assert "has not appeared" in str(results[refused]["content"]), refused
+        replayed = [m for m in captured[1]["messages"] if m["role"] == "assistant"][-1]
+        assert [b["type"] for b in replayed["content"]] == ["text", *["tool_use"] * len(asked)]
+        assert OPENROUTER_CITATIONS_BLOCK not in repr(captured[1]["messages"])
+        assert audit_calls and OPENROUTER_CITATIONS_BLOCK not in repr(audit_calls)
+    finally:
+        _reset_settings_cache()
+
+
 # ---------------------------------------------------------------------------
 # client_search_handlers: which handlers a turn (or a research call) gets
 # ---------------------------------------------------------------------------

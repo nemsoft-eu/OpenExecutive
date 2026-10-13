@@ -11,6 +11,8 @@ import json
 import pytest
 
 from openexecutive.providers.translator import (
+    OPENROUTER_CITATIONS_BLOCK,
+    OPENROUTER_REASONING_BLOCK,
     StreamAccumulator,
     from_openai_response,
     to_openai_request,
@@ -1208,6 +1210,175 @@ def test_stream_accumulator_drops_server_tool_call_continuation_chunks() -> None
     acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "done"}, "finish_reason": "tool_calls"}]})
     final = acc2.finalize()
     assert [b.type for b in final.content] == ["text"] and final.stop_reason == "end_turn"
+
+
+# --------------------------------------------------------------------------
+# OpenRouter search citations — the result URLs web_fetch may open
+# --------------------------------------------------------------------------
+
+
+def _citation(url: object, **fields: object) -> dict:
+    """One ``url_citation`` annotation in the chat-completions shape
+    OpenRouter documents (fields nested under ``url_citation``)."""
+    return {
+        "type": "url_citation",
+        "url_citation": {"url": url, "title": "T", "content": "excerpt",
+                         "start_index": 0, "end_index": 4, **fields},
+    }
+
+
+def _citation_urls(msg) -> list[list[str]]:
+    return [b.urls for b in msg.content if b.type == OPENROUTER_CITATIONS_BLOCK]
+
+
+def test_response_carries_search_citations_between_the_text_and_the_reasoning() -> None:
+    body = {"id": "r", "model": "m", "choices": [{"message": {
+        "role": "assistant", "content": "Acme cut staff.",
+        "annotations": [_citation("https://a.example/1"), _citation("https://b.example/2")],
+        "reasoning_details": [{"type": "reasoning.text", "text": "why"}],
+    }, "finish_reason": "stop"}]}
+    msg = from_openai_response(body)
+    assert [b.type for b in msg.content] == [
+        "text", OPENROUTER_CITATIONS_BLOCK, OPENROUTER_REASONING_BLOCK,
+    ]
+    assert msg.content[0].text == "Acme cut staff."
+    assert msg.content[1].urls == ["https://a.example/1", "https://b.example/2"]
+
+
+def test_response_reads_the_flat_citation_form_too() -> None:
+    """The Responses-API form puts ``url`` beside ``type``."""
+    body = {"choices": [{"message": {
+        "content": "x", "annotations": [{"type": "url_citation", "url": "https://flat.example/"}],
+    }, "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [["https://flat.example/"]]
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [None, "https://a.example/", {"type": "url_citation", "url": "https://a.example/"},
+     [None, "https://a.example/", 3, ["https://a.example/"]], []],
+    ids=["none", "string", "dict", "non-dict-entries", "empty"],
+)
+def test_response_without_usable_annotations_has_no_citations_block(annotations) -> None:
+    body = {"choices": [{"message": {"content": "x", "annotations": annotations},
+                         "finish_reason": "stop"}]}
+    assert [b.type for b in from_openai_response(body).content] == ["text"]
+
+
+def test_only_the_url_of_a_url_citation_is_carried() -> None:
+    """Another annotation type, a missing, empty or non-string url, and a
+    non-dict ``url_citation`` contribute nothing; the title and excerpt are
+    never read, so a URL written there is not carried."""
+    body = {"choices": [{"message": {"content": "x", "annotations": [
+        {"type": "file_citation", "url_citation": {"url": "https://file.example/"}},
+        {"type": "file_citation", "url": "https://file-flat.example/"},
+        {"type": "url_citation", "url_citation": {"title": "https://no-url.example/"}},
+        _citation(""),
+        _citation(42),
+        _citation(None),
+        {"type": "url_citation", "url_citation": "https://not-a-dict.example/"},
+        _citation("https://real.example/a", title="https://title.example/",
+                  content="see https://excerpt.example/"),
+    ]}, "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [["https://real.example/a"]]
+
+
+def test_response_text_and_tool_arguments_never_become_citations() -> None:
+    """The model writes only content and tool_calls. A URL there, with no
+    annotation, produces no citations block."""
+    body = {"choices": [{"message": {
+        "content": "Read https://text.example/x",
+        "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "web_fetch", "arguments": json.dumps({"url": "https://arg.example/y"})}}],
+    }, "finish_reason": "tool_calls"}]}
+    assert [b.type for b in from_openai_response(body).content] == ["text", "tool_use"]
+
+
+def test_stream_accumulator_collects_citations_from_deltas_and_a_final_message() -> None:
+    """Where a stream carries the annotations is undocumented: both
+    ``delta.annotations`` and a final chunk's ``message.annotations`` are
+    read, split across chunks, and a URL cited twice is carried once."""
+    a, b, c = "https://a.example/1", "https://b.example/2", "https://c.example/3"
+    acc = StreamAccumulator()
+    acc.feed({"id": "s", "model": "m", "choices": [{
+        "delta": {"content": "Acme ", "annotations": [_citation(a)]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{
+        "delta": {"content": "cut staff.", "annotations": [_citation(b), _citation(a)]},
+        "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{
+        "delta": {}, "message": {"annotations": [_citation(c), _citation(b)]},
+        "finish_reason": "stop"}]})
+    msg = acc.finalize()
+    assert [blk.type for blk in msg.content] == ["text", OPENROUTER_CITATIONS_BLOCK]
+    assert msg.content[0].text == "Acme cut staff."
+    assert msg.content[1].urls == [a, b, c]
+
+
+def test_stream_accumulator_ignores_malformed_streamed_annotations() -> None:
+    acc = StreamAccumulator()
+    acc.feed({"choices": [{"delta": {"content": "x", "annotations": "https://a.example/"},
+                           "message": "not a dict", "finish_reason": None}]})
+    acc.feed({"choices": [{"delta": {"annotations": [None, {"type": "url_citation"}]},
+                           "message": {"annotations": {"url": "https://b.example/"}},
+                           "finish_reason": "stop"}]})
+    assert [blk.type for blk in acc.finalize().content] == ["text"]
+
+
+def test_response_with_tool_calls_keeps_the_citations_after_them() -> None:
+    body = {"choices": [{"message": {
+        "content": "Opening it.",
+        "annotations": [_citation("https://a.example/1")],
+        "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "web_fetch", "arguments": json.dumps({"url": "https://a.example/1"})}}],
+        "reasoning_details": [{"type": "reasoning.text", "text": "why"}],
+    }, "finish_reason": "tool_calls"}]}
+    msg = from_openai_response(body)
+    assert [b.type for b in msg.content] == [
+        "text", "tool_use", OPENROUTER_CITATIONS_BLOCK, OPENROUTER_REASONING_BLOCK,
+    ]
+    assert msg.stop_reason == "tool_use"
+
+
+def test_response_with_citations_and_no_text_has_only_the_citations_block() -> None:
+    body = {"choices": [{"message": {
+        "content": None, "annotations": [_citation("https://a.example/1")],
+    }, "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [["https://a.example/1"]]
+
+
+def test_many_citations_keep_first_arrival_order_and_fold_exact_duplicates() -> None:
+    """Only an identical string is a duplicate here: a fragment or case
+    variant is a different string, and SeenUrls folds it later."""
+    urls = [f"https://a.example/{i}" for i in range(10_000)]
+    variants = ["https://a.example/0#frag", "HTTPS://A.EXAMPLE/0"]
+    annotations = [_citation(u) for u in [*urls, *reversed(urls), *variants]]
+    body = {"choices": [{"message": {"content": "x", "annotations": annotations},
+                         "finish_reason": "stop"}]}
+    assert _citation_urls(from_openai_response(body)) == [[*urls, *variants]]
+
+
+def test_stream_accumulator_reads_citations_wherever_they_arrive() -> None:
+    """Before any text, repeated in every chunk, in a final chunk with only a
+    ``message``, and after finish_reason: each URL once, in first-arrival
+    order, behind the text and the tool call. A chunk with no choices (the
+    usage chunk) carries none and costs nothing."""
+    a, b, c = "https://a.example/1", "https://b.example/2", "https://c.example/3"
+    acc = StreamAccumulator()
+    acc.feed({"choices": [{"delta": {"annotations": [_citation(a)]}, "finish_reason": None}]})
+    acc.feed({"choices": [{"delta": {"content": "Read it.", "annotations": [_citation(a)]},
+                           "finish_reason": None}]})
+    acc.feed({"choices": [{"delta": {"annotations": [_citation(a), _citation(b)], "tool_calls": [
+        {"index": 0, "id": "c1", "type": "function",
+         "function": {"name": "web_fetch", "arguments": json.dumps({"url": a})}}]},
+        "finish_reason": "tool_calls"}]})
+    acc.feed({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    acc.feed({"choices": [{"message": {"annotations": [_citation(b), _citation(c)]},
+                           "finish_reason": None}]})
+    msg = acc.finalize()
+    assert [blk.type for blk in msg.content] == ["text", "tool_use", OPENROUTER_CITATIONS_BLOCK]
+    assert msg.content[0].text == "Read it."
+    assert msg.content[2].urls == [a, b, c]
+    assert msg.stop_reason == "tool_use"
 
 
 # --------------------------------------------------------------------------
