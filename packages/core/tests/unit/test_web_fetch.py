@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import encodings
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -939,6 +942,601 @@ async def test_the_declared_charset_decodes_the_page(
     assert json.loads(outcome.content)["content"] == expected
     assert expected in outcome.content  # not \u-escaped: it counts once against the cap
     outcome.content.encode("utf-8")  # what a provider's JSON request body needs
+
+
+# --- the page's own charset (meta prescan) ----------------------------------
+
+_KOI8_PRIVET = "\u041f\u0440\u0438\u0432\u0435\u0442"  # Cyrillic "privet"
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (b'<meta charset="koi8-r">', "koi8-r"),
+        (b"<meta charset='koi8-r'>", "koi8-r"),
+        (b"<meta charset=koi8-r>", "koi8-r"),
+        (b"<META CHARSET = 'KOI8-R' >", "koi8-r"),
+        (b'<meta charset=" koi8-r ">', "koi8-r"),
+        (b"<meta/charset=koi8-r>", "koi8-r"),
+        (b"<meta\tcharset\n=\x0ckoi8-r\r>", "koi8-r"),
+        (b"<meta charset=koi8-r />", "koi8-r"),
+        # a quoted value ends at its quote; a bare one runs to whitespace or
+        # ">", so "koi8-r/" is the label and names no charset, in browsers too
+        (b'<meta charset="koi8-r"x>', "koi8-r"),
+        (b"<meta charset=koi8-r/>", None),
+        # the vertical tab is no separator in the prescan
+        (b"<meta\x0bcharset=koi8-r>", None),
+        (b"<meta charset=koi8-r\x0bx>", None),
+        # an empty or unusable charset attribute decides the tag: no charset
+        (b"<meta charset>", None),
+        (b"<meta charset http-equiv=content-type content='charset=koi8-r'>", None),
+        (b"<meta charset=bogus http-equiv=content-type content='charset=koi8-r'>", None),
+        # a name may start with "=", so this attribute is "=charset"
+        (b"<meta =charset=koi8-r>", None),
+        (b"<meta>", None),
+        # no head element in the prescan: the tag counts wherever it is
+        (b"<!DOCTYPE html><html><head><title>t</title><meta charset=koi8-r>", "koi8-r"),
+        (b"<html><head></head><body><meta charset=koi8-r>", "koi8-r"),
+        (b"<noscript><meta charset=koi8-r></noscript>", "koi8-r"),
+        # a tag name runs to whitespace or ">", "/" included, so this quote
+        # opens no attribute value
+        (b"<a/x='><meta charset=koi8-r>'>", "koi8-r"),
+        # the scan skips an XML declaration like any "<?": a meta tag wins,
+        # and the declaration's encoding counts only when no tag names one
+        (b"<?xml version='1.0' encoding='koi8-r'?><p>", "koi8-r"),
+        (b"<?xml version='1.0' encoding='koi8-r'?><meta charset=windows-1251>", "cp1251"),
+        # bytes that end before the tag does, or that are not text at all
+        (b"<meta", None),
+        (b"<me", None),
+        (b"<meta charset='koi8-r", None),
+        (b"\x00\xff<meta charset=koi8-r>\xfe", "koi8-r"),
+        (bytes(range(256)) * 4, None),
+        (b'<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">', "koi8-r"),
+        (b"<meta content='text/html;charset = \"koi8-r\"' http-equiv=CONTENT-TYPE>", "koi8-r"),
+        (b"<meta http-equiv=content-type content='text/html;charset=cp1251;x=y'>", "cp1251"),
+        # in content, a "charset" without "=" is passed over, but the first
+        # "charset=" decides: a bare value runs to whitespace or ";", and an
+        # unclosed quote or no value leaves no charset
+        (b"<meta http-equiv=content-type content='charset koi8-r; charset=cp1251'>", "cp1251"),
+        (b"<meta http-equiv=content-type content='charset=koi8-r\"; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset=\"koi8-r; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset=; charset=cp1251'>", None),
+        (b"<meta http-equiv=content-type content='charset='>", None),
+        # content counts only beside http-equiv=Content-Type
+        (b'<meta content="text/html; charset=koi8-r">', None),
+        (b'<meta http-equiv="refresh" content="0; charset=koi8-r">', None),
+        # charset wins over content, and the first of a repeated attribute counts
+        (b'<meta http-equiv=content-type content="charset=cp1251" charset=koi8-r>', "koi8-r"),
+        (b"<meta charset=koi8-r charset=windows-1251>", "koi8-r"),
+        # the first usable tag wins; a refused one does not stop the scan
+        (b"<meta charset=koi8-r><meta charset=windows-1251>", "koi8-r"),
+        (b"<meta charset=utf-7><meta charset=koi8-r>", "koi8-r"),
+        (b"<meta charset=no-such-codec><meta charset=koi8-r>", "koi8-r"),
+        # browsers' label table: these decode with the wider codec
+        (b"<meta charset=iso-8859-1>", "cp1252"),
+        (b"<meta charset=latin1>", "cp1252"),
+        (b"<meta charset=us-ascii>", "cp1252"),
+        (b"<meta charset=windows-1252>", "cp1252"),
+        (b"<meta charset=iso-8859-9>", "cp1254"),
+        (b"<meta charset=gb2312>", "gb18030"),
+        (b"<meta charset=GBK>", "gb18030"),
+        (b"<meta charset=euc-kr>", "cp949"),
+        (b"<meta charset=shift_jis>", "cp932"),
+        (b"<meta charset=big5>", "big5hkscs"),
+        (b"<meta charset=iso-2022-jp>", "iso2022_jp_ext"),
+        # the prescan reads x-user-defined as windows-1252
+        (b"<meta charset=x-user-defined>", "cp1252"),
+        # a tag readable as ASCII proves the page is not UTF-16
+        (b"<meta charset=utf-16>", "utf-8"),
+        (b"<meta charset=UTF-16LE>", "utf-8"),
+        (b"<meta charset=utf-16be>", "utf-8"),
+        # a commented-out tag does not count; "<!-->" closes its comment
+        (b"<!-- <meta charset=koi8-r> --><meta charset=windows-1251>", "cp1251"),
+        (b"<!--><meta charset=koi8-r>", "koi8-r"),
+        (b"<!-- <meta charset=koi8-r>", None),
+        # a "<meta" inside another tag's attribute value is not a tag
+        (b"<div title='<meta charset=koi8-r>'><meta charset=windows-1251>", "cp1251"),
+        # the prescan knows no script element, in browsers either
+        (b"<script>s = '<meta charset=koi8-r>'</script><meta charset=cp1251>", "koi8-r"),
+        (b"</meta charset=koi8-r>", None),
+        (b"<metadata charset=koi8-r>", None),
+        (b"<p>no declaration</p>", None),
+        (b"", None),
+    ],
+)
+def test_the_prescan_reads_a_meta_charset(page: bytes, expected: str | None) -> None:
+    assert web_fetch._sniffed_charset(page) == expected
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        # None of these is a browser label, so the label table refuses them
+        # all; the codec checks behind it are pinned separately below.
+        # not text encodings at all
+        "rot13", "rot_13", "base64", "base_64", "hex", "zlib", "bz2", "uu", "quopri",
+        # text codecs that are no page's charset
+        "utf-7", "UTF-7", "utf_7", "unicode_escape", "unicode-escape",
+        "raw_unicode_escape", "idna", "punycode", "undefined",
+        # codecs that do not read ASCII as ASCII
+        "cp500", "cp037", "utf-32", "utf-32le", "hz",
+        # the "replacement" encoding's labels: browsers do not decode these
+        "iso-2022-kr", "csiso2022kr", "hz-gb-2312", "iso-2022-cn",
+        "iso-2022-cn-ext", "replacement",
+        # not the shape of a label (codecs.lookup would take the long one as
+        # iso-8859-1, and "utf 8" as utf-8)
+        "koi8-r,x", "utf 8", "iso" + "-" * 40 + "8859-1", "koi8-r\x00", "\u0138oi8-r", "",
+        # the vertical tab is not ASCII whitespace, so it is not stripped
+        "\x0bkoi8-r", "koi8-r\x0b",
+        # unknown
+        "no-such-codec",
+    ],
+)
+def test_a_dangerous_or_unknown_meta_charset_is_refused(label: str) -> None:
+    raw = label.encode("utf-8")
+    assert web_fetch._codec_for_label(raw) is None
+    assert web_fetch._sniffed_charset(b'<meta charset="' + raw + b'">') is None
+    assert web_fetch._sniffed_charset(
+        b'<meta http-equiv=content-type content="text/html; charset=' + raw + b'">'
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "codec",
+    [
+        "rot13", "base64", "utf-7", "unicode_escape", "idna", "undefined",
+        "iso2022_kr", "cp500", "utf-32", "hz", "no-such-codec",
+    ],
+)
+def test_the_codec_checks_refuse_a_bad_codec_the_table_might_name(
+    codec: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defence in depth: a table entry naming a codec that is no page's
+    charset is still refused."""
+    monkeypatch.setitem(web_fetch._LABEL_CODECS, "x-test", codec)
+    assert web_fetch._codec_for_label(b"x-test") is None
+
+
+def test_an_unknown_meta_charset_does_not_grow_the_codec_cache() -> None:
+    """CPython keeps every name its codec search fails to resolve in
+    ``encodings._cache`` for good, so a page naming fresh labels must not
+    reach ``codecs.lookup``."""
+    cache: dict[str, Any] = encodings._cache  # type: ignore[attr-defined]
+    # Fresh per run, so a repeated run still names labels nothing has cached.
+    run = uuid.uuid4().hex[:3].encode("ascii")
+    # The sensor works: a failed lookup of a fresh name is cached under the
+    # key the check computes.
+    probe = f"Zq--{uuid.uuid4().hex}.Probe:Name"
+    before = len(cache)
+    with pytest.raises(LookupError):
+        codecs.lookup(probe)
+    assert len(cache) == before + 1
+    assert encodings.normalize_encoding(probe.lower()) in cache
+
+    before = len(cache)
+    for page_number in range(50):
+        page = b"".join(
+            b"<meta charset=%s%02x%02x>" % (run, page_number, n) for n in range(46)
+        )
+        assert len(page) <= web_fetch._PRESCAN_BYTES
+        assert web_fetch._sniffed_charset(page) is None
+    assert len(cache) == before
+
+
+@pytest.mark.parametrize(
+    ("label", "codec"),
+    [
+        ("KOI8_R", "koi8-r"),
+        ("Shift-JIS", "cp932"),
+        ("X-SJIS", "cp932"),
+        ("ANSI_X3.4-1968", "cp1252"),
+        ("iso_8859-1:1987", "cp1252"),
+        # ASCII whitespace is stripped, as the Encoding Standard says
+        (" \t\n\x0c\rutf-8 \r\n", "utf-8"),
+    ],
+)
+def test_a_known_meta_charset_still_resolves(label: str, codec: str) -> None:
+    assert web_fetch._codec_for_label(label.encode("ascii")) == codec
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        # spellings Python's codec lookup normalises, but no browser label
+        "UTF:8", "-utf-8-", "utf_8", "Windows--1251", "windows_1251", "ISO.8859.15",
+        "ansi.x3.4.1968", "latin-1", "latin_1", "iso_8859_1", "euc_kr", "euc_jp",
+        "mac_roman", "big5hkscs",
+        # codecs Python has and browsers do not
+        "cp437", "cp850", "koi8_t", "johab", "utf-8-sig", "hp-roman8",
+    ],
+)
+def test_a_label_outside_the_browser_table_is_refused(label: str) -> None:
+    """A page names its charset by an Encoding Standard label or not at all:
+    a browser decodes these with its default, and so does web_fetch."""
+    codecs.lookup(label)  # Python itself would take every one of them
+    assert web_fetch._codec_for_label(label.encode("ascii")) is None
+
+
+# The standard's 228 labels, less the six of the "replacement" encoding.
+_WHATWG_LABEL_COUNT = 222
+
+
+def test_the_label_table_holds_the_whatwg_labels_once_each() -> None:
+    labels = [
+        label
+        for _, _, group in web_fetch._WHATWG_ENCODINGS
+        for label in group.split()
+    ]
+    assert len(labels) == _WHATWG_LABEL_COUNT
+    # No label maps to two codecs, or is listed twice.
+    assert len(set(labels)) == len(labels)
+    assert set(labels) == set(web_fetch._LABEL_CODECS)
+    names = [name for name, _, _ in web_fetch._WHATWG_ENCODINGS]
+    assert len(names) == len(set(names)) == 39
+    for label in labels:
+        assert label.isascii() and label == label.lower() == label.strip()
+        assert web_fetch._LABEL_RE.fullmatch(label.encode("ascii"))
+
+
+@pytest.mark.parametrize(
+    ("label", "codec"), sorted(web_fetch._LABEL_CODECS.items())
+)
+def test_every_label_in_the_table_resolves_to_its_codec(label: str, codec: str) -> None:
+    """Each codec is one Python resolves by that canonical name, and passes
+    every check a label's codec must (a text codec, not refused, reading
+    ASCII as ASCII), both as written and in upper case."""
+    info = codecs.lookup(codec)
+    assert info.name == codec
+    assert info._is_text_encoding
+    assert web_fetch._codec_for_label(label.encode("ascii")) == codec
+    assert web_fetch._codec_for_label(label.upper().encode("ascii")) == codec
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "expected"),
+    [
+        (label, raw, expected)
+        for labels, raw, expected in [
+            # Shift_JIS, its aliases included, reads as Windows-31J (cp932)
+            ("shift_jis sjis x-sjis ms_kanji windows-31j csshiftjis", b"\x93\xfa\x96\x7b", "\u65e5\u672c"),
+            ("x-euc-jp euc-jp", b"\xc6\xfc\xcb\xdc", "\u65e5\u672c"),
+            ("cn-big5 big5 x-x-big5", b"\xa4\xa4\xa4\xe5", "\u4e2d\u6587"),
+            ("x-gbk gbk gb2312 chinese", b"\xd6\xd0\xce\xc4", "\u4e2d\u6587"),
+            ("ks_c_5601-1987 euc-kr korean", b"\xc7\xd1\xb1\xb9", "\ud55c\uad6d"),
+            # each of these reads as windows-1252, smart quotes and all
+            ("latin1 l1 ascii us-ascii iso-8859-1", b"\x93caf\xe9\x94", "\u201ccaf\u00e9\u201d"),
+            ("utf8 utf-8 unicode-1-1-utf-8", b"caf\xc3\xa9", "caf\u00e9"),
+            ("windows-1251 x-cp1251", b"\xcf\xf0\xe8\xe2\xe5\xf2", _KOI8_PRIVET),
+        ]
+        for label in labels.split()
+    ],
+)
+async def test_a_browser_label_decodes_the_page(
+    label: str, raw: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = b"<meta charset=" + label.encode("ascii") + b"><p>" + raw + b"</p>"
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The WHATWG Shift_JIS index (index-jis0208.txt), not Python's
+        # shift_jis: the wave dash 0x8160 is U+FF5E (shift_jis: U+301C) ...
+        (b"\x81\x60", "\uff5e"),
+        (b"\x81\x5f", "\uff3c"),
+        (b"\x81\x61", "\u2225"),
+        (b"\x81\x7c", "\uff0d"),
+        (b"\x81\x91\x81\x92\x81\xca", "\uffe0\uffe1\uffe2"),
+        # ... and NEC row 13, the NEC-selected IBM rows and the IBM
+        # extensions decode (shift_jis: U+FFFD), the last "hashigo-taka"
+        (b"\x87\x40", "\u2460"),
+        (b"\xed\x40", "\u7e8a"),
+        (b"\xfb\xfc", "\u9ad9"),
+        # single bytes 0x5C and 0x7E stay ASCII, 0x80 is U+0080
+        (b"\\~\x80", "\\~\x80"),
+    ],
+)
+def test_shift_jis_decodes_as_browsers_do(raw: bytes, expected: str) -> None:
+    codec = web_fetch._codec_for_label(b"shift_jis")
+    assert codec is not None
+    assert web_fetch._decode(raw, codec) == expected
+
+
+# --- the XML declaration fallback ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (b'<?xml version="1.0" encoding="windows-1251"?>', "cp1251"),
+        (b"<?xml version='1.0' encoding='koi8-r'?>", "koi8-r"),
+        # bytes up to 0x20 around "=", and no version
+        (b"<?xml encoding \t\n\x00= \x0b'koi8-r'?>", "koi8-r"),
+        (b"<?xml\nversion='1.0'\nencoding='KOI8-R'?>", "koi8-r"),
+        # the same label table as a meta tag, utf-16 read as utf-8
+        (b"<?xml version='1.0' encoding='x-sjis'?>", "cp932"),
+        (b"<?xml version='1.0' encoding='UTF-16'?>", "utf-8"),
+        # a known deviation: the table reads x-user-defined as windows-1252,
+        # which the prescan does for a meta tag only; a browser would read
+        # an XML declaration's with the x-user-defined decoder
+        (b"<?xml version='1.0' encoding='x-user-defined'?>", "cp1252"),
+        # after a refused meta tag, and after the scan stops inside a tag
+        (b"<?xml version='1.0' encoding='koi8-r'?><meta charset=bogus>", "koi8-r"),
+        (b"<?xml version='1.0' encoding='koi8-r'?><meta charset='cp1251", "koi8-r"),
+        # a value holding the declaration's ">" is no label
+        (b"<?xml encoding='koi8-r>'?>", None),
+        # not at byte 0, not "<?xml" exactly, or no closing ">"
+        (b" <?xml version='1.0' encoding='koi8-r'?>", None),
+        (b"\n<?xml version='1.0' encoding='koi8-r'?>", None),
+        (b"<p><?xml version='1.0' encoding='koi8-r'?>", None),
+        (b"<?XML version='1.0' encoding='koi8-r'?>", None),
+        (b"<?xml version='1.0' encoding='koi8-r'", None),
+        # the first "encoding" decides; one after the first ">" does not count
+        (b"<?xml version='1.0' x='encoding' encoding='koi8-r'?>", None),
+        (b"<?xml version='1.0'?><p encoding='koi8-r'>", None),
+        (b"<?xml version='1.0' ENCODING='koi8-r'?>", None),
+        # no "=", no quotes, an unclosed quote, or a byte up to 0x20 inside
+        (b"<?xml version='1.0' encoding 'koi8-r'?>", None),
+        (b"<?xml version='1.0' encoding=koi8-r?>", None),
+        (b"<?xml version='1.0' encoding='koi8-r?>", None),
+        (b"<?xml version='1.0' encoding=' koi8-r'?>", None),
+        (b"<?xml version='1.0' encoding='koi8-r\t'?>", None),
+        (b"<?xml version='1.0' encoding=''?>", None),
+        # unknown, dangerous, or replacement labels
+        (b"<?xml version='1.0' encoding='no-such-codec'?>", None),
+        (b"<?xml version='1.0' encoding='utf-7'?>", None),
+        (b"<?xml version='1.0' encoding='rot13'?>", None),
+        (b"<?xml version='1.0' encoding='iso-2022-kr'?>", None),
+        (b"<?xml version='1.0' encoding='utf-32'?>", None),
+        # read only within the prescan's 1,024 bytes
+        (b"<?xml " + b" " * 1024 + b"encoding='koi8-r'?>", None),
+        # UTF-16 "<?x" at byte 0, the prescan's first step
+        ("<?xml version='1.0'?>".encode("utf-16-le"), "utf-16-le"),
+        ("<?xml version='1.0'?>".encode("utf-16-be"), "utf-16-be"),
+        ("<?x".encode("utf-16-le") + b"\x00", "utf-16-le"),
+        (b" " + "<?xml version='1.0'?>".encode("utf-16-le"), None),
+    ],
+)
+def test_the_prescan_falls_back_to_an_xml_declaration(
+    page: bytes, expected: str | None
+) -> None:
+    assert web_fetch._sniffed_charset(page) == expected
+
+
+_CP1251_PRIVET = b"\xcf\xf0\xe8\xe2\xe5\xf2"  # _KOI8_PRIVET in windows-1251
+
+
+@pytest.mark.parametrize(
+    ("content_type", "head", "text", "expected"),
+    [
+        (
+            "text/html", b'<?xml version="1.0" encoding="windows-1251"?>',
+            _CP1251_PRIVET, _KOI8_PRIVET,
+        ),
+        (
+            "application/xhtml+xml", b"<?xml version='1.0' encoding='windows-1251'?>",
+            _CP1251_PRIVET, _KOI8_PRIVET,
+        ),
+        # a dangerous label leaves the page utf-8: UTF-7 would read this
+        # text as the tag "<b>", which the reduction would then drop
+        ("text/html", b"<?xml version='1.0' encoding='utf-7'?>", b"+ADw-b+AD4-x", "+ADw-b+AD4-x"),
+        # plain text reads no declaration
+        ("text/plain", b"<?xml version='1.0' encoding='windows-1251'?>", _CP1251_PRIVET, None),
+    ],
+)
+async def test_an_xml_declaration_decodes_a_page_without_a_charset(
+    content_type: str, head: bytes, text: bytes, expected: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = head + b"<p>" + text + b"</p>"
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": content_type}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    content = json.loads(outcome.content)["content"]
+    if expected is None:
+        assert content == page.decode("utf-8", errors="replace")
+    else:
+        assert content == expected
+
+
+async def test_a_utf_16_xml_declaration_decodes_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = b"caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac".decode("utf-8")
+    page = ("<?xml version='1.0'?><p>" + text + "</p>").encode("utf-16-le")
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == text
+
+
+@pytest.mark.parametrize(
+    "label", ["utf-7", "unicode_escape", "raw_unicode_escape", "base64", "rot13"]
+)
+async def test_a_refused_meta_charset_leaves_the_page_utf_8(
+    label: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each of these would turn the ASCII below into other characters."""
+    page = (
+        b'<meta charset="' + label.encode() + b'">'
+        b"<p>+AGE- \\u0041 aGk= caf\xc3\xa9</p>"
+    )
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == "+AGE- \\u0041 aGk= caf\u00e9"
+
+
+def test_the_prescan_reads_only_the_first_1024_bytes() -> None:
+    tag = b"<meta charset=koi8-r>"
+    filler = b"<p>" + b"x" * (1024 - len(tag) - 7) + b"</p>"
+    assert len(filler + tag) == 1024
+    assert web_fetch._sniffed_charset(filler + tag) == "koi8-r"
+    # One byte later the tag's ">" is past the prescan, so the tag is not
+    # read, rather than read cut short.
+    assert web_fetch._sniffed_charset(b" " + filler + tag) is None
+    assert web_fetch._sniffed_charset(filler + b"<meta charset=koi8-r >") is None
+    assert web_fetch._sniffed_charset(b"<p>" + b"x" * 2000 + b"</p>" + tag) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "codec", "text"),
+    [
+        (
+            codecs.BOM_UTF8 + b"<meta charset=koi8-r><p>caf\xc3\xa9</p>",
+            "utf-8-sig",
+            "<meta charset=koi8-r><p>caf\u00e9</p>",
+        ),
+        (codecs.BOM_UTF16_LE + "<p>caf\u00e9</p>".encode("utf-16-le"), "utf-16", "<p>caf\u00e9</p>"),
+        (codecs.BOM_UTF16_BE + "<p>caf\u00e9</p>".encode("utf-16-be"), "utf-16", "<p>caf\u00e9</p>"),
+    ],
+)
+def test_a_byte_order_mark_comes_before_the_meta_tag(
+    body: bytes, codec: str, text: str
+) -> None:
+    """The mark decides the codec and is dropped from the text."""
+    assert web_fetch._sniffed_charset(body) == codec
+    assert web_fetch._decode(body, codec) == text
+
+
+@pytest.mark.parametrize(
+    ("head", "text", "expected"),
+    [
+        (b'<meta charset="iso-8859-1">', b"Caf\xe9", "Caf\u00e9"),
+        # iso-8859-1 is read as windows-1252, so the smart quotes survive
+        (b"<meta charset=iso-8859-1>", b"\x93hi\x94", "\u201chi\u201d"),
+        (b"<meta charset=windows-1252>", b"\x93quoted\x94 \x80", "\u201cquoted\u201d \u20ac"),
+        (b"<meta charset=shift_jis>", "\u65e5\u672c\u8a9e".encode("shift_jis"), "\u65e5\u672c\u8a9e"),
+        (b"<meta charset=gbk>", "\u4e2d\u6587".encode("gbk"), "\u4e2d\u6587"),
+        (b"<meta charset=gb2312>", "\u4e2d\u6587".encode("gb2312"), "\u4e2d\u6587"),
+        (b"<meta charset=euc-kr>", "\ud55c\uad6d\uc5b4".encode("euc-kr"), "\ud55c\uad6d\uc5b4"),
+        (b"<meta charset=koi8-r>", _KOI8_PRIVET.encode("koi8-r"), _KOI8_PRIVET),
+        (
+            b'<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">',
+            _KOI8_PRIVET.encode("koi8-r"),
+            _KOI8_PRIVET,
+        ),
+        # declared utf-16, read as utf-8
+        (b"<meta charset=utf-16>", "caf\u00e9".encode(), "caf\u00e9"),
+        # the declaration decides even when it is wrong, as in a browser:
+        # utf-8 bytes under an iso-8859-1 tag read as windows-1252 ...
+        (b"<meta charset=iso-8859-1>", b"caf\xc3\xa9", "caf\u00c3\u00a9"),
+        # ... and bytes that are not utf-8 under a utf-8 tag are replaced
+        (b"<meta charset=utf-8>", b"caf\xe9", "caf\ufffd"),
+        # nothing declared: utf-8, as before
+        (b"<style>p{}</style>", "caf\u00e9".encode(), "caf\u00e9"),
+        (b"<meta charset=no-such-codec>", "caf\u00e9".encode(), "caf\u00e9"),
+    ],
+)
+async def test_a_page_without_a_header_charset_is_decoded_by_its_meta_tag(
+    head: bytes, text: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = b"<html><head>" + head + b"</head><body><p>" + text + b"</p></body></html>"
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == expected
+    outcome.content.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/xhtml+xml",
+        "TEXT/HTML",
+        "text/html;profile=x",
+        # an empty charset parameter names none
+        "text/html; charset=",
+        'text/html; charset=""',
+    ],
+)
+async def test_an_html_type_without_a_header_charset_reads_its_meta_tag(
+    content_type: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = b"<meta charset=koi8-r><p>" + _KOI8_PRIVET.encode("koi8-r") + b"</p>"
+    headers = {"content-type": content_type}
+    _serve(monkeypatch, {"https://a.example/": (200, headers, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == _KOI8_PRIVET
+
+
+async def test_the_meta_tag_decodes_the_page_past_the_prescan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the first 1,024 bytes are scanned; the codec found there decodes
+    the whole page."""
+    page = (
+        b"<meta charset=koi8-r><p>" + b"x" * 5_000 + b" "
+        + _KOI8_PRIVET.encode("koi8-r") + b"</p>"
+    )
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/html"}, page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"].endswith(" " + _KOI8_PRIVET)
+
+
+@pytest.mark.parametrize(
+    ("header_charset", "text", "expected"),
+    [
+        ("utf-8", _KOI8_PRIVET.encode(), _KOI8_PRIVET),
+        ("iso-8859-1", b"Caf\xe9", "Caf\u00e9"),
+        # a header naming an unknown charset still decides: utf-8, as before
+        ("no-such-codec", "caf\u00e9".encode(), "caf\u00e9"),
+    ],
+)
+async def test_the_header_charset_wins_over_the_meta_tag(
+    header_charset: str, text: bytes, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = b"<meta charset=shift_jis><p>" + text + b"</p>"
+    _serve(monkeypatch, {"https://a.example/": (200, _html(header_charset), page)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == expected
+
+
+async def test_plain_text_ignores_a_meta_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"<meta charset=koi8-r>" + _KOI8_PRIVET.encode("koi8-r")
+    _serve(monkeypatch, {"https://a.example/": (200, {"content-type": "text/plain"}, body)})
+    handle, _ = _fetcher("https://a.example/")
+    outcome = await handle({"url": "https://a.example/"})
+    assert json.loads(outcome.content)["content"] == body.decode("utf-8", errors="replace")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<meta " * 40_000,
+        b'<meta charset="' + b"a" * 200_000,
+        b"<meta charset=" + b"a" * 200_000 + b">",
+        b"<a " + b"x=" * 100_000,
+        b"<a " + b" " * 200_000 + b">",
+        b'<meta http-equiv=content-type content="' + b'charset="' * 25_000,
+        b'<meta http-equiv=content-type content="' + b"charset " * 25_000 + b'">',
+        b"<!--" * 50_000,
+        b"<" * 200_000,
+        b"<!" * 100_000,
+        b"<?xml " + b"encoding" * 25_000 + b">",
+        b"<?xml encoding" + b" " * 200_000 + b"='koi8-r'?>",
+        b"<?xml encoding='" + b"a" * 200_000,
+        b"<?xml encoding=" * 15_000 + b">",
+    ],
+    ids=[
+        "meta-repeats", "unclosed-quote", "long-bare-value", "bare-equals",
+        "whitespace-run", "content-unclosed-quotes", "content-no-equals",
+        "comment-openers", "lone-lt", "bang-run", "xml-encoding-repeats",
+        "xml-whitespace-run", "xml-unclosed-quote", "xml-declaration-repeats",
+    ],
+)
+def test_the_prescan_stays_fast_on_a_hostile_page(body: bytes) -> None:
+    """Only the first 1,024 bytes are scanned, and each scan is linear."""
+    started = time.perf_counter()
+    web_fetch._decode(body, web_fetch._sniffed_charset(body))
+    assert time.perf_counter() - started < 1.0
 
 
 @pytest.mark.parametrize(
