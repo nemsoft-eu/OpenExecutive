@@ -1118,6 +1118,11 @@ async def _run_executive(
 
     if source is None:
         allow_mail_ids(session, message_id, thread_id)
+    # Whether the mailbox vouches for mail from another principal (a
+    # co-principal, or the principal from an alias): it opens the mail's links
+    # (``fetch_own_urls`` below) and grants nothing else, so neither session
+    # flag is widened for it.
+    other_principal_proven = False
     if from_addr:
         # Who the mail claims to be from, and whether Gmail authenticated it:
         # the fact tools let the principal's own authenticated mail ask for a
@@ -1139,9 +1144,8 @@ async def _run_executive(
         except Exception:  # noqa: BLE001 - optional step; must not lose the email.
             logger.warning("principal lookup failed; email turn left unauthenticated", exc_info=True)
             principal = ""
-        session.email_authenticated = bool(principal) and session.email_from == principal and (
-            await prove()
-        )
+        principal_checked = bool(principal) and session.email_from == principal
+        session.email_authenticated = principal_checked and (await prove())
         if not session.email_authenticated:
             # A teammate's own mail is theirs to read back only when Gmail
             # vouches the email is from them (orchestrator.teammate_mail).
@@ -1154,6 +1158,10 @@ async def _run_executive(
                     session.email_sender_authenticated = teammate_authenticated
                 elif sender is not None and not sender.is_principal:
                     session.email_sender_authenticated = await prove()
+                elif sender is not None and principal and not principal_checked:
+                    # The principal check above did not read this one's proof.
+                    # A failed principal lookup reads nothing, as it does there.
+                    other_principal_proven = await prove()
             except Exception:  # noqa: BLE001 - optional step; must not lose the email.
                 logger.warning("sender check failed; teammate mail stays private this turn", exc_info=True)
     if from_addr:
@@ -1386,10 +1394,11 @@ async def _run_executive(
     # off-roster senders the gateway will not let us reply to anyway.
     # A From line proves nothing, so a rostered sender's links open only when
     # the mailbox authenticated the mail: the principal's own
-    # (``email_authenticated``) or a teammate's (``email_sender_authenticated``),
-    # both settled above. A forged teammate gets none opened.
+    # (``email_authenticated``), a teammate's (``email_sender_authenticated``)
+    # or another principal's (``other_principal_proven``), all settled above.
+    # A forged teammate gets none opened.
     fetch_own_urls = person_id is not None and bool(from_addr) and (
-        session.email_authenticated or session.email_sender_authenticated
+        session.email_authenticated or session.email_sender_authenticated or other_principal_proven
     )
     #
     # The poller handles one message at a time, so the turn has a ceiling

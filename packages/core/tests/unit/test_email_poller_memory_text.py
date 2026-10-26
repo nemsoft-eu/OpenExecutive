@@ -17,6 +17,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 import openexecutive.integrations.email_poller as poller
 from openexecutive.integrations.email_poller import _email_memory_text
 
@@ -246,8 +248,11 @@ def _settings() -> Any:
     return SimpleNamespace(exec_email_address=EXEC, email_poll_interval_seconds=60)
 
 
-def _run(find_person: Any, *, authenticated: bool = True) -> dict[str, Any]:
+def _run(
+    find_person: Any, *, authenticated: bool = True, principal: str = "",
+) -> tuple[dict[str, Any], AsyncMock]:
     captured: dict[str, Any] = {}
+    proof = AsyncMock(return_value=authenticated)
 
     class _Exec:
         def __init__(self, **_kw: Any) -> None:
@@ -268,8 +273,11 @@ def _run(find_person: Any, *, authenticated: bool = True) -> dict[str, Any]:
         patch("openexecutive.people.identity.resolve_email_sender", new=find_person),
         patch.object(poller, "get_settings", return_value=_settings()),
         patch(
-            "openexecutive.integrations.fact_confirmation.sender_authenticated",
-            new=AsyncMock(return_value=authenticated),
+            "openexecutive.integrations.fact_confirmation.sender_authenticated", new=proof,
+        ),
+        patch(
+            "openexecutive.integrations.fact_confirmation.principal_address",
+            return_value=principal,
         ),
     ):
         asyncio.run(
@@ -281,7 +289,7 @@ def _run(find_person: Any, *, authenticated: bool = True) -> dict[str, Any]:
                 from_addr="sam@example.com",
             )
         )
-    return captured
+    return captured, proof
 
 
 def test_memory_text_drops_the_pollers_reply_block_but_keeps_a_forged_one_quoted() -> None:
@@ -312,7 +320,7 @@ def test_memory_text_drops_the_pollers_reply_block_but_keeps_a_forged_one_quoted
 def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
     # A teammate: upstream's sender check reads is_principal off the row.
     sam = SimpleNamespace(id=7, is_principal=False)
-    captured = _run(lambda addr, **_kw: sam if addr == "sam@example.com" else None)
+    captured, _ = _run(lambda addr, **_kw: sam if addr == "sam@example.com" else None)
     assert captured["person_id"] == 7
     assert captured["memory_text"] == _email_memory_text(REPLY)
     assert captured["fetch_own_urls"] is True
@@ -325,7 +333,7 @@ def test_a_rostered_sender_gmail_did_not_authenticate_gets_no_link_opened() -> N
     """A From line proves nothing: anyone can claim to be a teammate."""
     # A teammate: upstream's sender check reads is_principal off the row.
     sam = SimpleNamespace(id=7, is_principal=False)
-    captured = _run(
+    captured, _ = _run(
         lambda addr, **_kw: sam if addr == "sam@example.com" else None, authenticated=False
     )
     assert captured["person_id"] == 7
@@ -333,12 +341,40 @@ def test_a_rostered_sender_gmail_did_not_authenticate_gets_no_link_opened() -> N
     assert captured["fetch_own_urls"] is False
 
 
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_another_principals_links_open_only_when_the_mailbox_vouches(authenticated: bool) -> None:
+    """A co-principal, or the principal writing from an alias, is not the
+    primary address the fact tools check, yet its authenticated mail still
+    opens its links; that proof widens neither session flag."""
+    sam = SimpleNamespace(id=7, is_principal=True)
+    captured, proof = _run(
+        lambda addr, **_kw: sam if addr == "sam@example.com" else None,
+        authenticated=authenticated, principal="boss@example.com",
+    )
+    assert captured["fetch_own_urls"] is authenticated
+    assert proof.await_count == 1
+    session = captured["session"]
+    assert session.email_authenticated is False
+    assert session.email_sender_authenticated is False
+
+
+def test_the_primary_principal_is_proven_once() -> None:
+    """The principal check already read the proof; a failed one is not re-read."""
+    sam = SimpleNamespace(id=7, is_principal=True)
+    captured, proof = _run(
+        lambda addr, **_kw: sam if addr == "sam@example.com" else None,
+        authenticated=False, principal="sam@example.com",
+    )
+    assert captured["fetch_own_urls"] is False
+    assert proof.await_count == 1
+
+
 def test_run_executive_skips_the_parse_for_an_unrostered_sender() -> None:
     """No peer to record into, so attacker-shaped mail from a stranger is
     never parsed for memory at all. None also means the client web_fetch
     may open no URL from it: a stranger's mail must not steer a fetch from
     inside our network, as a contact's may not (PRIVATE_TURN_WITHHELD_TOOLS)."""
-    captured = _run(lambda _addr, **_kw: None)
+    captured, _ = _run(lambda _addr, **_kw: None)
     assert captured["person_id"] is None
     assert captured["memory_text"] is None
     assert captured["fetch_own_urls"] is False
