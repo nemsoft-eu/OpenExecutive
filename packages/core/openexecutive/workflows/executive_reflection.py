@@ -140,6 +140,21 @@ _KNOWLEDGE_RULE = (
 
 
 # briefing/grounding.py enforces this on the outward tools and the flags.
+# Both modes. The flags are read by the morning brief, whose reader is the
+# principal: a flag naming them ("a status review with <their name>") came out
+# of the brief as a third person, and a flag copied from YESTERDAY'S STANDUP
+# outlived what it was about (a goal back on track was still "off track" two
+# days later).
+_FLAG_RULE = (
+    "Flagged for the brief: only what today's input still shows. YESTERDAY'S "
+    "STANDUP is history, not input: never copy a flag from it unless today's "
+    "input shows the same problem, so a goal back on track or a question "
+    "since answered drops out. Call the YOUR PRINCIPAL person 'the "
+    "principal', never by name, and leave person_id and alert_id numbers "
+    "out of the summary: the brief is written to the principal from it.\n\n"
+)
+
+
 _GROUNDING_RULE = (
     "Grounding: name only people and figures that appear in the input or in "
     "a tool result, exactly as written there. An outward tool call "
@@ -185,6 +200,7 @@ def _build_reflection_system(configured: set[str], has_roster: bool = True) -> s
         "principal can verify in one click.\n\n"
         + _GROUNDING_RULE
         + _KNOWLEDGE_RULE
+        + _FLAG_RULE
         + "Memory: the block YESTERDAY'S STANDUP lists what you already did "
         "on the previous run. Do NOT re-act on or re-notify anyone about a "
         "signal listed there unless the input shows it changed since — "
@@ -262,6 +278,7 @@ def _build_reflection_system_solo() -> str:
         "in one click.\n\n"
         + _GROUNDING_RULE
         + _KNOWLEDGE_RULE
+        + _FLAG_RULE
         + "Memory: the block YESTERDAY'S STANDUP lists what you already did "
         "on the previous run. Do NOT re-act on or re-raise a signal listed "
         "there unless the input shows it changed since — repeating an alert "
@@ -306,9 +323,10 @@ def _find_principal() -> Any:
 
 
 def _render_principal_line(principal: Any) -> str:
-    """Solo: the principal's person_id and follow-up refs, in place of the
+    """The principal's person_id and follow-up refs. Solo: in place of the
     team roster — the model needs them for create_alert / schedule_followup,
-    and this pass addresses nobody else."""
+    and this pass addresses nobody else. Team: under the roster, so the pass
+    knows which teammate the brief it writes for is read by."""
     if principal is None or getattr(principal, "id", None) is None:
         return ""
     refs: list[str] = []
@@ -362,8 +380,9 @@ def _render_reflection_context(
         # levels and nobody else awaiting.
         parts.append("AREAS WITH GOALS AT RISK:")
         for d in at_risk:
+            where = f"area slug={d['slug']}" if d.get("slug") else "no area"
             parts.append(
-                f"- {d['title']} (area slug={d['slug']}): "
+                f"- {d['title']} ({where}): "
                 f"at_risk={d.get('at_risk_count', 0)} "
                 f"off_track={d.get('off_track_count', 0)}"
             )
@@ -371,6 +390,14 @@ def _render_reflection_context(
     elif at_risk:
         parts.append("DEPARTMENTS WITH RISK:")
         for d in at_risk:
+            if not d.get("slug"):
+                # The goals with no department: no head, channel or authority.
+                parts.append(
+                    f"- {d['title']} (no department): "
+                    f"at_risk={d.get('at_risk_count', 0)} "
+                    f"off_track={d.get('off_track_count', 0)}"
+                )
+                continue
             parts.append(
                 f"- {d['title']} (slug={d['slug']}): "
                 f"at_risk={d.get('at_risk_count', 0)} "
@@ -493,12 +520,16 @@ def _with_lead_tools(
         return tools, handlers, False
     if gateway is None:
         return tools, handlers, True
+    from openexecutive.orchestrator.teammate_mail import guard_in_turn
+
     extra = [t for t in MCP_TOOLS if t["name"] in ("search_tools", "call_tool")]
     tools = sorted([*tools, *extra], key=lambda t: t["name"])
     handlers = {
         **handlers,
         "search_tools": gateway.search_tools,
-        "call_tool": take_the_lead.gated_call_tool(gateway.call_tool, source="reflection"),
+        # Run from a chat turn, the pass reaches the mailbox the way the chat
+        # does (orchestrator.teammate_mail).
+        "call_tool": guard_in_turn(take_the_lead.gated_call_tool(gateway.call_tool, source="reflection")),
     }
     return tools, handlers, True
 
@@ -758,9 +789,11 @@ class ExecutiveReflectionWorkflow(Workflow):
             outreach=_outreach_lines(),
             mode=mode,
         )
-        # Solo has no team roster: only the principal's own line.
-        principal = _find_principal() if solo else None
-        roster = _render_principal_line(principal) if solo else _render_team_roster(people)
+        # Solo has no team roster: only the principal's own line. Team: the
+        # roster, then which of them is the principal.
+        principal = _find_principal()
+        team_roster = "" if solo else _render_team_roster(people)
+        roster = team_roster + _render_principal_line(principal)
         if roster:
             user_content = roster + "\n" + user_content
         # The principal's kept corrections, so nothing this pass flags, DMs
@@ -866,7 +899,7 @@ class ExecutiveReflectionWorkflow(Workflow):
         reflection_system = (
             _build_reflection_system_solo()
             if solo
-            else _build_reflection_system(configured, bool(roster))
+            else _build_reflection_system(configured, bool(team_roster))
         )
         model = settings.routing_model
         messages: list[dict[str, Any]] = [

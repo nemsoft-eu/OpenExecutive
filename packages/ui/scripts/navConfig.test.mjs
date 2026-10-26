@@ -4,11 +4,13 @@ import {
   ADVANCED_GROUPS,
   ADVANCED_ITEMS,
   PROFILE_NAV,
+  SETTINGS_GROUPS,
   SETTINGS_PAGES,
   advancedItemsByGroup,
   buildDestinations,
   buildHubs,
   buildMobilePrimary,
+  groupSettingsPages,
   hubForPath,
   isDestinationActive,
   profileWording,
@@ -56,7 +58,7 @@ test("team hubs: Work and Company tabs", () => {
   );
 });
 
-test("Delegate holds Act as me, Handle it for me and Take the lead, each a named feature", () => {
+test("Delegate opens on Act as me, then Handle it for me and Take the lead, each a named feature", () => {
   for (const opts of [{}, { mode: "solo", roleKind: "owner" }]) {
     const delegate = buildHubs(opts).find((h) => h.key === "delegate");
     assert.deepEqual(links(delegate.tabs), [
@@ -112,6 +114,21 @@ test("a hub's menu entry stays lit on every one of its tabs", () => {
   assert.deepEqual(lit("/departments/finance"), ["company"]);
   assert.deepEqual(lit("/company-profile"), ["company"]);
   assert.deepEqual(lit("/settings"), []);
+});
+
+test("team: the Departments tab shows only once a department exists", () => {
+  const company = buildHubs({ hasDepartments: false })[1];
+  assert.deepEqual(links(company.tabs), [
+    "People → /people",
+    "Goals → /goals",
+    "Company profile → /company-profile",
+  ]);
+  // The Departments pages keep it: that is where the first one is added.
+  const onDepts = hubForPath("/departments/new", { hasDepartments: false });
+  assert.ok(onDepts?.tabs.some((t) => t.href === "/departments"));
+  assert.ok(!hubForPath("/goals", { hasDepartments: false })?.tabs.some((t) => t.href === "/departments"));
+  // Solo never shows it, departments or not.
+  assert.ok(!JSON.stringify(buildHubs({ mode: "solo", hasDepartments: true })).includes("/departments"));
 });
 
 test("hubForPath finds the hub a page belongs to", () => {
@@ -201,6 +218,7 @@ test("the Settings hub: one tile per page, each with its own route", () => {
     SETTINGS_PAGES.map((p) => `${p.label} → ${p.href}`),
     [
       "Your Executive → /settings/executive",
+      "Notifications → /settings/notifications",
       "About you → /settings/memory",
       "Workspace → /settings/workspace",
       "Advanced → /settings/advanced",
@@ -237,4 +255,25 @@ test("old /settings#anchors land on the matching page", () => {
   // Every anchor belongs to exactly one page.
   const all = SETTINGS_PAGES.flatMap((p) => p.hashes);
   assert.equal(new Set(all).size, all.length);
+});
+
+test("every Settings page sits in a known group, and the hub lists the groups in order", () => {
+  const ids = SETTINGS_GROUPS.map((g) => g.id);
+  for (const p of SETTINGS_PAGES) assert.ok(ids.includes(p.group), `${p.id} has group ${p.group}`);
+  assert.deepEqual(
+    groupSettingsPages(SETTINGS_PAGES).map(({ group, pages }) => [group.label, pages.map((p) => p.label)]),
+    [
+      ["You and your Executive", ["Your Executive", "Notifications", "About you"]],
+      ["Company", ["Workspace"]],
+      ["More", ["Advanced", "About"]],
+    ],
+  );
+});
+
+test("a Settings group with no page left is dropped", () => {
+  const pages = SETTINGS_PAGES.filter((p) => p.group !== "company");
+  assert.deepEqual(
+    groupSettingsPages(pages).map(({ group }) => group.id),
+    ["you", "more"],
+  );
 });

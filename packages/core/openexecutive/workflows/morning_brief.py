@@ -27,7 +27,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,9 @@ from openexecutive.workflows.base import (
     WorkflowSection,
     WorkflowStepDef,
 )
+
+if TYPE_CHECKING:
+    from openexecutive.briefing.reader import Reader
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +125,26 @@ def _private_ok() -> bool:
 # both surfaces tell the same story in the same voice.
 
 
+def _now_and_reader(now: datetime) -> tuple[str, Reader | None]:
+    """The NOW line ("Thursday 15 October 2026, 08:00 local time") and the
+    principal as the brief's reader (None when there is none)."""
+    from openexecutive.briefing.reader import principal_reader
+    from openexecutive.memory.workspace_settings import get_user_timezone
+
+    try:
+        local = now.astimezone(get_user_timezone())
+    except Exception:
+        logger.exception("morning_brief: timezone lookup failed — NOW is in UTC")
+        local = now.astimezone(UTC)
+    label = f"{local:%A} {local.day} {local:%B %Y}, {local:%H:%M} local time"
+    # One reader only when there is one principal: the fan-out sends the same
+    # brief to every founder, and naming the lowest-id one "the reader" would
+    # tell the other that the first one's day is theirs.
+    from openexecutive.people.store import active_principals
+
+    return label, principal_reader() if len(active_principals()) <= 1 else None
+
+
 class MorningBriefWorkflow(Workflow):
     name = "morning_brief"
     title = "Morning Brief"
@@ -180,7 +203,11 @@ class MorningBriefWorkflow(Workflow):
         from openexecutive.alerts.models import PRIVATE_ALERT_TAG
         from openexecutive.api.routes import today as today_route
         from openexecutive.briefing import brief_state
-        from openexecutive.briefing.live_signals import gather_live_signals, refresh_calendar
+        from openexecutive.briefing.live_signals import (
+            gather_live_signals,
+            refresh_calendar,
+            settle_principal_drafts,
+        )
         from openexecutive.memory.workspace_settings import effective_workspace_mode
         from openexecutive.orchestrator.schedule_tools import current_session
         from openexecutive.people.store import active_principals
@@ -248,7 +275,7 @@ class MorningBriefWorkflow(Workflow):
             # active projects, each with a free slot when a calendar can be
             # read (one short call). Never raises; without a calendar there
             # are no slots and no calendar block.
-            top_three, calendar = await build_top_three(today_data["due_soon"])
+            top_three, calendar = await build_top_three(today_data["due_soon"], include_own=private_ok)
             if top_three:
                 today_data["top_three"] = top_three
             if calendar is not None:
@@ -266,6 +293,10 @@ class MorningBriefWorkflow(Workflow):
         events = None
         if own_private_ok and not top_three_calendar:
             events = await refresh_calendar(now, max_age=0)
+        if own_private_ok:
+            # Drafts they sent or deleted in their mailbox since are not stuck.
+            # The mailbox is `find_principal_person()`'s, so `own_private_ok`.
+            await settle_principal_drafts(now)
         live = gather_live_signals(
             since, now=now, include_private=own_private_ok,
             calendar=events, use_cached_calendar=False,
@@ -299,11 +330,20 @@ class MorningBriefWorkflow(Workflow):
                 owner_notes = await asyncio.to_thread(
                     history_brief.due_soon_block, owner.id, history_brief.local_today(now),
                 )
+        # The first week's GETTING STARTED block (goals, departments with no
+        # leader and, on the delivery to the principal alone, who wrote to
+        # their own inbox), so a new install's first brief is never "quiet".
+        from openexecutive.briefing.first_week import getting_started
+
+        first_week = await getting_started(
+            include_inbox=PRINCIPAL_DELIVERY.get(), now=now, solo=mode == "solo",
+        )
         # Did this brief actually draw on anything private to the principal?
         # Then its text stays out of the shared run history (the principal
         # gets it where it is delivered).
         private_used = private_ok and (
             bool(owner_notes.text)
+            or first_week.private
             or teammate_changes != in_force_changes
             or live.calendar is not None
             or any(
@@ -331,6 +371,7 @@ class MorningBriefWorkflow(Workflow):
             pending_watch_suggestions=pending_suggestions, mode=mode,
             live_keys=live.keys, reflection_flags=reflection_flags,
             teammate_changes=teammate_changes, owner_notes=owner_notes.keys,
+            getting_started=first_week.keys,
         )
         previous = brief_state.last_delivered(BRIEF_KIND)
         suppressed = (
@@ -395,7 +436,6 @@ class MorningBriefWorkflow(Workflow):
 
         from openexecutive.briefing.grounding import ground_brief
         from openexecutive.briefing.narrative import (
-            QUIET_PRINCIPAL,
             STANDALONE_BRIEF_SOLO_SYSTEM,
             STANDALONE_BRIEF_SYSTEM,
             render_briefing_context,
@@ -404,14 +444,22 @@ class MorningBriefWorkflow(Workflow):
 
         try:
             # Rendered here (not inside the synthesizer) so the grounding pass
-            # checks the brief against exactly the text the model read.
+            # checks the brief against exactly the text the model read. NOW
+            # and THE READER anchor the dates in the context and who "you"
+            # is: without them yesterday's "call tomorrow" read as today's
+            # and the brief named its own reader.
+            now_label, reader = _now_and_reader(now)
             rendered = render_briefing_context(
                 period_label=period, today_data=today_data, activity=activity,
                 since=since, handled=handled,
                 pending_watch_suggestions=pending_suggestions, mode=mode,
                 live=live, live_window="since the last brief",
                 reflection_flags=reflection_flags, teammate_changes=teammate_changes,
-                owner_notes=owner_notes.text,
+                owner_notes=owner_notes.text, getting_started=first_week.text,
+                now_label=now_label, reader=reader,
+                # The owner's raise / leave-out lines: only for the owner
+                # alone, never a teammate's or a co-principal's run.
+                brief_requests=own_private_ok,
             )
             # standalone=True → the enumerated DM brief (no cards beside it),
             # not the /today header synthesis.
@@ -421,16 +469,12 @@ class MorningBriefWorkflow(Workflow):
                 pending_watch_suggestions=pending_suggestions, mode=mode,
                 live=live, live_window="since the last brief",
                 reflection_flags=reflection_flags, rendered_context=rendered,
+                reader=reader,
             )
         except Exception as exc:
             logger.exception("morning_brief: synthesis failed")
             yield WorkflowEvent(type="error", message=f"Synthesis failed: {exc}")
             return
-
-        if not artifact_text:
-            # The shared synthesizer's own quiet-day line, so the empty
-            # fallback reads identically to a model-produced quiet brief.
-            artifact_text = QUIET_PRINCIPAL
 
         # Nobody reads this before it ships: hold back any line naming a
         # person or figure the context doesn't hold, and cite the figures.

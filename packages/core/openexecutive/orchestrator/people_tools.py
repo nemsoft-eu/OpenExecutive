@@ -22,6 +22,8 @@ from types import SimpleNamespace
 from typing import Any, ParamSpec
 
 from openexecutive.memory.honcho_client import directional_chat
+from openexecutive.people import contact_info
+from openexecutive.people.models import DETAIL_KINDS, ContactDetail
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +39,10 @@ LIST_PEOPLE_TOOL: dict[str, Any] = {
         "a name to a person_id before calling upsert_person, archive_person, "
         "set_department_head, create_calendar_event or message_person. The "
         "principal's contacts (`kind` \"contact\") are private to the "
-        "principal: they are listed only when the principal asks directly. "
-        "Returns a compact JSON list."
+        "principal: they are listed only when the principal asks directly, "
+        "each with what you remember about them from the principal's own mail "
+        "and meetings (`what_you_deal_with`, `topics`, `recent_activity`). "
+        "Use that to suggest who to ask or loop in. Returns a compact JSON list."
     ),
     "input_schema": {
         "type": "object",
@@ -113,6 +117,25 @@ UPSERT_PERSON_TOOL: dict[str, Any] = {
             "slack_user_id": {"type": "string"},
             "telegram_chat_id": {"type": "string"},
             "discord_user_id": {"type": "string"},
+            "details": {
+                "type": "array",
+                "description": (
+                    "Other ways to reach them, for the principal to read (never used to send): "
+                    "phone, mobile, website, linkedin, social (another profile link), address. "
+                    "REPLACES the current list; omit to leave it unchanged."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["phone", "mobile", "website", "linkedin", "social", "address"],
+                        },
+                        "value": {"type": "string"},
+                    },
+                    "required": ["kind", "value"],
+                },
+            },
             "preferred_channel": {
                 "type": "string",
                 "enum": ["email", "slack", "telegram", "discord", "any"],
@@ -218,6 +241,9 @@ ASK_ABOUT_PERSON_TOOL: dict[str, Any] = {
         "the team, and then only about how they work (no `target_person_id`). "
         "When the result says `shared: false`, tell the asker that person hasn't "
         "chosen to share it and suggest asking them directly.\n"
+        "For one of the principal's contacts, on the principal's own turn, it "
+        "returns what you remember from the principal's own mail and meetings "
+        "with them instead.\n"
         "Returns the synthesized answer, or an empty string if Honcho is disabled / no data."
     ),
     "input_schema": {
@@ -321,14 +347,45 @@ def _audit(tool: str, kind: str, ok: bool, summary: str, details: dict[str, Any]
 # Surfaces that verify who sent every message: the web chat (the signed-in
 # Google account, stamped by the UI proxy), and Slack / Discord (the platform's
 # own user id, over an authenticated connection). Email (an unauthenticated
-# From header), Google Chat (no sender identity), the CLI, the MCP server and
-# unattended runs (scheduler, workflows, alert review) don't. Telegram only
-# sometimes — see `_is_verified_speaker_surface`.
+# From header), Google Chat (its sender is matched by email for the department gate only), the CLI, the MCP server
+# (unless the turn may act: `Session.mcp_client_may_act`) and unattended runs (scheduler, workflows, alert review) don't. Telegram only
+# sometimes — see `_is_verified_speaker_surface`. A channel adapter this module
+# doesn't know counts when it verified the sender itself
+# (`Session.speaker_verified`, with the `caller_person_id` it resolved).
 _VERIFIED_SPEAKER_CHANNELS = frozenset({"slack", "discord"})
 
 
+def _adapter_verified_turn(session: Any) -> bool:
+    """The rest of what an adapter's ``speaker_verified`` needs to count, as
+    ``history_chat.verified_speaker`` asks of it: a resolved caller, a turn
+    someone is in that no email started, not private to the principal and
+    not run on their behalf (an eval's ``delegation_override``)."""
+    from openexecutive.delegation.settings import DelegationOverride
+
+    return (
+        getattr(session, "caller_person_id", None) is not None
+        and not getattr(session, "email_from", "")
+        and getattr(session, "unattended", False) is not True
+        and getattr(session, "private_to_principal", False) is not True
+        and not isinstance(getattr(session, "delegation_override", None), DelegationOverride)
+    )
+
+
 def _is_verified_speaker_surface(session: Any) -> bool:
+    # A host origin's page (Session.from_host) proves nothing about who
+    # wrote the turn: a script on it may have.
+    if getattr(session, "from_host", False) is True:
+        return False
     if bool(getattr(session, "from_web_chat", False)):
+        return True
+    # Another AI app over Open Executive's own MCP server: its caller is the
+    # one the API verified (`api.caller`), as for the web chat, but only a
+    # turn allowed to act (`Session.mcp_client_may_act`) counts it, so each
+    # tool's own owner-only and person checks then decide. A read-only one
+    # never does.
+    if getattr(session, "from_mcp_client", False) is True:
+        return getattr(session, "mcp_client_may_act", False) is True and _adapter_verified_turn(session)
+    if getattr(session, "speaker_verified", False) is True and _adapter_verified_turn(session):
         return True
     channel = str(getattr(session, "origin_channel", "") or "")
     if channel in _VERIFIED_SPEAKER_CHANNELS:
@@ -451,7 +508,9 @@ def audit_row_owner(private_to_person: int | None = None) -> int | None:
 
     The one given, else the person whose own mailbox the work is in: the
     ``rows_for_person`` scope (the inbox watcher, a reply's Send, their Act as
-    me settings), or the speaker on a turn that read their mail. None when
+    me settings, a teammate's own turn on a chat adapter or the web app), the
+    speaker on a turn that read their mail, or the teammate whose own turn
+    this is (``teammate_turn_owner``). None when
     that person is the principal: their rows stay private to the principal,
     as before. Fails closed: a principal lookup that fails keeps the owner."""
     from openexecutive.audit.context import rows_owner
@@ -461,9 +520,14 @@ def audit_row_owner(private_to_person: int | None = None) -> int | None:
         from openexecutive.delegation.settings import turn_delegation
         from openexecutive.orchestrator.schedule_tools import current_session
 
-        pinned = turn_delegation(current_session.get())
+        session = current_session.get()
+        pinned = turn_delegation(session)
         if pinned is not None and pinned.touched_mail:
             owner = pinned.person_id
+        else:
+            # A teammate's own conversation with the Executive is theirs, as
+            # their mail is (``orchestrator.teammate_mail``).
+            owner = teammate_turn_owner(session)
     if owner is None:
         return None
     try:
@@ -476,6 +540,45 @@ def audit_row_owner(private_to_person: int | None = None) -> int | None:
     if principal is not None and principal.id == owner:
         return None
     return int(owner)
+
+
+def team_member_id(person_id: int | None) -> int | None:
+    """``person_id`` when it is a team member other than the principal (not a
+    contact, not archived), else None. A lookup that fails keeps the id, so
+    the rows it decides stay private rather than shown to the principal."""
+    if person_id is None:
+        return None
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(int(person_id))
+    except Exception:
+        logger.warning("people_tools: teammate lookup for audit rows failed — rows kept to them", exc_info=True)
+        return int(person_id)
+    if person is None or person.is_principal or person.archived or person.kind != "team":
+        return None
+    return int(person_id)
+
+
+def teammate_turn_owner(session: Any) -> int | None:
+    """The teammate whose own conversation with the Executive this turn is,
+    so every audit row it writes is theirs alone (``audit_row_owner``): a team
+    member other than the principal speaking on a surface that proved who
+    they are, or by email Gmail authenticated as theirs. None otherwise: an
+    unproven sender's rows stay where the principal reads them, so a forged
+    From or an unverified Telegram chat can't hide a turn from them."""
+    if (
+        session is None
+        or getattr(session, "unattended", False)
+        or getattr(session, "private_to_principal", False)
+    ):
+        return None
+    if getattr(session, "email_from", ""):
+        if getattr(session, "email_sender_authenticated", False) is not True:
+            return None
+    elif not _is_verified_speaker_surface(session):
+        return None
+    return team_member_id(getattr(session, "caller_person_id", None))
 
 
 def audit_row_private_to_principal(*payloads: Any) -> bool:
@@ -511,21 +614,45 @@ def audit_row_private_to_principal(*payloads: Any) -> bool:
     return _names_a_contact(payloads)
 
 
-def sent_by_principal(channel: str, channel_ref: str, sender: Any) -> bool:
+def sent_by_principal(
+    channel: str, channel_ref: str, sender: Any, *, speaker_verified: bool = False
+) -> bool:
     """Whether a message a chat adapter received on ``channel`` from
     ``sender`` (the Person it resolved, or None) starts the principal's own
     verified turn — what ``is_principal_on_verified_surface`` answers once the
     turn's session is bound. ``channel_ref`` is the id that session carries as
     its ``origin_channel_ref`` (Telegram's chat id decides whether it is
-    verified at all)."""
+    verified at all). ``speaker_verified``: the adapter verified ``sender``
+    itself, as it will say on the turn's session (``Session.speaker_verified``)."""
     if sender is None or getattr(sender, "is_principal", False) is not True:
         return False
     if getattr(sender, "archived", False) is True:
         return False
-    surface = SimpleNamespace(
-        from_web_chat=False, origin_channel=channel, origin_channel_ref=channel_ref
+    return _is_verified_speaker_surface(_inbound_surface(channel, channel_ref, sender, speaker_verified))
+
+
+def _inbound_surface(channel: str, channel_ref: str, sender: Any, speaker_verified: bool) -> SimpleNamespace:
+    """The surface an inbound message's turn will have, before its session exists."""
+    return SimpleNamespace(
+        from_web_chat=False,
+        origin_channel=channel,
+        origin_channel_ref=channel_ref,
+        speaker_verified=speaker_verified,
+        caller_person_id=getattr(sender, "id", None),
     )
-    return _is_verified_speaker_surface(surface)
+
+
+def sent_by_teammate(
+    channel: str, channel_ref: str, sender: Any, *, speaker_verified: bool = False
+) -> int | None:
+    """The teammate (not the principal) a chat adapter's inbound message on
+    ``channel`` is from, when the channel proved who sent it — the person
+    whose own turn it starts (``teammate_turn_owner``) — else None."""
+    if sender is None or getattr(sender, "id", None) is None:
+        return None
+    if not _is_verified_speaker_surface(_inbound_surface(channel, channel_ref, sender, speaker_verified)):
+        return None
+    return team_member_id(int(sender.id))
 
 
 _P = ParamSpec("_P")
@@ -540,7 +667,8 @@ def audit_rows_on_senders_turn(
     turn binds its session (the inbound row, the knowledge retrieval, alert
     triage) follow the rule they follow once it is: when the principal sent
     the message on a verified surface, a row that names one of their contacts
-    is private to the principal (``audit.context.principal_turn_rows``).
+    is private to the principal (``audit.context.principal_turn_rows``); when
+    a teammate did, every row is theirs alone (``rows_for_person``).
 
     ``sender_ref`` picks the sender's user or chat id out of the handler's
     arguments (by name), and ``find_sender`` resolves it to a Person, off the
@@ -555,7 +683,7 @@ def audit_rows_on_senders_turn(
 
         @functools.wraps(handler)
         async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
-            from openexecutive.audit.context import principal_turn_rows
+            from openexecutive.audit.context import principal_turn_rows, rows_for_person
 
             try:
                 bound = signature.bind(*args, **kwargs)
@@ -563,14 +691,18 @@ def audit_rows_on_senders_turn(
                 ref = sender_ref(dict(bound.arguments))
                 sender = await asyncio.to_thread(find_sender, ref) if ref else None
                 principal = sent_by_principal(channel, ref, sender)
+                teammate = sent_by_teammate(channel, ref, sender)
             except Exception as exc:
                 logger.warning(
                     "people_tools: could not tell who sent an inbound %s message (%s) — "
                     "its audit rows follow the ordinary rule", channel, type(exc).__name__,
                     exc_info=True,
                 )
-                principal = False
-            with principal_turn_rows(principal):
+                principal, teammate = False, None
+            with (
+                principal_turn_rows(principal),
+                rows_for_person(teammate) if teammate is not None else contextlib.nullcontext(),
+            ):
                 await handler(*args, **kwargs)
 
         return wrapper
@@ -783,6 +915,13 @@ async def handle_list_people(tool_input: dict[str, Any]) -> str:
         _audit("list_people", "read", False, f"list_people failed: {exc}", {"error": str(exc)[:300]})
         return json.dumps({"error": str(exc)})
 
+    from openexecutive.people import contact_notes
+
+    # What is remembered about each person, from the principal's own mail and
+    # meetings: on the principal's own turn only, for contacts and team alike.
+    notes = contact_notes.get_many(
+        p.id for p in people if p.id is not None and not p.archived and not p.is_principal
+    ) if include_contacts else {}
     out = [
         {
             "person_id": p.id,
@@ -792,10 +931,14 @@ async def handle_list_people(tool_input: dict[str, Any]) -> str:
             "kind": p.kind,
             "email": p.email,
             "email_aliases": p.email_aliases,
+            # Phone numbers and addresses on the principal's own turn only,
+            # like the notes: never on a stranger's or a teammate's turn.
+            **({"details": [d.model_dump() for d in p.details]} if p.details and include_contacts else {}),
             "preferred_channel": p.preferred_channel,
             "department_slugs": p.department_slugs,
             "authority_scope": [s.value for s in p.authority_scope],
             "archived": p.archived,
+            **contact_notes.for_model(notes.get(p.id or 0)),
         }
         for p in people
     ]
@@ -810,6 +953,36 @@ async def handle_list_people(tool_input: dict[str, Any]) -> str:
     return json.dumps({"people": out, "count": len(out)})
 
 
+def _hold_until_next_turn(person_id: int) -> None:
+    """Hold a person just written to the roster for the rest of the turn
+    (``outside_content.note_added_person``). The id is held even when the
+    row can't be read back; only the refusal's address text is lost."""
+    from openexecutive.orchestrator import outside_content
+    from openexecutive.people import store as people_store
+
+    try:
+        written = people_store.get_person(person_id)
+    except Exception:
+        written = None
+    outside_content.note_added_person(person_id, written)
+
+
+def _new_way_to_reach(existing: Any, tool_input: dict[str, Any], aliases: list[str] | None) -> bool:
+    """Whether an update gives ``existing`` an address or chat account they
+    did not have: a new email, alias, Slack, Telegram or Discord id."""
+    def norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    for key in ("email", "slack_user_id", "telegram_chat_id", "discord_user_id"):
+        if key in tool_input and norm(tool_input.get(key)) and norm(tool_input.get(key)) != norm(getattr(existing, key, None)):
+            return True
+    if aliases:
+        known = {norm(a) for a in (getattr(existing, "email_aliases", None) or [])}
+        known.add(norm(getattr(existing, "email", None)))
+        return any(norm(a) not in known for a in aliases)
+    return False
+
+
 async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
     from openexecutive.people import registry as people_registry
     from openexecutive.people import store as people_store
@@ -820,6 +993,14 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         return json.dumps({"error": err})
 
     refused = _refuse_unless_owner("upsert_person")
+    if refused is not None:
+        return refused
+    # No roster change on a turn that read outside content, nor one Act as
+    # me's lockdown refuses (the chat loop refuses both first; this holds
+    # for any other path).
+    from openexecutive.delegation.lockdown import outside_reach_refusal
+
+    refused = outside_reach_refusal("upsert_person", tool_input)
     if refused is not None:
         return refused
 
@@ -925,6 +1106,21 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         if person_id is not None
         else False
     )
+    # Other contact details: each kept only when it is plainly its kind.
+    details: list[ContactDetail] | None = None
+    if isinstance(tool_input.get("details"), list):
+        details = []
+        for item in tool_input["details"][:20]:
+            detail_kind = str(item.get("kind") or "") if isinstance(item, dict) else ""
+            raw_value = str(item.get("value") or "") if isinstance(item, dict) else ""
+            if detail_kind not in DETAIL_KINDS:
+                return _bad(f"details: unknown kind {detail_kind[:20]!r}")
+            if not raw_value.strip():
+                continue
+            value = contact_info.clean_detail(detail_kind, raw_value)
+            if not value:
+                return _bad(f"details: that doesn't look like a {detail_kind}")
+            details.append(ContactDetail(kind=detail_kind, value=value))  # type: ignore[arg-type]
     kwargs: dict[str, Any] = {
         "full_name": full_name,
         "role": str(tool_input.get("role", "") or ""),
@@ -944,17 +1140,24 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         kwargs["person_id"] = person_id
 
     action = "updated" if person_id is not None else "created"
+    new_id: int | None = None
     try:
         new_id = people_store.upsert_person(**kwargs)
         if authority_scopes is not None:
             people_store.set_authority_scope(new_id, authority_scopes)
         if aliases is not None:
             people_store.set_person_emails(new_id, aliases, source="chat_tool")
+        if details is not None:
+            people_store.set_person_details(new_id, details, source="chat_tool")
     except Exception as exc:
         logger.exception("upsert_person: failed")
         # Always invalidate — a partial write (e.g. row inserted but scopes
         # failed) must not leave the registry serving stale data.
         people_registry.invalidate()
+        if new_id is not None:
+            # The row (and maybe a new address) is written: hold it like a
+            # full write.
+            _hold_until_next_turn(new_id)
         # No name or kind in the audit row (readable by everyone): a contact
         # is private to the principal, and a team row must look the same.
         _audit(
@@ -964,6 +1167,10 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         )
         return json.dumps({"error": str(exc)})
     people_registry.invalidate()
+    if existing is None or _new_way_to_reach(existing, tool_input, aliases):
+        # Nothing reaches someone added (or given a new address or chat
+        # account) until the next turn: every send check trusts the roster.
+        _hold_until_next_turn(new_id)
     # Someone waiting on a roster request may match now.
     from openexecutive.integrations.roster_intake import after_roster_write
 
@@ -978,6 +1185,11 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         {"person_id": new_id, "action": action},
     )
     stored = people_store.get_person(new_id)
+    if existing is None and stored is not None and stored.kind == "contact":
+        # Listed in Contacts' "Changes I made", so a chat add has an Undo too.
+        from openexecutive.people.contact_keeper import note_chat_add
+
+        note_chat_add(new_id, full_name, stored.email)
     return json.dumps({
         "status": "ok",
         "action": action,
@@ -1203,6 +1415,29 @@ def _person_name(person_id: int) -> str:
     return name.split()[0] if name else "This person"
 
 
+def _contact_note_answer(person_id: int, target_person_id: int | None) -> str | None:
+    """What is remembered about one of the principal's contacts, on the
+    principal's own turn (``contact_notes``): contacts never chat, so memory
+    has nothing on them. None when ``person_id`` is not a contact or this is
+    not the principal's turn."""
+    if target_person_id is not None or not contacts_reachable_now():
+        return None
+    from openexecutive.people import contact_notes
+    from openexecutive.people import store as people_store
+
+    try:
+        person = people_store.get_person(person_id)
+    except Exception:
+        return None
+    if person is None or person.kind != "contact" or person.archived:
+        return None
+    known = contact_notes.for_model(contact_notes.get_many([person_id]).get(person_id))
+    return json.dumps(
+        {"person_id": person_id, "target_person_id": None, "found": bool(known), **known},
+        ensure_ascii=False,
+    )
+
+
 async def handle_ask_about_person(input: dict[str, Any]) -> str:
     """Query Honcho's per-person memory via the directional_chat wrapper.
 
@@ -1237,6 +1472,9 @@ async def handle_ask_about_person(input: dict[str, Any]) -> str:
     # a verified asker. Everyone else gets the same "not shared" answer,
     # whether or not anything is known.
     asker_id = _verified_asker_id()
+    contact_answer = _contact_note_answer(person_id, target_person_id)
+    if contact_answer is not None:
+        return contact_answer
     if person_id != asker_id:
         # Shared with the team: a verified teammate or the principal asking,
         # never an inbound email, an unverified chat or an unattended run.

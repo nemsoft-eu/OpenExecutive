@@ -97,11 +97,24 @@ class TurnDelegation:
     # Never carried into the next turn: what the mail said reaches a later
     # turn only as the Executive's own reply, which the person has read.
     read_mail: bool = False
+    # What the safety check made of the mail this turn read
+    # (``outside_content.check_mail_read``), which decides how much of the
+    # lockdown applies under Balanced (``delegation.lockdown.mail_lock_holds``):
+    # ``mail_vetted`` once every mail read so far was checked, ``mail_held``
+    # once one was flagged or too big to check. A read not yet checked
+    # leaves ``mail_vetted`` false, so the whole lockdown holds.
+    mail_vetted: bool = False
+    mail_held: bool = False
     # Who sent the mail this turn read, address to display name
     # (``mail_read_tools``): a new contact's address may be one of them, when
     # its name or address matches the contact's, never one the mail's text
     # only mentions (``delegation.lockdown.speaker_named_contact``).
     mail_senders: dict[str, str] = field(default_factory=dict)
+    # Threads a search this turn listed whose newest message's sender the mail
+    # service authenticated, thread id to that address (``mail_read_tools``):
+    # the Executive's own mail among them skips the safety check
+    # (``outside_content.check_mail_read``).
+    mail_verified: dict[str, str] = field(default_factory=dict)
     # Drafts made this turn, against the per-turn cap.
     drafts: int = 0
     # Searches and thread reads of their mailbox this turn, against the
@@ -109,6 +122,9 @@ class TurnDelegation:
     searches: int = 0
     threads_read: int = 0
     attachments_read: int = 0
+    # Files copied from their mail to the Executive's Drive or OneDrive
+    # (``save_my_email_attachment``).
+    files_saved: int = 0
     # Reminders set this turn (orchestrator.reminder_tools).
     reminders: int = 0
     # Approval cards left this turn (orchestrator.action_card_tools).
@@ -281,6 +297,11 @@ def set_enabled(
         conn.commit()
     finally:
         conn.close()
+    # Right now's read of the principal's sent mail goes with it when they
+    # turn it off, and is read again soon after they turn it on.
+    from openexecutive.briefing import waiting_on
+
+    waiting_on.reset_cache()
 
 
 def _principal() -> Person | None:
@@ -338,12 +359,20 @@ _DM_SESSION_PREFIXES = {"slack": "slack:dm:", "discord": "discord:dm:"}
 
 def private_conversation(session: Any) -> bool:
     """Whether only the speaker (and the Executive) can read this
-    conversation: the web chat, a Slack or Discord DM, or a Telegram chat
-    (``is_principal_on_verified_surface`` already accepts only a private one).
+    conversation: the web chat, a Slack or Discord DM, a Telegram chat
+    (``is_principal_on_verified_surface`` already accepts only a private one),
+    or one a channel adapter marked so (``Session.private_chat``) for a
+    sender it verified (``Session.speaker_verified``).
     Also the morning brief's rule for reading what is private to the
-    principal from a chat turn (``workflows.morning_brief``)."""
+    principal from a chat turn (``workflows.morning_brief``). A web chat
+    shared with teammates (``Session.shared_chat``) is read by all of them,
+    so it isn't."""
     if getattr(session, "from_web_chat", False) is True:
-        return True
+        return getattr(session, "shared_chat", False) is not True
+    if getattr(session, "private_chat", False) is True:
+        # Whose conversation it is matters to callers that ask nothing else
+        # (``correction_tools._scheduled_by``).
+        return getattr(session, "speaker_verified", False) is True
     channel = str(getattr(session, "origin_channel", "") or "")
     if channel == "telegram":
         return True
@@ -387,6 +416,12 @@ def _offered(session: Any, person: Person | None, enabled: bool) -> bool:
     if getattr(session, "unattended", False) is True:
         return False
     if getattr(session, "private_to_principal", False) is True:
+        return False
+    # Another AI app asking over the MCP server: nobody is here to approve.
+    if getattr(session, "from_mcp_client", False) is True:
+        return False
+    # A host origin's turn (Session.from_host) only reads and advises.
+    if getattr(session, "from_host", False) is True:
         return False
     override = getattr(session, "delegation_override", None)
     if isinstance(override, DelegationOverride):

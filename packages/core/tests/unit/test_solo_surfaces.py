@@ -598,7 +598,7 @@ def test_brief_context_in_solo_has_no_department_or_people_block() -> None:
             period_label="p", today_data=_today_data(), activity=[], since=since
         )
         assert "DEPARTMENTS WITH RISK:" in team
-        assert "PEOPLE WAITING ON YOU:" in team
+        assert "PEOPLE YOU ARE WAITING ON" in team
 
 
 def test_eod_context_in_solo_has_no_department_or_people_block() -> None:
@@ -613,7 +613,7 @@ def test_eod_context_in_solo_has_no_department_or_people_block() -> None:
     assert "PEOPLE STILL WAITING" not in solo
     team = _render_eod_context(period_label="p", today_data=_today_data(), activity=[], since=since)
     assert "DEPARTMENTS WITH RISK CARRIED FORWARD:" in team
-    assert "PEOPLE STILL WAITING ON YOU:" in team
+    assert "PEOPLE YOU ARE STILL WAITING ON" in team
 
 
 def test_solo_brief_prompts_drop_the_team_sections() -> None:
@@ -633,7 +633,7 @@ def test_solo_brief_prompts_drop_the_team_sections() -> None:
         assert "departments / goals" not in prompt
     for section in ("**Top call**", "**What changed**", "**Needs you**", "**Goals at risk**"):
         assert section in STANDALONE_BRIEF_SOLO_SYSTEM
-    assert "**Open decisions**" in _EOD_DIGEST_SOLO_SYSTEM
+    assert "**Next**" in _EOD_DIGEST_SOLO_SYSTEM and "named with its area" in _EOD_DIGEST_SOLO_SYSTEM
     assert "name the person and what's blocking" not in _EOD_DIGEST_SOLO_SYSTEM
 
 
@@ -718,6 +718,7 @@ def test_morning_brief_and_eod_follow_the_workspace_mode(
 
 
 def test_narrative_hash_differs_by_mode_and_team_is_unchanged() -> None:
+    from openexecutive.briefing.narrative import brief_model
     from openexecutive.briefing.narrative_cache import (
         NARRATIVE_PROMPT_VERSION,
         build_narrative_input_hash,
@@ -725,12 +726,13 @@ def test_narrative_hash_differs_by_mode_and_team_is_unchanged() -> None:
 
     ctx = "PERIOD: 2026-09-25\n\nNEEDS YOU: x"
     team = build_narrative_input_hash(ctx, "principal")
-    # The team key is exactly the pre-solo formula — no team cache invalidated.
+    # The team key carries no mode — solo mode invalidated no team cache.
     legacy = hashlib.sha256(json.dumps({
         "scope": "principal",
         "prompt_version": NARRATIVE_PROMPT_VERSION,
         "date": datetime.now(UTC).strftime("%Y-%m-%d"),
         "context": ctx,
+        "model": brief_model(),
     }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     assert team == legacy
     assert build_narrative_input_hash(ctx, "principal", mode="team") == team

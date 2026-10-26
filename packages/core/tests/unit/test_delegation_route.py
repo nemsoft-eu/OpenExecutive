@@ -93,6 +93,39 @@ def test_a_request_without_a_sign_in_is_refused(
     assert client.get("/delegation").status_code == 200
 
 
+def _roster_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlite3
+    from contextlib import contextmanager
+
+    @contextmanager
+    def broken(db_path: Any = None) -> Iterator[Any]:
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr(people_store, "_get_conn", broken)
+
+
+def test_a_roster_it_cannot_read_says_so(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roster_down(monkeypatch)
+    resp = client.get("/delegation", headers=OWNER)
+    assert resp.status_code == 503 and resp.json()["detail"]["code"] == "roster_unavailable"
+
+
+def test_it_knows_the_caller_the_way_the_rest_of_the_app_does(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deployment can map a signed-in account to its person in the shared
+    # caller resolver; Act as me must follow that, not look the email up again.
+    monkeypatch.setattr(
+        "openexecutive.api.routes.chat._resolve_caller_person_id", lambda request: ids["principal"],
+    )
+    resp = client.get("/delegation", headers={"x-caller-email": "signed-in@elsewhere.example"})
+    assert resp.status_code == 200
+    assert "--email olivia@co.example" in resp.json()["gmail"]["connect_command"]
+
+
 @pytest.mark.parametrize(("status", "code"), [
     ("not_configured", "gmail_not_connected"),
     ("needs_reconnect", "gmail_needs_reconnect"),
@@ -383,3 +416,168 @@ def test_a_style_is_written_from_their_words_without_saving(
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "too_many"
     assert client.post("/delegation/voice/describe", json={"description": "x"}, headers=TEAMMATE).status_code == 403
     assert client.post("/delegation/voice/describe", json={"nope": 1}, headers=OWNER).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Read my calendar
+# --------------------------------------------------------------------------- #
+
+
+class _Calendar:
+    def __init__(self, outcome: Exception | None = None, granted: bool | None = False) -> None:
+        self.outcome = outcome
+        self.granted = granted
+        self.asked = 0
+
+    async def calendar_granted(self) -> bool | None:
+        return self.granted
+
+    async def list_events(self, start: Any, end: Any, *, max_results: int = 100) -> list[Any]:
+        self.asked += 1
+        if self.outcome is not None:
+            raise self.outcome
+        return []
+
+
+def test_read_my_calendar_turns_on_only_once_the_calendar_opens(
+    client: TestClient,
+    ids: dict[str, int],
+    gmail: dict[str, str],
+    audit: list[tuple[str, dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import calendar
+    from openexecutive.delegation.gmail import CalendarNotGranted
+
+    box = _Calendar(CalendarNotGranted("no"))
+    monkeypatch.setattr(route, "gmail_for", lambda email: box)
+    body = client.get("/delegation", headers=OWNER).json()
+    # Not connected: whether the sign-in includes the calendar isn't known.
+    assert body["calendar"] == {
+        "enabled": False, "granted": None, "connect_command": body["gmail"]["connect_command"] + " --calendar",
+    }
+    resp = client.put("/delegation/calendar", json={"enabled": True}, headers=OWNER)
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "act_as_me_off"
+    gmail["status"] = "connected"
+    assert client.get("/delegation", headers=OWNER).json()["calendar"]["granted"] is False
+    client.put("/delegation", json={"enabled": True}, headers=OWNER)
+    resp = client.put("/delegation/calendar", json={"enabled": True}, headers=OWNER)
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "calendar_not_granted"
+    box.outcome = GmailError("down")
+    assert client.put("/delegation/calendar", json={"enabled": True}, headers=OWNER).status_code == 503
+    assert calendar.enabled(ids["principal"]) is False
+    box.outcome, box.granted = None, True
+    body = client.put("/delegation/calendar", json={"enabled": True}, headers=OWNER).json()
+    assert body["calendar"]["enabled"] is True and calendar.enabled(ids["principal"]) is True
+    assert body["calendar"]["granted"] is True
+    assert calendar.enabled(ids["teammate"]) is False
+    # Act as me off takes it with it, and it is audited privately each way.
+    client.put("/delegation", json={"enabled": False}, headers=OWNER)
+    assert calendar.enabled(ids["principal"]) is False
+    changed = [kw for et, kw in audit if et == "delegation_calendar_changed"]
+    assert [kw["details"]["enabled"] for kw in changed] == [True, False]
+    assert all(kw["private"] is True for kw in changed)
+    # Off never needs the calendar.
+    box.outcome = CalendarNotGranted("no")
+    assert client.put("/delegation/calendar", json={"enabled": False}, headers=OWNER).status_code == 200
+
+
+# ── How far it goes as you (PUT /delegation/reach) ────────────────────────────
+
+
+def _reach(client: TestClient, step: str) -> Any:
+    return client.put("/delegation/reach", json={"step": step}, headers=OWNER)
+
+
+@pytest.fixture
+def signed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sending on its own needs a caller the API can tie to the person."""
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+
+
+def test_the_dial_climbs_one_switch_at_a_time(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
+) -> None:
+    from openexecutive.delegation import handle_it, inbox
+
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    assert route.reach_of(pid) == "off"
+    assert _reach(client, "inbox").status_code == 200
+    assert is_enabled(pid) and inbox.get_watch(pid).enabled and not handle_it.get(pid).enabled
+    assert route.reach_of(pid) == "inbox"
+    _reach(client, "bold")
+    assert handle_it.get(pid).enabled and handle_it.get(pid).mode == "bold"
+    _reach(client, "everything")
+    assert route.reach_of(pid) == "everything"
+    # Across the sending steps: Everything goes, the level stays the one picked.
+    _reach(client, "careful")
+    assert route.reach_of(pid) == "careful" and not handle_it.leading(pid)
+
+
+def test_moving_down_turns_everything_above_off(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
+) -> None:
+    from openexecutive.delegation import handle_it, inbox
+
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    _reach(client, "everything")
+    assert _reach(client, "when_asked").status_code == 200
+    assert is_enabled(pid) and not inbox.get_watch(pid).enabled
+    assert not handle_it.get(pid).enabled and not handle_it.leading(pid)
+    _reach(client, "off")
+    assert route.reach_of(pid) == "off" and not is_enabled(pid)
+
+
+def test_without_a_mailbox_the_dial_stays_off(client: TestClient, ids: dict[str, int], gmail: dict[str, str]) -> None:
+    resp = _reach(client, "inbox")
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "gmail_not_connected"
+    assert route.reach_of(ids["principal"]) == "off"
+
+
+def test_sending_needs_a_signed_sign_in_but_holding_back_doesnt(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import handle_it
+
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    _reach(client, "bold")
+    monkeypatch.delenv("OE_LOCAL_LOGIN")
+    # Without signed sign-ins it can't go higher...
+    assert _reach(client, "everything").status_code == 409
+    assert route.reach_of(pid) == "bold"
+    # ...but a lower level, or no sending at all, is always possible.
+    assert _reach(client, "careful").status_code == 200 and handle_it.get(pid).mode == "careful"
+    assert _reach(client, "inbox").status_code == 200 and route.reach_of(pid) == "inbox"
+
+
+def test_everything_is_the_owners_and_not_in_training(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import training
+
+    gmail["status"] = "connected"
+    _reach(client, "balanced")
+    training.set_(ids["principal"], {training.REPLIES: True}, updated_by="t")
+    resp = _reach(client, "everything")
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "in_training"
+    assert route.reach_of(ids["principal"]) == "balanced"
+
+
+def test_training_set_before_sending_holds_once_it_sends(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
+) -> None:
+    from openexecutive.delegation import handle_it, training
+
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    _reach(client, "inbox")
+    resp = client.put("/delegation/training", json={"replies": True, "follow_ups": True}, headers=OWNER)
+    assert resp.status_code == 200
+    _reach(client, "careful")
+    assert handle_it.get(pid).enabled
+    t = training.get(pid)
+    assert t.replies and t.follow_ups

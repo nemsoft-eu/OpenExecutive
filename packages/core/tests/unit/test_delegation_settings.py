@@ -144,6 +144,20 @@ def _web(person_id: int, *, signed_in: bool = True) -> Session:
                        caller_person_id=r.principal), False),
     ("principal on Telegram without a webhook secret",
      lambda r: Session(origin_channel="telegram", origin_channel_ref="5001", caller_person_id=r.principal), False),
+    # A channel whose adapter verified the sender itself: like Slack, only
+    # in a conversation it also marked private.
+    ("principal in an adapter-verified private chat",
+     lambda r: Session(session_id="otherchat:dm:1", origin_channel="otherchat",
+                       caller_person_id=r.principal, speaker_verified=True, private_chat=True), True),
+    ("principal in an adapter-verified shared space",
+     lambda r: Session(session_id="otherchat:space:1", origin_channel="otherchat",
+                       caller_person_id=r.principal, speaker_verified=True), False),
+    ("an adapter's private chat it didn't verify the sender of",
+     lambda r: Session(session_id="otherchat:dm:1", origin_channel="otherchat",
+                       caller_person_id=r.principal, private_chat=True), False),
+    ("an adapter-verified chat started by an email",
+     lambda r: Session(session_id="otherchat:dm:1", origin_channel="otherchat", email_from="olivia@co.example",
+                       caller_person_id=r.principal, speaker_verified=True, private_chat=True), False),
     ("a teammate on the web", lambda r: _web(r.teammate), False),
     ("an email turn about the principal's mail",
      lambda r: Session(caller_person_id=r.principal, private_to_principal=True), False),
@@ -353,3 +367,16 @@ def test_the_setup_check_is_bounded(roster: SimpleNamespace, monkeypatch: pytest
 def test_no_address_counts_as_typed_beside_an_attachment(attachment: str) -> None:
     assert typed_addresses(f"{attachment}\n\nemail sam@co.example as me") == set()
     assert typed_addresses("email sam@co.example as me") == {"sam@co.example"}
+
+
+def test_an_adapters_private_chat_is_private_only_for_a_sender_it_verified() -> None:
+    from openexecutive.delegation.settings import private_conversation
+
+    def chat(**kw: object) -> Session:
+        return Session(session_id="otherchat:dm:1", origin_channel="otherchat", caller_person_id=1, **kw)  # type: ignore[arg-type]
+
+    assert private_conversation(chat(private_chat=True, speaker_verified=True)) is True
+    # Anyone writing into an unverified one could manage its follow-ups
+    # (correction_tools._scheduled_by asks nothing else).
+    assert private_conversation(chat(private_chat=True)) is False
+    assert private_conversation(chat(speaker_verified=True)) is False

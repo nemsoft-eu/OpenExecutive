@@ -96,6 +96,11 @@ class ScheduledAction(BaseModel):
     # pin per-action routing (e.g. fixture-staged proposals; the
     # Executive's schedule_followup tool when the LLM specifies scope).
     required_scope: str | None = None
+    # The person whose turn queued this row (schedule_followup,
+    # suggest_workflow). A row a teammate other than the principal queued
+    # runs as that teammate and reaches only them (scheduler.runner). NULL
+    # for rows the system queued and for rows from before the column.
+    created_by_person_id: int | None = None
 
 
 class OutboundContext(BaseModel):
@@ -311,6 +316,11 @@ def initialize_db(db_path: Path | None = None) -> None:
             # what their working-style profile learns from; the principal
             # rating someone else's session is not that person's reaction.
             ("feedback_by_person_id", "INTEGER"),
+            # Where a user message was written: "host" for a host origin's
+            # page (api.caller.from_host), else NULL. A conversation holding
+            # such a line stays read-only on every surface
+            # (session_store.host_wrote).
+            ("sender_surface", "TEXT"),
         ):
             if col not in _cm_existing:
                 try:
@@ -336,6 +346,8 @@ def initialize_db(db_path: Path | None = None) -> None:
             # route to a non-principal approver (e.g. vendor_onboarding
             # → the Product head). Nullable; None falls back to WILDCARD.
             ("required_scope", "TEXT"),
+            # Who queued the row (ScheduledAction.created_by_person_id).
+            ("created_by_person_id", "INTEGER"),
         ):
             if col not in _sa_existing:
                 try:
@@ -463,6 +475,17 @@ def initialize_db(db_path: Path | None = None) -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+        # Host origins: 1 once a host origin's page wrote a line here
+        # (session_store.host_wrote). Never cleared, rewinding included: the
+        # line's words could otherwise be sent again as the person's own.
+        if "host_wrote" not in _sessions_existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN host_wrote INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         # Act as me: 1 once a turn here read or drafted in the speaker's own
         # mailbox — from then on the conversation is its owner's alone, the
         # principal included (session_store.mark_mail_private).
@@ -491,6 +514,87 @@ def initialize_db(db_path: Path | None = None) -> None:
                 "WHERE chat_messages.session_id = sessions.session_id) "
                 "WHERE mail_private = 1 AND mail_read_at IS NULL"
             )
+        # Chat list controls (session_store.set_pinned / rename_session): when
+        # the owner pinned the chat (NULL = not pinned), and 1 once they named
+        # it, so the auto-title never writes over their name.
+        if "pinned_at" not in _sessions_existing:
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN pinned_at TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        if "title_locked" not in _sessions_existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Chat topics (memory/chat_topics.py): the topic a chat is grouped
+        # under on its owner's Chats page, and who put it there. NULL source =
+        # not looked at yet; 'auto' = the model chose (topic_id NULL = none
+        # fits); 'owner' = the owner moved or ungrouped it, never retagged.
+        if "topic_id" not in _sessions_existing:
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN topic_id INTEGER")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        if "topic_source" not in _sessions_existing:
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN topic_source TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # One person's topics. `kept` = the owner named, pinned or filed a chat
+        # under it, so it shows even with one chat and is never merged away.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_topics (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_person_id  INTEGER NOT NULL,
+                name             TEXT NOT NULL COLLATE NOCASE,
+                kept             INTEGER NOT NULL DEFAULT 0,
+                pinned_at        TEXT,
+                created_at       TEXT NOT NULL,
+                UNIQUE (owner_person_id, name)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_topic ON sessions(topic_id)"
+        )
+        # A topic's area: a broader matter it shares with other topics (one
+        # property, deal or client), shown as one heading over them. NULL =
+        # not looked at yet; '' = looked at, none. `area_kept` = the owner
+        # renamed or ungrouped its area, so the model leaves it alone.
+        _topics_existing = {r[1] for r in conn.execute("PRAGMA table_info(chat_topics)").fetchall()}
+        for column, ddl in (
+            ("area", "ALTER TABLE chat_topics ADD COLUMN area TEXT COLLATE NOCASE"),
+            ("area_kept", "ALTER TABLE chat_topics ADD COLUMN area_kept INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in _topics_existing:
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        # Who a chat's owner shared it with, to read (session_store.share_session).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_shares (
+                session_id          TEXT NOT NULL,
+                person_id           INTEGER NOT NULL,
+                shared_by_person_id INTEGER,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (session_id, person_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_shares_person ON session_shares(person_id)"
+        )
 
         # Trust-ledger tables (first-climb autonomy, Build 1+2).
         # `decision_instances` is the correlation unit: links a proposal, its
@@ -1149,6 +1253,7 @@ def insert_scheduled_action(
     scope_key: str | None = None,
     required_scope: str | None = None,
     status: str = "pending",
+    created_by_person_id: int | None = None,
     db_path: Path | None = None,
 ) -> int:
     if channel not in _VALID_SCHEDULED_CHANNELS:
@@ -1171,12 +1276,12 @@ def insert_scheduled_action(
             "INSERT INTO scheduled_actions "
             "(created_at, run_at, channel, channel_ref, intent_text, originating_session_id, "
             "department, kind, assigned_to_person_id, awaiting_response_since, scope_key, "
-            "required_scope, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "required_scope, status, created_by_person_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 now, run_at, channel, channel_ref, intent_text, originating_session_id,
                 department, kind, assigned_to_person_id, awaiting_str, scope_key,
-                required_scope, status,
+                required_scope, status, created_by_person_id,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -1426,7 +1531,8 @@ def count_activity_by_day(
         ("scheduled_actions",
          "SELECT substr(run_at, 1, 10) AS day FROM scheduled_actions"
          " WHERE status = 'done' AND channel != '__internal__'"
-         " AND kind != 'nudge_scan' AND substr(run_at, 1, 10) >= ?"),
+         " AND kind != 'nudge_scan' AND kind != 'brief_delivery'"
+         " AND substr(run_at, 1, 10) >= ?"),
         ("workflow_runs",
          "SELECT substr(updated_at, 1, 10) AS day FROM workflow_runs"
          " WHERE status = 'done' AND substr(updated_at, 1, 10) >= ?"),
@@ -1739,6 +1845,14 @@ def get_scheduled_action(
     return ScheduledAction(**dict(row)) if row else None
 
 
+# The kind of the done row a send writes when it delivers one of the
+# Executive's own briefs or digests to its reader (``orchestrator.schedule_tools.
+# recorded_as``). It still counts for the outbound guard, but it is not work
+# done for anyone: the activity feed and the heatmap leave it out, so a brief
+# never reads its own last message back as news.
+BRIEF_DELIVERY_KIND = "brief_delivery"
+
+
 def list_scheduled_actions(
     *,
     status: str | None = None,
@@ -1751,7 +1865,8 @@ def list_scheduled_actions(
 
     ``exclude_internal`` drops ``__internal__``-channel rows in SQL, so a
     caller that only wants real sends (the activity feed) is not starved by
-    internal rows — open loops, heartbeats — filling its ``limit``.
+    internal rows — open loops, heartbeats — filling its ``limit``. It drops
+    brief deliveries (``BRIEF_DELIVERY_KIND``) too.
 
     `order` sorts by `run_at`: "asc" (default) puts the soonest-due pending
     rows first — the right default for the upcoming queue; "desc" puts the
@@ -1771,6 +1886,8 @@ def list_scheduled_actions(
         params.append(status)
     if exclude_internal:
         clauses.append("channel != '__internal__'")
+        clauses.append("kind != ?")
+        params.append(BRIEF_DELIVERY_KIND)
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     with _get_conn(resolved) as conn:
         rows = conn.execute(
@@ -2271,6 +2388,9 @@ def should_extract(user_message: str, *, session: Any) -> bool:
     )
 
     if not strip_untrusted(user_message).strip():
+        return False
+    # A replay of a graded turn (memory.replay) is kept nowhere.
+    if getattr(session, "replay", False) is True:
         return False
     return principal_speaking(session)
 

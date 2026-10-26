@@ -86,7 +86,7 @@ def test_telegram_keeps_attachment_text_and_backstory_out_of_memory_text() -> No
     ):
         asyncio.run(telegram_bot._process_and_reply(
             message_text="Summarise this", sender_name="Ben", chat_id=5002, message_id=1,
-            token="t", attachment_file_ids=[("f1", "notes.pdf", "application/pdf")],
+            token="t", attachment_file_ids=[("f1", "notes.pdf", "application/pdf", False)],
         ))
     assert PLANTED in captured["user_message"]
     assert captured["memory_text"] == "Summarise this\n\n(Attached files: notes.pdf)"

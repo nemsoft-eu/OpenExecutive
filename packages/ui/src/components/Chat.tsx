@@ -1,13 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import Message from "./Message";
+import FlagsCard from "./FlagsCard";
+import HeldStepsCard, { APPROVE_MESSAGE } from "./HeldStepsCard";
 import BrandMark from "./BrandMark";
 import TurnStatusRow, { useTurnClock } from "./TurnStatusRow";
 import Icon from "./Icon";
+import MicButton from "./MicButton";
 import InfoTip from "./InfoTip";
 import OverflowMenu from "./ui/OverflowMenu";
+import { SharePanel } from "./sessions/ChatHistory";
 import {
   MAX_FILES_PER_TURN,
   mergePickedFiles,
@@ -20,10 +24,31 @@ import {
   DebugEvent,
   FALLBACK_ACTIVITY_LABEL,
   getFollowupSuggestion,
+  getSessionMessages,
+  getSessionPeople,
   getSuggestedPrompts,
+  leaveSharedChat,
+  rewindSession,
+  sendTyping,
   setMessageFeedback,
   streamChat,
+  type ChatPeople,
+  type LiveChatEvent,
 } from "@/lib/api";
+import { joinDictation } from "@/lib/dictation";
+import { initials } from "@/lib/initials";
+import {
+  applyLiveEvent,
+  EMPTY_LIVE,
+  peopleLine,
+  TYPING_EVERY_MS,
+  typingLine,
+  type LiveState,
+  type LiveTurn,
+} from "@/lib/liveChat";
+import { useLiveChat } from "@/lib/useLiveChat";
+import { useExecutiveName } from "@/components/executive/ExecutiveStatusContext";
+import { confirmRedoText, dropLastTurn, lastTurn } from "@/lib/chatTurns";
 import { answerSourcesFrom, type AnswerSources } from "@/lib/answerSources";
 import { matchingMessages } from "@/lib/chatSearch";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
@@ -62,6 +87,11 @@ interface ChatProps {
   // Chats page): the chat starts at the newest message containing them and
   // steps through the others.
   initialFind?: string;
+  // A chat someone else shared with the viewer: they write in it with its
+  // owner, without rating, Try again or Edit, and can leave it.
+  member?: { sharedBy: string; onLeft?: () => void };
+  // Bumped by the parent to open the Share panel (its ⋯ menu's Share).
+  shareRequest?: number;
 }
 
 // The browser's own highlight for found words, where it has one
@@ -91,9 +121,10 @@ function endsOnReply(messages: ChatMessage[] | undefined): boolean {
 const FALLBACK_SUBTITLE =
   "Pick up where we left off — decisions to revisit, drafts to push forward, people to pull in.";
 
-export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind }: ChatProps) {
+export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind, member, shareRequest }: ChatProps) {
   const { data: session } = useSession();
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
+  const executiveName = useExecutiveName();
 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages ?? []);
   const [input, setInput] = useState(initialInput ?? "");
@@ -106,6 +137,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Reset on every turn; frozen onto the message at `done` event time.
   const [streamingActions, setStreamingActions] = useState<ActionTaken[]>([]);
   const [isConsulting, setIsConsulting] = useState(false);
+  // The reply whose held steps the person put off with Not now (its index).
+  const [heldDismissed, setHeldDismissed] = useState<number | null>(null);
   const [activityLabel, setActivityLabel] = useState<string | null>(null);
   const [committeeEnabled, setCommitteeEnabled] = useState(false);
   const [committeePhase, setCommitteePhase] = useState<CommitteePhase | null>(null);
@@ -145,8 +178,38 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setFind(null);
     setFindPos(null);
   };
+  // Try again / Edit on the last turn. `editingReplyId` is the reply the
+  // edit replaces: once the chat's last reply changes, the edit is over.
+  const [editingReplyId, setEditingReplyId] = useState<number | null>(null);
+  const [redoing, setRedoing] = useState(false);
+  const [redoError, setRedoError] = useState<string | null>(null);
+
+  // A shared chat (more than one person in it): who is in it, someone
+  // else's turn as it runs, who is typing, and whether this viewer lost it.
+  // Kept with the chat it is for, so another chat never shows its people.
+  const [peopleOf, setPeopleOf] = useState<{ sessionId: string; people: ChatPeople } | null>(null);
+  const [peopleVersion, setPeopleVersion] = useState(0);
+  const [live, setLiveState] = useState<LiveState>(EMPTY_LIVE);
+  const liveRef = useRef<LiveState>(EMPTY_LIVE);
+  // Someone else's turn that just ended, kept on screen until the saved
+  // chat (which has it) has been read again.
+  const [settling, setSettling] = useState<LiveTurn | null>(null);
+  const [closed, setClosed] = useState<"removed" | "deleted" | null>(null);
+  const [sharing, setSharing] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const [leaveError, setLeaveError] = useState<string | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
+  // Turns this page sent, whose own stream shows them: the live copy skips them.
+  const myTurnKeysRef = useRef<Set<string>>(new Set());
+  const isLoadingRef = useRef(false);
+  const reloadPendingRef = useRef(false);
+  const lastTypingRef = useRef(0);
+  const chatPeople = peopleOf && peopleOf.sessionId === sessionId ? peopleOf.people : null;
+  const shared = (chatPeople?.people.length ?? 0) > 1;
 
   useEffect(() => {
+    // Someone else's chat is never empty: nothing to suggest.
+    if (member) return;
     const ctrl = new AbortController();
     getSuggestedPrompts(ctrl.signal)
       .then((r) => {
@@ -163,6 +226,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         setIsLoadingPrompts(false);
       });
     return () => ctrl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function clearFollowup() {
@@ -204,9 +268,83 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setFind(initialFind?.trim() || null);
     setFindPos(null);
     clearFollowup();
+    liveRef.current = EMPTY_LIVE;
+    setLiveState(EMPTY_LIVE);
+    setSettling(null);
+    setClosed(null);
+    setSharing(false);
     if (initialSessionId && endsOnReply(initialMessages)) loadFollowup(initialSessionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialSessionId]);
+
+  // Who is in this chat. Read when it opens, after its first turn names it,
+  // and whenever someone joins or leaves.
+  useEffect(() => {
+    if (!sessionId) return;
+    const ctrl = new AbortController();
+    getSessionPeople(sessionId, ctrl.signal)
+      .then((people) => setPeopleOf({ sessionId, people }))
+      .catch(() => {
+        // A chat with no row yet, or a network blip: nobody else is in it.
+      });
+    return () => ctrl.abort();
+  }, [sessionId, peopleVersion]);
+
+  // The parent's ⋯ menu asked for the Share panel (adjusted while rendering,
+  // as React suggests over an effect).
+  const [seenShareRequest, setSeenShareRequest] = useState(shareRequest);
+  if (shareRequest !== seenShareRequest) {
+    setSeenShareRequest(shareRequest);
+    if (shareRequest) setSharing(true);
+  }
+
+  // Read the saved chat again: someone else's turn ended, or the live
+  // stream (re)connected. Waits for this page's own turn to finish, whose
+  // reply the read would otherwise drop.
+  const reloadMessages = useCallback(async () => {
+    const id = adoptedSessionIdRef.current;
+    if (!id) return;
+    if (isLoadingRef.current) {
+      reloadPendingRef.current = true;
+      return;
+    }
+    try {
+      const fresh = await getSessionMessages(id);
+      if (adoptedSessionIdRef.current !== id) return;
+      if (isLoadingRef.current) {
+        reloadPendingRef.current = true;
+        return;
+      }
+      setMessages(fresh);
+    } catch {
+      // Kept as shown; the next turn or reconnect reads it again.
+    }
+    setSettling(null);
+  }, []);
+
+  const onLiveEvent = (event: LiveChatEvent) => {
+    const before = liveRef.current;
+    const step = applyLiveEvent(before, event, {
+      mine: (key) => myTurnKeysRef.current.has(key),
+      you: chatPeople?.you ?? null,
+      now: Date.now(),
+    });
+    if (event.type === "turn_ended" && before.turn && !step.state.turn) setSettling(before.turn);
+    liveRef.current = step.state;
+    setLiveState(step.state);
+    if (step.state.typing.length) setClock(Date.now());
+    if (step.reload) void reloadMessages();
+    if (step.people) setPeopleVersion((v) => v + 1);
+    if (step.closed) setClosed(step.closed);
+  };
+  useLiveChat(sessionId, shared && !closed, onLiveEvent);
+
+  // "Is typing" fades on its own: tick while anyone is.
+  useEffect(() => {
+    if (live.typing.length === 0) return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live.typing.length]);
 
   useEffect(() => {
     // While finding, the chat stays on the match instead.
@@ -318,6 +456,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     }
     const message = (text ?? input).trim();
     if ((!message && pendingFiles.length === 0) || isLoading) return;
+    setRedoError(null);
     const restored = restoredHandoffRef.current;
     restoredHandoffRef.current = undefined;
     const turnMemoryText =
@@ -337,6 +476,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     clearFollowup();
     setMessages((prev) => [...prev, { role: "user", content: userBubbleContent }]);
     setIsLoading(true);
+    isLoadingRef.current = true;
     turnClock.start();
     setStreamingContent("");
     setStreamingActions([]);
@@ -345,6 +485,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setCommitteePhase(null);
     const { clientTurnId, signal } = beginTurn();
     turnIdRef.current = clientTurnId;
+    myTurnKeysRef.current.add(clientTurnId);
     setQueued([]);
     onTurnStart?.();
 
@@ -360,6 +501,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     const turnActions: ActionTaken[] = [];
     // What the reply looked at; sent once, just before `done`.
     let turnSources: AnswerSources | undefined;
+    // Steps the turn held for an outside read; sent once, just before `done`.
+    let turnHeld: string[] | undefined;
+    let turnFlags: string[] | undefined;
     let wasStopped = false;
     // Row id of the persisted reply, from `done`; it is what makes the reply
     // rateable with 👍/👎.
@@ -420,6 +564,10 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           setStreamingActions([...turnActions]);
         } else if (item.type === "sources") {
           turnSources = answerSourcesFrom(item);
+        } else if (item.type === "held_steps") {
+          turnHeld = item.steps.length > 0 ? item.steps : undefined;
+        } else if (item.type === "flags") {
+          turnFlags = item.flags.length > 0 ? item.flags : undefined;
         } else if (item.type === "message_added") {
           setQueued(markTaken(queuedRef.current, item.ids));
         } else if (item.type === "stopped") {
@@ -478,6 +626,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             stopped: wasStopped || undefined,
             sources: turnSources,
             id: replyId,
+            held_steps: turnHeld,
+            flags: turnFlags,
           },
         ]);
         // Only a complete, persisted reply gets a follow-up: a stopped one
@@ -530,6 +680,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       endTurn();
       turnIdRef.current = null;
       setIsLoading(false);
+      isLoadingRef.current = false;
+      // Someone else's turn ended while this one ran: read the chat now.
+      if (reloadPendingRef.current) {
+        reloadPendingRef.current = false;
+        void reloadMessages();
+      }
       setIsConsulting(false);
       setActivityLabel(null);
       setCommitteePhase(null);
@@ -550,6 +706,99 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       setMessages((prev) => prev.map((m, i) => (i === index ? { ...m, feedback: v } : m)));
     apply(value);
     setMessageFeedback(sessionId, target.id, value).catch(() => apply(previous));
+  }
+
+  // What the last turn allows. Not while anything is in flight, never in
+  // someone else's chat, and in a shared one only on the viewer's own words.
+  const turn = lastTurn(messages, sessionId);
+  const lastAsker = turn.userIndex !== null ? messages[turn.userIndex].sender_person_id : undefined;
+  const ownLastTurn = !shared || lastAsker === undefined || lastAsker === chatPeople?.you;
+  const othersTurn = live.turn ?? settling;
+  const canRedo =
+    !member && ownLastTurn && turn.canRedo && !isLoading && !redoing && !streamingContent &&
+    queued.length === 0 && !othersTurn;
+  // Not tied to canRedo: the edit stays on while its rewind is in flight.
+  const editing = !member && editingReplyId !== null && editingReplyId === turn.replyId;
+
+  // Takes the last turn back on the server, then here. Returns the words it
+  // answered, or null when the server refused (the reason shows above the
+  // composer and nothing else changes).
+  async function takeBackLastTurn(): Promise<string | null> {
+    if (!sessionId || turn.replyId === null) return null;
+    if (turn.didSomething) {
+      const reply = turn.replyIndex !== null ? messages[turn.replyIndex] : undefined;
+      if (!window.confirm(confirmRedoText(reply?.actions))) return null;
+    }
+    setRedoError(null);
+    setRedoing(true);
+    try {
+      const asked = await rewindSession(sessionId, turn.replyId);
+      clearFollowup();
+      setMessages((prev) => dropLastTurn(prev));
+      return asked;
+    } catch (err) {
+      setRedoError(err instanceof Error ? err.message : "Couldn't redo that answer.");
+      return null;
+    } finally {
+      setRedoing(false);
+    }
+  }
+
+  // Try again: the same words as a new turn. Sent like a queued follow-up so
+  // whatever is in the composer (text, files) stays there.
+  async function handleRetry() {
+    const asked = await takeBackLastTurn();
+    if (asked !== null) void handleSend(asked, undefined, true);
+  }
+
+  // Edit: the last message goes back in the composer; sending replaces it
+  // and its answer.
+  function startEdit() {
+    if (turn.replyIndex === null || turn.userIndex === null) return;
+    const words = dropLastTurn(messages).length;
+    const text = messages
+      .slice(words, turn.replyIndex)
+      .filter((m) => m.role === "user")
+      .map((m) => m.content)
+      .join("\n\n");
+    setRedoError(null);
+    setEditingReplyId(turn.replyId);
+    setInput(text);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(text.length, text.length);
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 160) + "px";
+    });
+  }
+
+  function cancelEdit() {
+    setEditingReplyId(null);
+    setInput("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+  }
+
+  async function sendEdit() {
+    const text = input.trim();
+    if (!text) return;
+    const asked = await takeBackLastTurn();
+    if (asked === null) return;
+    setEditingReplyId(null);
+    setInput("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+    // Files picked before the edit stay for the next message.
+    void handleSend(text, undefined, true);
+  }
+
+  // Enter and the Send button: an edit replaces the last turn.
+  function submit() {
+    if (redoing) return;
+    // One turn at a time in a shared chat: wait for someone else's to end.
+    if (!editing && !isLoading && liveRef.current.turn) return;
+    if (editing) void sendEdit();
+    else void handleSend();
   }
 
   // The "still working" line: before the reply starts, and again under the
@@ -580,7 +829,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     });
   }
 
-  const showFollowup = Boolean(followup) && !input && !isLoading;
+  const showFollowup = Boolean(followup) && !input && !isLoading && !live.turn;
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // Tab / → take the suggestion only while the box is empty; otherwise
@@ -595,12 +844,21 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      submit();
+    }
+    if (e.key === "Escape" && editing) {
+      e.preventDefault();
+      cancelEdit();
     }
   }
 
   function handleTextareaChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setInput(e.target.value);
+    // The others in a shared chat see who is writing.
+    if (shared && sessionId && e.target.value.trim() && Date.now() - lastTypingRef.current > TYPING_EVERY_MS) {
+      lastTypingRef.current = Date.now();
+      void sendTyping(sessionId);
+    }
     e.target.style.height = "auto";
     // Emptied: drop the pixel height so the textarea stretches to its grid
     // cell again, which the suggestion ghost may have made taller.
@@ -627,10 +885,112 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
-  const isEmpty = messages.length === 0 && !isLoading && !streamingContent;
+  async function handleLeave() {
+    if (!sessionId) return;
+    setLeaveError(null);
+    try {
+      await leaveSharedChat(sessionId);
+      setLeaving(false);
+      setClosed("removed");
+      member?.onLeft?.();
+    } catch (err) {
+      setLeaveError(err instanceof Error ? err.message : "Couldn't leave this chat.");
+    }
+  }
+
+  const isEmpty = messages.length === 0 && !isLoading && !streamingContent && !othersTurn;
+  const you = chatPeople?.you ?? null;
+  const others = (chatPeople?.people ?? []).filter((p) => p.person_id !== you);
+  const firstOf = (name: string) => name.trim().split(/\s+/)[0] || name;
+  const typingNow = shared ? typingLine(live.typing, clock) : null;
+  // Someone else's turn is running: one turn at a time, so Send waits.
+  const blockedBy = !isLoading && live.turn ? firstOf(live.turn.senderName) : null;
 
   return (
     <div className="flex flex-col h-full">
+      {/* Who is in a shared chat, with Share (its owner) or Leave (the others). */}
+      {sessionId && (shared || sharing || member) && !closed && (
+        <div className="border-b border-line bg-surface">
+          <div className="max-w-3xl mx-auto px-4 sm:px-6 py-2 flex items-center gap-3">
+            {shared && (
+              <div className="flex flex-shrink-0" aria-hidden>
+                {(chatPeople?.people ?? []).slice(0, 4).map((p, i) => (
+                  <span
+                    key={p.person_id}
+                    className={
+                      "inline-flex h-7 w-7 items-center justify-center rounded-full border-2 border-surface bg-surface-overlay text-[11px] font-semibold text-fg" +
+                      (i > 0 ? " -ml-2" : "")
+                    }
+                  >
+                    {initials(p.full_name)}
+                  </span>
+                ))}
+              </div>
+            )}
+            <p
+              className="mr-auto min-w-0 truncate text-sm text-fg-muted"
+              title={(chatPeople?.people ?? []).map((p) => p.full_name).join(", ") || undefined}
+            >
+              {shared ? peopleLine(others.map((p) => p.full_name)) : member ? `${member.sharedBy} added you` : "Only you"}
+            </p>
+            {member ? (
+              <button
+                type="button"
+                onClick={() => setLeaving((v) => !v)}
+                className="min-h-[2.25rem] px-3 rounded-lg border border-line text-sm font-medium text-fg hover:bg-surface-overlay cursor-pointer"
+              >
+                Leave
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setSharing((v) => !v)}
+                aria-expanded={sharing}
+                className="min-h-[2.25rem] px-3 rounded-lg border border-line text-sm font-medium text-fg hover:bg-surface-overlay cursor-pointer"
+              >
+                Share
+              </button>
+            )}
+          </div>
+          {sharing && !member && (
+            <div className="max-w-3xl mx-auto">
+              <SharePanel
+                sessionId={sessionId}
+                onClose={() => setSharing(false)}
+                onSaved={() => setPeopleVersion((v) => v + 1)}
+              />
+            </div>
+          )}
+          {leaving && member && (
+            <div className="max-w-3xl mx-auto border-t border-line px-4 sm:px-6 py-3 space-y-2">
+              <p className="text-sm text-fg">
+                Leave this chat? It goes from your chats, and {firstOf(member.sharedBy)} can add you again.
+              </p>
+              {leaveError && (
+                <p role="alert" className="text-sm text-red-400">
+                  {leaveError}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setLeaving(false)}
+                  className="min-h-[2.25rem] px-3 rounded-lg text-sm font-medium text-fg-muted hover:text-fg hover:bg-surface-overlay cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleLeave()}
+                  className="min-h-[2.25rem] px-3 rounded-lg bg-red-600 text-sm font-medium text-white hover:bg-red-600/90 cursor-pointer"
+                >
+                  Leave chat
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
         {find && (
@@ -678,7 +1038,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           </div>
         )}
         <div ref={messagesRef} className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
-          {isEmpty ? (
+          {isEmpty && member ? (
+            <p className="py-10 text-center text-[15px] text-fg-muted">This chat is empty.</p>
+          ) : isEmpty ? (
             /* Empty state */
             <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
               <div className="mb-6">
@@ -736,13 +1098,36 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   actions={msg.role === "assistant" ? msg.actions : undefined}
                   stopped={msg.role === "assistant" ? msg.stopped : undefined}
                   sources={msg.role === "assistant" ? msg.sources : undefined}
-                  feedback={msg.role === "assistant" ? msg.feedback : undefined}
+                  feedback={msg.role === "assistant" && !member ? msg.feedback : undefined}
+                  author={
+                    shared && msg.role === "user" && msg.sender_name
+                      ? { name: msg.sender_name, mine: msg.sender_person_id === you }
+                      : undefined
+                  }
                   onFeedback={
-                    msg.role === "assistant" && msg.id && sessionId
+                    !member && msg.role === "assistant" && msg.id && sessionId
                       ? (v) => handleFeedback(i, v)
                       : undefined
                   }
+                  onRetry={canRedo && i === turn.replyIndex ? () => void handleRetry() : undefined}
+                  onEdit={canRedo && !editing && i === turn.userIndex ? startEdit : undefined}
                 />
+                {!member && msg.role === "assistant" && msg.flags && msg.flags.length > 0 && (
+                  <FlagsCard flags={msg.flags} />
+                )}
+                {!member &&
+                  msg.role === "assistant" &&
+                  i === messages.length - 1 &&
+                  heldDismissed !== i &&
+                  msg.held_steps &&
+                  msg.held_steps.length > 0 && (
+                    <HeldStepsCard
+                      steps={msg.held_steps}
+                      disabled={isLoading}
+                      onApprove={() => void handleSend(APPROVE_MESSAGE)}
+                      onDismiss={() => setHeldDismissed(i)}
+                    />
+                  )}
                 </div>
               ))}
 
@@ -777,10 +1162,41 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                     <BrandMark size="md" consulting />
                   </div>
                   <div className="flex-1 pt-1.5">
-                    <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">Executive</div>
+                    <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
                     <TurnStatusRow status={status} committeePhase={committeePhase} showMark={false} />
                   </div>
                 </div>
+              )}
+
+              {/* Someone else's turn, as it happens. */}
+              {othersTurn && (
+                <>
+                  <Message
+                    role="user"
+                    content={othersTurn.content}
+                    author={{ name: othersTurn.senderName, mine: othersTurn.senderPersonId === you }}
+                  />
+                  {othersTurn.reply ? (
+                    <Message
+                      role="assistant"
+                      content={othersTurn.reply}
+                      isStreaming={Boolean(live.turn)}
+                      actions={othersTurn.actions.length > 0 ? othersTurn.actions : undefined}
+                    />
+                  ) : (
+                    <div className="flex gap-4 mb-8">
+                      <div className="flex-shrink-0 mt-1">
+                        <BrandMark size="md" consulting />
+                      </div>
+                      <div className="flex-1 pt-1.5">
+                        <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
+                        <p className="text-sm text-fg-muted" aria-live="polite">
+                          {othersTurn.activity ?? FALLBACK_ACTIVITY_LABEL}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
             </>
           )}
@@ -788,9 +1204,48 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         </div>
       </div>
 
-      {/* Input */}
+      {closed ? (
+        <div className="border-t border-line bg-surface px-4 sm:px-6 py-3 sm:py-4">
+          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-3">
+            <p role="status" className="mr-auto text-sm text-fg-muted">
+              {closed === "deleted" ? "This chat was deleted." : "You're no longer in this chat."}
+            </p>
+          </div>
+        </div>
+      ) : (
+      /* Input */
       <div className="border-t border-line bg-surface px-4 sm:px-6 py-3 sm:py-4">
         <div className="max-w-3xl mx-auto">
+          {typingNow && (
+            <p aria-live="polite" className="mb-1.5 px-1 text-xs text-fg-muted">
+              {typingNow}
+            </p>
+          )}
+          {redoError && (
+            <div role="alert" className="mb-2 flex items-start gap-2 rounded-lg border border-line bg-surface-elevated px-3 py-2 text-sm text-fg">
+              <span className="mr-auto">{redoError}</span>
+              <button
+                type="button"
+                onClick={() => setRedoError(null)}
+                aria-label="Dismiss"
+                className="-my-1 inline-flex h-8 w-8 items-center justify-center rounded-md text-fg-muted hover:text-fg hover:bg-surface-overlay cursor-pointer"
+              >
+                <Icon name="close" size="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+          {editing && (
+            <div className="mb-2 flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-sm text-fg">
+              <span className="mr-auto">Editing your last message. Sending replaces it and its answer.</span>
+              <button
+                type="button"
+                onClick={cancelEdit}
+                className="min-h-[2rem] px-2 rounded-md font-medium text-fg-muted hover:text-fg hover:bg-surface-overlay cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
           {/* Committee review is switched in the + menu; while it is on, this
               chip says so and turns it off. */}
           {committeeEnabled && (
@@ -841,7 +1296,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/png,image/jpeg,image/gif,image/webp,.pdf,.docx,.doc,.txt,.md,.csv"
+              accept="image/png,image/jpeg,image/gif,image/webp,.pdf,.docx,.doc,.xlsx,.xlsm,.txt,.md,.csv"
               onChange={handleFilesPicked}
               className="hidden"
               aria-hidden="true"
@@ -859,7 +1314,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       ? `Attach files (limit ${MAX_FILES_PER_TURN} per message)`
                       : "Attach files or photos",
                   onSelect: () => fileInputRef.current?.click(),
-                  disabled: isLoading || pendingFiles.length >= MAX_FILES_PER_TURN,
+                  // An edit replaces the words only.
+                  disabled: isLoading || editing || pendingFiles.length >= MAX_FILES_PER_TURN,
                 },
                 {
                   label: committeeEnabled ? "Turn off committee review" : "Committee review (slower, reviewed)",
@@ -887,7 +1343,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 value={input}
                 onChange={handleTextareaChange}
                 onKeyDown={handleKeyDown}
-                placeholder={isLoading ? WORKING_PLACEHOLDER : followup ?? DEFAULT_PLACEHOLDER}
+                placeholder={
+                  isLoading
+                    ? WORKING_PLACEHOLDER
+                    : blockedBy
+                      ? `The Executive is answering ${blockedBy}…`
+                      : followup ?? DEFAULT_PLACEHOLDER
+                }
                 rows={1}
                 aria-label="Message"
                 className={
@@ -897,6 +1359,18 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 style={{ minHeight: "24px" }}
               />
             </div>
+            {/* Talk instead of typing: the words land in the box to send. */}
+            {!isLoading && (
+              <MicButton
+                disabled={Boolean(blockedBy)}
+                onText={(text) => {
+                  setInput((prev) => joinDictation(prev, text));
+                  setFileError(null);
+                  textareaRef.current?.focus();
+                }}
+                onError={setFileError}
+              />
+            )}
             {isLoading && (
               <button
                 type="button"
@@ -913,9 +1387,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             {(!isLoading || input.trim()) && (
               <button
                 type="button"
-                onClick={() => handleSend()}
-                disabled={!input.trim() && pendingFiles.length === 0}
-                aria-label={isLoading ? "Add to what it's working on" : "Send message"}
+                onClick={submit}
+                disabled={
+                  editing
+                    ? !input.trim() || redoing
+                    : Boolean(blockedBy) || (!input.trim() && pendingFiles.length === 0)
+                }
+                aria-label={isLoading ? "Add to what it's working on" : editing ? "Send edited message" : "Send message"}
                 className="flex-shrink-0 w-11 h-11 rounded-xl bg-accent-strong hover:bg-accent-strong/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"
               >
                 <Icon name="arrow-send" size="w-4 h-4" className="text-white" />
@@ -946,6 +1424,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           </p>
         </div>
       </div>
+      )}
     </div>
   );
 }

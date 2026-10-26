@@ -111,7 +111,7 @@ _FORWARDED_ENV_VARS = (
 
 # Outbound Gmail tools whose arguments may carry recipients. Any tool name
 # matching one of these (after the `google_workspace__` namespace prefix) is
-# subject to the recipient allow-list. Names track workspace-mcp 1.29.0: the
+# subject to the recipient allow-list. Names track workspace-mcp 2.1.0: the
 # send/reply/forward surface is a single `send_gmail_message` (reply is that
 # tool with thread_id/quoting; forward is its `forward_message_id` arg, which
 # `_GMAIL_ALLOWED_ARG_KEYS` refuses), and `draft_gmail_message` replaced
@@ -208,7 +208,9 @@ _M365_MESSAGE_LOOKUP_SELECT = "id,from,replyTo,toRecipients,ccRecipients,bccReci
 # ATTENDEE. Like the reply family, the gate reads the event first
 # (`_check_m365_referenced_event` → get-calendar-event) and roster-checks the
 # implied recipients; fail-closed. `delete-calendar-event` carries no free
-# text and stays ungated (it is the typed cancel_calendar_event path).
+# text, but Exchange still mails every attendee the cancellation: outside the
+# typed cancel_calendar_event path (`calendar_cancel_grant`), its attendees
+# are roster-checked the same way (`_check_m365_event_delete`).
 _M365_EVENT_RESPONSE_TOOLS = frozenset({
     "microsoft_365__accept_calendar_event",
     "microsoft_365__decline_calendar_event",
@@ -216,6 +218,7 @@ _M365_EVENT_RESPONSE_TOOLS = frozenset({
 })
 _M365_EVENT_CANCEL_TOOL = "microsoft_365__cancel_calendar_event"
 _M365_EVENT_BY_ID_TOOLS = _M365_EVENT_RESPONSE_TOOLS | {_M365_EVENT_CANCEL_TOOL}
+_M365_EVENT_DELETE_TOOL = "microsoft_365__delete_calendar_event"
 _M365_EVENT_LOOKUP_TOOL = "microsoft_365__get-calendar-event"
 _M365_EVENT_LOOKUP_SELECT = "id,organizer,attendees"
 
@@ -552,7 +555,8 @@ _GMAIL_RECIPIENT_FIELDS = ("to", "cc", "bcc")
 # is rejected by default. Add new keys here only after confirming they cannot
 # carry an unvalidated address.
 #
-# Deliberately NOT allowed (workspace-mcp 1.29.0 send_gmail_message args):
+# Deliberately NOT allowed (workspace-mcp send_gmail_message args, and since
+# 2.1.0 draft_gmail_message's too):
 #   - reply_all: workspace-mcp derives To/Cc from the thread itself, so the
 #     recipients never pass through the roster check below.
 #   - forward_message_id / include_forwarded_attachments: forward any inbox
@@ -596,6 +600,11 @@ _GMAIL_ALLOWED_ARG_KEYS = frozenset({
 
 def _block(field: str, addr: str, tool: str, *, reason: str | None = None) -> str:
     from openexecutive.audit import log_event as audit_log
+    from openexecutive.orchestrator import outside_content
+
+    if outside_content.added_ref(addr):
+        # On the roster, but only since this turn (outside_content).
+        reason = f"{addr!r} {outside_content.ADDED_REFUSAL}"
 
     logger.warning(
         "blocked outbound gmail send: tool=%s field=%s addr=%s not in allow-list",
@@ -962,6 +971,7 @@ def _roster_allow_set() -> RosterAllow:
     contact's address is refused exactly like a stranger's, so the refusal
     cannot reveal that the address belongs to a contact.
     """
+    from openexecutive.orchestrator import outside_content
     from openexecutive.orchestrator.people_tools import (
         contacts_reachable_now,
         turn_is_private_to_principal,
@@ -973,6 +983,9 @@ def _roster_allow_set() -> RosterAllow:
     if turn_is_private_to_principal():
         # A turn about the principal's private mail reaches the principal only.
         everyone = [p for p in everyone if p.is_principal]
+    # Nobody added (or given a new address) this turn until the next one: a
+    # contact planted and used in one turn would pass every check below.
+    everyone = [p for p in everyone if not outside_content.added_this_turn(p.id)]
     # Primary addresses and aliases exactly; for a teammate, also their
     # local part on the company's own domains (people.identity) — the same
     # rule inbound mail is matched by.
@@ -1047,6 +1060,295 @@ def _roster_ack_admits(tool: str, arguments: dict[str, Any]) -> bool:
         return False
     grant["used"] = True
     return True
+
+
+# Act as me's ``save_my_email_attachment`` (``orchestrator.mail_file_save``)
+# copies a file from the speaker's own mail into the Executive's Drive or
+# OneDrive, usually on the very turn that read the mail, where the lockdown
+# (``delegation.lockdown``) refuses every gateway call outside
+# ``PRIVATE_TURN_MCP_TOOLS``. Its calls are built in code, never by the model:
+# the folder is fixed, the file name is cleaned, the bytes come from the
+# mailbox client, and the one grantee is the speaker's own address. So the
+# lockdown admits exactly those calls: the very ``tool_input`` object the
+# handler holds (``code_built_call``), for one of these tools only. A model's
+# call is always a different object, so it can never pass as one. Every
+# other gate (acting account, URL fetch, sheet formulas, the Drive / OneDrive
+# share gates, own-drive writes) still runs on them as on any call.
+# ``ghostwrite_email``'s ``drive_files`` (``orchestrator.drive_attach``)
+# sizes and downloads the Drive files it attaches the same way: the file id is
+# the model's choice, checked there against the saved files and folders, and
+# the bytes go onto the principal's draft without reaching the model.
+_CODE_BUILT_TOOLS = frozenset({
+    "google_workspace__get_drive_file_permissions",
+    "google_workspace__get_drive_file_download_url",
+    "google_workspace__create_drive_folder",
+    "google_workspace__create_drive_file",
+    "google_workspace__manage_drive_access",
+    "microsoft_365__list-drives",
+    "microsoft_365__create-onedrive-folder",
+    "microsoft_365__upload-file-content",
+    "microsoft_365__share-drive-item",
+})
+_code_built: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "code_built_call", default=None
+)
+
+
+@contextlib.contextmanager
+def code_built_call(tool_input: dict[str, Any]) -> Iterator[None]:
+    """Let ``call_tool`` run this exact ``tool_input`` on a turn that read the
+    owner's mail (see ``_CODE_BUILT_TOOLS``). For code that built every
+    argument itself; never around a model's input."""
+    token = _code_built.set(tool_input)
+    try:
+        yield
+    finally:
+        _code_built.reset(token)
+
+
+def _code_built_admits(tool_input: Any) -> bool:
+    granted = _code_built.get()
+    return (
+        granted is not None
+        and granted is tool_input
+        and isinstance(tool_input, dict)
+        and tool_input.get("name") in _CODE_BUILT_TOOLS
+    )
+
+
+# A rename or move the person approved on a card (``delegation.action_cards``,
+# ``drive_files``) runs as that very ``tool_input``, built in code from what
+# the card showed them: the file, its new name, the folder it goes to. Their
+# tap is the approval, so the own-file check (`_check_google_file_write`)
+# looks only at the folder it goes to. Every other gate still runs.
+_TAPPED_DRIVE_TOOLS = frozenset({"google_workspace__update_drive_file"})
+_TAPPED_DRIVE_KEYS = frozenset({"fileid", "name", "addparents", "removeparents"})
+_tapped_drive: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "tapped_drive_call", default=None
+)
+
+
+@contextlib.contextmanager
+def tapped_drive_call(tool_input: dict[str, Any]) -> Iterator[None]:
+    """Run this exact ``tool_input`` as a rename or move the person tapped
+    Approve on (see ``_TAPPED_DRIVE_TOOLS``). For code that built every
+    argument from a card; never around a model's input."""
+    token = _tapped_drive.set(tool_input)
+    try:
+        yield
+    finally:
+        _tapped_drive.reset(token)
+
+
+def _tapped_drive_admits(tool_input: Any) -> bool:
+    granted = _tapped_drive.get()
+    if granted is None or granted is not tool_input or not isinstance(tool_input, dict):
+        return False
+    arguments = tool_input.get("arguments")
+    return (
+        tool_input.get("name") in _TAPPED_DRIVE_TOOLS
+        and isinstance(arguments, dict)
+        and all(isinstance(k, str) and _norm_key(k) in _TAPPED_DRIVE_KEYS for k in arguments)
+    )
+
+
+# Files ``save_my_email_attachment`` copied from someone's own mail are theirs
+# alone (``delegation.saved_files``), but they sit in the Executive's own Drive
+# or OneDrive, which every turn's Drive and OneDrive tools can reach. So:
+#
+# - **Files.** On any turn whose speaker is not a file's owner
+#   (``saved_files.viewer_person_id``), a call whose arguments name a recorded
+#   file id is refused before it runs (an open, a download, a share, a copy, a
+#   move), and a result that names one loses that entry (a JSON list item) or
+#   line (workspace-mcp's one line per file), and any id still left is masked.
+# - **The folder.** Sharing, moving or listing the folder would reach every
+#   file in it, so on every turn, the owner's included, a model call naming a
+#   folder a save made is refused, and so is a OneDrive call addressing a path
+#   through a folder of that name ("root:/From your email/…", percent-encoded
+#   or not). The folder's own entry is dropped from results and its id masked
+#   elsewhere. Only the save's own code-built calls (``code_built_call``) touch
+#   it, and those skip this filter: they name nothing the model chose.
+#
+# Ids are matched raw and percent-decoded (a raw Graph path is decoded by
+# Graph), and the record is read again after each call, so a file a save
+# recorded while a listing ran is hidden from that listing too.
+#
+# Limits, honestly: it matches ids as text, so it hides a file only where its
+# id appears (a listing, a link); a result that names the file without its id
+# (an activity feed, a notification quoting its title) still shows the name. A
+# copy someone makes of it is a new file and isn't covered. Someone signed in
+# to the Executive's account outside the app sees everything. The lookup
+# fails closed for the file tools (``_FILE_TOOL_RE``: Drive, OneDrive, Docs,
+# Sheets, Slides, Excel): when the tables can't be read they are refused, while mail
+# and calendar tools run unfiltered.
+_FILE_TOOL_RE = re.compile(
+    r"drive|folder|file|download_bytes|doc|sheet|slide|presentation|excel|workbook"
+)
+_SAVED_FILE_REFUSAL = (
+    "{tool} was not run: that file is private to the person it was saved for "
+    "and isn't available in this conversation. Do not retry."
+)
+_SAVED_FOLDER_REFUSAL = (
+    "{tool} was not run: the folder of files saved from people's own email "
+    "can't be opened, shared, moved or listed from chat; each file there is "
+    "shared with its owner alone. Do not retry."
+)
+
+
+@dataclass(frozen=True)
+class _SavedView:
+    """What this turn may not see or name: other people's saved files, and
+    every folder the saves made."""
+
+    files: frozenset[str] = frozenset()
+    folders: frozenset[str] = frozenset()
+
+    def __bool__(self) -> bool:
+        return bool(self.files or self.folders)
+
+
+def _saved_files_hidden(normalized: str) -> _SavedView | str:
+    """What this turn may not see, or the refusal when that can't be read
+    for a file tool. Only Google Workspace and Microsoft 365 tools are
+    filtered."""
+    if not normalized.startswith((_GW_PREFIX, _M365_PREFIX)):
+        return _SavedView()
+    from openexecutive.delegation import saved_files
+
+    try:
+        files, folders = saved_files.protected(saved_files.viewer_person_id())
+        return _SavedView(files, folders)
+    except Exception:
+        logger.warning("saved files: couldn't read which files are private", exc_info=True)
+        if _FILE_TOOL_RE.search(normalized.partition("__")[2]):
+            return json.dumps({
+                "error": (
+                    "Couldn't check which files are private just now, so "
+                    f"{normalized[:200]} was not run. Try again in a moment."
+                ),
+            })
+        return _SavedView()
+
+
+def _arguments_text(arguments: Any) -> str:
+    try:
+        return json.dumps(arguments, default=str)
+    except (TypeError, ValueError, RecursionError):
+        return str(arguments)
+
+
+def _argument_spellings(arguments: Any) -> tuple[str, ...]:
+    """The arguments as text, raw and percent-decoded until stable: a raw
+    Graph path (``download-bytes``) is decoded by Graph, so "%30%31…" names
+    the same item as "01…"."""
+    spellings = [_arguments_text(arguments)]
+    for _ in range(3):
+        decoded = unquote(spellings[-1])
+        if decoded == spellings[-1]:
+            break
+        spellings.append(decoded)
+    return tuple(spellings)
+
+
+def _names_any(arguments: Any, ids: frozenset[str]) -> bool:
+    return any(
+        item_id in text for text in _argument_spellings(arguments) for item_id in ids
+    )
+
+
+def _names_saved_file(arguments: Any, hidden: frozenset[str]) -> bool:
+    return bool(hidden) and _names_any(arguments, hidden)
+
+
+def _names_saved_folder(normalized: str, arguments: Any, folders: frozenset[str]) -> bool:
+    """Whether a model call names a folder the saves made, by id anywhere in
+    its arguments, or (OneDrive) by a path through a folder of that name."""
+    if folders and _names_any(arguments, folders):
+        return True
+    if not normalized.startswith(_M365_PREFIX) or not _FILE_TOOL_RE.search(normalized.partition("__")[2]):
+        # Only a file tool takes a path: a mail subject or event title that
+        # happens to read "Re: From your email: …" isn't one.
+        return False
+    from openexecutive.delegation.saved_files import FOLDER_NAME
+
+    wanted = " ".join(FOLDER_NAME.casefold().split())
+    for value in _iter_arg_strings(arguments):
+        if value is _TOO_DEEP:
+            return True
+        plain = " ".join(unquote(value).casefold().split())
+        if ":" in plain and wanted in plain:
+            return True
+    return False
+
+
+def _prune_saved(value: Any, present: list[str], depth: int = 0) -> Any:
+    """``value`` without the list entries that name one of ``present``."""
+    if depth > _WALK_DEPTH_MAX:
+        return value
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            try:
+                text = json.dumps(item, default=str)
+            except (TypeError, ValueError, RecursionError):
+                text = str(item)
+            if not any(file_id in text for file_id in present):
+                kept.append(_prune_saved(item, present, depth + 1))
+        return kept
+    if isinstance(value, dict):
+        return {k: _prune_saved(v, present, depth + 1) for k, v in value.items()}
+    return value
+
+
+def _hide_saved_files(text: str, hidden: frozenset[str]) -> str:
+    """``text`` with every entry naming one of ``hidden`` dropped: a JSON
+    result's list items, then any line still naming one, then any id still
+    left masked. Unchanged when it names none."""
+    present = [file_id for file_id in hidden if file_id in text]
+    if not present:
+        return text
+    parsed = _parsed_json(text)
+    if parsed is not None:
+        text = json.dumps(_prune_saved(parsed, present))
+    lines = [line for line in text.splitlines() if not any(file_id in line for file_id in present)]
+    text = "\n".join(lines)
+    for file_id in present:
+        text = text.replace(file_id, "[hidden]")
+    return text or "No files found."
+
+
+def _drop_folder_entries(value: Any, folders: frozenset[str], depth: int = 0) -> Any:
+    """``value`` without the list entries that are one of ``folders`` (a dict
+    whose ``id`` is one)."""
+    if depth > _WALK_DEPTH_MAX:
+        return value
+    if isinstance(value, list):
+        return [
+            _drop_folder_entries(v, folders, depth + 1) for v in value
+            if not (isinstance(v, dict) and any(
+                isinstance(k, str) and k.lower() == "id" and x in folders for k, x in v.items()
+            ))
+        ]
+    if isinstance(value, dict):
+        return {k: _drop_folder_entries(v, folders, depth + 1) for k, v in value.items()}
+    return value
+
+
+def _hide_saved_folders(text: str, folders: frozenset[str]) -> str:
+    """``text`` without the saves' folders: their own entries dropped (a JSON
+    list item whose id is one, a workspace-mcp line "(ID: <id>"), and the id
+    masked anywhere else (a file's parent), so the file itself still shows."""
+    present = [folder_id for folder_id in folders if folder_id in text]
+    if not present:
+        return text
+    parsed = _parsed_json(text)
+    if parsed is not None:
+        text = json.dumps(_drop_folder_entries(parsed, frozenset(present)))
+    lines = [line for line in text.splitlines() if not any(f"ID: {f}" in line for f in present)]
+    text = "\n".join(lines)
+    for folder_id in present:
+        text = text.replace(folder_id, "[hidden]")
+    return text or "No files found."
 
 
 # Artifact attachments on one email. Gmail caps a message at 25 MB and base64
@@ -1553,6 +1855,98 @@ def _check_calendar_attendees(tool: str, arguments: dict[str, Any]) -> str | Non
     return None
 
 
+def _mail_recipients(*values: Any) -> list[str]:
+    """Every address in Gmail-style ``to`` / ``cc`` / ``bcc`` values (a
+    string or a list of them)."""
+    found: list[str] = []
+    for value in values:
+        items = value if isinstance(value, list) else [value]
+        found += [a for _, a in getaddresses([v for v in items if isinstance(v, str)]) if a]
+    return found
+
+
+def _m365_recipients(message: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    for key in ("toRecipients", "ccRecipients", "bccRecipients"):
+        entries = message.get(key)
+        for entry in entries if isinstance(entries, list) else []:
+            address = entry.get("emailAddress") if isinstance(entry, dict) else None
+            if isinstance(address, dict) and isinstance(address.get("address"), str):
+                found.append(address["address"])
+    return found
+
+
+def _with_disclosure(
+    tool_name: Any, normalized: str, arguments: dict[str, Any], *, bare: bool = False,
+) -> dict[str, Any] | str:
+    """The Executive's own mail send or draft with the AI disclosure line
+    under its body (``orchestrator.disclosure``), or a JSON refusal for HTML
+    that could hide it. Runs after every gate, on a copy; a shape it doesn't
+    know is left as it is. ``bare``: the acknowledgement to a new sender,
+    whose line names nobody."""
+    from openexecutive.orchestrator.disclosure import applies, hides_what_follows, with_mail_line
+
+    def html_refusal(key: str, text: str, recipients: list[str] | None) -> str | None:
+        if applies(recipients) and hides_what_follows(text):
+            return _refuse(
+                str(tool_name), key, "<hidden-markup>",
+                reason=(
+                    "this HTML has markup that can hide text after it (a comment, a style or "
+                    "script block, or text styled out of sight), so the line saying it was "
+                    "written by an AI could be hidden — refusing. Send it as plain text, or "
+                    "as HTML without that markup."
+                ),
+            )
+        return None
+
+    if tool_name in _GATED_GMAIL_TOOLS:
+        out = dict(arguments)
+        recipients = _mail_recipients(out.get("to"), out.get("cc"), out.get("bcc"))
+        if isinstance(out.get("html_body"), str) and out["html_body"]:
+            refused = html_refusal("html_body", out["html_body"], recipients)
+            if refused is not None:
+                return refused
+            out["html_body"] = with_mail_line(out["html_body"], recipients=recipients, as_html=True, bare=bare)
+        if isinstance(out.get("body"), str) and out["body"]:
+            as_html = str(out.get("body_format") or "").lower() == "html"
+            refused = html_refusal("body", out["body"], recipients) if as_html else None
+            if refused is not None:
+                return refused
+            out["body"] = with_mail_line(out["body"], recipients=recipients, as_html=as_html, bare=bare)
+        return out
+    if normalized not in _GATED_M365_MAIL_TOOLS or normalized == _M365_SEND_DRAFT_TOOL:
+        return arguments
+    body = arguments.get("body")
+    if not isinstance(body, dict):
+        return arguments
+    body = dict(body)
+    # A reply or forward carries its words as Comment, which Graph puts in
+    # the HTML reply; a new message or a draft as a Graph message (under
+    # Message for send_mail).
+    if isinstance(body.get("Comment"), str) and body["Comment"]:
+        refused = html_refusal("Comment", body["Comment"], None)
+        if refused is not None:
+            return refused
+        body["Comment"] = with_mail_line(body["Comment"], as_html=True)
+        return {**arguments, "body": body}
+    wrapped = isinstance(body.get("Message"), dict)
+    message = body["Message"] if wrapped else body
+    content = message.get("body")
+    if not (isinstance(content, dict) and isinstance(content.get("content"), str) and content["content"]):
+        return arguments
+    as_html = str(content.get("contentType") or "").lower() == "html"
+    recipients = _m365_recipients(message)
+    refused = html_refusal("body", content["content"], recipients) if as_html else None
+    if refused is not None:
+        return refused
+    content = {
+        **content,
+        "content": with_mail_line(content["content"], recipients=recipients, as_html=as_html),
+    }
+    message = {**message, "body": content}
+    return {**arguments, "body": {**body, "Message": message} if wrapped else message}
+
+
 def _pin_calendar_notifications(arguments: dict[str, Any]) -> dict[str, Any]:
     """Keep a manage_event call that named no attendees from emailing the
     event's existing guests.
@@ -1563,23 +1957,61 @@ def _pin_calendar_notifications(arguments: dict[str, Any]) -> dict[str, Any]:
     description or time unless ``send_updates`` is "none". So such a call is
     forced to "none": the change lands on the calendar and nobody is emailed
     text the gate never saw. A call that passes attendees had them checked
-    and keeps its own ``send_updates``; delete and rsvp carry no new text; a
+    and keeps its own ``send_updates``; an rsvp carries no new text; a
     create without attendees has nobody to mail, so the pin is moot there.
+
+    A delete is pinned too: Google mails every guest the cancellation, and
+    the guest list is one the gate never saw. Only the typed
+    ``cancel_calendar_event`` path, which cancels a meeting the Executive
+    booked with rostered attendees, keeps its notice
+    (``calendar_cancel_grant``).
     """
     action = str(_arg(arguments, "action") or "").strip().lower()
-    if action in ("delete", "rsvp"):
+    if action == "rsvp":
         return arguments
+    if action == "delete":
+        granted = _calendar_cancel.get()
+        event_ids = [v for v in _arg_values(arguments, "event_id") if v is not None]
+        if granted is not None and event_ids == [granted]:
+            return arguments
+        return _without_notifications(arguments)
     supplied = [v for v in _arg_values(arguments, "attendees") if v is not None]
     if any(not (isinstance(v, list) and not v) for v in supplied):
         return arguments
     if _arg_values(arguments, "send_updates") == ["none"]:
         return arguments
     logger.info("manage_event without attendees: send_updates pinned to none")
-    # Every spelling goes, so no `sendUpdates: "all"` survives beside the pin.
+    return _without_notifications(arguments)
+
+
+def _without_notifications(arguments: dict[str, Any]) -> dict[str, Any]:
+    """``arguments`` with ``send_updates`` pinned to "none". Every spelling
+    goes, so no `sendUpdates: "all"` survives beside the pin."""
+    if _arg_values(arguments, "send_updates") == ["none"]:
+        return arguments
     pinned = {k: v for k, v in arguments.items()
               if not (isinstance(k, str) and _norm_key(k) == "sendupdates")}
     pinned["send_updates"] = "none"
     return pinned
+
+
+# The one manage_event delete that may mail its guests: the typed
+# cancel_calendar_event of a meeting the Executive booked (its attendees were
+# roster-checked when it was booked). Set only around that call, to the event
+# id, by ``calendar_cancel_grant``.
+_calendar_cancel: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "calendar_cancel_grant", default=None
+)
+
+
+@contextlib.contextmanager
+def calendar_cancel_grant(event_id: str) -> Iterator[None]:
+    """Let a manage_event delete of ``event_id`` keep its cancellation notice."""
+    token = _calendar_cancel.set(event_id)
+    try:
+        yield
+    finally:
+        _calendar_cancel.reset(token)
 
 
 def _parsed_json(text: str) -> dict[str, Any] | list[Any] | None:
@@ -1759,6 +2191,35 @@ def _m365_implied_recipients(normalized: str, message: dict[str, Any]) -> list[s
 _Discover = Callable[[str], Awaitable[bool]]
 
 
+class GatewayCallTimeout(TimeoutError):
+    """A call through the MCP gateway got no answer within
+    ``MCP_TOOL_TIMEOUT_S``. The workspace server may still have run it."""
+
+
+def _tool_timeout_s() -> float:
+    """``MCP_TOOL_TIMEOUT_S``; a settings stub without it (tests patch
+    ``get_settings`` here) gets config's default."""
+    return float(getattr(get_settings(), "mcp_tool_timeout_s", 120.0))
+
+
+async def _session_call(
+    session: Any, name: str, arguments: dict[str, Any], timeout: float | None = None,
+) -> Any:
+    """``session.call_tool`` with the per-call ceiling. Without one, a
+    workspace server that never answers (a hung Google or Microsoft request,
+    a stuck child process) held whatever awaited it for good: the email
+    poller, which handles one message at a time, a brief, a chat turn. The
+    call is cancelled on our side; the server may still finish it."""
+    if timeout is None:
+        timeout = _tool_timeout_s()
+    try:
+        return await asyncio.wait_for(session.call_tool(name, arguments), timeout=timeout)
+    except TimeoutError as exc:
+        tool = arguments.get("tool_name") if name == "call_tool" else name
+        logger.warning("MCPGateway: %s got no answer within %.0fs", str(tool)[:200], timeout)
+        raise GatewayCallTimeout(f"{str(tool)[:200]} got no answer within {timeout:.0f}s") from exc
+
+
 async def _fetch_m365_json(
     session: Any, tool_name: str, arguments: dict[str, Any], discover: _Discover | None = None,
 ) -> dict[str, Any] | None:
@@ -1768,8 +2229,8 @@ async def _fetch_m365_json(
     that only searched for the reply tool never returned the lookup: then
     ``discover`` it and read once more."""
     try:
-        result = await session.call_tool(
-            "call_tool", {"tool_name": tool_name, "arguments": arguments},
+        result = await _session_call(
+            session, "call_tool", {"tool_name": tool_name, "arguments": arguments},
         )
         text = result.content[0].text if result.content else ""
         if (
@@ -1779,8 +2240,8 @@ async def _fetch_m365_json(
             and _UNDISCOVERED_MARKER in text
             and await discover(tool_name)
         ):
-            result = await session.call_tool(
-                "call_tool", {"tool_name": tool_name, "arguments": arguments},
+            result = await _session_call(
+                session, "call_tool", {"tool_name": tool_name, "arguments": arguments},
             )
             text = result.content[0].text if result.content else ""
         parsed = json.loads(text) if isinstance(text, str) and text.strip() else None
@@ -1824,6 +2285,41 @@ async def _check_m365_referenced_event(
         )
     allow = _roster_allow_set()
     for addr in implied:
+        blocked = _block_unless_rostered(addr, tool, allow)
+        if blocked is not None:
+            return blocked
+    return None
+
+
+async def _check_m365_event_delete(
+    session: Any, tool: str, arguments: dict[str, Any], discover: _Discover | None = None,
+) -> str | None:
+    """Exchange mails a deleted meeting's cancellation to every attendee, a
+    guest list the arguments never name. The typed cancel of that one event
+    (`calendar_cancel_grant`) passes; any other delete runs only when the
+    event has no attendees or all of them are on the roster. Fail-closed."""
+    # Every spelling, and exactly one: two could check one event and delete
+    # another.
+    values = _arg_values(arguments, "eventId")
+    event_id = values[0] if len(values) == 1 else None
+    if not isinstance(event_id, str) or not event_id.strip():
+        return _block(
+            "eventId", "<missing>", tool,
+            reason=f"{tool} needs one eventId so its attendees can be roster-checked — refusing.",
+        )
+    if _calendar_cancel.get() == event_id:
+        return None
+    event = await _fetch_m365_json(
+        session, _M365_EVENT_LOOKUP_TOOL,
+        {"eventId": event_id, "select": _M365_EVENT_LOOKUP_SELECT}, discover,
+    )
+    if event is None:
+        return _block(
+            "eventId", event_id, tool,
+            reason=f"could not read event {event_id!r} to roster-check who {tool} would notify — refusing.",
+        )
+    allow = _roster_allow_set()
+    for addr in _m365_recipient_addresses(_ci_get(event, "attendees")):
         blocked = _block_unless_rostered(addr, tool, allow)
         if blocked is not None:
             return blocked
@@ -2146,6 +2642,322 @@ async def _check_m365_drive_write(
                     "OneDrive and share it with the People who need it."
                 ),
             )
+    return None
+
+
+# Google Docs, Sheets, Slides, Forms and Drive writes land only in files and
+# folders the Executive's own account owns, or the company's own
+# (`_company_item`): owned by someone on a company domain or kept on a shared
+# drive only the company organizes, and open to nobody outside the company.
+# The twin of `_M365_DRIVE_WRITE_TOOLS`. A stranger can share a doc, sheet or
+# folder with the Executive's account, and planted text could then have it
+# append company data there ("add the Q3 numbers to this sheet"), with
+# nothing shared and no roster check; a company file shared outside the
+# company is the same open door. Every Google write that names a file
+# (`_GOOGLE_WRITTEN_FILE_KEYS`) or a destination folder
+# (`_GOOGLE_DESTINATION_KEYS`) is checked; a write is any tool whose name
+# starts with a write verb (`outside_content.gateway_call_reads`). Sharing has
+# its own gate (`_GATED_DRIVE_TOOLS`), and mail and calendar name no file.
+# Reading what others shared stays open. A rename or move the person approved
+# on a card (`tapped_drive_call`) checks only where the file goes.
+_GOOGLE_WRITTEN_FILE_KEYS = frozenset({"documentid", "spreadsheetid", "presentationid", "formid", "fileid"})
+_GOOGLE_DESTINATION_KEYS = frozenset({"folderid", "parentfolderid", "addparents"})
+# Writes whose file argument is only read: the copy or PDF goes to the
+# destination folder, which is checked (and a copy with none stays beside its
+# source, owned by whoever owns that).
+_GOOGLE_SOURCE_ONLY_TOOLS = frozenset({
+    "google_workspace__copy_drive_file",
+    "google_workspace__export_doc_to_pdf",
+})
+_GOOGLE_OWNER_LOOKUP_TOOL = "google_workspace__get_drive_file_permissions"
+# The one "Owners:" line of the lookup's answer; the address in the last
+# parentheses is the owner's (a display name comes before it, so it can't
+# stand in for the address).
+_GOOGLE_OWNERS_LINE_RE = re.compile(r"Owners: .* \(([^()\s]+@[^()\s]+)\)")
+
+
+def _google_ids(arguments: dict[str, Any], keys: frozenset[str]) -> list[Any] | None:
+    """Every id under one of ``keys`` (any spelling); a comma-separated
+    string (``add_parents``) or a list gives each id. None when one isn't a
+    string."""
+    ids: list[Any] = []
+    for k, v in arguments.items():
+        if not isinstance(k, str) or _norm_key(k) not in keys or v is None:
+            continue
+        values = v if isinstance(v, list) else str(v).split(",") if isinstance(v, str) else [v]
+        for item in values:
+            if not isinstance(item, str):
+                return None
+            if item.strip():
+                ids.append(item.strip())
+    return ids
+
+
+async def _google_item_text(session: Any, file_id: str, discover: _Discover | None) -> str | None:
+    """The owner lookup's answer for Drive item ``file_id``, or None when it
+    can't be read."""
+    arguments = {"file_id": file_id}
+    try:
+        result = await _session_call(
+            session, "call_tool", {"tool_name": _GOOGLE_OWNER_LOOKUP_TOOL, "arguments": arguments},
+        )
+        text = result.content[0].text if result.content else ""
+        if (
+            discover is not None
+            and isinstance(text, str)
+            and _UNDISCOVERED_MARKER in text
+            and await discover(_GOOGLE_OWNER_LOOKUP_TOOL)
+        ):
+            result = await _session_call(
+                session, "call_tool", {"tool_name": _GOOGLE_OWNER_LOOKUP_TOOL, "arguments": arguments},
+            )
+            text = result.content[0].text if result.content else ""
+    except Exception:
+        logger.warning("google gate: owner lookup failed", exc_info=True)
+        return None
+    if not isinstance(text, str) or _is_error_payload(text):
+        return None
+    return text
+
+
+def _google_owner_of(text: str) -> str | None:
+    """The owner address in an owner lookup's answer, lowercased, or None when
+    it doesn't name exactly one owner line (a shared drive item has none)."""
+    # A file's name is the line above and can hold a line break: more than one
+    # owners line is refused, never guessed between.
+    lines = [line for line in text.splitlines() if line.startswith("Owners: ")]
+    if len(lines) != 1:
+        return None
+    match = _GOOGLE_OWNERS_LINE_RE.fullmatch(lines[0].rstrip())
+    return match.group(1).strip().lower() if match else None
+
+
+async def _google_file_owner(session: Any, file_id: str, discover: _Discover | None) -> str | None:
+    """The owner address of Drive item ``file_id``, lowercased, or None when
+    it can't be read or doesn't name exactly one owner line (a shared drive
+    item has none)."""
+    text = await _google_item_text(session, file_id, discover)
+    return None if text is None else _google_owner_of(text)
+
+
+# One permission line of the owner lookup (workspace-mcp's
+# ``format_permission_info``): "    - User: a@b.com (writer) [id: 1]", with
+# " | inherited from: …" after it on a shared drive. Any other line in the
+# list (an unknown kind) counts as someone outside the company.
+_GOOGLE_PERMISSION_RE = re.compile(
+    r"\s+- (?:(?P<kind>User|Group): (?P<addr>[^\s()]+@[^\s()]+)|Domain: (?P<domain>[^\s()]+)"
+    r"|(?P<anyone>Anyone) with the link) \((?P<role>\w+)\)(?: \[id: [^\]]*\])?(?: \|.*)?"
+)
+
+
+@dataclass(frozen=True)
+class _DriveItem:
+    """What the owner lookup says of one Drive item: its owner (None on a
+    shared drive), whether it is on a shared drive, and who can open it as
+    ``(kind, address or domain, role)``, kind "user", "group", "domain",
+    "anyone" or "other"."""
+
+    owner: str | None
+    shared_drive: bool
+    permissions: tuple[tuple[str, str, str], ...]
+
+
+def _parse_drive_item(text: str, item_id: str) -> _DriveItem | None:
+    """Read ``text`` (the owner lookup for ``item_id``) from its last
+    ``ID: <item_id>`` line on. Everything before that line is the item's name
+    (the first line), which whoever named the file chose, line breaks and
+    all; everything after it is Drive's own. None when it can't be read."""
+    lines = text.splitlines()
+    anchor = f"ID: {item_id}"
+    starts = [i for i, line in enumerate(lines) if line.rstrip() == anchor]
+    if not starts:
+        return None
+    rest = [line.rstrip() for line in lines[starts[-1] + 1:]]
+    # Drive's own lines in their fixed order: a line break in the type or an
+    # owner's display name (chosen by whoever uploaded or owns it) shifts
+    # them, and is refused.
+    if len(rest) < 4 or not (
+        rest[0].startswith("Type: ") and rest[1].startswith("Parents: ")
+        and rest[2].startswith("Owners: ") and rest[3].startswith("Size: ")
+    ):
+        return None
+    if sum(1 for line in rest if line.startswith("Owners: ")) != 1:
+        return None
+    owner: str | None = None
+    if rest[2] != "Owners: None available":
+        match = _GOOGLE_OWNERS_LINE_RE.fullmatch(rest[2])
+        if match is None:
+            return None
+        owner = match.group(1).strip().lower()
+    shared_drive = any(line.startswith("Shared Drive ID: ") for line in rest)
+    # The permission list: exactly one header, right after its count, then
+    # exactly that many entries and a blank line.
+    headers = [i for i, line in enumerate(rest) if line == "  Permissions:"]
+    permissions: list[tuple[str, str, str]] = []
+    if headers:
+        if len(headers) != 1:
+            return None
+        at = headers[0]
+        count = re.fullmatch(r"  Number of permissions: (\d+)", rest[at - 1]) if at else None
+        if count is None:
+            return None
+        entries = rest[at + 1:at + 1 + int(count.group(1))]
+        if len(entries) != int(count.group(1)) or rest[at + 1 + len(entries):at + 2 + len(entries)] != [""]:
+            return None
+        for line in entries:
+            found = _GOOGLE_PERMISSION_RE.fullmatch(line) if line.startswith("    - ") else None
+            if found is None:
+                permissions.append(("other", "", ""))
+            elif found.group("addr"):
+                # A group can hold anyone, so only a user counts as one of the company's.
+                kind = "user" if found.group("kind") == "User" else "group"
+                permissions.append((kind, found.group("addr").lower(), found.group("role").lower()))
+            elif found.group("domain"):
+                permissions.append(("domain", found.group("domain").lower(), found.group("role").lower()))
+            else:
+                permissions.append(("anyone", "", found.group("role").lower()))
+    elif "  No additional permissions (private file)" not in rest:
+        return None
+    return _DriveItem(owner=owner, shared_drive=shared_drive, permissions=tuple(permissions))
+
+
+def _company_domains_with(exec_address: str) -> frozenset[str]:
+    """The company's own email domains (``people.identity.company_domains``),
+    and the Executive's own unless it is free mail."""
+    from openexecutive.people.identity import FREEMAIL_DOMAINS, company_domains
+
+    domains = set(company_domains())
+    _, _, exec_domain = exec_address.rpartition("@")
+    if exec_domain and exec_domain not in FREEMAIL_DOMAINS:
+        domains.add(exec_domain)
+    return frozenset(domains)
+
+
+def _company_item(item: _DriveItem, exec_address: str, domains: frozenset[str]) -> bool:
+    """Whether a Drive item is the company's own: owned by the Executive or
+    someone on a company domain, or on a shared drive whose every organizer
+    is; and nobody outside the company can open it (every user and domain
+    it is shared with is the company's; never a group, which can hold
+    anyone, nor "anyone with the link"). A file owned by someone else must show who can open it: the list
+    is hidden from a reader, and a hidden list proves nothing."""
+
+    def ours(address: str) -> bool:
+        return address == exec_address or address.rpartition("@")[2] in domains
+
+    if item.owner is not None:
+        if not ours(item.owner):
+            return False
+        if item.owner != exec_address and not item.permissions:
+            return False
+    elif not item.shared_drive or not any(role == "organizer" for _, _, role in item.permissions):
+        return False
+    for kind, who, _role in item.permissions:
+        if kind == "user" and ours(who):
+            continue
+        if kind == "domain" and who in domains:
+            continue
+        return False
+    return True
+
+
+async def _google_company_items(
+    session: Any, ids: Iterable[str], discover: _Discover | None = None,
+) -> set[str]:
+    """The ids in ``ids`` that are the company's own (``_company_item``).
+    Fails closed: an item whose lookup can't be read is not."""
+    exec_address = get_settings().exec_email_address.strip().lower()
+    domains: frozenset[str] | None = None
+    out: set[str] = set()
+    for item_id in ids:
+        text = await _google_item_text(session, item_id, discover)
+        if text is None:
+            continue
+        # The Executive's own files too: one it shared outside the company
+        # holds outside words like any other.
+        item = _parse_drive_item(text, item_id)
+        if item is None:
+            continue
+        if domains is None:
+            domains = _company_domains_with(exec_address)
+        if _company_item(item, exec_address, domains):
+            out.add(item_id)
+    return out
+
+
+# Google tools whose name starts with one of these, and names no write verb
+# after it, only read; every other name is checked as a write (fail closed:
+# a new write verb is covered).
+_GOOGLE_READ_VERBS = frozenset({
+    "check", "debug", "get", "inspect", "list", "query", "read", "search",
+})
+
+
+def _google_reads_only(tool: str) -> bool:
+    from openexecutive.orchestrator.outside_content import _WRITE_VERBS
+
+    words = tool.split("__")[-1].lower().replace("-", "_").split("_")
+    return words[0] in _GOOGLE_READ_VERBS and not any(w in _WRITE_VERBS for w in words[1:])
+
+
+# What a refused Drive write tells the model to do instead: a rename or move
+# the person asked for goes on a card they tap (``action_cards``,
+# ``drive_files``), which runs it with only the destination checked.
+_GOOGLE_WRITE_CARD_HINT = (
+    " If the person asked you to rename or move these files, put that on an "
+    "approval card (propose_actions, kind drive_files) for them to tap, and tell "
+    "them it is waiting. Do not ask them to share it again: sharing won't change this."
+)
+
+
+async def _check_google_file_write(
+    session: Any, tool: str, arguments: dict[str, Any], discover: _Discover | None = None,
+    *, tapped: bool = False,
+) -> str | None:
+    """Keep Google writes in files and folders the Executive's own account
+    owns or the company's own (see `_GOOGLE_WRITTEN_FILE_KEYS`). Fail closed
+    when an owner can't be read. ``tapped``: a rename or move the person
+    approved on a card, so only the folder it goes to is checked."""
+    if _google_reads_only(tool) or tool in _GATED_DRIVE_TOOLS:
+        return None
+    files = [] if tool in _GOOGLE_SOURCE_ONLY_TOOLS or tapped else _google_ids(arguments, _GOOGLE_WRITTEN_FILE_KEYS)
+    folders = _google_ids(arguments, _GOOGLE_DESTINATION_KEYS)
+    if files is None or folders is None:
+        return _refuse(tool, "file_id", "<unreadable>", reason=f"{tool} ids must be strings — refusing.")
+    # "root" is the Executive's own My Drive (the server's default folder).
+    targets = list(dict.fromkeys(t for t in [*files, *folders] if t.lower() != "root"))
+    if not targets:
+        return None
+    exec_address = get_settings().exec_email_address.strip().lower()
+    domains: frozenset[str] | None = None
+    for target in targets[:10]:
+        text = await _google_item_text(session, target, discover)
+        owner = None if text is None else _google_owner_of(text)
+        if owner == exec_address:
+            continue
+        item = None if text is None else _parse_drive_item(text, target)
+        if owner is None and item is None:
+            return _refuse(
+                tool, "file_id", target[:60],
+                reason=f"could not read who owns {target[:60]!r} to check {tool} — refusing." + _GOOGLE_WRITE_CARD_HINT,
+            )
+        if item is not None:
+            if domains is None:
+                domains = _company_domains_with(exec_address)
+            if _company_item(item, exec_address, domains):
+                continue
+        return _refuse(
+            tool, "file_id", target[:60],
+            reason=(
+                f"{tool} may only write to files and folders the Executive's own "
+                "Google account owns, or the company's own: owned by someone at the "
+                "company or on its shared drive, and not shared with anyone outside "
+                "it. This one is not — refusing. Save it to a new file in the "
+                "Executive's Drive and share that with the People who need it."
+                + _GOOGLE_WRITE_CARD_HINT
+            ),
+        )
+    if len(targets) > 10:
+        return _refuse(tool, "file_id", "<too-many>", reason=f"{tool} names too many files — refusing.")
     return None
 
 
@@ -2574,6 +3386,46 @@ def _record_m365_outbound_context(arguments: dict[str, Any]) -> None:
         )
 
 
+# Outlook replies that answer one message by its id (a draft only waits).
+_M365_SENT_REPLY_TOOLS = frozenset({
+    "microsoft_365__reply_mail_message",
+    "microsoft_365__reply_all_mail_message",
+})
+
+
+def _note_mail_sent(tool_name: str, normalized: str, arguments: dict[str, Any]) -> None:
+    """Mark on the conversation (``Session.mail_sent_to`` /
+    ``mail_replied_ids``) who a send the mailbox accepted went to, so the
+    email poller can tell whether an inbound email got its reply
+    (``integrations.unanswered_mail``). Nothing without a live session, and
+    never raises: the send already happened."""
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    session = current_session.get()
+    if session is None:
+        return
+    try:
+        if tool_name == "google_workspace__send_gmail_message":
+            for field in _OUTBOUND_CONTEXT_RECIPIENT_FIELDS:
+                value = arguments.get(field)
+                items = value if isinstance(value, list) else [value]
+                for _name, addr in getaddresses([s for s in items if isinstance(s, str)]):
+                    if addr.strip():
+                        session.mail_sent_to.add(addr.strip().lower())
+        elif normalized == _M365_RECORD_SEND_TOOL:
+            message = _ci_get(_ci_get(arguments, "body"), "message")
+            for key in ("toRecipients", "ccRecipients"):
+                for addr in _m365_recipient_addresses(_ci_get(message, key)):
+                    if addr.strip():
+                        session.mail_sent_to.add(addr.strip().lower())
+        elif normalized in _M365_SENT_REPLY_TOOLS:
+            message_id = _ci_get(arguments, "messageId")
+            if isinstance(message_id, str) and message_id:
+                session.mail_replied_ids.add(message_id)
+    except Exception:
+        logger.exception("note_mail_sent: could not record the send (non-fatal)")
+
+
 # extensible-mcp's refusal for a tool no search in this session has returned
 # (DiscoveredToolsFilter, surfaced by its call_tool handler as "Error: ...").
 _UNDISCOVERED_MARKER = "has not been discovered via search_tools"
@@ -2736,6 +3588,46 @@ class MCPGateway:
         # as "every pinned tool is present" — only PinnedToolsProbe(missing=())
         # asserts that.
         self.pinned_tools: PinnedToolsProbe | None = None
+        # Servers whose sign-in has died (``mark_needs_reconnect``): the
+        # Connected Systems prompt section says so instead of "connected",
+        # and the Setup page shows it. Cleared by ``mark_reconnected`` or by
+        # the next call to one of that server's tools that answers without
+        # an authorization error.
+        self.needs_reconnect: set[str] = set()
+        # MCP_TOOL_TIMEOUT_S, read on first use (`_call_timeout`) and kept:
+        # `get_settings()` builds a fresh Settings on every call.
+        self._tool_timeout_s: float | None = None
+
+    def _call_timeout(self, settings: Settings | None = None) -> float:
+        """The per-call ceiling, read once per gateway (from ``settings``
+        when the caller already holds a read)."""
+        if self._tool_timeout_s is None:
+            self._tool_timeout_s = (
+                float(getattr(settings, "mcp_tool_timeout_s", 120.0))
+                if settings is not None
+                else _tool_timeout_s()
+            )
+        return self._tool_timeout_s
+
+    def mark_needs_reconnect(self, server: str, reason: str | None = None) -> bool:
+        """Note that ``server``'s grant no longer works. True when this is
+        news (the first report), so the caller can log or notify once."""
+        if server in self.needs_reconnect:
+            return False
+        self.needs_reconnect.add(server)
+        logger.warning(
+            "MCP server %s needs reconnecting%s; the prompt now says so",
+            server, f": {reason[:200]}" if reason else "",
+        )
+        return True
+
+    def mark_reconnected(self, server: str) -> bool:
+        """The grant works again (a reconnect, or a call that succeeded)."""
+        if server not in self.needs_reconnect:
+            return False
+        self.needs_reconnect.discard(server)
+        logger.info("MCP server %s is connected again", server)
+        return True
 
     async def start(self, config_path: Path) -> None:
         from mcp import ClientSession, StdioServerParameters
@@ -2777,7 +3669,7 @@ class MCPGateway:
         # (extensible-mcp defaults to 5 results).
         if isinstance(tool_input.get("top_k"), int):
             args["top_k"] = tool_input["top_k"]
-        result = await session.call_tool("search_tools", args)
+        result = await _session_call(session, "search_tools", args, self._call_timeout())
         text = result.content[0].text if result.content else json.dumps({"tools": []})
         return _drop_blocked_tools(text)
 
@@ -2840,6 +3732,7 @@ class MCPGateway:
 
         settings = get_settings()
         pinned = pinned_google_tools(settings)
+        self._call_timeout(settings)
         try:
             missing = [n for n in sorted(pinned) if not await self._discover(n, settings)]
         except asyncio.CancelledError:
@@ -2872,8 +3765,28 @@ class MCPGateway:
         refused = outside_reach_refusal(
             str(tool_input.get("name") or "call_tool")[:200], tool_input, tool_name="call_tool"
         )
-        if refused is not None:
+        code_built = _code_built_admits(tool_input)
+        if refused is not None and not code_built:
             return refused
+        # A turn another AI app asked over Open Executive's MCP server runs
+        # gateway reads only (schedule_tools.MCP_CLIENT_MCP_TOOLS), whether or
+        # not it may act: a mail send or draft goes on an approval card. The
+        # chat loop already refuses anything else; this holds for any other
+        # path.
+        from openexecutive.orchestrator.schedule_tools import (
+            current_session,
+            mcp_client_acting,
+            mcp_client_withheld_error,
+            mcp_client_withholds,
+            mcp_rules_turn,
+        )
+
+        turn_session = current_session.get()
+        if mcp_rules_turn(turn_session) and mcp_client_withholds("call_tool", tool_input):
+            return mcp_client_withheld_error(
+                str(tool_input.get("name") or "call_tool")[:200],
+                acting=mcp_client_acting(turn_session),
+            )
         session = self._require_session()
         arguments = tool_input.get("arguments", {})
         if isinstance(arguments, str):
@@ -2884,6 +3797,16 @@ class MCPGateway:
                 arguments = {}
         tool_name = tool_input.get("name", "")
         normalized = _normalize_tool_name(tool_name)
+        # Files saved from someone's own mail are theirs alone, and their
+        # folder is no model's to name (see `_saved_files_hidden`). The save's
+        # own code-built calls are the one exception.
+        hidden = _SavedView() if code_built else _saved_files_hidden(normalized)
+        if isinstance(hidden, str):
+            return hidden
+        if _names_saved_file(arguments, hidden.files):
+            return json.dumps({"error": _SAVED_FILE_REFUSAL.format(tool=str(tool_name)[:200])})
+        if not code_built and _names_saved_folder(normalized, arguments, hidden.folders):
+            return json.dumps({"error": _SAVED_FOLDER_REFUSAL.format(tool=str(tool_name)[:200])})
         attached_artifacts: list[str] = []
         # Every Google Workspace call acts as the Executive's own account.
         if _is_apps_script_tool(tool_name):
@@ -2922,6 +3845,11 @@ class MCPGateway:
             if blocked is not None:
                 return blocked
             blocked = _check_sheet_formulas(tool_name, arguments)
+            if blocked is not None:
+                return blocked
+            blocked = await _check_google_file_write(
+                session, tool_name, arguments, self._discover, tapped=_tapped_drive_admits(tool_input),
+            )
             if blocked is not None:
                 return blocked
         if tool_name in _GATED_GMAIL_TOOLS:
@@ -2972,6 +3900,10 @@ class MCPGateway:
             )
             if blocked is not None:
                 return blocked
+        if normalized == _M365_EVENT_DELETE_TOOL:
+            blocked = await _check_m365_event_delete(session, tool_name, arguments, self._discover)
+            if blocked is not None:
+                return blocked
         if normalized == _M365_DOWNLOAD_TOOL:
             blocked = _check_m365_download_target(tool_name, arguments)
             if blocked is not None:
@@ -3004,21 +3936,45 @@ class MCPGateway:
             if isinstance(expanded, str):
                 return expanded
             arguments, attached_artifacts = expanded
-        result = await session.call_tool(
-            "call_tool",
-            {"tool_name": tool_input["name"], "arguments": arguments},
-        )
-        result_text = result.content[0].text if result.content else json.dumps({"result": None})
-        # A pinned tool called before startup priming reached it: the prompt
-        # told the model to call it directly, so discover it and retry once.
-        # The refused call ran nothing, and every gate above has already
-        # passed these same arguments.
-        if _is_undiscovered_refusal(tool_name, result_text) and await self._discover(tool_name):
-            result = await session.call_tool(
-                "call_tool",
-                {"tool_name": tool_input["name"], "arguments": arguments},
+        # Last, once every gate passed: the AI disclosure line, on what goes
+        # out only; what is recorded below stays the words the model wrote.
+        wire_arguments = arguments
+        if tool_name in _GATED_GMAIL_TOOLS or normalized in _GATED_M365_MAIL_TOOLS:
+            # The roster acknowledgement (the one send to an address nobody
+            # checked) gets the line that names nobody, as the ack itself.
+            grant = _roster_ack.get()
+            disclosed = _with_disclosure(
+                tool_name, normalized, arguments, bare=bool(grant is not None and grant["used"]),
             )
+            if isinstance(disclosed, str):
+                return disclosed
+            wire_arguments = disclosed
+        wire_input = {"tool_name": tool_input["name"], "arguments": wire_arguments}
+        try:
+            result = await _session_call(session, "call_tool", wire_input, self._call_timeout())
             result_text = result.content[0].text if result.content else json.dumps({"result": None})
+            # A pinned tool called before startup priming reached it: the prompt
+            # told the model to call it directly, so discover it and retry once.
+            # The refused call ran nothing, and every gate above has already
+            # passed these same arguments.
+            if _is_undiscovered_refusal(tool_name, result_text) and await self._discover(tool_name):
+                result = await _session_call(session, "call_tool", wire_input, self._call_timeout())
+                result_text = result.content[0].text if result.content else json.dumps({"result": None})
+        except GatewayCallTimeout:
+            # An error payload, not a raise: the model reads it like any tool
+            # error, and every caller that checks for one (`_is_error_payload`)
+            # treats the call as failed. Not a failed send, though: the server
+            # may still have run it, so say to check before calling again.
+            # Nothing below runs: no outbound linkage or attachment row for a
+            # send that may not have happened, and no grant-health reading.
+            return json.dumps({
+                "error": (
+                    f"{str(tool_name)[:200]} did not answer within "
+                    f"{self._call_timeout():.0f}s. It may still have run: "
+                    "check its effect before calling it again."
+                ),
+                "timed_out": True,
+            })
         # On the final result, retry or not: roster answer tokens are hidden
         # from every mailbox read (Google Workspace or Microsoft 365) but the
         # poller's own.
@@ -3028,6 +3984,23 @@ class MCPGateway:
             and not _reveal_tokens.get()
         ):
             result_text = hide_roster_tokens(result_text)
+        if not code_built:
+            # Read again: a save that landed while this call ran (its file
+            # already in a listing, recorded only once its upload returned)
+            # is hidden too.
+            after = _saved_files_hidden(normalized)
+            if isinstance(after, str):
+                return json.dumps({"error": (
+                    "Couldn't check which files are private just now, so the "
+                    f"result of {normalized[:200]} was withheld. It did run: "
+                    "check its effect before calling it again."
+                )})
+            hidden = _SavedView(hidden.files | after.files, hidden.folders | after.folders)
+        if hidden:
+            # Before anything below keeps or reads the result.
+            result_text = _hide_saved_files(result_text, hidden.files)
+            result_text = _hide_saved_folders(result_text, hidden.folders)
+        self._note_grant_health(tool_name, result_text)
         if tool_name in drive_reads.DRIVE_READ_TOOLS:
             result_text = _remember_drive_read(tool_name, arguments, result_text)
         if normalized == _M365_DOWNLOAD_TOOL and isinstance(arguments.get("target"), str):
@@ -3042,6 +4015,10 @@ class MCPGateway:
             _record_email_outbound_context(arguments)
         elif normalized == _M365_RECORD_SEND_TOOL and not _is_error_payload(result_text):
             _record_m365_outbound_context(arguments)
+        # A plain-text "Error …" result (FastMCP, extensible-mcp) is no send
+        # either: marking it would hide the unanswered-email card.
+        if not _is_error_payload(result_text) and not result_text.lstrip().lower().startswith("error"):
+            _note_mail_sent(tool_name, normalized, arguments)
         if attached_artifacts and not _is_error_payload(result_text):
             from openexecutive.audit import log_event as audit_log
 
@@ -3057,6 +4034,95 @@ class MCPGateway:
             )
         return result_text
 
+    def _note_grant_health(self, tool_name: object, result_text: str) -> None:
+        """Read a tool's answer for a dead grant (``grant_failure``) and keep
+        ``needs_reconnect`` in step: an authorization failure marks the
+        server, an answer that is not one clears it."""
+        server = _server_of(tool_name)
+        if server is None:
+            return
+        failure = grant_failure(result_text)
+        if failure is not None:
+            self.mark_needs_reconnect(server, failure)
+        elif server in self.needs_reconnect:
+            self.mark_reconnected(server)
+
+    async def company_drive_items(self, ids: Iterable[str]) -> set[str]:
+        """The Google Drive ids in ``ids`` that are the company's own
+        (``_company_item``), so reading them is not reading outside content
+        (``outside_content.vet_reads``). Empty when it can't tell."""
+        try:
+            session = self._require_session()
+        except Exception:
+            return set()
+        try:
+            return await _google_company_items(session, ids, self._discover)
+        except Exception:
+            logger.warning("company_drive_items: lookup failed", exc_info=True)
+            return set()
+
+    async def drive_item_names(self, ids: Iterable[str]) -> dict[str, str]:
+        """Each Drive item's current name, as the owner lookup gives it (for
+        a card to show; whoever named the file chose it). Missing when it
+        can't be read."""
+        out: dict[str, str] = {}
+        try:
+            session = self._require_session()
+        except Exception:
+            return out
+        for item_id in ids:
+            text = await _google_item_text(session, item_id, self._discover)
+            first = (text or "").split("\n", 1)[0]
+            if first.startswith("File: "):
+                out[item_id] = first[len("File: "):].strip()
+        return out
+
+    async def tapped_drive_change(self, file_id: str, *, name: str = "", move_to: str = "") -> str | None:
+        """Rename and/or move one Drive file as the person approved it on a
+        card (``tapped_drive_call``): a move takes it out of every folder it
+        is in now. None when it worked, else what went wrong in plain words."""
+        arguments: dict[str, Any] = {"file_id": file_id}
+        if name:
+            arguments["name"] = name
+        if move_to:
+            session = self._require_session()
+            text = await _google_item_text(session, file_id, self._discover)
+            item_lines = (text or "").splitlines()
+            anchor = f"ID: {file_id}"
+            starts = [i for i, line in enumerate(item_lines) if line.rstrip() == anchor]
+            # Drive's own Parents line, second after the id, in a lookup
+            # whose lines are all where Drive puts them.
+            after = item_lines[starts[-1] + 1:starts[-1] + 3] if starts else []
+            parents_line = after[1].rstrip() if (
+                len(after) == 2 and after[1].startswith("Parents: ") and _parse_drive_item(text or "", file_id)
+            ) else None
+            if parents_line is None:
+                return "Couldn't read which folder it is in now."
+            parents = [
+                p.strip() for p in parents_line[len("Parents: "):].split(",")
+                if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", p.strip())
+            ]
+            arguments["add_parents"] = move_to
+            if parents:
+                arguments["remove_parents"] = ",".join(p for p in parents if p != move_to)
+                if not arguments["remove_parents"]:
+                    del arguments["remove_parents"]
+        tool_input = {"name": "google_workspace__update_drive_file", "arguments": arguments}
+        with tapped_drive_call(tool_input):
+            result = await self.call_tool(tool_input)
+        text = result if isinstance(result, str) else ""
+        head = text.lstrip()
+        if head.startswith("{"):
+            try:
+                parsed = json.loads(head)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("error"):
+                return str(parsed["error"])[:300]
+        if not head or head.lower().startswith(("error", "tool error")):
+            return (head or "Drive didn't answer.")[:300]
+        return None
+
     async def load_mcp_server(self, tool_input: dict[str, Any]) -> str:
         from openexecutive.delegation.lockdown import outside_reach_refusal
 
@@ -3066,9 +4132,11 @@ class MCPGateway:
         url: str = tool_input["url"]
         if not url.startswith("https://"):
             return json.dumps({"error": "load_mcp_server requires an HTTPS URL"})
-        result = await session.call_tool(
+        result = await _session_call(
+            session,
             "load_mcp_server",
             {"name": tool_input["name"], "url": url},
+            self._call_timeout(),
         )
         return result.content[0].text if result.content else json.dumps({"ok": True})
 
@@ -3152,6 +4220,69 @@ def get_active_gateway() -> MCPGateway | None:
     return _active_gateway
 
 
+# What a Google or Microsoft tool answers once the stored grant is dead:
+# workspace-mcp relays google-auth's "invalid_grant: Token has been expired or
+# revoked", the Graph server a 401 / InvalidAuthenticationToken. A rate limit,
+# a missing scope on one call or a 403 on a single file is not a dead grant,
+# so none of those match.
+_GRANT_FAILURE_RE = re.compile(
+    r"invalid_grant|token has been (?:expired|revoked)|refresh ?token (?:is )?(?:expired|revoked|invalid)"
+    r"|invalidauthenticationtoken|(?:^|[^\w])401(?:[^\w]|$).{0,80}unauthori[sz]ed"
+    r"|unauthori[sz]ed.{0,80}(?:^|[^\w])401(?:[^\w]|$)|reauthentication (?:is )?required"
+    r"|credentials (?:have |are )?(?:expired|been revoked)|invalid authentication credentials"
+    r"|\bUNAUTHENTICATED\b",
+    re.IGNORECASE | re.DOTALL,
+)
+# How much of a result is read for it: an error comes first; a long mailbox
+# listing quoting the words "invalid_grant" is not one.
+_GRANT_FAILURE_SCAN_CHARS = 4000
+
+
+# How a failed call reads as text (the gateway's gates and the MCP client
+# render errors these ways; workflows/action_step.py reads the same). A
+# successful answer that happens to open with "error" ("Errors in Q3…") is
+# not one, and a model-echoed argument never starts a result.
+_ERROR_TEXT_PREFIXES = ("Error: ", "Error calling tool ", "Tool error:", "Error executing tool ")
+
+
+def grant_failure(result_text: object) -> str | None:
+    """The authorization failure a tool result reports, in a line, or None
+    when the result is not one. Only an error payload counts (``{"error":
+    …}``, or text that opens with an error marker), never a successful
+    answer that merely quotes those words."""
+    if not isinstance(result_text, str) or not result_text:
+        return None
+    head = result_text[:_GRANT_FAILURE_SCAN_CHARS]
+    error: str | None = None
+    try:
+        parsed = json.loads(head) if head.lstrip().startswith("{") else None
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        if "error" not in parsed:
+            return None
+        error = json.dumps(parsed.get("error"))[:_GRANT_FAILURE_SCAN_CHARS]
+    elif head.lstrip().startswith(_ERROR_TEXT_PREFIXES):
+        error = head
+    if error is None:
+        return None
+    match = _GRANT_FAILURE_RE.search(error)
+    if match is None:
+        return None
+    start = max(match.start() - 40, 0)
+    return " ".join(error[start:match.end() + 80].split())[:200]
+
+
+def _server_of(tool_name: object) -> str | None:
+    """The server a prefixed tool name belongs to (``google_workspace__x`` →
+    ``google_workspace``), or None."""
+    if not isinstance(tool_name, str):
+        return None
+    normalized = _normalize_tool_name(tool_name)
+    server, sep, _ = normalized.partition("__")
+    return server if sep and server else None
+
+
 def gateway_server_names(gateway: object) -> tuple[str, ...]:
     """The servers ``gateway`` started with, or () for no gateway (or a
     stand-in without the attribute)."""
@@ -3159,3 +4290,57 @@ def gateway_server_names(gateway: object) -> tuple[str, ...]:
     if not isinstance(names, tuple | list):
         return ()
     return tuple(n for n in names if isinstance(n, str))
+
+
+def gateway_reconnect_needed(gateway: object) -> tuple[str, ...]:
+    """The servers ``gateway`` has marked as needing a reconnect, sorted; ()
+    for no gateway or a stand-in without the attribute."""
+    names = getattr(gateway, "needs_reconnect", ())
+    if not isinstance(names, set | frozenset | tuple | list):
+        return ()
+    return tuple(sorted(n for n in names if isinstance(n, str)))
+
+
+# The supervisor that starts the gateway and retries while it is down
+# (orchestrator/gateway_boot.py). Set by the app lifespan next to the active
+# gateway, so code that is about to need the gateway can ask for a start now
+# (``ensure_active_gateway``) and the Setup page can say why it is down.
+_supervisor: Any = None
+
+
+def set_gateway_supervisor(supervisor: Any) -> None:
+    global _supervisor
+    _supervisor = supervisor
+
+
+def get_gateway_supervisor() -> Any:
+    return _supervisor
+
+
+async def ensure_active_gateway() -> MCPGateway | None:
+    """The active gateway, after a start attempt if it is down and the
+    supervisor is not already in one. The lazy re-check before a scheduled
+    delivery: with no supervisor (tests, a process started without the
+    lifespan) this is just ``get_active_gateway``."""
+    if _active_gateway is not None or _supervisor is None:
+        return _active_gateway
+    try:
+        await _supervisor.ensure()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("MCP gateway re-check failed")
+    return _active_gateway
+
+
+def gateway_problem(*, with_error: bool = True) -> str | None:
+    """Why there is no active gateway, in one line, or None while there is
+    one. Without a supervisor the answer is only that it is not running.
+    ``with_error=False`` leaves the failure's text out (a page every team
+    member reads)."""
+    if _active_gateway is not None:
+        return None
+    if _supervisor is None:
+        return "the MCP gateway is not running"
+    problem = _supervisor.problem(with_error=with_error)
+    return str(problem) if problem else "the MCP gateway is not running"

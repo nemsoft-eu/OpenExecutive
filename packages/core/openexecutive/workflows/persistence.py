@@ -225,6 +225,10 @@ def get_run(run_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
     return out
 
 
+# How much of each artifact `list_runs(with_body=True)` reads.
+BODY_CHARS = 20_000
+
+
 def list_runs(
     workflow_name: str | None = None,
     limit: int = 100,
@@ -232,6 +236,7 @@ def list_runs(
     status: str | None = None,
     *,
     visible_to: int | None | Literal["all"] = "all",
+    with_body: bool = False,
 ) -> list[dict[str, Any]]:
     """Recent runs, newest-updated first. `workflow_name` and `status` are
     optional SQL filters — pushing `status` into the query (rather than letting
@@ -239,7 +244,9 @@ def list_runs(
     starved when the most-recent `limit` rows are dominated by running/awaiting
     runs. `visible_to` keeps only the runs that person may see
     (`run_visible_to`; None = nobody on the roster: team runs only); the
-    default "all" is for the server's own reads, never a person's."""
+    default "all" is for the server's own reads, never a person's.
+    `with_body` adds each run's `inputs` (parsed) and the start of its
+    `artifact` (`BODY_CHARS`), enough to say what came of it."""
     if not _resolve(db_path).exists():
         return []
     clauses: list[str] = []
@@ -258,11 +265,19 @@ def list_runs(
     params.append(limit)
     with _get_conn(_resolve(db_path)) as conn:
         rows = conn.execute(
-            "SELECT run_id, workflow_name, title, status, created_at, updated_at "
-            f"FROM workflow_runs {where}ORDER BY updated_at DESC LIMIT ?",
+            "SELECT run_id, workflow_name, title, status, created_at, updated_at"
+            + (f", inputs, substr(artifact, 1, {BODY_CHARS}) AS artifact " if with_body else " ")
+            + f"FROM workflow_runs {where}ORDER BY updated_at DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if with_body:
+        for run in out:
+            try:
+                run["inputs"] = json.loads(run["inputs"]) if run["inputs"] else {}
+            except json.JSONDecodeError:
+                run["inputs"] = {}
+    return out
 
 
 def list_artifact_runs(

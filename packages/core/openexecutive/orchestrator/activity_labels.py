@@ -78,6 +78,11 @@ _LABELS: dict[str, str] = {
     "list_open_loops": "Checking what people owe…",
     "close_open_loop": "Closing an open loop…",
     "assign_open_loop": "Assigning a task…",
+    "leave_out_of_brief": "Updating your brief…",
+    "list_followups": "Checking follow-ups…",
+    "cancel_followup": "Cancelling a follow-up…",
+    "move_followup": "Moving a follow-up…",
+    "mark_draft_sent": "Marking the draft sent…",
 
     # Departments
     "list_department_goals": "Reviewing department goals…",
@@ -115,6 +120,8 @@ _LABELS: dict[str, str] = {
 
     # Ask OE panel form fill
     "propose_form_values": "Filling in the form…",
+    # How the app itself works (the user guide)
+    "read_user_guide": "Checking the user guide…",
 
     # Act as me: a draft in the speaker's own Gmail (never sent)
     "ghostwrite_email": "Drafting an email in your voice…",
@@ -122,10 +129,15 @@ _LABELS: dict[str, str] = {
     "search_my_email": "Searching your email…",
     "read_my_email": "Reading your email…",
     "read_my_email_attachment": "Reading an attachment…",
+    "save_my_email_attachment": "Saving a file from your email…",
     "remind_me": "Setting a reminder…",
     "propose_actions": "Leaving you a card to approve…",
+    "find_in_app": "Looking that up in the app…",
+    "do_in_app": "Making that change…",
+    "open_in_app": "Finding the right screen…",
     "my_email_awaiting_reply": "Checking what's waiting on a reply…",
     "my_email_read_before": "Finding the email you mean…",
+    "my_calendar": "Checking your calendar…",
 
     # Always in the loop: the speaker's own notes
     "recall_history": "Checking your notes…",
@@ -182,6 +194,10 @@ _PRIORITY: tuple[frozenset[str], ...] = (
         "update_company_profile",
         "close_open_loop",
         "assign_open_loop",
+        "leave_out_of_brief",
+        "cancel_followup",
+        "move_followup",
+        "mark_draft_sent",
     }),
     frozenset({
         "create_alert",
@@ -229,11 +245,22 @@ def _label_for(tool_use: dict[str, Any]) -> tuple[str, str]:
         return FALLBACK_LABEL, ""
     if name == "call_tool":
         return _mcp_label(tool_use.get("input"))
-    return _LABELS.get(name, FALLBACK_LABEL), name
+    return _LABELS.get(name) or _extension_label(name) or FALLBACK_LABEL, name
+
+
+def _extension_label(name: Any) -> str | None:
+    """The activity line an installed extension's tool registered
+    (orchestrator/extensions.py), if any."""
+    if not isinstance(name, str) or name in _LABELS:
+        return None
+    from openexecutive.orchestrator import extensions
+
+    return extensions.activity_label(name)
 
 
 def _is_nameable(tool_use: dict[str, Any]) -> bool:
-    return tool_use.get("name") in _LABELS or tool_use.get("name") == "call_tool"
+    name = tool_use.get("name")
+    return name in _LABELS or name == "call_tool" or _extension_label(name) is not None
 
 
 def _pick(tool_uses: list[dict[str, Any]]) -> dict[str, Any]:

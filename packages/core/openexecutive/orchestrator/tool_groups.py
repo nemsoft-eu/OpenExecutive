@@ -34,8 +34,17 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         ("cancel_calendar_event", "create_calendar_event", "create_instant_meeting"),
     ),
     "people": (
-        "add, change or archive people on the roster, department heads, roster requests",
-        ("archive_person", "resolve_roster_request", "set_department_head", "upsert_person"),
+        "add, change or archive people on the roster, department heads, roster requests, "
+        "what memory holds about one person",
+        ("archive_person", "ask_about_person", "resolve_roster_request", "set_department_head", "upsert_person"),
+    ),
+    "memory": (
+        "forget a remembered fact, change a company-profile field (industry, headcount, ARR, priorities, ...)",
+        ("forget_fact", "update_company_profile"),
+    ),
+    "corrections": (
+        "leave something out of the brief, list, cancel or move a follow-up or reminder, mark a chat draft sent",
+        ("cancel_followup", "leave_out_of_brief", "list_followups", "mark_draft_sent", "move_followup"),
     ),
     "goals": (
         "department goals, decision outcomes, open loops",
@@ -69,6 +78,12 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "documents": (
         "write, read back or list documents such as memos, reports and plans (artifacts)",
         ("draft_artifact", "get_artifact", "list_artifacts"),
+    ),
+    "app": (
+        "do what the app's own buttons do: pin, rename, delete or share chats; topics, documents, "
+        "files, cards on Today, workflows, memory, departments, skills, the person's own settings; "
+        "links to screens",
+        ("do_in_app", "find_in_app", "open_in_app"),
     ),
     "messaging": (
         "Slack, Telegram and Discord messages, department messages, company broadcasts",
@@ -129,12 +144,10 @@ def open_tools_tool(offered: Iterable[str]) -> dict[str, Any]:
     return {
         "name": OPEN_TOOLS,
         "description": (
-            "Open a group of further tools. You have more tools than the ones listed "
-            "directly; they sit in the groups below. When a request needs one, open "
-            "its group: the result gives each tool's description and input, and you "
-            "then call it with use_tool. Open a group only when the request needs it. "
-            "Before you tell the person you can't do something, check these groups: "
-            "if one covers it, open it.\n"
+            "Open a group of further tools; the result gives each tool's description "
+            "and input, and you call it with use_tool. Open one only when the request "
+            "needs it, and before telling the person you can't do something, check "
+            "whether a group below covers it.\n"
             + lines
         ),
         "input_schema": {

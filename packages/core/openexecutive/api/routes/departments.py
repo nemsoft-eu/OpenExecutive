@@ -18,7 +18,12 @@ from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from openexecutive.departments import registry, store
-from openexecutive.departments.cadence import CADENCE_FORMATS_HINT, is_valid_cadence_spec
+from openexecutive.departments.cadence import (
+    CADENCE_FORMATS_HINT,
+    is_valid_cadence_spec,
+    next_check_in_at,
+    reschedule_check_in,
+)
 from openexecutive.departments.models import (
     AuthorityLevel,
     DepartmentCharter,
@@ -100,6 +105,21 @@ class DepartmentPatch(BaseModel):
         return cleaned
 
 
+class DepartmentDetail(DepartmentState):
+    """One department as its page reads it: the state plus when its next
+    check-in is queued (ISO-8601 UTC, ``None`` when none is: the check-in is
+    off, the workspace is solo, or the scheduler has not queued it yet)."""
+
+    next_check_in_at: str | None = None
+
+
+def _detail(state: DepartmentState) -> DepartmentDetail:
+    return DepartmentDetail(
+        **state.model_dump(),
+        next_check_in_at=next_check_in_at(state.config.slug),
+    )
+
+
 class GoalCreate(BaseModel):
     """Only `key_result` (the goal itself) is required. A missing or blank
     `period_value` is filled with the current period for `period_type`, and
@@ -114,6 +134,15 @@ class GoalCreate(BaseModel):
     target: str = Field(default="", max_length=512)
     current: str = Field(default="", max_length=512)
     status: GoalStatus = "on_track"
+    # Who the goal is on. Unset = the department's lead, else the principal.
+    owner_person_id: int | None = None
+
+
+class GoalCreateInArea(GoalCreate):
+    """A goal that may name its department in words: an existing one by slug
+    or title, else a new one of that name. Blank = no department."""
+
+    area: str = Field(default="", max_length=80)
 
 
 class GoalPatch(BaseModel):
@@ -126,6 +155,18 @@ class GoalPatch(BaseModel):
     target: str | None = Field(default=None, max_length=512)
     current: str | None = Field(default=None, max_length=512)
     status: GoalStatus | None = None
+    # Sent as null to clear: no owner of its own / no department.
+    owner_person_id: int | None = None
+    department_slug: str | None = None
+
+
+class GoalView(Goal):
+    """A goal as the Goals page reads it: who it is on (its own owner, else
+    its department's lead, else the principal) and its department's title."""
+
+    owner_id: int | None = None
+    owner_name: str = ""
+    department_title: str | None = None
 
 
 def _translate_legacy_body(body: dict) -> dict:
@@ -155,12 +196,12 @@ def list_departments() -> list[DepartmentState]:
     return store.list_departments()
 
 
-@router.get("/departments/{slug}", response_model=DepartmentState)
-def get_department(slug: str) -> DepartmentState:
+@router.get("/departments/{slug}", response_model=DepartmentDetail)
+def get_department(slug: str) -> DepartmentDetail:
     state = store.get_department(slug)
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown department")
-    return state
+    return _detail(state)
 
 
 # --------------------------------------------------------------------------- #
@@ -188,14 +229,15 @@ def delete_department(slug: str) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.patch("/departments/{slug}", response_model=DepartmentState)
-def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentState:
-    if store.get_department(slug) is None:
+@router.patch("/departments/{slug}", response_model=DepartmentDetail)
+def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentDetail:
+    before = store.get_department(slug)
+    if before is None:
         raise HTTPException(status_code=404, detail="Unknown department")
 
     raw = patch.model_dump(exclude_unset=True)
     if not raw:
-        return _must_get(slug)
+        return _detail(before)
 
     # An unparseable spec would be stored and then silently skipped by the
     # scheduler, so reject it here. Only an exactly empty spec means "no
@@ -245,7 +287,18 @@ def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentState:
         watched_entities=patch.watched_entities,
     )
     registry.invalidate()
-    return _must_get(slug)
+    # A changed check-in cadence takes effect now: the pending check-in on the
+    # old schedule is cancelled and the next one on the new schedule queued
+    # (none when it was switched off with an empty spec).
+    if (
+        patch.cadences is not None
+        and patch.cadences.get("check_in", "") != before.config.cadences.get("check_in", "")
+    ):
+        try:
+            reschedule_check_in(slug)
+        except Exception:  # noqa: BLE001 - the edit is saved; a failed re-time keeps the old row.
+            logger.exception("departments.patch: could not re-time %r's check-in", slug)
+    return _detail(_must_get(slug))
 
 
 # --------------------------------------------------------------------------- #
@@ -267,12 +320,25 @@ def _current_period_value(period_type: str) -> str:
     return default_period_value(period_type, today)
 
 
-def _create_goal(slug: str, body: GoalCreate) -> Goal:
-    if store.get_department(slug) is None:
+def _check_owner(person_id: int | None) -> None:
+    if person_id is None:
+        return
+    from openexecutive.people import store as people_store
+
+    person = people_store.get_person(person_id)
+    # A goal is owned by someone on the team, never an outside contact.
+    if person is None or person.archived or person.kind != "team":
+        raise HTTPException(status_code=422, detail="Unknown owner")
+
+
+def _create_goal(slug: str | None, body: GoalCreate) -> Goal:
+    if slug is not None and store.get_department(slug) is None:
         raise HTTPException(status_code=404, detail="Unknown department")
+    _check_owner(body.owner_person_id)
     period_value = (body.period_value or "").strip() or _current_period_value(body.period_type)
     goal_id = store.insert_goal(
         slug,
+        owner_person_id=body.owner_person_id,
         period_type=body.period_type,
         period_value=period_value,
         key_result=body.key_result,
@@ -289,10 +355,21 @@ def _create_goal(slug: str, body: GoalCreate) -> Goal:
     return goal
 
 
-def _patch_goal(slug: str, goal_id: int, body: GoalPatch) -> Goal:
+def _patch_goal(slug: str | None, goal_id: int, body: GoalPatch) -> Goal:
+    """``slug`` None = the department-free ``/goals/{id}`` route, which may
+    reach any goal; a department route reaches only that department's."""
     existing = store.get_goal(goal_id)
-    if existing is None or existing.department_slug != slug:
+    if existing is None or (slug is not None and existing.department_slug != slug):
         raise HTTPException(status_code=404, detail="Unknown Goal for department")
+    sent = body.model_fields_set
+    moves: dict[str, object] = {}
+    if "owner_person_id" in sent:
+        _check_owner(body.owner_person_id)
+        moves["owner_person_id"] = body.owner_person_id
+    if "department_slug" in sent:
+        if body.department_slug and store.get_department(body.department_slug) is None:
+            raise HTTPException(status_code=422, detail="Unknown department")
+        moves["department_slug"] = body.department_slug or None
     store.update_goal(
         goal_id,
         period_type=body.period_type,
@@ -301,6 +378,7 @@ def _patch_goal(slug: str, goal_id: int, body: GoalPatch) -> Goal:
         target=body.target,
         current=body.current,
         status=body.status,
+        **moves,  # type: ignore[arg-type]
     )
     updated = store.get_goal(goal_id)
     if updated is None:
@@ -309,9 +387,9 @@ def _patch_goal(slug: str, goal_id: int, body: GoalPatch) -> Goal:
     return updated
 
 
-def _delete_goal_impl(slug: str, goal_id: int) -> None:
+def _delete_goal_impl(slug: str | None, goal_id: int) -> None:
     existing = store.get_goal(goal_id)
-    if existing is None or existing.department_slug != slug:
+    if existing is None or (slug is not None and existing.department_slug != slug):
         raise HTTPException(status_code=404, detail="Unknown Goal for department")
     store.delete_goal(goal_id)
     registry.invalidate()
@@ -324,6 +402,57 @@ def _delete_goal_impl(slug: str, goal_id: int) -> None:
 )
 def create_goal(slug: str, body: GoalCreate) -> Goal:
     return _create_goal(slug, body)
+
+
+@router.get("/goals", response_model=list[GoalView])
+def list_all_goals() -> list[GoalView]:
+    """Every goal, with or without a department, with its owner resolved."""
+    from openexecutive.departments.goals import list_goal_views
+
+    return [
+        GoalView(
+            **v.goal.model_dump(),
+            owner_id=v.owner_id,
+            owner_name=v.owner_name,
+            department_title=v.department_title,
+        )
+        for v in list_goal_views()
+    ]
+
+
+@router.post("/goals", response_model=Goal, status_code=status.HTTP_201_CREATED)
+def create_goal_in_area(body: GoalCreateInArea) -> Goal:
+    """Add a goal. With ``area`` blank it has no department; a named area is
+    matched to an existing department by slug or title, else created (like
+    ``POST /departments``, with no specialist; its goals are then graded by
+    the weekly goal review, ``departments.goal_review``)."""
+    title = body.area.strip()
+    store.initialize_db()
+    slug: str | None = None
+    if title:
+        known = [d.config for d in store.list_departments()]
+        match = store.match_department(title, known)
+        if match is None:
+            try:
+                match = store.create_department(title).config
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            registry.invalidate()
+        slug = match.slug
+    return _create_goal(slug, GoalCreate.model_validate(body.model_dump(exclude={"area"})))
+
+
+@router.patch("/goals/{goal_id}", response_model=Goal)
+def patch_any_goal(goal_id: int, body: GoalPatch) -> Goal:
+    """Edit a goal wherever it is, including moving it between departments
+    (``department_slug``, null = none) or owners (``owner_person_id``)."""
+    return _patch_goal(None, goal_id, body)
+
+
+@router.delete("/goals/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_any_goal(goal_id: int) -> Response:
+    _delete_goal_impl(None, goal_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/departments/{slug}/goals/{goal_id}", response_model=Goal)

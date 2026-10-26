@@ -524,3 +524,40 @@ def test_limit_cannot_widen_what_is_printed_past_the_board(db: Path) -> None:
 
     assert len(printed) == BOARD_LIMIT
     assert len(ids) == BOARD_LIMIT
+
+
+@pytest.mark.parametrize("co_principal", [False, True])
+@pytest.mark.parametrize("verified", [True, False])
+def test_waiting_drafts_reach_the_principals_own_turn_only(
+    verified: bool, co_principal: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A brief line about a draft waiting for review can be discussed: the
+    principal's own turn names each waiting draft; anyone else's never. With
+    a co-principal the verified speaker may be the other founder, whose
+    drafts these are not, so none are named."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from openexecutive.briefing import context as ctx
+    from openexecutive.delegation import drafts
+    from openexecutive.memory import episodic
+    from openexecutive.orchestrator import people_tools
+    from openexecutive.people import store as people_store
+
+    path = tmp_path / "episodic.db"
+    episodic.initialize_db(path)
+    monkeypatch.setattr(episodic, "DB_PATH", path)
+    owner = SimpleNamespace(id=1, email="owner@example.com")
+    monkeypatch.setattr(people_store, "find_principal_person", lambda *a, **k: owner)
+    # One principal: the drafts are then the speaker's own (context._single_principal).
+    roster = [owner, SimpleNamespace(id=2, email="co@example.com")] if co_principal else [owner]
+    monkeypatch.setattr(people_store, "active_principals", lambda *a, **k: roster)
+    monkeypatch.setattr(people_tools, "is_principal_on_verified_surface", lambda _s: verified)
+    monkeypatch.setattr(ctx, "format_open_alerts_for_prompt", lambda **_kw: "")
+    row = drafts.record(1, source=drafts.SOURCE_CHAT, thread_id="t1", draft_id="d1",
+                        message_id="m1", now=datetime.now(UTC))
+    monkeypatch.setattr(drafts, "_seen", {(1, row): (("dana@example.com",), "Pilot pricing")})
+
+    block = ctx.render_and_trust(_FakeSession())
+
+    assert ('to dana@example.com — "Pilot pricing"' in block) is (verified and not co_principal)

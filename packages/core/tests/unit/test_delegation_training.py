@@ -314,7 +314,7 @@ def test_the_switches_and_the_list_through_the_api(client: TestClient, owner: An
     resp = client.put("/delegation/training", json={"replies": True, "drafts": True}, headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()["training"]
-    assert body == {"replies": True, "follow_ups": False, "actions": False, "drafts": True, "learned": []}
+    assert body == {"replies": True, "follow_ups": False, "actions": False, "drafts": True, "actions_on": False, "learned": []}
     assert resp.json()["handle_it"]["lead"] is False
     assert not take_the_lead.get(take_the_lead.person_scope(owner.id)).enabled
     allowed = training.allow_sender(owner.id, DANA, "Dana Park", decision_id=None)
@@ -343,5 +343,7 @@ def test_widening_needs_a_provable_caller(client: TestClient, owner: Any, monkey
     # Holding more back is fine without signed sign-ins...
     assert client.put("/delegation/training", json={"replies": True, "actions": False}, headers=HEADERS).status_code == 200
     # ...letting more go is not.
-    for body in ({"replies": False}, {"actions": True}, {"drafts": True}):
+    for body in ({"replies": False}, {"actions": True}, {"drafts": True}, {"actions_on": True}):
         assert client.put("/delegation/training", json=body, headers=HEADERS).status_code == 409
+    # Taking Suggested actions out of training or On is narrowing too.
+    assert client.put("/delegation/training", json={"actions_on": False}, headers=HEADERS).status_code == 200

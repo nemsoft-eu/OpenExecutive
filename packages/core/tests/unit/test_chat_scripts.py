@@ -303,6 +303,10 @@ def test_a_later_turn_of_a_mail_conversation_is_not_locked_once_the_mail_is_out_
 
     pinned = SimpleNamespace(offered=False, touched_mail=True, read_mail=False)
     monkeypatch.setattr("openexecutive.orchestrator.executive.turn_delegation", lambda _s: pinned)
+    # The send passes the teammate-mail guard, which reads the roster and
+    # refuses when it can't: give it an empty one rather than whatever
+    # ./episodic_memory.db an earlier test left behind.
+    monkeypatch.setattr("openexecutive.people.store.list_people", lambda *a, **kw: [])
     slack: list[dict[str, Any]] = []
 
     async def send_slack_dm(tool_input: dict[str, Any]) -> str:
@@ -316,10 +320,12 @@ def test_a_later_turn_of_a_mail_conversation_is_not_locked_once_the_mail_is_out_
     provider = _ScriptedProvider([
         _FinalMsg([
             _ToolUseBlock("tu-s", "run_script", {"script": SCRIPT}),
-            _ToolUseBlock("tu-f", "call_tool", fetch),
             _ToolUseBlock("tu-g", "call_tool", send),
             _ToolUseBlock("tu-d", "send_slack_dm", {"slack_user_id": "U1", "text": "hi"}),
         ], "tool_use"),
+        # A read in a round of its own: one beside the sends would hold them
+        # (orchestrator.outside_content).
+        _FinalMsg([_ToolUseBlock("tu-f", "call_tool", fetch)], "tool_use"),
         _FinalMsg([_TextBlock("Done.")], "end_turn"),
     ])
     _run(provider, gateway)
@@ -477,6 +483,34 @@ def test_a_script_can_use_the_executives_own_tools(
     rows = [r for r in audit if r["details"].get("via") == "run_script"]
     assert [(r["details"]["tool"], r["details"]["kind"]) for r in rows] == [("create_alert", "skill")] * 3
     assert json.loads(_any_result(provider, "tu-s"))["result"] == 0
+
+
+def test_a_script_cannot_raise_an_alert_the_mail_hold_withholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a mail read, a script's own calls are held as a direct call would
+    be (delegation.lockdown.mail_turn_withholds): an alert at any level."""
+    from openexecutive.orchestrator import executive as executive_module
+
+    made: list[dict[str, Any]] = []
+
+    async def create_alert(tool_input: dict[str, Any]) -> str:
+        made.append(tool_input)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setitem(executive_module._ALL_SKILL_HANDLERS, "create_alert", create_alert)
+    from types import SimpleNamespace
+
+    pinned = SimpleNamespace(offered=False, touched_mail=True, read_mail=True)
+    monkeypatch.setattr("openexecutive.orchestrator.executive.turn_delegation", lambda _s: pinned)
+    # The mail read this turn was checked and clean: the script runs, its
+    # alert doesn't.
+    monkeypatch.setattr(
+        executive_module, "mail_turn_withholds", lambda name, _input, **_kw: name == "create_alert"
+    )
+    provider = _script_turn("create_alert(title='Mail said', severity='low')\nlen(inputs)")
+    _run(provider, _Gateway())
+    assert made == []
 
 
 def test_an_own_tool_the_turn_is_not_offered_is_not_a_function(

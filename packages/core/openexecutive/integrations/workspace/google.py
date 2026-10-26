@@ -273,7 +273,7 @@ class GoogleMail:
 def _extract_meet_link(event: dict[str, Any]) -> str | None:
     """Pull the Google Meet video URL out of a created-event response.
 
-    The workspace-mcp ``manage_event`` returns the Calendar event object; the
+    For a Calendar event object (as JSON), the
     Meet link lives under ``conferenceData.entryPoints[].uri`` for the ``video``
     entry point. Some servers also surface ``hangoutLink`` directly. Tolerant of
     both snake_case and camelCase key spellings.
@@ -291,6 +291,114 @@ def _extract_meet_link(event: dict[str, Any]) -> str | None:
                 if isinstance(uri, str) and uri:
                     return uri
     return None
+
+
+# workspace-mcp answers ``manage_event`` in plain text ("Successfully created
+# event 'X' for a@b.com. Link: https://www.google.com/calendar/event?eid=...
+# Google Meet: https://meet.google.com/..."), and a failure as the error's
+# text. Only the gateway's own refusals are JSON.
+_CREATED_PREFIX = "successfully created event"
+_DELETED_PREFIX = "successfully deleted event"
+_EVENT_LINK_RE = re.compile(r"Link:\s*(\S+)")
+_MEET_LINK_RE = re.compile(r"Google Meet:\s*(https://\S+)")
+_EVENT_LINK_HOSTS = frozenset({"www.google.com", "calendar.google.com"})
+_MEET_HOST = "meet.google.com"
+
+
+def _json_object(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _event_id_from_link(link: str, calendar_owner: str | None) -> str | None:
+    """The event id inside a Calendar ``htmlLink``: its ``eid`` parameter is
+    base64url of ``"<event id> <calendar id>"``. Only a Google Calendar link,
+    and only an event on ``calendar_owner``'s calendar when that is known."""
+    import base64
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(link)
+    if parsed.scheme != "https" or parsed.netloc.lower() not in _EVENT_LINK_HOSTS:
+        return None
+    eid = (parse_qs(parsed.query).get("eid") or [""])[0]
+    if not eid:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(eid + "=" * (-len(eid) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    event_id, _, calendar_id = decoded.partition(" ")
+    event_id = event_id.strip()
+    if calendar_owner and calendar_id.strip().lower() != calendar_owner.strip().lower():
+        return None
+    return event_id or None
+
+
+def _after_echoed_title(text: str, title: str | None) -> str:
+    """The reply with the event's own title cut off. workspace-mcp echoes the
+    title before the link, and the title is the model's text: a title that
+    spells out its own "Link: …" must not be read as the event's."""
+    for spelling in dict.fromkeys((title, (title or "").strip())):
+        if spelling:
+            marker = f"'{spelling}' for "
+            at = text.find(marker)
+            if at != -1:
+                return text[at + len(marker):]
+    # Unknown or reworded title: the real link and Meet link come last.
+    return text
+
+
+def _last(pattern: re.Pattern[str], text: str) -> str | None:
+    found = pattern.findall(text)
+    return found[-1] if found else None
+
+
+def _parse_created_event(
+    raw: Any, *, title: str | None = None, calendar_owner: str | None = None,
+) -> dict[str, Any]:
+    """``{"event_id", "raw"[, "meet_link"]}`` for a created event, else
+    ``{"error"}``. A confirmed create is a success even when no id can be read
+    from it: reporting it failed would invite a second, duplicate booking."""
+    from urllib.parse import urlparse
+
+    result = _json_object(raw)
+    if result is not None:
+        if "error" in result:
+            return {"error": result["error"]}
+        event_id = result.get("id") or result.get("event_id") or result.get("eventId")
+        out: dict[str, Any] = {"event_id": event_id, "raw": result}
+        meet_link = _extract_meet_link(result)
+        if meet_link:
+            out["meet_link"] = meet_link
+        return out
+    text = raw if isinstance(raw, str) else str(raw)
+    if not text.strip().lower().startswith(_CREATED_PREFIX):
+        return {"error": f"unexpected manage_event response: {text.strip()[:200]}"}
+    rest = _after_echoed_title(text, title)
+    link = _last(_EVENT_LINK_RE, rest)
+    event_id = _event_id_from_link(link, calendar_owner) if link else None
+    if event_id is None:
+        logger.warning("calendar: created an event but read no id from its link")
+    out = {"event_id": event_id, "raw": {"text": text}}
+    meet = _last(_MEET_LINK_RE, rest)
+    if meet and urlparse(meet).netloc.lower() == _MEET_HOST:
+        out["meet_link"] = meet
+    return out
+
+
+def _parse_deleted_event(raw: Any) -> dict[str, Any]:
+    result = _json_object(raw)
+    if result is not None:
+        return result
+    text = raw if isinstance(raw, str) else str(raw)
+    if text.strip().lower().startswith(_DELETED_PREFIX):
+        return {"ok": True}
+    return {"error": f"unexpected manage_event response: {text.strip()[:200]}"}
 
 
 class GoogleCalendar:
@@ -323,35 +431,31 @@ class GoogleCalendar:
                 "name": "google_workspace__manage_event",
                 "arguments": arguments,
             })
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            # If the MCP returned an error dict, surface it directly.
-            if isinstance(result, dict) and "error" in result:
-                return {"error": result["error"]}
-            if not isinstance(result, dict):
-                return {"error": f"unexpected manage_event response: {str(result)[:200]}"}
-            # The MCP returns the event object; extract the id field.
-            event_id = result.get("id") or result.get("event_id") or result.get("eventId")
-            meet_link = _extract_meet_link(result)
-            out: dict[str, Any] = {"event_id": event_id, "raw": result}
-            if meet_link:
-                out["meet_link"] = meet_link
-            return out
+            return _parse_created_event(
+                raw,
+                title=payload["title"],
+                calendar_owner=getattr(settings, "exec_email_address", None),
+            )
         except Exception as exc:
             logger.exception("calendar: manage_event create failed")
             return {"error": str(exc)}
 
     async def delete_event(self, gateway: Any, external_event_id: str) -> dict[str, Any]:
+        from openexecutive.orchestrator.mcp_gateway import calendar_cancel_grant
+
         try:
-            raw = await gateway.call_tool({
-                "name": "google_workspace__manage_event",
-                "arguments": {
-                    "action": "delete",
-                    "event_id": external_event_id,
-                    "send_updates": "all",
-                },
-            })
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            return result if isinstance(result, dict) else {"ok": True}
+            # A meeting the Executive booked, attendees roster-checked when
+            # booked: the gateway lets this delete mail its cancellation.
+            with calendar_cancel_grant(external_event_id):
+                raw = await gateway.call_tool({
+                    "name": "google_workspace__manage_event",
+                    "arguments": {
+                        "action": "delete",
+                        "event_id": external_event_id,
+                        "send_updates": "all",
+                    },
+                })
+            return _parse_deleted_event(raw)
         except Exception as exc:
             logger.exception("calendar: manage_event delete failed")
             return {"error": str(exc)}

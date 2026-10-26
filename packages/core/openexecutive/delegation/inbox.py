@@ -27,7 +27,8 @@ still need a look, settled ones passed over first. Each is recorded once in
 - it is from the person or one of their send-as addresses, from the
   Executive, or one of this package's own drafts;
 - it is automatic, bulk, a bounce or a calendar invite, or from a mailing
-  list;
+  list (with Read my calendar on, an invite goes to ``delegation.invites``
+  instead: a card to accept or decline it, from someone the person knows);
 - the person is not in To or Cc, or it has more than 10 recipients;
 - the person replied last, or a draft already sits in the thread.
 
@@ -47,8 +48,9 @@ also went to others is drafted for only when the person is in To and it asks
 them themselves, not someone else by name or the group at large
 (``inbox_classifier.wants_draft``). The reply goes to everyone the email went to
 (reply to all, never the person's own addresses or the Executive); a
-stranger's holding reply goes to the sender alone. The card flags
-``others_on_thread``.
+stranger's holding reply starts with the sender alone. The card flags
+``others_on_thread`` and lets the person choose: the sender only, or
+everyone (``card_drafts.set_recipients``).
 
 **Limits.** Per scan 5 drafts; per day ``DELEGATION_INBOX_MAX_DRAFTS_PER_DAY``
 within the shared daily limit (``delegation.caps``), 200 classifications, 2
@@ -94,6 +96,8 @@ DECISION_CLASS = "delegation_reply"
 # A card whose draft follows up the person's own unanswered email
 # (delegation.follow_ups) rather than answering someone else's.
 FOLLOW_UP_SOURCE = "follow_up"
+# Card payload key: everyone else the email went to, for the Reply to choice.
+REPLY_OTHERS = "reply_others"
 
 GRACE = timedelta(minutes=10)
 STALE = timedelta(days=3)
@@ -177,8 +181,11 @@ class ScanResult:
     deferred: int = 0
     failed: int = 0
     closed: int = 0
-    # Replies sent on their own under Handle it for me (delegation.handle_it).
+    # Replies sent on their own under Handle it for me (delegation.handle_it),
+    # and invites accepted on their own (delegation.invites).
     handled: int = 0
+    # Meeting invite cards made (delegation.invites).
+    invites: int = 0
 
     def counts(self) -> dict[str, Any]:
         return asdict(self)
@@ -721,11 +728,24 @@ class Reply:
     references: str | None
     # Everyone else the email went to, on a group email (reply to all).
     cc: list[str] = field(default_factory=list)
+    # Everyone else the email went to, whether or not ``cc`` holds them: who
+    # the card's Reply to choice adds for "Everyone" (``card_drafts.set_recipients``).
+    others: list[str] = field(default_factory=list)
+    # What the person can tap to answer each open question, in order
+    # (``delegation.answers.suggest``); shorter than ``open_questions`` when
+    # a question has none.
+    question_choices: list[dict[str, Any]] = field(default_factory=list)
+    # What the email asks and what the draft says, for the card's closed view.
+    gist: str = ""
 
 
-async def compose_reply(person: Any, message: Any, thread: Any, *, relation: str, own: set[str]) -> Reply | str:
+async def compose_reply(
+    person: Any, message: Any, thread: Any, *, relation: str, own: set[str], mailbox: Any = None,
+) -> Reply | str:
     """The reply to ``message``, written as ``person``, or why there is none
-    (a code). Raises ``ComposeError`` when the composer returns nothing."""
+    (a code). ``mailbox`` is their mailbox's client, which also reads their
+    calendar for a time question's free slots (Read my calendar on); None
+    offers none. Raises ``ComposeError`` when the composer returns nothing."""
     from openexecutive.config import get_settings
     from openexecutive.delegation.ghostwriter import Recipient, asks_if_ai, compose
     from openexecutive.delegation.threads import plan_reply, thread_text, writer_said
@@ -746,16 +766,18 @@ async def compose_reply(person: Any, message: Any, thread: Any, *, relation: str
     exec_address = (get_settings().exec_email_address or "").strip().lower()
     # Everyone else the email went to, never the person's own addresses or
     # the Executive (Send refuses a draft addressed to it), filtered before
-    # trimming so the room goes to real recipients.
-    cc: list[str] = []
-    if relation != "stranger":
-        cc = [
-            a for a in dict.fromkeys([*message.to, *message.cc])
-            if a not in own and a != exec_address and a != message.from_addr
-        ]
-        if len(cc) > MAX_RECIPIENTS - 1:
-            cc = cc[: MAX_RECIPIENTS - 1]
+    # trimming so the room goes to real recipients. A stranger's reply starts
+    # with the sender alone (anyone can be put on a stranger's email); the
+    # card lets the person add the others themselves.
+    others = [
+        a for a in dict.fromkeys([*message.to, *message.cc])
+        if a not in own and a != exec_address and a != message.from_addr
+    ]
+    if len(others) > MAX_RECIPIENTS - 1:
+        others = others[: MAX_RECIPIENTS - 1]
+        if relation != "stranger":
             plan["flags"].append("cc_trimmed")
+    cc = [] if relation == "stranger" else list(others)
     relation_text = {
         "team": "on their team",
         "contact": "one of their contacts",
@@ -781,19 +803,25 @@ async def compose_reply(person: Any, message: Any, thread: Any, *, relation: str
     )
     if not composed.subject:
         return "no_subject"
+    from openexecutive.delegation.answers import suggest
+
     questions = list(composed.open_questions)
+    choices = await suggest(person, questions, composed.question_choices, mailbox=mailbox)
     flags = [*card_flags(message, plan, own=own, exec_address=exec_address), *composed.flags]
     if "asks_if_ai" in flags:
         questions.append("They asked whether they're talking to an AI — answer that yourself.")
     return Reply(
+        question_choices=choices,
         to=plan["to"],
         cc=cc,
+        others=others,
         subject=composed.subject,
         body=composed.body,
         open_questions=questions,
         flags=list(dict.fromkeys(flags)),
         in_reply_to=plan["in_reply_to"],
         references=plan["references"],
+        gist=composed.gist,
     )
 
 
@@ -815,11 +843,13 @@ async def reply_for(
     reply is wanted). The evals run this; a scan runs the same two steps with
     its limits in between."""
     from openexecutive.delegation.ghostwriter import ComposeError
-    from openexecutive.delegation.inbox_classifier import classify, wants_draft
+    from openexecutive.delegation.inbox_classifier import classify, their_last_words, wants_draft
 
     relation = handling_relation(relation, message)
     addressed = addressed_for(person, message, own)
-    verdict = await classify(message, relation=relation, addressed=addressed)
+    verdict = await classify(
+        message, relation=relation, addressed=addressed, earlier=their_last_words(thread, message, own)
+    )
     if verdict is None or not wants_draft(verdict, relation, addressed):
         return verdict, None
     try:
@@ -858,9 +888,14 @@ def _card_payload(
         "they_wrote": sender_new_text(message.text or "")[:_THEY_WROTE_CHARS],
         # Everyone it goes to: Send checks the draft against this list.
         "draft_to": [*reply.to, *reply.cc],
+        # Who Reply to: Everyone adds (``card_drafts.set_recipients``).
+        REPLY_OTHERS: [] if follow_up else reply.others,
         "draft_subject": reply.subject,
         "draft_body": reply.body,
+        "gist": reply.gist,
         "open_questions": reply.open_questions,
+        # One per question, in order (delegation.answers).
+        "question_choices": reply.question_choices,
         "flags": reply.flags,
         "kind": verdict.kind,
         "confidence": verdict.confidence,
@@ -1023,13 +1058,16 @@ async def _scan(person: Any, client: Any, watch: InboxWatch, now: datetime) -> S
     email = (person.email or "").strip().lower()
     own = {email, *await client.send_as_addresses()}
     exec_address = (get_settings().exec_email_address or "").strip().lower()
+    from openexecutive.delegation import invites
+
     result = ScanResult("ok")
     result.closed = await reconcile(person, client, now=now, own=own)
+    result.closed += invites.reconcile(person.id, now=now)
     cards = open_cards(person.id)
     if len(cards) >= OPEN_CARDS_MAX:
         result.status = "backlog_full"
         return result
-    carded = {str(card_payload(c).get("thread_id") or "") for c in cards}
+    carded = {str(card_payload(c).get("thread_id") or "") for c in cards} | invites.carded_threads(person.id)
     since = _parse(watch.watch_since) or now
     listed = await client.inbox_message_ids(after=since, max_results=SCAN_LIST)
     # The newest message of each thread that still needs a look, newest
@@ -1086,6 +1124,56 @@ async def _scan(person: Any, client: Any, watch: InboxWatch, now: datetime) -> S
     return result
 
 
+async def answer_thread(person: Any, client: Any, thread_id: str, *, now: datetime) -> str:
+    """Answer the newest message in ``thread_id`` the way a scan would
+    (``_consider``): written in their voice, sent on its own when Handle it
+    for me's rules allow, otherwise a card for the person. For a workflow
+    step (``delegation.workflow_reply``). Returns what happened: ``sent``,
+    ``card``, ``not_needed``, ``skipped``, ``theirs_last`` (nothing to
+    answer), ``backlog_full``, ``busy`` or ``not_now`` (too new, already
+    looked at, or a limit). Raises a Gmail error as a scan does."""
+    from openexecutive.audit import rows_for_person
+    from openexecutive.config import get_settings
+
+    if person.id in _SCANNING or _client_slot_active():
+        return "busy"
+    # Taken like a scan: the daily and per-thread counts Handle it for me
+    # checks are check-then-act, so one person's answers go one at a time,
+    # and every row it writes is theirs alone, as a scan's are.
+    _SCANNING.add(person.id)
+    try:
+        with rows_for_person(person.id):
+            return await _answer(person, client, thread_id, now=now, exec_address=(
+                get_settings().exec_email_address or ""
+            ).strip().lower())
+    finally:
+        _SCANNING.discard(person.id)
+
+
+async def _answer(person: Any, client: Any, thread_id: str, *, now: datetime, exec_address: str) -> str:
+    email = (person.email or "").strip().lower()
+    own = {email, *(a.strip().lower() for a in await client.send_as_addresses())}
+    if len(open_cards(person.id)) >= OPEN_CARDS_MAX:
+        return "backlog_full"
+    thread = await client.get_thread(thread_id)
+    shown = [m for m in thread.messages if "DRAFT" not in m.labels]
+    if not shown or shown[-1].from_addr in own:
+        return "theirs_last"
+    result = ScanResult("ok")
+    # Only staleness bounds it: the step named this thread, whenever the
+    # watcher started watching (if it does at all).
+    await _consider(person, client, shown[-1].id, thread.id, own, exec_address, now - STALE, now, result)
+    if result.handled:
+        return "sent"
+    if result.drafted:
+        return "card"
+    if result.not_needed:
+        return "not_needed"
+    if result.skipped:
+        return "skipped"
+    return "not_now"
+
+
 async def _consider(
     person: Any, client: Any, message_id: str, thread_id: str, own: set[str], exec_address: str,
     since: datetime, now: datetime, result: ScanResult,
@@ -1094,10 +1182,23 @@ async def _consider(
     Once claimed, a message is finished or left for a later scan
     (``_retry_later``); a Gmail failure is raised for the scan to back off."""
     from openexecutive.config import get_settings
-    from openexecutive.delegation import caps, card_drafts, drafts, handle_it
+    from openexecutive.delegation import (
+        caps,
+        card_drafts,
+        drafts,
+        handle_it,
+        injection_check,
+        invites,
+    )
+    from openexecutive.delegation import disclosure as ai_disclosure
     from openexecutive.delegation.ghostwriter import ComposeError
     from openexecutive.delegation.gmail import DraftSpec, GmailError
-    from openexecutive.delegation.inbox_classifier import addressing, classify, wants_draft
+    from openexecutive.delegation.inbox_classifier import (
+        addressing,
+        classify,
+        their_last_words,
+        wants_draft,
+    )
 
     email = (person.email or "").strip().lower()
     thread = await client.get_thread(thread_id)
@@ -1107,6 +1208,15 @@ async def _consider(
     received = _parse(message.received_at)
     if received is not None and now - received < GRACE:
         return False  # not yet: mail they answer straight away never gets a card
+    if message.calendar_invite and invites.watching(person.id):
+        # A meeting invite: a card to accept or decline it (Read my calendar on).
+        reason = invites.skip_reason(message, own=own, exec_address=exec_address, watch_since=since, now=now)
+        if reason is not None:
+            if _claim(person.id, message, relation="", outcome=SKIPPED, reason=reason, now=now):
+                result.skipped += 1
+            return False
+        await invites.consider(person, client, message, thread, now=now, result=result)
+        return False
     reason = skip_reason(message, thread, own=own, exec_address=exec_address, watch_since=since, now=now)
     if reason is not None:
         if _claim(person.id, message, relation="", outcome=SKIPPED, reason=reason, now=now):
@@ -1124,7 +1234,9 @@ async def _consider(
     if not _claim(person.id, message, relation=relation, outcome=PROCESSING, now=now):
         return False
     asked = addressing(message, name=person.full_name or "", own=own, exec_address=exec_address)
-    verdict = await classify(message, relation=relation, addressed=asked)
+    verdict = await classify(
+        message, relation=relation, addressed=asked, earlier=their_last_words(thread, message, own)
+    )
     _set_outcome(person.id, message.id, PROCESSING, classified=1)
     if verdict is None:
         # The call failed or answered nonsense: that may pass.
@@ -1145,7 +1257,7 @@ async def _consider(
     saved = False
     try:
         try:
-            reply = await compose_reply(person, message, thread, relation=relation, own=own)
+            reply = await compose_reply(person, message, thread, relation=relation, own=own, mailbox=client)
         except ComposeError:
             reply = "compose_failed"
         except Exception as exc:
@@ -1166,6 +1278,13 @@ async def _consider(
             person.id, message, thread, reply, verdict, relation=relation, own=own,
             exec_address=exec_address, now=now,
         ) if handling.enabled else "level"
+        if held is None and await injection_check.held_back(message, relation=relation):
+            # One more look, only ever holding back: an email that tries to
+            # steer an assistant waits for the person.
+            held = injection_check.REASON
+        # The AI line, by the person's own switch for this kind of send: in
+        # the words themselves, so card, draft and what goes all match.
+        reply.body = ai_disclosure.sign(person.id, reply.body, on_its_own=held is None)
         names = (person.full_name or "").split()
         # Write from the address the mail went to: one of their send-as
         # addresses rather than the primary when only that one was used.
@@ -1283,28 +1402,23 @@ def _create_card(
     kept: dict[str, Any] | None = None,
 ) -> int | None:
     """The card for this reply, made once per message (its idempotency key):
-    a second call for the same message finds the one the first made. A card
-    Handle it for me will send is ``auto_execute``; every other is ``propose``."""
-    from openexecutive.memory.decision_ledger import create_decision_instance, get_live_by_idem
+    a second call for the same message finds the open one the first made, a
+    card dismissed or lapsed under that key doesn't stop a new one, and one
+    sent or settled in the mailbox means None (``invites.create_once``). A card Handle it for me
+    will send is ``auto_execute``; every other is ``propose``."""
+    from openexecutive.delegation.invites import create_once
 
-    key = f"{DECISION_CLASS}:{person.id}:{message.id}"
-    try:
-        return create_decision_instance(
-            decision_class=DECISION_CLASS,
-            department="",
-            originating_session_id=None,
-            proposed_payload=_card_payload(
-                person, message, thread, reply, draft, relation=relation, handled_as=handled_as, verdict=verdict,
-                handle_it_reason=handle_it_reason, source=source,
-            ) | (kept or {}),
-            idempotency_key=key,
-            gate_mode="auto_execute" if on_its_own else "propose",
-            approver_person_id=person.id,
-            confidence=verdict.confidence,
-        )
-    except sqlite3.IntegrityError:
-        existing = get_live_by_idem(key)
-        return existing.id if existing is not None else None
+    return create_once(
+        DECISION_CLASS,
+        f"{DECISION_CLASS}:{person.id}:{message.id}",
+        _card_payload(
+            person, message, thread, reply, draft, relation=relation, handled_as=handled_as, verdict=verdict,
+            handle_it_reason=handle_it_reason, source=source,
+        ) | (kept or {}),
+        approver_person_id=person.id,
+        gate_mode="auto_execute" if on_its_own else "propose",
+        confidence=verdict.confidence,
+    )
 
 
 # --------------------------------------------------------------------------- #

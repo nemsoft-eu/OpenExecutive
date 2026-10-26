@@ -48,6 +48,13 @@ interface BuildOpts {
    * but the principal).
    */
   roleKind?: RoleKind | null;
+  /**
+   * Whether any department exists. A team's Departments tab shows only then:
+   * goals stand on their own, so a team may never need one (it is reached
+   * from the Goals page's "Add a department"). Defaults to true, so a caller
+   * that doesn't know keeps the tab.
+   */
+  hasDepartments?: boolean;
 }
 
 // What the profile at /company-profile is called. A team's is its company.
@@ -111,19 +118,24 @@ const GOALS_ITEM: NavItem = {
 
 // The Company hub's tabs in a team: who's on it, what you're aiming for,
 // how it's organised, and the profile.
-function companyTabs(isOnboarded: boolean): NavItem[] {
+function companyTabs(isOnboarded: boolean, hasDepartments: boolean): NavItem[] {
   return [
     { href: "/people", label: "People", icon: "users", description: PEOPLE_DESCRIPTION },
     {
       ...GOALS_ITEM,
-      description: "Every department's goals in one place — add, update and close them.",
+      description: "Every goal in one place, by owner, department or status — add, update and close them.",
     },
-    {
-      href: "/departments",
-      label: "Departments",
-      icon: "grid",
-      description: "Your departments, their goals, how much each may decide on its own, and the expert behind each.",
-    },
+    ...(hasDepartments
+      ? [
+          {
+            href: "/departments",
+            label: "Departments",
+            icon: "grid",
+            description:
+              "Your departments, their goals, how much each may decide on its own, and the expert behind each.",
+          } satisfies NavItem,
+        ]
+      : []),
     profileItem("company", isOnboarded),
   ];
 }
@@ -167,7 +179,8 @@ const WORK_TABS: NavItem[] = [
 
 // The Delegate hub's tabs: what the Executive does as you (Act as me,
 // Handle it for me) and on its own (Take the lead). Each is a named feature,
-// so its tab shows the brand label.
+// so its tab shows the brand label. What it does for you sits beside each
+// tab (DelegatePage).
 const DELEGATE_TABS: NavItem[] = [
   {
     href: "/delegate/act-as-me",
@@ -209,6 +222,7 @@ export function buildHubs({
   isOnboarded = true,
   mode = "team",
   roleKind = null,
+  hasDepartments = true,
 }: BuildOpts = {}): Hub[] {
   const work: Hub = {
     key: "work",
@@ -231,7 +245,7 @@ export function buildHubs({
           label: "Company",
           icon: "building",
           description: "People, goals, departments and the company profile.",
-          tabs: companyTabs(isOnboarded),
+          tabs: companyTabs(isOnboarded, hasDepartments),
         };
   const delegate: Hub = {
     key: "delegate",
@@ -245,8 +259,11 @@ export function buildHubs({
 
 // The hub a page belongs to, or null for a page that isn't in one.
 export function hubForPath(pathname: string, opts: BuildOpts = {}): Hub | null {
+  // On the Departments pages the tab shows even before the first department
+  // exists: that is where it gets added.
+  const withTab = isNavActive("/departments", pathname) ? { ...opts, hasDepartments: true } : opts;
   return (
-    buildHubs(opts).find((hub) => hub.tabs.some((tab) => isNavActive(tab.href, pathname))) ?? null
+    buildHubs(withTab).find((hub) => hub.tabs.some((tab) => isNavActive(tab.href, pathname))) ?? null
   );
 }
 
@@ -273,8 +290,9 @@ export function buildDestinations({
   reviewBadge = 0,
   mode = "team",
   roleKind = null,
+  hasDepartments = true,
 }: BuildOpts = {}): Destination[] {
-  const hubs = buildHubs({ isOnboarded, mode, roleKind });
+  const hubs = buildHubs({ isOnboarded, mode, roleKind, hasDepartments });
   const hubEntry = (hub: Hub): Destination => ({
     key: hub.key,
     href: hub.tabs[0].href,
@@ -442,7 +460,27 @@ export function advancedItemsByGroup(): {
 // notes to keep (signed in and on the People list). `hashes` are the anchors the
 // old one-page Settings used (`/settings#workspace`): links that still
 // carry one land on the matching page (see settingsPageForHash).
-export type SettingsPageId = "executive" | "memory" | "workspace" | "advanced" | "about";
+export type SettingsPageId =
+  | "executive"
+  | "notifications"
+  | "memory"
+  | "workspace"
+  | "advanced"
+  | "about";
+
+// The headed groups the Settings hub sorts its pages into, in order.
+export type SettingsGroupId = "you" | "company" | "more";
+
+export interface SettingsGroupDef {
+  id: SettingsGroupId;
+  label: string;
+}
+
+export const SETTINGS_GROUPS: SettingsGroupDef[] = [
+  { id: "you", label: "You and your Executive" },
+  { id: "company", label: "Company" },
+  { id: "more", label: "More" },
+];
 
 export interface SettingsPageDef {
   id: SettingsPageId;
@@ -452,11 +490,14 @@ export interface SettingsPageDef {
   /** What's on the page, as the hub tile says it. */
   description: string;
   hashes: string[];
+  /** The hub group the page is listed under. */
+  group: SettingsGroupId;
 }
 
 export const SETTINGS_PAGES: SettingsPageDef[] = [
   {
     id: "executive",
+    group: "you",
     label: "Your Executive",
     href: "/settings/executive",
     icon: "cog",
@@ -464,7 +505,17 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
     hashes: ["executive", "on-its-own"],
   },
   {
+    id: "notifications",
+    group: "you",
+    label: "Notifications",
+    href: "/settings/notifications",
+    icon: "bell",
+    description: "Quiet hours, and whether things reach you as they happen or in your briefs.",
+    hashes: [],
+  },
+  {
     id: "memory",
+    group: "you",
     label: "About you",
     href: "/settings/memory",
     icon: "user",
@@ -473,6 +524,7 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
   },
   {
     id: "workspace",
+    group: "company",
     label: "Workspace",
     href: "/settings/workspace",
     icon: "building",
@@ -481,6 +533,7 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
   },
   {
     id: "advanced",
+    group: "more",
     label: "Advanced",
     href: "/settings/advanced",
     icon: "grid",
@@ -490,6 +543,7 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
   },
   {
     id: "about",
+    group: "more",
     label: "About",
     href: "/settings/about",
     icon: "info",
@@ -497,6 +551,17 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
     hashes: ["about"],
   },
 ];
+
+// The hub's groups with the pages in each, in group order and each page in
+// the order given; a group with no page left is dropped.
+export function groupSettingsPages<P extends SettingsPageDef>(
+  pages: P[],
+  groups: SettingsGroupDef[] = SETTINGS_GROUPS,
+): { group: SettingsGroupDef; pages: P[] }[] {
+  return groups
+    .map((group) => ({ group, pages: pages.filter((p) => p.group === group.id) }))
+    .filter((g) => g.pages.length > 0);
+}
 
 // The page an old `/settings#<hash>` link meant, or null for no hash or one
 // that never named a section. Takes the hash with or without its "#".

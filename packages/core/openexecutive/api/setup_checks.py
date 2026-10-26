@@ -155,6 +155,11 @@ class Snapshot:
     # nobody chose one, so UTC).
     brief_delivery: DeliveryOutcome | None = None
     brief_email_ready: bool = False
+    # Why the gateway that sends email is down (orchestrator.mcp_gateway.
+    # gateway_problem), or None while it is up; and the servers whose
+    # sign-in has died (``MCPGateway.needs_reconnect``).
+    gateway_problem: str | None = None
+    gateway_needs_reconnect: tuple[str, ...] = ()
     brief_next_runs: dict[str, datetime] = field(default_factory=dict)
     brief_zone: str | None = None
 
@@ -486,7 +491,8 @@ async def check_slack(snap: Snapshot, http: httpx.AsyncClient) -> SetupCheck:
             f"Copy the Bot User OAuth Token again from your Slack app's settings into .env, {_RESTART}",
         )
     workspace = _clip(str(body.get("team") or "your Slack workspace"))
-    if not app_token:
+    over_http = not app_token and bool((snap.settings.slack_signing_secret or "").strip())
+    if not app_token and not over_http:
         return _result(
             "slack",
             "warn",
@@ -500,6 +506,16 @@ async def check_slack(snap: Snapshot, http: httpx.AsyncClient) -> SetupCheck:
             "error",
             f"The tokens work for {workspace}, but the Slack listener didn't start.",
             f'The API log says why — look for "Failed to start Slack bot". Fix that, {_RESTART}',
+        )
+    if over_http:
+        # Slack posts to /webhook/slack; there is no connection to ask about,
+        # so the last message that arrived is the only sign it is delivering.
+        return _channel_ready(
+            snap,
+            "slack",
+            f"Takes Slack events from {workspace} at /webhook/slack.",
+            actor="slack",
+            roster=_Roster("slack_user_id", "Slack member ID"),
         )
     try:
         listening = bool(
@@ -817,11 +833,21 @@ def check_gmail(snap: Snapshot) -> SetupCheck:
             "To connect Gmail, follow the Google Workspace steps in .env.example.",
         )
     if snap.mcp_gateway is None:
+        problem = snap.gateway_problem or "the MCP gateway is not running"
         return _result(
             "gmail",
             "error",
-            "The connection to Google didn't start, so email is off.",
-            f'The API log says why — look for "MCP gateway". Fix that, {_RESTART}',
+            f"The connection to Google didn't start, so email is off: {problem}.",
+            'It keeps retrying on its own. If it stays off, the API log says why — look for '
+            f'"MCP gateway". Fix that, {_RESTART}',
+        )
+    if "google_workspace" in snap.gateway_needs_reconnect:
+        return _result(
+            "gmail",
+            "error",
+            f"Google turned the Executive's sign-in as {settings.exec_email_address} away: "
+            "it expired or was revoked, so email, calendar and files are off.",
+            f"Sign Google in again as that address (scripts/mint-google-token.py), {_RESTART}",
         )
     missing = _google_sign_in_missing()
     if missing:
@@ -1042,9 +1068,13 @@ def _brief_problem_result(
     the other's — the light's COLOUR still follows the worst reason, which is
     all that was ever really competing for space.
     """
-    from openexecutive.briefing.brief_state import brief_name, render_problems
+    from openexecutive.briefing.brief_state import brief_name, problem_details, render_problems
 
-    problem, fix = render_problems(problems)
+    # The fix may read the detail (a grant that died names a reconnect) but
+    # the summary never quotes it: every team member reads this page, and the
+    # text can name the owner's channels. Home carries it, for the owner alone.
+    problem, _ = render_problems(problems)
+    _, fix = render_problems(problems, problem_details(last, unreachable))
     failed_run = [(r, names) for r, names in problems if r in ("send_failed", "not_written")]
     # `last is not None` is what the type checker needs for `last.kind`; at
     # runtime a non-empty `failed_run` already implies it, since both reasons
@@ -1061,6 +1091,10 @@ def _brief_problem_result(
             else f"Your last {brief_name(last.kind)} wasn't sent"
         )
         return _result("brief", "error", f"{lead}: {problem}.", fix)
+    if any(r == "gateway_down" for r, _ in problems):
+        # Email is set up and the Executive's own gateway isn't running: its
+        # fault, red, and not a channel for the founder to connect.
+        return _result("brief", "error", f"Not sent by email: {problem}.", fix)
     # Ranked above the channel and time-zone warnings in `check_brief`: those
     # are about how and when a brief that IS arriving goes out, while this
     # founder gets none at all. Both of those are `warn` too, so the light's
@@ -1089,9 +1123,14 @@ def check_brief(snap: Snapshot) -> SetupCheck:
         backup_channel_problem,
         brief_name,
         channel_phrase,
+        describe_problem,
         outstanding_problems,
     )
-    from openexecutive.scheduler.runner import delivery_order, unreachable_principals
+    from openexecutive.scheduler.runner import (
+        delivery_order,
+        mail_gateway_problem,
+        unreachable_principals,
+    )
 
     if not snap.settings.scheduler_enabled:
         return _result("brief", "off", "Off, because the scheduler is turned off.")
@@ -1117,10 +1156,17 @@ def check_brief(snap: Snapshot) -> SetupCheck:
     principals = [p for p in snap.people if p.is_principal] or [principal]
     missing = unreachable_principals(principals, email_ready=snap.brief_email_ready)
     if not plan and len(missing) >= len(principals):
-        # Nobody can be reached, so the brief really is app-only. With some
-        # founder reachable it is not, even when this row is the unreachable
-        # one, so that case falls through to the partial below rather than
-        # telling the reader nothing can reach "you".
+        # Nobody can be reached, so the brief really is app-only — unless
+        # email is set up and only its gateway is down, which is said as such.
+        # With some founder reachable it is not, even when this row is the
+        # unreachable one, so that case falls through to the partial below
+        # rather than telling the reader nothing can reach "you".
+        blocked = mail_gateway_problem(principal, with_error=False)
+        if blocked is not None:
+            # The attempt count, not the error text: every team member reads
+            # this page; the owner's own notice on Home carries the text.
+            problem, fix = describe_problem("gateway_down", blocked)
+            return _result("brief", "error", f"Not sent by email: {problem}.", fix)
         problem, fix = DELIVERY_PROBLEMS["no_channel"]
         return _result(
             "brief",
@@ -1226,6 +1272,10 @@ def gather_snapshot(settings: Settings, *, local_login: bool, app_state: Any) ->
     from openexecutive.briefing.brief_state import last_delivery_outcome
     from openexecutive.integrations.slack_bot import bot_user_id
     from openexecutive.memory.workspace_settings import get_user_timezone, get_workspace
+    from openexecutive.orchestrator.mcp_gateway import (
+        gateway_problem,
+        gateway_reconnect_needed,
+    )
     from openexecutive.people.store import find_principal_person, list_people
     from openexecutive.scheduler.runner import email_ready, next_brief_runs
 
@@ -1246,6 +1296,8 @@ def gather_snapshot(settings: Settings, *, local_login: bool, app_state: Any) ->
         slack_handler=getattr(app_state, "slack_handler", None),
         slack_bot_id_resolved=bot_user_id() is not None,
         mcp_gateway=getattr(app_state, "mcp_gateway", None),
+        gateway_problem=gateway_problem(with_error=False),
+        gateway_needs_reconnect=gateway_reconnect_needed(getattr(app_state, "mcp_gateway", None)),
         brief_delivery=last_delivery_outcome(),
         brief_email_ready=email_ready(),
         brief_next_runs=next_brief_runs(now),

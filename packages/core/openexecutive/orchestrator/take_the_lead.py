@@ -601,6 +601,16 @@ def _rule_hit(rules: list[Rule], text: str, recipients: list[str]) -> Hit | None
     return None
 
 
+def _mcp_deletes(tool: str, tool_input: dict[str, Any]) -> bool:
+    """Whether a connected tool deletes, cancels or shares: by its name, or
+    by its ``action`` (Google's ``manage_event`` deletes with
+    ``action="delete"``)."""
+    if _MCP_DELETE_RE.search(tool):
+        return True
+    action = tool_input.get("action") if isinstance(tool_input, dict) else None
+    return isinstance(action, str) and bool(_MCP_DELETE_RE.search(action))
+
+
 def check(
     tool: str,
     tool_input: dict[str, Any],
@@ -623,7 +633,7 @@ def check(
     if hit is not None:
         return hit
     checks: list[tuple[str, bool, str]] = [
-        (DELETE_SHARE, tool in _DELETE_TOOLS or (mcp and bool(_MCP_DELETE_RE.search(tool))),
+        (DELETE_SHARE, tool in _DELETE_TOOLS or (mcp and _mcp_deletes(tool, tool_input)),
          "it deletes, cancels or shares something"),
         (BIG_SEND, tool in _BROADCAST_TOOLS or len(recipients) > BIG_SEND_RECIPIENTS,
          "it goes to a lot of people"),
@@ -1394,7 +1404,7 @@ def hold(
             severity="medium",
             headline=f"The Executive wants to: {shown}"[:160],
             body=f"{shown}\n\nIt waited because {hit.reason}."
-            + (f" Approve + allow lets it do this from now on: {grant[1]}." if grant is not None else ""),
+            + (f" Tick Do this on its own next time to let it do this from now on: {grant[1]}." if grant is not None else ""),
             suggested_action=shown,
             topic_tags=[
                 decision_instance_tag(decision_id),

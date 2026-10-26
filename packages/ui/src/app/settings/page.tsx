@@ -10,6 +10,7 @@ import { MODE_LABEL } from "@/components/settings/WorkspaceCard";
 import {
   ADVANCED_ITEMS,
   SETTINGS_PAGES,
+  groupSettingsPages,
   settingsHrefForHash,
   type SettingsPageDef,
   type SettingsPageId,
@@ -18,16 +19,21 @@ import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import {
   getAgentDetail,
   getHistory,
+  getNotificationSettings,
   getVersion,
   listPersonas,
   type HistoryState,
+  type NotificationSettings,
 } from "@/lib/api";
 import { retentionLabel } from "@/lib/history";
+import { tileStatus as notificationsTileStatus } from "@/lib/notifications";
 import { versionNotice } from "@/lib/versionNotice";
 
-// Settings — a hub of tiles, one per page (SETTINGS_PAGES): Your Executive,
-// About you, Workspace, Advanced and About. Each tile says what's on its page
-// and, where it's cheap to know, how things stand right now. The one-page
+// Settings — a hub with a row per page (SETTINGS_PAGES), in headed groups
+// (SETTINGS_GROUPS): You and your Executive (Your Executive, Notifications,
+// About you), Company (Workspace) and More (Advanced, About). Each row says,
+// where it's cheap to know, how things stand right now, and otherwise what's
+// on its page. The one-page
 // Settings this replaces used anchors (`/settings#workspace`); a link that
 // still carries one is sent on to the matching page (Act as me's, to its tab
 // under Delegate).
@@ -62,7 +68,13 @@ export default function SettingsPage() {
   const statuses = useTileStatuses();
   // About you has a tile only for someone with notes to keep (GET /memories/history
   // answers null for anyone not signed in or not on the People list).
-  const pages = SETTINGS_PAGES.filter((p) => p.id !== "memory" || statuses.memoryOffered);
+  // Notifications likewise only for someone on the People list (GET
+  // /notifications/settings answers null for anyone else).
+  const pages = SETTINGS_PAGES.filter(
+    (p) =>
+      (p.id !== "memory" || statuses.memoryOffered) &&
+      (p.id !== "notifications" || statuses.notificationsOffered),
+  );
 
   if (hash === null || target) return <main className="flex-1" />;
 
@@ -73,36 +85,47 @@ export default function SettingsPage() {
         <p className="mt-2 text-[15px] text-fg-muted">
           How the Executive runs, who it runs for, and the tools for looking under the hood.
         </p>
-        {/* Phones: one compact list (a card with a row per page) so every page
-            fits on one screen. Wider: a grid of tiles. */}
-        <ul className="mt-6 sm:mt-8 grid grid-cols-1 overflow-hidden rounded-2xl border border-line bg-surface-elevated divide-y divide-line sm:overflow-visible sm:rounded-none sm:border-0 sm:bg-transparent sm:divide-y-0 sm:gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {pages.map((page) => (
-            <li key={page.id} className="min-w-0">
-              <SettingsTile page={page} status={statuses.byPage[page.id]} />
-            </li>
+        {/* The pages in headed groups, each a card with a row per page. Phones:
+            one column. Wider: two columns of cards. */}
+        <div className="mt-6 sm:mt-8 sm:columns-2 sm:gap-6">
+          {groupSettingsPages(pages).map(({ group, pages: rows }) => (
+            <section key={group.id} aria-labelledby={`settings-group-${group.id}`} className="mb-6 break-inside-avoid">
+              <h2
+                id={`settings-group-${group.id}`}
+                className="mx-1 mb-2.5 text-[13px] font-bold uppercase tracking-wider text-fg-subtle"
+              >
+                {group.label}
+              </h2>
+              <ul className="overflow-hidden rounded-2xl border border-line bg-surface-elevated divide-y divide-line">
+                {rows.map((page) => (
+                  <li key={page.id} className="min-w-0">
+                    <SettingsRow page={page} status={statuses.byPage[page.id]} />
+                  </li>
+                ))}
+              </ul>
+            </section>
           ))}
-        </ul>
+        </div>
       </div>
     </main>
   );
 }
 
-function SettingsTile({ page, status }: { page: SettingsPageDef; status?: TileStatus }) {
+// One page's row: its name, and under it how things stand (or, for a page
+// with no status, what's on it).
+function SettingsRow({ page, status }: { page: SettingsPageDef; status?: TileStatus }) {
   return (
     <Link
       href={page.href}
-      className="group flex h-full min-h-14 items-center gap-3 px-4 py-3 sm:items-start sm:flex-col sm:gap-0 sm:rounded-2xl sm:border sm:border-line sm:bg-surface-elevated sm:p-6 transition-colors hover:bg-surface-overlay/40 sm:hover:border-accent/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/60"
+      className="group flex min-h-16 items-center gap-3.5 px-4 py-3 sm:px-5 sm:py-3.5 transition-colors hover:bg-surface-overlay/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/60"
     >
-      <span className="flex w-9 h-9 sm:w-11 sm:h-11 flex-shrink-0 items-center justify-center rounded-xl bg-accent/10 text-accent">
+      <span className="flex w-10 h-10 flex-shrink-0 items-center justify-center rounded-xl bg-accent/10 text-accent">
         <Icon name={page.icon} size="w-5 h-5" />
       </span>
-      <span className="min-w-0 flex-1 sm:mt-4 sm:w-full">
-        <span className="block font-display text-base sm:text-lg font-bold tracking-tight text-fg">{page.label}</span>
-        <span className="hidden sm:block mt-1 text-[15px] text-fg-muted leading-relaxed">
-          {page.description}
-        </span>
-        <span className="mt-0.5 sm:mt-3 flex min-h-[1.25rem] items-center gap-2 text-[13px] sm:text-sm text-fg-muted">
-          {status && (
+      <span className="min-w-0 flex-1">
+        <span className="block font-display text-base sm:text-[17px] font-bold tracking-tight text-fg">{page.label}</span>
+        <span className="mt-0.5 flex min-h-[1.25rem] items-center gap-2 text-[13px] sm:text-sm text-fg-muted">
+          {status ? (
             <>
               {status.tone !== "none" && (
                 <span
@@ -114,30 +137,34 @@ function SettingsTile({ page, status }: { page: SettingsPageDef; status?: TileSt
               )}
               <span className="truncate">{status.text}</span>
             </>
+          ) : (
+            <span className="truncate">{page.description}</span>
           )}
         </span>
       </span>
       <Icon
         name="chevron-right"
         size="w-5 h-5"
-        className="sm:hidden text-fg-subtle group-hover:text-fg transition-colors"
+        className="flex-shrink-0 text-fg-subtle group-hover:text-fg transition-colors"
       />
     </Link>
   );
 }
 
-// The one-line status under each tile. Each comes from a read the app makes
+// The one-line status under each row. Each comes from a read the app makes
 // anyway (run state, workspace) or one small request; a read that fails
 // leaves its tile without a status rather than guessing.
 function useTileStatuses(): {
   byPage: Partial<Record<SettingsPageId, TileStatus>>;
   memoryOffered: boolean;
+  notificationsOffered: boolean;
 } {
   const { status: run, unknown } = useExecutiveStatus();
   const { mode, effectiveTimezone, loading: workspaceLoading } = useWorkspace();
   const [voice, setVoice] = useState<string | null>(null);
   const [version, setVersion] = useState<TileStatus | null>(null);
   const [history, setHistory] = useState<HistoryState | null | "error">(null);
+  const [notifications, setNotifications] = useState<NotificationSettings | null | "error">(null);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -152,6 +179,11 @@ function useTileStatuses(): {
       .then((h) => setHistory(h))
       .catch((err) => {
         if ((err as Error)?.name !== "AbortError") setHistory("error");
+      });
+    getNotificationSettings(ctrl.signal)
+      .then((n) => setNotifications(n))
+      .catch((err) => {
+        if ((err as Error)?.name !== "AbortError") setNotifications("error");
       });
     getVersion(ctrl.signal)
       .then((v) => {
@@ -189,6 +221,10 @@ function useTileStatuses(): {
     };
   }
 
+  if (notifications && notifications !== "error") {
+    byPage.notifications = { text: notificationsTileStatus(notifications), tone: "none" };
+  }
+
   if (!workspaceLoading) {
     byPage.workspace = {
       text: [MODE_LABEL[mode], effectiveTimezone].filter(Boolean).join(" · "),
@@ -199,5 +235,5 @@ function useTileStatuses(): {
   byPage.advanced = { text: `${ADVANCED_ITEMS.length} tools for power users`, tone: "none" };
   if (version) byPage.about = version;
 
-  return { byPage, memoryOffered: history !== null };
+  return { byPage, memoryOffered: history !== null, notificationsOffered: notifications !== null };
 }

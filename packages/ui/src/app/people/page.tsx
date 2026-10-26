@@ -1,22 +1,28 @@
 "use client";
 
 import Link from "next/link";
-import { type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { useAskOEFormContext } from "@/components/askoe/AskOEContext";
-import { TeamModeOffer } from "@/components/people/TeamModeOffer";
+import { ChatAppPickers } from "@/components/people/ChatAppPickers";
+import { ContactChangesCard, ContactKeeperSwitch } from "@/components/people/ContactChanges";
+import { TeamModeSwitch } from "@/components/people/TeamModeSwitch";
 import Button from "@/components/ui/Button";
+import { useChatDirectory, useSlackEmailMatch } from "@/components/ui/ChatPicker";
 import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import SidePanel from "@/components/ui/SidePanel";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import {
   createPerson,
+  getContactChanges,
   getPeopleViewer,
   listPeople,
+  type ContactChanges,
   type PageFormField,
   type Person,
   type PersonKind,
 } from "@/lib/api";
+import { newlyAdded } from "@/lib/contactChanges";
 import {
   defaultKindForTab,
   defaultPeopleTab,
@@ -25,7 +31,7 @@ import {
   isContact,
   peopleForTab,
   personCardStatus,
-  shouldOfferTeamMode,
+  shouldSwitchToTeam,
   tabsFor,
   type PeopleTab,
 } from "@/lib/peopleKinds";
@@ -58,10 +64,10 @@ const KINDS: PersonKind[] = ["team", "contact"];
 const TONE_DOT = { ok: "bg-emerald-500", warn: "bg-amber-500", muted: "bg-fg-subtle" } as const;
 
 function channelLabel(channel: string): string {
-  return channel === "any" ? "Any channel" : channel.charAt(0).toUpperCase() + channel.slice(1);
+  return channel === "any" ? "Where they last talked" : channel.charAt(0).toUpperCase() + channel.slice(1);
 }
 
-function PersonCard({ person, today }: { person: Person; today: string }) {
+function PersonCard({ person, today, isNew = false }: { person: Person; today: string; isNew?: boolean }) {
   const contact = isContact(person);
   const status = personCardStatus(person, today);
   return (
@@ -80,6 +86,11 @@ function PersonCard({ person, today }: { person: Person; today: string }) {
           {person.is_principal && (
             <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-accent/10 text-accent">
               Principal
+            </span>
+          )}
+          {isNew && (
+            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium border border-emerald-500/40 text-emerald-500">
+              New
             </span>
           )}
         </div>
@@ -192,6 +203,18 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
   const [showContact, setShowContact] = useState(false);
   const [showAuthority, setShowAuthority] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
+
+  // Slack, Discord and Telegram by name. Slack suggests whoever has the
+  // email typed above, and opens the fold to show it until it is toggled.
+  const chatDirectory = useChatDirectory("people");
+  const slackMatch = useSlackEmailMatch(form.email, !!chatDirectory?.slack.configured);
+  const [contactToggled, setContactToggled] = useState(false);
+  const contactOpen = showContact || (!contactToggled && !!slackMatch);
+  const setChatId = useCallback(
+    (field: "slack_user_id" | "discord_user_id" | "telegram_chat_id", id: string) =>
+      setForm((f) => (f[field] === id ? f : { ...f, [field]: id })),
+    [],
+  );
 
   useEffect(() => {
     // After the panel has taken focus on open, so it remembers the button
@@ -449,9 +472,12 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
 
           {/* Contact & routing */}
           <DisclosureSection
-            label={contact ? "Chat IDs" : "Contact & routing"}
-            open={showContact}
-            onToggle={() => setShowContact((v) => !v)}
+            label={contact ? "Chat apps" : "Contact & routing"}
+            open={contactOpen}
+            onToggle={() => {
+              setContactToggled(true);
+              setShowContact(!contactOpen);
+            }}
           >
             {!contact && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -469,7 +495,7 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
                   </select>
                 </label>
                 <p className={HINT_CLS}>
-                  Proposals routed to this person are sent via {form.preferred_channel === "any" ? "any available channel" : form.preferred_channel}.
+                  Proposals routed to this person are sent via {form.preferred_channel === "any" ? "the app they last talked in, then any other" : form.preferred_channel}.
                 </p>
               </div>
               <div>
@@ -493,38 +519,12 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
             </div>
             )}
 
-            <label className={LABEL_CLS}>
-              Slack user ID
-              <input
-                value={form.slack_user_id}
-                onChange={(e) => setForm((f) => ({ ...f, slack_user_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="U01ABC123"
-              />
-            </label>
-
-            <label className={LABEL_CLS}>
-              Discord user ID
-              <input
-                value={form.discord_user_id}
-                onChange={(e) => setForm((f) => ({ ...f, discord_user_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="123456789012345678"
-              />
-              <span className={HINT_CLS}>
-                Right-click your Discord username and &quot;Copy User ID&quot; (developer mode required).
-              </span>
-            </label>
-
-            <label className={LABEL_CLS}>
-              Telegram chat ID
-              <input
-                value={form.telegram_chat_id}
-                onChange={(e) => setForm((f) => ({ ...f, telegram_chat_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="123456789"
-              />
-            </label>
+            <ChatAppPickers
+              ids={form}
+              onChange={setChatId}
+              directory={chatDirectory}
+              slackMatch={slackMatch}
+            />
           </DisclosureSection>
 
           {/* Approval authority — a contact approves nothing */}
@@ -572,7 +572,7 @@ export default function PeoplePage() {
   const [error, setError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [tab, setTab] = useState<PeopleTab | null>(null);
-  const [offerFor, setOfferFor] = useState<string | null>(null);
+  const [switchedFor, setSwitchedFor] = useState<string | null>(null);
   // Contacts are private to the principal. Until the viewer is known (or if
   // the check fails) nobody is offered them; the API enforces it regardless.
   const [viewerIsPrincipal, setViewerIsPrincipal] = useState(false);
@@ -592,8 +592,26 @@ export default function PeoplePage() {
       .finally(() => setLoading(false));
   }
 
+  // What the Executive changed in the contacts: the principal's alone.
+  const [contactChanges, setContactChanges] = useState<ContactChanges | null>(null);
+  const loadContactChanges = useCallback((next?: ContactChanges) => {
+    if (next) {
+      setContactChanges(next);
+      return;
+    }
+    getContactChanges().then(setContactChanges, () => setContactChanges(null));
+    listPeople({ includeContacts: true }).then(setPeople, () => {});
+  }, []);
+
+  useEffect(() => {
+    if (viewerIsPrincipal) getContactChanges().then(setContactChanges, () => setContactChanges(null));
+  }, [viewerIsPrincipal]);
+
   useEffect(() => {
     refresh();
+    // Done for you's contacts line opens the Contacts tab (?tab=contacts).
+    const linked = new URLSearchParams(window.location.search).get("tab");
+    if (linked === "team" || linked === "contacts") setTab(linked);
     getPeopleViewer()
       .then((v) => setViewerIsPrincipal(v.is_principal))
       .catch(() => setViewerIsPrincipal(false))
@@ -601,6 +619,7 @@ export default function PeoplePage() {
   }, []);
 
   const shown = peopleForTab(people, activeTab, mode);
+  const fresh = activeTab === "contacts" && contactChanges ? newlyAdded(contactChanges.changes) : new Set<number>();
   const hidden = activeTab === "team" ? hiddenTeamCount(people, mode) : 0;
   const copy = TAB_COPY[activeTab];
   const tabsId = useId();
@@ -618,12 +637,12 @@ export default function PeoplePage() {
             setShowAdd(false);
             // Show the new row where it lives.
             setTab(isContact(p) ? "contacts" : "team");
-            if (shouldOfferTeamMode(mode, p.kind ?? "team", p.is_principal)) setOfferFor(p.full_name);
+            if (shouldSwitchToTeam(mode, p.kind ?? "team", p.is_principal)) setSwitchedFor(p.full_name);
           }}
           onClose={() => setShowAdd(false)}
         />
       )}
-      {offerFor && <TeamModeOffer name={offerFor} onDone={() => setOfferFor(null)} />}
+      {switchedFor && <TeamModeSwitch name={switchedFor} onDone={() => setSwitchedFor(null)} />}
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between mb-6">
@@ -660,6 +679,12 @@ export default function PeoplePage() {
               {error}
             </div>
           )}
+          {activeTab === "contacts" && contactChanges && (
+            <>
+              <ContactChangesCard data={contactChanges} onChanged={loadContactChanges} />
+              <ContactKeeperSwitch data={contactChanges} onChanged={loadContactChanges} />
+            </>
+          )}
           {!loading && !error && shown.length === 0 && (
             <div className="rounded-2xl border border-line bg-surface-elevated p-10 text-center">
               <p className="text-fg-muted text-[15px] mb-5">{copy.empty}</p>
@@ -671,7 +696,7 @@ export default function PeoplePage() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {shown.map((person) => (
-              <PersonCard key={person.id} person={person} today={today} />
+              <PersonCard key={person.id} person={person} today={today} isNew={fresh.has(person.id)} />
             ))}
           </div>
 

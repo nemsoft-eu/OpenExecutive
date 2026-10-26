@@ -14,16 +14,22 @@ card (``InboxWatch.mailbox_drafts``):
 - Also in their mailbox's Drafts, as before: they can open it there, and
   Send sends it exactly as it is there.
 
-Either way the words can be changed on the card (``edit``) before Send. A
+Either way the words can be changed on the card (``edit``) before Send, by
+hand or by answering what it left them to decide (``delegation.answers``,
+which rewrites them through ``edit`` and its checks). A
 reply in their mailbox is rewritten there too (``update_draft_text``), and
 only while it is still the version the card last saw: an edit made in the
-mailbox meanwhile is never overwritten. Only the card's own person, from a
+mailbox meanwhile is never overwritten. Who it goes to can be changed the
+same way (``set_recipients``), between the two lists the watcher fixed when
+it wrote the card: the sender alone, or everyone the email went to. No
+address comes from the request. Only the card's own person, from a
 request the API can tie to them, can change it, and never while it is being
 sent on its own. Nothing here sends anything.
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -39,6 +45,9 @@ DRAFT_KEY = "draft_key"
 EDITED_ON_CARD = "edited_on_card"
 # A reply in their mailbox: its version after the last edit on the card.
 EDITED_VERSION = "edited_version"
+# Set once the person changed the words by hand: what is left of "Decide
+# before sending" no longer holds Send back (``delegation.answers``).
+QUESTIONS_SETTLED = "questions_settled"
 
 # Cards whose draft is being made right now in this process, so two taps
 # never make two.
@@ -198,10 +207,59 @@ async def _delete_quietly(client: Any, draft_id: str) -> None:
         logger.warning("delegation.card_drafts: couldn't take a draft back out of the mailbox", exc_info=True)
 
 
-async def edit(instance: Any, *, caller: Any, resolver: int | None, text: str, gmail: Any = None) -> dict[str, Any]:
+def _check_words(text: str) -> str:
+    from openexecutive.delegation.reply_send import SendRefused
+
+    words = text.rstrip()
+    if not words.strip():
+        raise SendRefused(422, "empty", "Write something before you save it.")
+    if len(words) > MAX_TEXT_CHARS:
+        raise SendRefused(422, "too_long", f"That's too long to send from here (at most {MAX_TEXT_CHARS:,} characters).")
+    return words
+
+
+# Rewrites the words for ``edit``: given the person and the card's payload,
+# the new words and any payload fields to keep with them.
+Rewrite = Callable[[Any, dict[str, Any]], Awaitable[tuple[str, dict[str, Any]]]]
+
+
+async def set_recipients(
+    instance: Any, *, caller: Any, resolver: int | None, everyone: bool, gmail: Any = None,
+) -> dict[str, Any]:
+    """Send the reply on ``instance`` to the sender alone, or to everyone the
+    email went to (``inbox.REPLY_OTHERS``), on the person's tap: on the card,
+    and in their mailbox when it is there too. The words stay. Returns the
+    card's payload as it now is; raises ``SendRefused``. Sends nothing."""
+    return await edit(instance, caller=caller, resolver=resolver, gmail=gmail, everyone=everyone)
+
+
+def recipients_for(payload: dict[str, Any], everyone: bool) -> tuple[list[str], list[str]]:
+    """To and Cc for the Reply to choice: the sender, plus everyone else the
+    email went to when ``everyone``. Both lists come from the card itself."""
+    from openexecutive.delegation.inbox import REPLY_OTHERS
+    from openexecutive.delegation.reply_send import SendRefused
+
+    sender = str(payload.get("from_email") or "")
+    others = payload.get(REPLY_OTHERS)
+    others = [a for a in others if isinstance(a, str) and a and a != sender] if isinstance(others, list) else []
+    if not sender or not others or payload.get("source") == "follow_up":
+        raise SendRefused(409, "no_choice", "This reply can only go to the people it's addressed to.")
+    return [sender], (others if everyone else [])
+
+
+async def edit(
+    instance: Any, *, caller: Any, resolver: int | None, text: str = "", gmail: Any = None,
+    rewrite: Rewrite | None = None, everyone: bool | None = None,
+) -> dict[str, Any]:
     """Change the words of the reply on ``instance`` to ``text``, on the
     person's tap. Returns the card's payload as it now is; raises
-    ``SendRefused``. Sends nothing."""
+    ``SendRefused``. Sends nothing.
+
+    With ``rewrite`` (answering its open questions, ``delegation.answers``)
+    the words come from it instead, once every check has passed and while
+    the card is held for this edit. A change by hand settles the card's open
+    questions (``QUESTIONS_SETTLED``): the person wrote what goes. With
+    ``everyone`` the words stay and who it goes to changes (``set_recipients``)."""
     from openexecutive.audit import rows_for_person
     from openexecutive.delegation.gmail import normalize_email
     from openexecutive.delegation.inbox import SENDING, card_payload
@@ -225,21 +283,30 @@ async def edit(instance: Any, *, caller: Any, resolver: int | None, text: str, g
             raise SendRefused(409, "already_handled", "This reply is being sent on its own right now.")
         if not is_enabled(person.id):
             raise SendRefused(409, "inbox_off", "Turn on Act as me to change this reply here.")
-        words = text.rstrip()
-        if not words.strip():
-            raise SendRefused(422, "empty", "Write something before you save it.")
-        if len(words) > MAX_TEXT_CHARS:
-            raise SendRefused(422, "too_long", f"That's too long to send from here (at most {MAX_TEXT_CHARS:,} characters).")
+        recipients = recipients_for(payload, everyone) if everyone is not None else None
+        if recipients is not None:
+            words = str(payload.get("draft_body") or "")
+        else:
+            words = _check_words(text) if rewrite is None else ""
         if instance.id in _EDITING or instance.id in _MAKING:
             raise SendRefused(409, "busy", "This reply is being saved or sent right now. Try again in a moment.")
         _EDITING.add(instance.id)
         try:
-            return await _edit(instance, person, payload, words, gmail)
+            # Words changed by hand: the card's summary no longer says what
+            # the draft says, so the card falls back to what they wrote.
+            extra: dict[str, Any] = {} if recipients is not None else {QUESTIONS_SETTLED: True, "gist": ""}
+            if rewrite is not None:
+                written, extra = await rewrite(person, payload)
+                words = _check_words(written)
+            return await _edit(instance, person, payload, words, gmail, extra, recipients)
         finally:
             _EDITING.discard(instance.id)
 
 
-async def _edit(instance: Any, person: Any, payload: dict[str, Any], words: str, gmail: Any) -> dict[str, Any]:
+async def _edit(
+    instance: Any, person: Any, payload: dict[str, Any], words: str, gmail: Any, extra: dict[str, Any],
+    recipients: tuple[list[str], list[str]] | None = None,
+) -> dict[str, Any]:
     """``edit`` once its checks passed, one at a time per card."""
     from openexecutive.delegation.gmail import (
         BLOCKING_CODES,
@@ -255,7 +322,13 @@ async def _edit(instance: Any, person: Any, payload: dict[str, Any], words: str,
     from openexecutive.delegation.reply_send import SendRefused
     from openexecutive.memory.decision_ledger import update_open_payload
 
-    changed = {**payload, "draft_body": words, EDITED_ON_CARD: True}
+    changed = {**payload, **extra, "draft_body": words, EDITED_ON_CARD: True}
+    if recipients is not None:
+        to, cc = recipients
+        changed["draft_to"] = [*to, *cc]
+        spec = payload.get(DRAFT_SPEC)
+        if isinstance(spec, dict):
+            changed[DRAFT_SPEC] = {**spec, "to": to, "cc": cc}
     draft_id = str(payload.get("draft_id") or "")
     if draft_id:
         email = normalize_email(person.email)
@@ -265,7 +338,10 @@ async def _edit(instance: Any, person: Any, payload: dict[str, Any], words: str,
             raise SendRefused(409, BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
         seen = str(payload.get(EDITED_VERSION) or payload.get("draft_message_id") or "")
         try:
-            version = await client.update_draft_text(draft_id, seen, words)
+            if recipients is not None:
+                version = await client.update_draft_text(draft_id, seen, words, to=recipients[0], cc=recipients[1])
+            else:
+                version = await client.update_draft_text(draft_id, seen, words)
         except GmailNotFound:
             _close_card(person.id, instance.id, str(payload.get("message_id") or ""), "draft_gone", CLOSED)
             raise SendRefused(
@@ -289,5 +365,6 @@ async def _edit(instance: Any, person: Any, payload: dict[str, Any], words: str,
         raise SendRefused(409, "already_handled", "This reply changed or was sent meanwhile. Look at it again.")
     _audit("delegation_reply_edited", f"Person {person.id} changed a reply on its card", {
         "person_id": person.id, "decision_id": instance.id, "in_mailbox": bool(draft_id),
+        **({"recipients": len(changed["draft_to"])} if recipients is not None else {}),
     })
     return changed

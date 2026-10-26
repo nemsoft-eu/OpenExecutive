@@ -27,7 +27,7 @@ GOOGLE_SERVER = "google_workspace"
 _SERVER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 # The Google Workspace tools the Executive reaches for on most turns, by
-# service, as workspace-mcp 1.29.0 (pinned in docker/Dockerfile) names them.
+# service, as workspace-mcp 2.1.0 (pinned in docker/Dockerfile) names them.
 # A new workspace-mcp can rename tools: re-check this list when bumping the
 # pin. Apps Script tools stay out, since the gateway refuses them. Listing a
 # name here never widens access: every call still runs the gateway's gates
@@ -85,7 +85,7 @@ GOOGLE_SERVICE_OF: dict[str, str] = {
 }
 
 # Pinned tools that workspace-mcp's `core` tier does NOT include, read from
-# `core/tool_tiers.yaml` in the pinned 1.29.0. Tiers are cumulative, so
+# `core/tool_tiers.yaml` in the pinned 2.1.0. Tiers are cumulative, so
 # `extended` and `complete` carry all 24 and only `core` needs subtracting.
 # Re-check when bumping the pin, exactly as for the manifest above.
 GOOGLE_TOOLS_ABOVE_CORE: frozenset[str] = frozenset({
@@ -147,17 +147,23 @@ def render_connected_systems(
     *,
     mcp_servers: Sequence[str],
     settings: Settings,
+    needs_reconnect: Sequence[str] = (),
 ) -> str:
     """The ``## Connected Systems`` section of block 0.
 
     ``mcp_servers`` is what the running gateway was configured with (empty
     when MCP is off or the gateway failed to start, so a Google server that
-    never came up is never described as connected). Act as me is named by a
-    constant line that points at ``DELEGATION_ADDENDUM``, which block 0
-    carries only while it is on.
+    never came up is never described as connected). ``needs_reconnect`` is
+    the servers whose sign-in has died (``MCPGateway.needs_reconnect``): a
+    Google server in it is described as needing a reconnect, not as
+    connected, so the model stops promising mail it cannot read. The block
+    is re-rendered, and re-cached once, when that set changes. Act as me is
+    named by a constant line that points at ``DELEGATION_ADDENDUM``, which
+    block 0 carries only while it is on.
     """
     servers = sorted({s for s in mcp_servers if _SERVER_NAME_RE.fullmatch(s)})
     google = GOOGLE_SERVER in servers
+    google_dead = google and GOOGLE_SERVER in set(needs_reconnect)
     others = [s for s in servers if s != GOOGLE_SERVER]
     email = settings.exec_email_address
 
@@ -168,7 +174,16 @@ def render_connected_systems(
         "to find out.\n",
     ]
 
-    if google:
+    if google_dead:
+        lines.append(
+            f"- **Google Workspace: needs reconnecting.** Your sign-in as {email} "
+            "has expired or was revoked, so you cannot read or send email, see "
+            "calendars, or open Drive, Docs or Sheets files until the owner "
+            "connects Google again (Settings → Status). If asked, say so plainly "
+            "and do not call the Google tools: every call fails with the same "
+            "authorization error until then."
+        )
+    elif google:
         manifest = google_tool_manifest(settings)
         # Derived, never hardcoded: naming all five while a subset is loaded is
         # the whole bug. Ordered as the manifest is, so the text is stable.

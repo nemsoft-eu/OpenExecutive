@@ -20,15 +20,18 @@ import pytest
 from openexecutive.departments import store as dept_store
 from openexecutive.onboarding.commit import (
     OwnerEmailError,
+    adopt_owner_row,
     check_owner_email,
     derive_org_structure,
     link_owner_email,
     reconcile_onboarding_departments,
+    save_onboarding_goals,
     save_onboarding_people,
 )
 from openexecutive.onboarding.interview import (
     CompanyDraft,
     DepartmentDraft,
+    GoalDraft,
     PersonDraft,
 )
 from openexecutive.people import store as people_store
@@ -677,3 +680,142 @@ def test_a_specialist_is_wired_to_only_one_new_department(empty_dept_db: Path) -
     )
     keys = [d.config.specialist_key for d in dept_store.list_departments(db_path=empty_dept_db)]
     assert keys.count("chro") == 1
+
+
+# ── the owner's seeded entry: matched by the sign-in email ───────────────────
+
+
+def test_the_signed_in_owner_may_name_their_own_seeded_entry(people_db: Path) -> None:
+    """A hosted sign-up seeds the owner's entry from the address ("ada"), and
+    setup drafts the real name. Signed in as that address, the save goes
+    through instead of asking for "the name on the People page"."""
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert (
+        check_owner_email("ada@example.com", "Ada Lovelace", caller_email="ada@example.com")
+        == "ada@example.com"
+    )
+
+
+def test_someone_else_signed_in_still_gets_the_rename_error(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ada@example.com", "Ada Lovelace", caller_email="sam@example.com")
+    assert "current owner" in str(err.value)
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("ada@example.com", "Ada Lovelace")
+
+
+def test_adopt_renames_the_owners_entry_so_the_upsert_updates_it(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row("ada@example.com", "Ada Lovelace", "ada@example.com") is True
+    rows = people_store.list_people()
+    assert [p.full_name for p in rows] == ["Ada Lovelace"]
+    assert rows[0].is_principal and rows[0].email == "ada@example.com"
+
+    ids = save_onboarding_people(
+        [PersonDraft(full_name="Ada Lovelace", role="Owner", is_principal=True)]
+    )
+    assert len(people_store.list_people()) == 1
+    assert ids["Ada Lovelace"] == rows[0].id
+
+
+@pytest.mark.parametrize(
+    ("email", "caller"),
+    [
+        ("ada@example.com", "sam@example.com"),  # not the signed-in person
+        ("ada@example.com", None),  # no signed-in person
+        ("other@example.com", "other@example.com"),  # not the owner's address
+        ("", "ada@example.com"),  # nothing to match on
+    ],
+)
+def test_adopt_leaves_other_cases_alone(people_db: Path, email: str, caller: str | None) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row(email, "Ada Lovelace", caller) is False
+    assert [p.full_name for p in people_store.list_people()] == ["ada"]
+
+
+def test_adopt_never_renames_onto_an_existing_name(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    people_store.upsert_person(full_name="Ada Lovelace")
+    assert adopt_owner_row("ada@example.com", "Ada Lovelace", "ada@example.com") is False
+
+
+def test_adopt_is_a_no_op_when_the_name_already_matches(people_db: Path) -> None:
+    people_store.upsert_person(full_name="Ada Lovelace", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row("ada@example.com", "ada lovelace", "ada@example.com") is False
+
+
+# ── goals ────────────────────────────────────────────────────────────────────
+
+
+def test_goals_are_saved_with_owners_and_no_department(empty_dept_db: Path) -> None:
+    created = save_onboarding_goals(
+        [
+            GoalDraft(title="Launch the hosted version", target="Live by June"),
+            GoalDraft(title="Ship the mobile apps", owner_name="dan lee"),
+            GoalDraft(title="  "),
+        ],
+        {"Rufus Ames": 1, "Dan Lee": 2},
+        principal_id=1,
+    )
+    assert created == 2
+    goals = {g.key_result: g for g in dept_store.list_all_goals()}
+    assert set(goals) == {"Launch the hosted version", "Ship the mobile apps"}
+    launch = goals["Launch the hosted version"]
+    assert launch.department_slug is None
+    assert launch.owner_person_id == 1
+    assert launch.target == "Live by June"
+    assert launch.period_type == "year"
+    assert goals["Ship the mobile apps"].owner_person_id == 2
+    # No department was drafted, so none exists.
+    assert dept_store.list_departments() == []
+
+
+def test_a_goal_lands_in_the_drafted_department(empty_dept_db: Path) -> None:
+    reconcile_onboarding_departments([DepartmentDraft(title="Engineering")], {})
+    save_onboarding_goals(
+        [GoalDraft(title="Ship v2", department_title="engineering")], {}, principal_id=7
+    )
+    (goal,) = dept_store.list_all_goals()
+    assert goal.department_slug == "engineering"
+    # The principal, not the department's head: the review showed "you".
+    assert goal.owner_person_id == 7
+
+
+def test_rerunning_setup_does_not_duplicate_goals(empty_dept_db: Path) -> None:
+    drafts = [GoalDraft(title="Launch the hosted version")]
+    assert save_onboarding_goals(drafts, {}, principal_id=1) == 1
+    again = [GoalDraft(title="launch the hosted version "), GoalDraft(title="Win customers")]
+    assert save_onboarding_goals(again, {}, principal_id=1) == 1
+    assert sorted(g.key_result for g in dept_store.list_all_goals()) == [
+        "Launch the hosted version",
+        "Win customers",
+    ]
+
+
+def test_last_years_goal_does_not_block_this_years(empty_dept_db: Path) -> None:
+    dept_store.insert_goal(
+        None, period_type="year", period_value="2001", key_result="Launch", target=""
+    )
+    assert save_onboarding_goals([GoalDraft(title="launch")], {}, principal_id=1) == 1
+    assert sorted(g.period_value for g in dept_store.list_all_goals())[0] == "2001"
+    assert len(dept_store.list_all_goals()) == 2
+
+
+def test_goal_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(dept_store, "initialize_db", boom)
+    assert save_onboarding_goals([GoalDraft(title="Launch")], {}, principal_id=1) == 0
+
+
+def test_goals_become_this_years_priorities() -> None:
+    d = _draft()
+    goals = [GoalDraft(title="Launch"), GoalDraft(title=" Win customers ")]
+    out = derive_org_structure(d.profile, d.people, d.departments, goals)
+    assert out.strategic_priorities.current_year == ["Launch", "Win customers"]
+    # No goals leaves the drafted priorities as they were.
+    d.profile.strategic_priorities.current_year = ["Grow"]
+    kept = derive_org_structure(d.profile, d.people, d.departments)
+    assert kept.strategic_priorities.current_year == ["Grow"]

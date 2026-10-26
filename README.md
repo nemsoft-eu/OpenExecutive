@@ -183,7 +183,7 @@ setup guide:
 
 | Integration | What it does | Setup |
 |---|---|---|
-| **Slack** | Answers mentions and DMs | Set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` (socket mode) |
+| **Slack** | Answers mentions and DMs | Set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` (socket mode), or `SLACK_SIGNING_SECRET` to take events over HTTP at `/webhook/slack` |
 | **Discord** | Answers DMs, mentions and slash commands | [Run the Discord Bot](#run-the-discord-bot) |
 | **Telegram** | Answers messages to your bot | [docs/telegram_setup.md](docs/telegram_setup.md) |
 | **Google Chat** | Answers mentions in a space | [docs/google_chat_setup.md](docs/google_chat_setup.md) |
@@ -200,6 +200,24 @@ setup guide:
 
 Synced Drive, OneDrive, Confluence and Notion content is kept apart from your uploaded
 documents and labelled as unreviewed, so it ranks below them.
+
+### Web search for any model
+
+`ENABLE_WEB_SEARCH` uses Anthropic's server-side `web_search` tool, so only Claude
+models get it. Any model that can use tools, local ones included, can search the web
+through a search MCP server under **MCP tools** instead. For example,
+[Keenable](https://keenable.ai) needs no account or API key. Add it under `mcpServers`
+in `company/mcp_servers.json` (Docker: `/data/company/mcp_servers.json`):
+
+```json
+"keenable": {
+  "url": "https://api.keenable.ai/mcp?keenable_title=openexecutive"
+}
+```
+
+Restart the API. The Executive finds `keenable__search_web_pages` and
+`keenable__fetch_page_content` with `search_tools` and runs them with `call_tool`,
+like every other MCP tool.
 
 ## Run the Discord Bot
 
@@ -301,12 +319,40 @@ claude mcp add --transport http open-executive http://localhost:8000/mcp \
 
 Connected clients get eight read-only resources (company profile, today's
 briefing and activity, people roster, department state, and episodic memory for
-decisions, initiatives and advice) and four tools, of which `consult_specialist`
-is the primary one: domain analysis from any of the ten specialists, each
-grounded in your company's knowledge base. The full inventory is on the **MCP
-Server** section of the `/architecture` page. With
-[signed callers](docs/auth.md#signed-callers) on, an MCP client holds only the
-shared secret, so it is never the owner: `ask_executive` asks as no one.
+decisions, initiatives and advice) and four tools: `consult_specialist` (domain
+analysis from any of the ten specialists, each grounded in your company's
+knowledge base), `search_knowledge`, `list_workflows` and `ask_executive`. The
+full inventory is on the **MCP Server** section of the `/architecture` page.
+
+`/mcp` answers as the caller the API verified, by the web app's rules. With no
+`x-caller-email` (open mode) the client is the owner, as the CLI is. A request
+that carries a signed-in person (a deployment that puts its own sign-in in
+front of `/mcp` and stamps the caller as the web UI's proxy does; see
+[signed callers](docs/auth.md#signed-callers)) gets that person's answers: the
+owner's episodic memory and recent activity go to the owner alone, the briefing
+and roster to someone on the roster (the briefing narrowed as the web app
+narrows it), and the company profile, departments, specialists, knowledge and
+workflow catalog to anyone. With signed callers on, a client holding only the
+shared secret is a service: never the owner, and `ask_executive` asks as no
+one. By default `ask_executive` only reads and advises: on its turn the
+Executive is not offered anything that sends, posts, books, schedules, runs or
+changes stored data, and of the connected MCP servers' tools only the reads.
+
+A client can let it act by sending `x-mcp-client-actions: on` (honored only on a
+request the `BACKEND_SHARED_SECRET` authenticated; with no secret set the header
+is ignored and `MCP_CLIENT_ACTIONS=true` turns it on for every request). Then it
+makes the person's own changes inside Open Executive (alerts, open loops,
+follow-ups, the watch list, goals, decision outcomes, remembered facts and the
+company profile), each under the same permissions as in the web app. It never
+changes the People list; a new contact goes on a card that always waits.
+A message or a meeting is left on an approval card instead of sent: it waits
+for the person's tap on the web, or goes on its own when their Handle it for me
+is on, everyone on it has been on the People list for at least a week, and
+nothing on it is sensitive. It still
+never runs scripts or workflows, loads MCP servers or reads their mailbox, and
+every action is recorded as coming from the AI app. On a server without signed
+callers (`CALLER_ASSERTION_PUBLIC_KEYS`), acting mode trusts whoever holds the
+shared secret to say who is asking.
 
 This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
 under [Configuration](#configuration), which configure the MCP *gateway*: Open
@@ -387,6 +433,7 @@ the app refuses to start.
 | `ROUTING_MODEL` | No | `claude-haiku-5-5` | Model for intent routing |
 | `SLACK_BOT_TOKEN` | No | — | Slack bot OAuth token |
 | `SLACK_APP_TOKEN` | No | — | Slack socket mode token |
+| `SLACK_SIGNING_SECRET` | No | — | Slack signing secret: hear Slack over HTTP at `/webhook/slack` instead of socket mode |
 | `EXEC_EMAIL_ADDRESS` | No | — | The Executive's own mailbox (Gmail via Google Workspace MCP, or Outlook via Microsoft 365 MCP) |
 | `EMAIL_POLL_INTERVAL_SECONDS` | No | `60` | How often to poll for new email |
 | `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token (from @BotFather) |

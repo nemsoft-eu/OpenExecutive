@@ -14,7 +14,10 @@ as me: ``{"version": 1, "provider": "microsoft", "email": ..., "account":
 "work" | "personal", "microsoft": {refresh_token, client_id, tenant}}``
 (no client secret: the sign-in is a public client's). ``scripts/connect-own-outlook.py``
 writes it. Delegated scopes: ``User.Read``, ``Mail.ReadWrite`` and
-``Mail.Send``, plus ``offline_access``. Microsoft rotates the refresh token on
+``Mail.Send``, plus ``offline_access``; with ``--calendar``,
+``Calendars.ReadWrite`` (reads, and answers a meeting invite as them:
+``answer_invite``), or ``Calendars.Read`` on a sign-in made before, which
+keeps reading. Microsoft rotates the refresh token on
 use; the new one is written back into the same file, keeping every other key.
 
 **One way to send.** It reads mail and saves or deletes drafts. The only send
@@ -50,7 +53,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from email.message import Message
 from email.utils import parseaddr
 from pathlib import Path
@@ -63,6 +66,10 @@ from openexecutive.delegation.gmail import (
     _AUTOREPLY_HEADERS,
     _BULK_PRECEDENCE,
     _REPORT_SENDERS,
+    MAX_EVENTS,
+    CalendarEvent,
+    CalendarNotGranted,
+    CalendarWriteNotGranted,
     CreatedDraft,
     DraftChanged,
     DraftInfo,
@@ -92,12 +99,20 @@ LOGIN_BASE = "https://login.microsoftonline.com"
 GRAPH_RESOURCE = "https://graph.microsoft.com/"
 GRAPH_SCOPES: tuple[str, ...] = ("User.Read", "Mail.ReadWrite", "Mail.Send")
 REQUEST_SCOPE = " ".join(["offline_access", *(GRAPH_RESOURCE + s for s in GRAPH_SCOPES)])
+# Read my calendar (delegation.calendar): optional, granted when they connected
+# with --calendar. Microsoft's token lists every Graph scope they consented to.
+CALENDAR_SCOPES: frozenset[str] = frozenset({"calendars.read", "calendars.readwrite"})
+# Answering a meeting invite (delegation.invites) needs this one.
+CALENDAR_WRITE_SCOPE = "calendars.readwrite"
 # The tenant every personal Microsoft account (Outlook.com, Hotmail) is in.
 CONSUMER_TENANT_ID = "9188040d-6c67-4c5b-b112-36a304b66dad"
 CREDENTIAL_VERSION = 1
 
 # A named MAPI property in our own namespace: "the Executive wrote this draft".
 GHOSTWRITTEN_PROPERTY = "String {3f0a7c52-8d1e-4b6a-9e2f-5c4d7b8a1e60} Name OEGhostwritten"
+# Graph takes a file of up to 3 MB in one request; larger ones need an upload
+# session, so a draft leaves them off (``CreatedDraft.skipped_attachments``).
+OUTLOOK_ATTACHMENT_MAX_BYTES = 3 * 1024 * 1024
 
 _PREFER = 'outlook.body-content-type="text", IdType="ImmutableId"'
 _SELECT = (
@@ -113,11 +128,21 @@ _ID_RE = re.compile(r"[A-Za-z0-9_=+/-]{1,512}")
 _TENANT_RE = re.compile(r"common|organizations|consumers|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _EMAIL_RE = re.compile(r"[\w.+\-']+@[\w\-]+(?:\.[\w\-]+)+")
 _DMARC_PASS = re.compile(r"dmarc=pass(?: action=[a-z]+)? header\.from=([a-z0-9.-]+)")
+_DMARC_NO_RECORD = re.compile(r"dmarc=(?:none|bestguesspass)(?: action=[a-z]+)? header\.from=([a-z0-9.-]+)")
+# Exchange's DKIM resinfo once its comment is stripped: "dkim=pass header.d=example.com".
+_EXCHANGE_DKIM_PASS = re.compile(r"dkim=pass header\.d=([a-z0-9.-]+)")
 _TOKEN_SLACK_SECONDS = 60
 _THREAD_LIMIT = 50
 
 # Access tokens by (address, refresh token) — never written anywhere.
 _TOKENS: dict[str, tuple[str, float]] = {}
+# The scopes Microsoft said each of those tokens carries ("" when it didn't say).
+_GRANTED: dict[str, str] = {}
+_EVENT_SELECT = "id,subject,start,end,isAllDay,location,organizer,attendees,isCancelled,responseStatus,showAs"
+_UTC_PREFER = 'outlook.timezone="UTC", IdType="ImmutableId"'
+# The invites Graph files as a request to answer (an eventMessage's
+# meetingMessageType); a cancellation or an answer is not one.
+_MEETING_REQUEST = "meetingRequest"
 
 
 @dataclass(frozen=True)
@@ -127,6 +152,8 @@ class OutlookCredential:
     client_id: str = ""
     tenant: str = "common"
     personal: bool = False
+    # The Graph scopes it was minted with (the file's ``scopes``), lowercased.
+    scopes: frozenset[str] = frozenset()
 
 
 def valid_id(value: object) -> bool:
@@ -183,7 +210,22 @@ def load_credential(email: str, *, directory: Path | None = None) -> OutlookCred
         client_id=str(values["client_id"]),
         tenant=tenant,
         personal=data.get("account") == "personal" or tenant in ("consumers", CONSUMER_TENANT_ID),
+        scopes=frozenset(
+            s.strip().lower() for s in data.get("scopes") or () if isinstance(s, str) and s.strip()
+        ) if isinstance(data.get("scopes"), list) else frozenset(),
     )
+
+
+def _refresh_scope(cred: OutlookCredential) -> str:
+    """The scopes a refresh asks for: the mail ones, plus the calendar one
+    only when the credential was minted with it (asking a mail-only one for
+    it would fail the refresh, and mail with it): ``Calendars.ReadWrite``,
+    or ``Calendars.Read`` for a sign-in made before invites were answered."""
+    if CALENDAR_WRITE_SCOPE in cred.scopes:
+        return f"{REQUEST_SCOPE} {GRAPH_RESOURCE}Calendars.ReadWrite"
+    if "calendars.read" in cred.scopes:
+        return f"{REQUEST_SCOPE} {GRAPH_RESOURCE}Calendars.Read"
+    return REQUEST_SCOPE
 
 
 def _store_rotated(email: str, old: str, new: str, directory: Path | None) -> None:
@@ -238,6 +280,73 @@ def _addresses(entries: object) -> list[str]:
     return [a for _, a in (_address(e) for e in entries) if "@" in a]
 
 
+def _names(*lists: object) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for entries in lists:
+        for entry in entries if isinstance(entries, list) else []:
+            name, address = _address(entry)
+            if "@" in address:
+                out.setdefault(address, clean_header(name))
+    return out
+
+
+def _who(entry: object) -> str:
+    name, address = _address(entry)
+    name = clean_header(name)
+    return f"{name} <{address}>" if name and address else (name or address)
+
+
+def _graph_when(value: object, all_day: bool, tz: tzinfo = UTC) -> str:
+    """Graph's ``{dateTime, timeZone}`` (UTC, asked for) as ISO 8601: the
+    date alone for an all-day event, read in ``tz`` (the person's zone)."""
+    raw = str(value.get("dateTime") or "") if isinstance(value, dict) else ""
+    if not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw[:19])
+    except ValueError:
+        return ""
+    if all_day:
+        # Midnight in the mailbox's own zone, shown in UTC: east of UTC that
+        # is the day before (Tokyo's 14th is 15:00 on the 13th, Auckland's
+        # 11:00). Read it in the person's zone, rounded to the nearest
+        # midnight there in case the mailbox's zone differs a little.
+        local = moment.replace(tzinfo=UTC).astimezone(tz)
+        return (local + timedelta(hours=12)).date().isoformat()
+    return moment.replace(tzinfo=UTC).isoformat()
+
+
+def parse_event(raw: dict[str, Any], tz: tzinfo = UTC) -> CalendarEvent | None:
+    """An Outlook event, or None for a cancelled one. ``tz`` is the zone an
+    all-day event's date is read in."""
+    if raw.get("isCancelled") is True:
+        return None
+    all_day = raw.get("isAllDay") is True
+    start = _graph_when(raw.get("start"), all_day, tz)
+    if not start:
+        return None
+    status_raw = raw.get("responseStatus")
+    status: dict[str, Any] = status_raw if isinstance(status_raw, dict) else {}
+    response = {
+        "organizer": "organizer", "accepted": "accepted", "declined": "declined",
+        "tentativelyAccepted": "tentative", "notResponded": "needs_action",
+    }.get(str(status.get("response") or ""), "")
+    location_raw = raw.get("location")
+    location: dict[str, Any] = location_raw if isinstance(location_raw, dict) else {}
+    attendees = [a for a in raw.get("attendees") or [] if isinstance(a, dict)]
+    return CalendarEvent(
+        id=str(raw.get("id") or ""),
+        title=clean_header(str(raw.get("subject") or "")) or "(no title)",
+        start=start,
+        end=_graph_when(raw.get("end"), all_day, tz),
+        all_day=all_day,
+        location=clean_header(str(location.get("displayName") or "")),
+        organizer=_who(raw.get("organizer")),
+        attendees=tuple(w for w in (_who(a) for a in attendees[:25]) if w),
+        response=response,
+    )
+
+
 def _header_list(raw: dict[str, Any]) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for h in raw.get("internetMessageHeaders") or []:
@@ -264,10 +373,20 @@ def exchange_authenticated(headers: Message, from_addr: str) -> bool:
     compauth=pass …``, above every header the sender wrote, so only the
     topmost one counts, it must read that way, and it must hold one DMARC
     verdict: a pass for From's own domain. It must also carry Exchange
-    Online Protection's own ``compauth=`` verdict, so a header the sender
-    wrote that reached the mailbox some way EOP never stamped (an on-premises
-    connector, an internal relay) doesn't count."""
-    from openexecutive.integrations.fact_confirmation import _strip_quotes_and_comments
+    Online Protection's ``compauth=`` verdict. That only checks the stamp
+    has EOP's shape (a sender can write one too): the proof rests on EOP
+    stamping every message that reaches the mailbox, which holds when the
+    domain's mail comes in through Exchange Online, not when an on-premises
+    server or another gateway delivers it without EOP's stamp. A stamp
+    echoing ``smtp.helo=`` (sender text, on null-sender mail) proves nothing.
+
+    A From domain with no DMARC record (``dmarc=none`` or
+    ``bestguesspass``) passes only on a DKIM signature Exchange verified for
+    exactly that domain, and mail a list or group resent never passes."""
+    from openexecutive.integrations.fact_confirmation import (
+        _relayed_by_a_list,
+        _strip_quotes_and_comments,
+    )
 
     address = normalize_email(from_addr)
     if "@" not in address:
@@ -277,17 +396,32 @@ def exchange_authenticated(headers: Message, from_addr: str) -> bool:
         results = headers.get_all("Authentication-Results") or []
     except Exception:  # noqa: BLE001 - an unreadable message is not authenticated.
         return False
-    if raw_from.strip().lower() != address or not results:
+    if raw_from.strip().lower() != address or not results or _relayed_by_a_list(headers):
         return False
     newest = _strip_quotes_and_comments(" ".join(str(results[0]).split()).lower())
-    if newest is None or not newest.startswith("spf="):
+    if newest is None or not newest.startswith("spf=") or "smtp.helo=" in newest:
         return False
     clauses = [c.strip() for c in newest.split(";")]
     verdicts = [c for c in clauses if c.startswith("dmarc=")]
     if len(verdicts) != 1 or sum(c.startswith("compauth=") for c in clauses) != 1:
         return False
+    domain = address.rsplit("@", 1)[1]
     verdict = _DMARC_PASS.fullmatch(verdicts[0])
-    return verdict is not None and verdict.group(1) == address.rsplit("@", 1)[1]
+    if verdict is not None:
+        return verdict.group(1) == domain
+    # A domain with no DMARC record: Exchange writes dmarc=none, or
+    # bestguesspass when SPF alone would pass. Only a DKIM signature Exchange
+    # verified for exactly that domain counts (SPF passes anyone sending
+    # through the same shared servers).
+    none = _DMARC_NO_RECORD.fullmatch(verdicts[0])
+    if none is None or none.group(1) != domain:
+        return False
+    # Exchange writes one dkim= verdict; a second is sender text it echoed.
+    signatures = [c for c in clauses if c.startswith("dkim=")]
+    if len(signatures) != 1:
+        return False
+    match = _EXCHANGE_DKIM_PASS.fullmatch(" ".join(signatures[0].split()))
+    return match is not None and match.group(1) == domain
 
 
 def _iso(value: object) -> str:
@@ -361,6 +495,7 @@ def parse_message(raw: dict[str, Any], sent_folder: str = "", own: str = "") -> 
         calendar_invite="eventmessage" in kind,
         sender_authenticated=(not draft) and exchange_authenticated(message, from_addr),
         has_attachments=raw.get("hasAttachments") is True,
+        names=_names(raw.get("toRecipients"), raw.get("ccRecipients")),
     )
 
 
@@ -451,7 +586,7 @@ class DelegateOutlook:
             "grant_type": "refresh_token",
             "refresh_token": cred.refresh_token,
             "client_id": cred.client_id,
-            "scope": REQUEST_SCOPE,
+            "scope": _refresh_scope(cred),
         }
         try:
             resp = await client.post(f"{LOGIN_BASE}/{cred.tenant}/oauth2/v2.0/token", data=form)
@@ -482,6 +617,7 @@ class DelegateOutlook:
             cred = replace(cred, refresh_token=rotated)
             self._credential = cred
         _TOKENS[_token_key(cred)] = (token, time.time() + ttl)
+        _GRANTED[_token_key(cred)] = granted
         return token
 
     async def _request(
@@ -493,9 +629,10 @@ class DelegateOutlook:
         params: Any = None,
         json_body: dict[str, Any] | None = None,
         if_match: str = "",
+        prefer: str = _PREFER,
     ) -> dict[str, Any]:
         token = await self._access_token(client)
-        headers = {"Authorization": f"Bearer {token}", "Prefer": _PREFER}
+        headers = {"Authorization": f"Bearer {token}", "Prefer": prefer}
         if if_match:
             headers["If-Match"] = if_match
         try:
@@ -556,6 +693,106 @@ class DelegateOutlook:
         a Gmail one) is matched by that sign-in address."""
         return normalize_email(str(me.get("mail") or me.get("userPrincipalName") or ""))
 
+    async def calendar_granted(self) -> bool | None:
+        """Whether their saved sign-in includes ``Calendars.Read``; None when
+        Microsoft didn't say which scopes it carries."""
+        async with self._client() as client:
+            await self._access_token(client)
+        granted = _GRANTED.get(_token_key(self._cred()), "")
+        return bool(CALENDAR_SCOPES & _granted(granted)) if granted else None
+
+    async def list_events(self, start: datetime, end: datetime, *, max_results: int = MAX_EVENTS) -> list[CalendarEvent]:
+        """The events on their calendar between ``start`` and ``end``,
+        recurring ones expanded, in order (``calendarView``), times in UTC.
+        Read-only (``Calendars.Read``)."""
+        async with self._client() as client:
+            await self._access_token(client)
+            granted = _GRANTED.get(_token_key(self._cred()), "")
+            if granted and not CALENDAR_SCOPES & _granted(granted):
+                raise CalendarNotGranted("Calendars.Read not granted")
+            params = {
+                "startDateTime": start.astimezone(UTC).isoformat(),
+                "endDateTime": end.astimezone(UTC).isoformat(),
+                "$orderby": "start/dateTime",
+                "$top": str(max(1, min(max_results, MAX_EVENTS))),
+                "$select": _EVENT_SELECT,
+            }
+            try:
+                data = await self._request(
+                    client, "GET", "/calendarView", params=params, prefer='outlook.timezone="UTC"',
+                )
+            except GmailAuthError as exc:
+                if str(exc) == "forbidden":
+                    raise CalendarNotGranted("calendar read refused") from exc
+                raise
+        items_raw = data.get("value")
+        items: list[Any] = items_raw if isinstance(items_raw, list) else []
+        # The window is in the person's zone (calendar.day_window).
+        zone = start.tzinfo or UTC
+        events = [parse_event(item, zone) for item in items if isinstance(item, dict)]
+        return [e for e in events if e is not None]
+
+    async def calendar_write_granted(self) -> bool | None:
+        """Whether their saved sign-in can answer a meeting invite
+        (``Calendars.ReadWrite``); None when Microsoft didn't say."""
+        async with self._client() as client:
+            await self._access_token(client)
+        granted = _GRANTED.get(_token_key(self._cred()), "")
+        return CALENDAR_WRITE_SCOPE in _granted(granted) if granted else None
+
+    async def find_invite(self, message: MailMessage) -> CalendarEvent | None:
+        """The event a meeting invite ``message`` asks them to (Graph's
+        ``eventMessage.event``, on their own calendar), or None: not a
+        request (a cancellation, someone's answer), or no event. A read."""
+        if not valid_id(message.id):
+            raise GmailError("invalid message id")
+        async with self._client() as client:
+            await self._access_token(client)
+            granted = _GRANTED.get(_token_key(self._cred()), "")
+            if granted and not CALENDAR_SCOPES & _granted(granted):
+                raise CalendarNotGranted("Calendars.Read not granted")
+            try:
+                data = await self._request(
+                    client, "GET", f"/messages/{quote(message.id, safe='')}",
+                    params={"$expand": "microsoft.graph.eventMessage/event"}, prefer=_UTC_PREFER,
+                )
+            except GmailAuthError as exc:
+                if str(exc) == "forbidden":
+                    raise CalendarNotGranted("calendar read refused") from exc
+                raise
+        if str(data.get("meetingMessageType") or "") != _MEETING_REQUEST:
+            return None
+        raw = data.get("event")
+        if not isinstance(raw, dict) or not valid_id(raw.get("id")):
+            return None
+        return parse_event(raw)
+
+    async def answer_invite(self, event_id: str, *, accept: bool) -> None:
+        """Answer the invite to ``event_id`` as them: Graph's event accept
+        or decline, telling the organizer (``sendResponse``). Called only by
+        ``delegation.invites``, on the person's tap or under Handle it for
+        me (accept only). Raises ``CalendarWriteNotGranted`` for a read-only
+        sign-in, ``GmailNotFound`` when the event is gone."""
+        if not valid_id(event_id):
+            raise GmailError("invalid event id")
+        async with self._client() as client:
+            await self._access_token(client)
+            granted = _GRANTED.get(_token_key(self._cred()), "")
+            if granted and CALENDAR_WRITE_SCOPE not in _granted(granted):
+                raise CalendarWriteNotGranted("Calendars.ReadWrite not granted")
+            answer = "accept" if accept else "decline"
+            try:
+                await self._request(
+                    client, "POST", f"/events/{quote(event_id, safe='')}/{answer}",
+                    json_body={"sendResponse": True},
+                )
+            except GmailAuthError as exc:
+                if str(exc) != "forbidden":
+                    raise
+                if granted and CALENDAR_WRITE_SCOPE in _granted(granted):
+                    raise GmailError("calendar write refused with the scope granted") from exc
+                raise CalendarWriteNotGranted("calendar write refused") from exc
+
     async def profile_email(self) -> str:
         """The address of the mailbox the credential opens, from the directory."""
         async with self._client() as client:
@@ -588,7 +825,7 @@ class DelegateOutlook:
             data = await self._get(client, "/messages", {
                 "$search": f'"{text}"',
                 "$top": 25,
-                "$select": "id,conversationId,subject,from,receivedDateTime",
+                "$select": "id,conversationId,subject,from,receivedDateTime,isDraft,internetMessageHeaders",
             })
         summaries: dict[str, ThreadSummary] = {}
         for raw in data.get("value") or []:
@@ -603,6 +840,8 @@ class DelegateOutlook:
                 subject=_hide_tokens(str(raw.get("subject") or "")),
                 sender=f"{name} <{addr}>" if name else addr,
                 date=_iso(raw.get("receivedDateTime")),
+                sender_authenticated=raw.get("isDraft") is not True
+                and exchange_authenticated(_header_message(_header_list(raw)), addr),
             )
             if len(summaries) >= max(1, min(max_results, 10)):
                 break
@@ -676,6 +915,26 @@ class DelegateOutlook:
                 "$search": f'"to:{target}"', "$top": 1, "$select": "id",
             })
         return bool(data.get("value"))
+
+    async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
+        """The newest mail ``address`` sent the person in the last ``days``,
+        or None. Graph wants the ordered property first in the filter."""
+        target = normalize_email(address)
+        if not _EMAIL_RE.fullmatch(target):
+            return None
+        since = (datetime.now(UTC) - timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        odata_quoted = target.replace("'", "''")  # an address may hold a quote (o'neil@)
+        async with self._client() as client:
+            await self._sent_folder_id(client)
+            data = await self._get(client, "/mailFolders/inbox/messages", {
+                "$filter": f"receivedDateTime ge {since} and from/emailAddress/address eq '{odata_quoted}'",
+                "$orderby": "receivedDateTime desc",
+                "$top": 1,
+                "$select": _SELECT,
+                "$expand": _EXPAND,
+            })
+        found = [m for m in data.get("value") or [] if isinstance(m, dict)]
+        return self._parse(found[0]) if found else None
 
     async def get_message(self, message_id: str) -> MailMessage:
         if not valid_id(message_id):
@@ -779,11 +1038,15 @@ class DelegateOutlook:
                 return False
         return True
 
-    async def update_draft_text(self, draft_id: str, expected_version: str, text: str) -> str:
+    async def update_draft_text(
+        self, draft_id: str, expected_version: str, text: str, *,
+        to: list[str] | None = None, cc: list[str] | None = None,
+    ) -> str:
         """Replace the words of the draft ``draft_id`` with ``text``, keeping
         who it goes to, the subject and the conversation, when it is still the
         version ``expected_version`` (``draft_version``; If-Match holds it to
-        that version on Microsoft's side too). Returns its new version.
+        that version on Microsoft's side too). With ``to`` it goes to ``to``
+        and ``cc`` instead. Returns its new version.
         Raises ``GmailNotFound`` when it is gone and ``DraftChanged`` when it
         changed meanwhile or is more than plain text. Nothing is sent."""
         if not valid_id(draft_id):
@@ -802,9 +1065,13 @@ class DelegateOutlook:
             ):
                 raise DraftChanged("not_plain")
             etag = str(data.get("@odata.etag") or f'W/"{change_key}"')
+            fields: dict[str, Any] = {"body": {"contentType": "text", "content": text}}
+            if to is not None:
+                fields["toRecipients"] = _recipients(to)
+                fields["ccRecipients"] = _recipients(cc or [])
             try:
                 updated = await self._request(
-                    client, "PATCH", path, json_body={"body": {"contentType": "text", "content": text}},
+                    client, "PATCH", path, json_body=fields,
                     if_match=etag,
                 )
             except GmailNotFound as exc:
@@ -845,12 +1112,48 @@ class DelegateOutlook:
                 data = await self._request(client, "POST", "/messages", json_body=fields)
             else:
                 data = await self._reply_draft(client, spec, fields)
-        draft_id = str(data.get("id") or "")
+            draft_id = str(data.get("id") or "")
+            skipped = 0
+            if spec.attachments and spec.forward is None:
+                data, skipped = await self._attach(client, draft_id, data, spec.attachments)
         return CreatedDraft(
             draft_id=draft_id,
             message_id=draft_version(draft_id, str(data.get("changeKey") or "")),
             thread_id=str(data.get("conversationId") or spec.thread_id or ""),
+            skipped_attachments=skipped,
         )
+
+    async def _attach(
+        self, client: httpx.AsyncClient, draft_id: str, data: dict[str, Any], files: list[tuple[str, str, bytes]],
+    ) -> tuple[dict[str, Any], int]:
+        """Put ``files`` on the new draft ``draft_id`` (Graph's one-request
+        upload, ``OUTLOOK_ATTACHMENT_MAX_BYTES`` a file; larger ones are left
+        off and counted). Returns the draft as it is afterwards (its
+        ``changeKey`` moved) and how many were left off. A failed upload
+        removes the draft, so no half-made one is left in their Drafts."""
+        if not valid_id(draft_id):
+            raise GmailError("graph returned no draft")
+        path = f"/messages/{quote(draft_id, safe='')}"
+        skipped = 0
+        try:
+            for name, mime, content in files:
+                if len(content) > OUTLOOK_ATTACHMENT_MAX_BYTES:
+                    skipped += 1
+                    continue
+                await self._request(client, "POST", f"{path}/attachments", json_body={
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": clean_header(name) or "attachment",
+                    "contentType": mime or "application/octet-stream",
+                    "contentBytes": base64.b64encode(content).decode("ascii"),
+                })
+            after = await self._get(client, path, {"$select": "id,changeKey,conversationId"})
+        except GmailError:
+            try:
+                await self._request(client, "DELETE", path)
+            except GmailError:
+                logger.warning("delegation.outlook: couldn't remove a draft whose files failed")
+            raise
+        return {**data, **after}, skipped
 
     async def _forward_draft(self, client: httpx.AsyncClient, spec: DraftSpec, fields: dict[str, Any]) -> dict[str, Any]:
         """A forward made with Graph's ``createForward``, which keeps the

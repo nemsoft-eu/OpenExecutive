@@ -30,6 +30,16 @@ _SEARCH_ENV_KEYS = (
 
 
 @pytest.fixture(autouse=True)
+def _balanced_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment default (``outside_mode.DEFAULT``, Balanced): a clean
+    search marks nothing, so its results can be opened. Under Careful every
+    read holds the turn (test_outside_content)."""
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "for_turn", lambda *_a, **_k: outside_mode.OUTSIDERS)
+
+
+@pytest.fixture(autouse=True)
 def _restore_search_env() -> Iterator[None]:
     """Undo every os.environ write this module makes, after each test.
 

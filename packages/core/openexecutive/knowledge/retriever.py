@@ -17,6 +17,7 @@ from openexecutive.knowledge.review_store import (
     ReviewStore,
 )
 from openexecutive.knowledge.store import ChromaDBStore
+from openexecutive.observability import traced
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,7 @@ def _with_general(domains: list[str] | None) -> list[str] | None:
     return domains if GENERAL_DOMAIN in domains else [*domains, GENERAL_DOMAIN]
 
 
+@traced("knowledge retrieve")
 def retrieve(
     query: str,
     domain_filter: list[str] | None = None,
@@ -253,6 +255,7 @@ def retrieve(
     builtin_distance_threshold: float | None = None,
     record_source: Callable[..., None] | None = None,
     n_synced: int = 3,
+    max_chars: int | None = None,
 ) -> str:
     """Retrieve knowledge for ``query`` as a prompt-ready block ("" for none).
 
@@ -262,6 +265,11 @@ def retrieve(
     ``record_source(kind, title, url=None)`` is told about each document the
     block quotes — the web chat lists them under the answer (see
     ``orchestrator.answer_sources``).
+
+    ``max_chars`` caps the excerpts' total text: the closest matches across
+    every collection are kept until it is reached (``_fit_to_budget``). The
+    chat surfaces pass ``KNOWLEDGE_CHAT_MAX_CHARS``; ``None`` or ``0`` keeps
+    every chunk that passed the gate.
     """
     effective_domains = domain_filter
     if effective_domains is None and specialist_name:
@@ -429,6 +437,26 @@ def retrieve(
         if _passes_threshold(r, distance_threshold) and _artifact_visible(r["metadata"])
     ][:2]
 
+    if max_chars:
+        (
+            company_results,
+            notion_results,
+            drive_results,
+            onedrive_results,
+            confluence_results,
+            research_results,
+            builtin_results,
+        ) = _fit_to_budget(
+            max_chars,
+            company_results,
+            notion_results,
+            drive_results,
+            onedrive_results,
+            confluence_results,
+            research_results,
+            builtin_results,
+        )
+
     active_annotations = rs.list_annotations(domains=effective_domains, active_only=True)
 
     # Audit emit — always fire, even on empty results, so the flow chart
@@ -564,7 +592,49 @@ def retrieve(
         for ann in active_annotations:
             parts.append(f"[SME annotation] {ann.correction}")
 
-    return "\n\n".join(parts)
+    context = "\n\n".join(parts)
+    if notion_results or drive_results or onedrive_results or confluence_results:
+        # A synced folder is multi-writer: what a turn reads from one is
+        # checked like any outside read, and marks the turn by the owner's
+        # safety level (orchestrator.outside_content). Queued as the same
+        # sections ``begin_turn`` takes from this context, so the same read
+        # is checked once.
+        from openexecutive.orchestrator import outside_content
+
+        outside_content.mark_pending(outside_content.SYNCED, outside_content.synced_sections(context))
+    return context
+
+
+def _fit_to_budget(
+    max_chars: int, *groups: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], ...]:
+    """Keep the closest chunks, across every group, whose text fits in
+    ``max_chars``.
+
+    Every chunk in the prompt is re-sent on each model call of the turn, so a
+    long tail of weaker matches costs on every call and rarely changes the
+    answer. Chunks are taken by distance (closest first); one that would
+    overflow is skipped, so a shorter, weaker one can still fit. The closest
+    chunk is always kept, even alone over the budget. Each group keeps its
+    own order, so priority sorting and section layout are unchanged.
+    """
+    ranked = sorted(
+        (float(r.get("distance") or 0.0), gi, ri)
+        for gi, group in enumerate(groups)
+        for ri, r in enumerate(group)
+    )
+    keep: set[tuple[int, int]] = set()
+    used = 0
+    for _distance, gi, ri in ranked:
+        size = len(str(groups[gi][ri].get("text", "")))
+        if keep and used + size > max_chars:
+            continue
+        keep.add((gi, ri))
+        used += size
+    return tuple(
+        [r for ri, r in enumerate(group) if (gi, ri) in keep]
+        for gi, group in enumerate(groups)
+    )
 
 
 def _onedrive_label(meta: dict[str, Any]) -> str:

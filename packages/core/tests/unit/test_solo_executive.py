@@ -29,7 +29,6 @@ from openexecutive.orchestrator.schedule_tools import (
     tools_withheld_in_mode,
 )
 from openexecutive.orchestrator.session import Session
-from tests.unit.offered_tools import capture_offered
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.prompts.cache_manager import build_system_blocks
@@ -38,6 +37,7 @@ from openexecutive.prompts.executive_persona import (
     EXECUTIVE_PERSONA_SOLO_PROMPT,
     default_persona,
 )
+from tests.unit.offered_tools import capture_offered
 
 from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlock
 
@@ -46,15 +46,17 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # deliberately: the inbound-email reply step names the `--- REPLY ---` block
 # instead of the Gmail send tool, so it holds for Outlook too. And once more:
 # the Skills paragraph saves repeatable work as a workflow, not a playbook.
+# And again: Domain Expertise says when to consult a specialist. And again:
+# the wording was tightened (same rules, ~27% shorter) to cut the cached prefix.
 #
-# FORK DELTA (2026-10-07 upstream sync): this digest necessarily differs from
-# upstream's. The fork adds a "## Consulting Your Leadership Team" section —
-# the local model ignores `tool_choice`, so the persona has to ask for the
-# consult in prose — and it lives in the SHARED _PERSONA_TAIL so BOTH the team
-# and solo prompts carry it. Upstream's value is
-# 1132deffbe673c84c5d69aa93240c0c237904bd612bb1c51ce69967599d10be0.
+# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-10-26): this digest
+# necessarily differs from upstream's. The fork adds a "## Consulting Your
+# Leadership Team" section — the local model ignores `tool_choice`, so the
+# persona has to ask for the consult in prose — and it lives in the SHARED
+# _PERSONA_TAIL so BOTH the team and solo prompts carry it. Upstream's value is
+# f68aafaabbff8891a3bc253cde793c91df7208ea0c961b98021669d47f6b8b59.
 # The test keeps its purpose: any *unintended* byte change still fails here.
-TEAM_PERSONA_SHA256 = "0635df5264894fb985537d6003393d3007968a49c2b00ff286be82b0c920ea18"
+TEAM_PERSONA_SHA256 = "985222079e0d7b5110996a4603588f517ee8aef64a6a649cfdfaa955d7561331"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",

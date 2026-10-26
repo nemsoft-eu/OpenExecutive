@@ -101,14 +101,16 @@ def test_seed_principal_briefs_inserts_all_recurring_rows_on_fresh_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Shift 5 added `executive_reflection` to the seed loop alongside
-    the morning and EoD brief. Fresh DB → 3 rows."""
+    the morning and EoD brief, and the chat replay and the weekly goal review
+    joined them. Fresh DB → 5 rows."""
     _setup_isolated_db(tmp_path / "briefs.db", monkeypatch)
 
     inserted = runner.seed_principal_briefs()
-    assert inserted == 3
+    assert inserted == 5
 
     actions = episodic.list_scheduled_actions(status="pending", limit=10)
     kinds = {a.kind for a in actions}
+    assert runner.GOAL_REVIEW_KIND in kinds
     assert "principal_brief_morning" in kinds
     assert "principal_brief_eod" in kinds
     assert "executive_reflection" in kinds
@@ -1638,3 +1640,37 @@ def test_a_channel_changed_while_the_brief_runs_uses_the_new_id(
     )
 
     assert captured == ["U-MOVED"]
+
+
+def test_a_delivered_brief_is_recorded_as_a_brief_not_as_work_done(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The brief's own send writes its done row as a brief delivery, so the
+    next brief's activity feed never reads it back as something the Executive
+    did (one top call was repeated three days running that way). A send
+    outside the delivery is still an ordinary one."""
+    import json
+
+    from openexecutive.orchestrator import schedule_tools
+
+    async def _send(args: dict) -> str:  # type: ignore[type-arg]
+        schedule_tools._record_send_to_activity(
+            channel="telegram", channel_ref=str(args["chat_id"]), intent_text=args["text"],
+        )
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(schedule_tools, "handle_send_telegram_message", _send)
+    _principal(preferred_channel="telegram", telegram_chat_id="42")
+    ok, _detail = _deliver("**Top call:** pick up the Maple Court buyout")
+    assert ok
+    schedule_tools._record_send_to_activity(
+        channel="telegram", channel_ref="42", intent_text="An ordinary message",
+    )
+
+    rows = episodic.list_scheduled_actions(status="done")
+    assert {r.intent_text: r.kind for r in rows} == {
+        "**Top call:** pick up the Maple Court buyout": episodic.BRIEF_DELIVERY_KIND,
+        "An ordinary message": "ad_hoc",
+    }
+    # The outbound guard still sees both sends to the recipient.
+    assert len(episodic.recent_sends_for_channel_ref("telegram", "42", "2000-01-01")) == 2

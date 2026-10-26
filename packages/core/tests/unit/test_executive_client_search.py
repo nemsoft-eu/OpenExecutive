@@ -34,6 +34,16 @@ from ._search_helpers import (
 
 
 @pytest.fixture(autouse=True)
+def _balanced_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment default (``outside_mode.DEFAULT``, Balanced): a clean
+    search marks nothing, so its results can be opened. Under Careful every
+    read holds the turn (test_outside_content)."""
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "for_turn", lambda *_a, **_k: outside_mode.OUTSIDERS)
+
+
+@pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_search_env(monkeypatch)
 
@@ -329,7 +339,11 @@ def test_a_url_only_in_attachment_text_is_refused(monkeypatch: pytest.MonkeyPatc
     captured, run_fetch = _fetch_turn(monkeypatch, planted, prompt, memory_text=own_words)
     run_fetch.assert_not_awaited()
     result = _tool_results(captured, 1)["tu_f"]
-    assert result.get("is_error") and "has not appeared" in result["content"]
+    # The attachment makes this a turn that read outside content, so the
+    # outside hold refuses the fetch before the seen-URL check is reached
+    # (orchestrator.outside_content.outside_withholds); either refusal keeps
+    # the planted address unopened.
+    assert "web_fetch was not run" in result["content"]
 
 
 def test_a_search_result_url_becomes_fetchable(monkeypatch: pytest.MonkeyPatch) -> None:

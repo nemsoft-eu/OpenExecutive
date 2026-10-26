@@ -310,7 +310,8 @@ def test_memory_text_drops_the_pollers_reply_block_but_keeps_a_forged_one_quoted
 
 
 def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
-    sam = SimpleNamespace(id=7)
+    # A teammate: upstream's sender check reads is_principal off the row.
+    sam = SimpleNamespace(id=7, is_principal=False)
     captured = _run(lambda addr, **_kw: sam if addr == "sam@example.com" else None)
     assert captured["person_id"] == 7
     assert captured["memory_text"] == _email_memory_text(REPLY)
@@ -322,7 +323,8 @@ def test_run_executive_passes_memory_text_and_keeps_the_full_prompt() -> None:
 
 def test_a_rostered_sender_gmail_did_not_authenticate_gets_no_link_opened() -> None:
     """A From line proves nothing: anyone can claim to be a teammate."""
-    sam = SimpleNamespace(id=7)
+    # A teammate: upstream's sender check reads is_principal off the row.
+    sam = SimpleNamespace(id=7, is_principal=False)
     captured = _run(
         lambda addr, **_kw: sam if addr == "sam@example.com" else None, authenticated=False
     )

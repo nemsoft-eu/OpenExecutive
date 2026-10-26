@@ -21,6 +21,10 @@ HANDLED_TABLE = "delegation_handled"
 REMINDERS_TABLE = "delegation_reminders"
 MAIL_READ_TABLE = "delegation_mail_read"
 TRAINING_TABLE = "delegation_training"
+DISCLOSURE_TABLE = "delegation_disclosure"
+CALENDAR_TABLE = "delegation_calendar"
+SAVED_FILES_TABLE = "delegation_saved_files"
+SAVED_FOLDER_TABLE = "delegation_saved_folder"
 
 TABLES: tuple[str, ...] = (
     SETTINGS_TABLE,
@@ -35,6 +39,10 @@ TABLES: tuple[str, ...] = (
     REMINDERS_TABLE,
     MAIL_READ_TABLE,
     TRAINING_TABLE,
+    DISCLOSURE_TABLE,
+    CALENDAR_TABLE,
+    SAVED_FILES_TABLE,
+    SAVED_FOLDER_TABLE,
 )
 
 _DDL: tuple[str, ...] = (
@@ -72,7 +80,8 @@ _DDL: tuple[str, ...] = (
     "  updated_by TEXT NOT NULL"
     ")",
     # Every draft saved in someone's Gmail (delegation.drafts): ids and
-    # times only, never an address, a subject or text.
+    # times only, never an address, a subject or text. gone_at: a chat draft
+    # found missing from their Drafts (sent or deleted there).
     f"CREATE TABLE IF NOT EXISTS {DRAFTS_TABLE} ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  person_id INTEGER NOT NULL,"
@@ -81,7 +90,8 @@ _DDL: tuple[str, ...] = (
     "  draft_id TEXT,"
     "  message_id TEXT,"
     "  sent_message_id TEXT,"
-    "  created_at TEXT NOT NULL"
+    "  created_at TEXT NOT NULL,"
+    "  gone_at TEXT"
     ")",
     f"CREATE INDEX IF NOT EXISTS idx_{DRAFTS_TABLE}_person_created "
     f"ON {DRAFTS_TABLE}(person_id, created_at)",
@@ -192,6 +202,50 @@ _DDL: tuple[str, ...] = (
     "  updated_by TEXT,"
     "  PRIMARY KEY (person_id, setting)"
     ")",
+    # The AI disclosure line on what is sent as a person (delegation.disclosure):
+    # one row per person who changed theirs. NULL follows the install's
+    # AI_DISCLOSURE_HANDLE_IT / AI_DISCLOSURE_APPROVED_SENDS.
+    f"CREATE TABLE IF NOT EXISTS {DISCLOSURE_TABLE} ("
+    "  person_id INTEGER PRIMARY KEY,"
+    "  handle_it INTEGER,"
+    "  approved_sends INTEGER,"
+    "  updated_at TEXT,"
+    "  updated_by TEXT"
+    ")",
+    # Read my calendar (delegation.calendar): one row per person who set it.
+    # Absent means off.
+    f"CREATE TABLE IF NOT EXISTS {CALENDAR_TABLE} ("
+    "  person_id INTEGER PRIMARY KEY,"
+    "  enabled INTEGER NOT NULL DEFAULT 0,"
+    "  updated_at TEXT,"
+    "  updated_by TEXT"
+    ")",
+    # The files save_my_email_attachment copied from someone's own mail into
+    # the Executive's Drive or OneDrive (delegation.saved_files): whose each
+    # one is, so the gateway hides it from everyone else's turns. The file's
+    # id and name, never its content or the mail it came from.
+    f"CREATE TABLE IF NOT EXISTS {SAVED_FILES_TABLE} ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  person_id INTEGER NOT NULL,"
+    "  provider TEXT NOT NULL,"
+    "  file_id TEXT NOT NULL,"
+    "  name TEXT NOT NULL DEFAULT '',"
+    "  saved_at TEXT NOT NULL,"
+    "  UNIQUE(provider, file_id)"
+    ")",
+    # Every "From your email" folder those files went in, made by the save
+    # itself (never one found by name): current marks the one in use per
+    # storage and Executive account; a retired one stays listed, since the
+    # gateway keeps every one of them out of reach of the model.
+    f"CREATE TABLE IF NOT EXISTS {SAVED_FOLDER_TABLE} ("
+    "  provider TEXT NOT NULL,"
+    "  account TEXT NOT NULL,"
+    "  folder_id TEXT NOT NULL,"
+    "  drive_id TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    "  current INTEGER NOT NULL DEFAULT 1,"
+    "  PRIMARY KEY (provider, folder_id)"
+    ")",
 )
 
 
@@ -252,10 +306,19 @@ def _add_mailbox_drafts(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _add_draft_gone_at(conn: sqlite3.Connection) -> None:
+    """Give a drafts table made before ``gone_at`` existed the column."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({DRAFTS_TABLE})")}
+    if "gone_at" not in columns:
+        conn.execute(f"ALTER TABLE {DRAFTS_TABLE} ADD COLUMN gone_at TEXT")
+        conn.commit()
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the tables if missing. Idempotent."""
     for statement in _DDL:
         conn.execute(statement)
     _add_handle_it_mode(conn)
     _add_mailbox_drafts(conn)
+    _add_draft_gone_at(conn)
     _move_training_off_the_dial(conn)

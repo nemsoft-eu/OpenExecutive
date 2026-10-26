@@ -8,6 +8,7 @@ import {
   type OnboardTurn,
   type RoleKind,
 } from "@/lib/api";
+import OnboardAnswers from "@/components/onboard/OnboardAnswers";
 
 const MAX_FILES = 8;
 
@@ -45,6 +46,9 @@ function flavourFor(solo: boolean, roleKind: RoleKind | null | undefined): Flavo
   if (roleKind === "owner" || roleKind === "in_house" || roleKind === "independent") return roleKind;
   return "solo";
 }
+
+// What Skip sends. The interviewer moves on and does not ask it again.
+const SKIP_ANSWER = "Skip this one.";
 
 export interface Bubble {
   role: "user" | "assistant";
@@ -95,8 +99,9 @@ export default function OnboardConversation({
     ]);
   }
 
-  async function send() {
-    const text = input.trim();
+  // A tapped suggestion or Skip sends its own text; otherwise the box's.
+  async function send(tapped?: string) {
+    const text = (tapped ?? input).trim();
     if ((!text && files.length === 0) || busy) return;
     setBusy(true);
     setError(null);
@@ -140,26 +145,31 @@ export default function OnboardConversation({
           {turn?.question_hint && (
             <p className="text-xs text-fg-muted mt-2">{turn.question_hint}</p>
           )}
+          {started && headline && (
+            <div className="flex flex-wrap gap-2 mt-3">
+              {(turn?.question_options ?? []).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => void send(option)}
+                  disabled={busy}
+                  className="min-h-9 px-3.5 py-1.5 rounded-full border border-line-strong text-sm text-fg text-left hover:border-indigo-500/60 hover:bg-indigo-500/10 disabled:opacity-40 transition-colors cursor-pointer"
+                >
+                  {option}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => void send(SKIP_ANSWER)}
+                disabled={busy}
+                className="min-h-9 px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-40 transition-colors cursor-pointer"
+              >
+                Skip
+              </button>
+            </div>
+          )}
         </div>
 
-        {earlier.length > 0 && (
-          <details className="text-xs text-fg-muted">
-            <summary className="cursor-pointer hover:text-fg transition-colors">
-              Earlier in this conversation ({earlier.length}{" "}
-              {earlier.length === 1 ? "message" : "messages"})
-            </summary>
-            <div className="flex flex-col gap-3 mt-3">
-              {earlier.map((b, i) => (
-                <div key={i} className={b.role === "user" ? "pl-6" : ""}>
-                  <p className="text-[10px] uppercase tracking-wide text-fg-subtle mb-0.5">
-                    {b.role === "user" ? "You" : "Setup"}
-                  </p>
-                  <p className="text-xs text-fg whitespace-pre-wrap">{b.text}</p>
-                </div>
-              ))}
-            </div>
-          </details>
-        )}
       </div>
 
       <div className="flex flex-col gap-2">
@@ -177,7 +187,7 @@ export default function OnboardConversation({
           autoFocus
           placeholder={
             started
-              ? "Your answer… (Enter to send, Shift+Enter for a new line)"
+              ? "Or type your own answer… (Enter to send, Shift+Enter for a new line)"
               : OPENING_EXAMPLE[flavour]
           }
           className="w-full rounded-lg border border-line-strong bg-surface-overlay px-3 py-2 text-sm text-fg placeholder-fg-subtle focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 resize-none transition-colors disabled:opacity-50"
@@ -221,18 +231,35 @@ export default function OnboardConversation({
               disabled={busy}
               className="text-xs text-fg-muted hover:text-fg disabled:opacity-40 transition-colors"
             >
-              Skip ahead — draft my profile now
+              Draft it now
             </button>
           )}
           {started && (
             <span className="text-xs text-fg-subtle ml-auto">
-              {turn!.questions_asked} of {turn!.max_questions} questions
+              {turn!.questions_asked} of up to {turn!.max_questions}
             </span>
           )}
         </div>
       </div>
 
+      {/* Below the box you answer in: a new question keeps that in view. */}
       <div ref={bottomRef} />
+
+      {started && (
+        <OnboardAnswers
+          sessionId={turn!.session_id}
+          bubbles={earlier}
+          disabled={busy}
+          onRevised={(next, turns) => {
+            if (next.phase === "draft") {
+              onDraft(next, turns);
+              return;
+            }
+            setTurn(next);
+            setBubbles(turns);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useExecutiveStatus } from "@/components/executive/ExecutiveStatusContext";
 import ExecutiveRunSwitch from "@/components/executive/ExecutiveRunSwitch";
 import VoicePicker from "@/components/executive/VoicePicker";
+import OutsideContentCard from "@/components/settings/OutsideContentCard";
 import SettingsCard from "@/components/settings/SettingsCard";
 import SettingsSubpage from "@/components/settings/SettingsSubpage";
 
@@ -13,10 +14,15 @@ const ALWAYS_DOES: { title: string; text: string }[] = [
   { title: "Morning brief and evening digest", text: "Sums up your day and what's waiting for you." },
   { title: "Nudges", text: "Reminds people about things they owe you." },
   { title: "Looks over your day", text: "Spots what's stuck or coming up and tells you." },
+  {
+    title: "Looks back at its chats",
+    text: "After a chat goes quiet, it fixes what it left undone and grades its own answers. What it learned is under Pulse, in Learning.",
+  },
   { title: "Research and monitoring", text: "Follows the topics and sources you asked it to watch." },
 ];
 
-// Settings → Your Executive: Pause, what it always does without asking, and
+// Settings → Your Executive: Pause, when it checks with you after reading
+// outside content (the owner only), what it always does without asking, and
 // the voice it answers in. Pause stops everything it does on its own,
 // including Take the lead and booking meetings, which live under Delegate
 // with what it sends as you. /settings/on-its-own lands here.
@@ -24,7 +30,7 @@ export default function ExecutiveSettingsPage() {
   return (
     <SettingsSubpage
       title="Your Executive"
-      description="Pause it, what it always does without asking, and the voice it answers in."
+      description="Pause it, when it checks with you, what it always does without asking, and the voice it answers in."
     >
       <SettingsCard
         title="Pause everything"
@@ -34,6 +40,8 @@ export default function ExecutiveSettingsPage() {
       </SettingsCard>
 
       <PausedNote />
+
+      <OutsideContentCard />
 
       <SettingsCard title="Always does on its own" description="No switch for these. Pause stops them too.">
         <ul className="flex flex-col gap-3">
