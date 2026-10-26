@@ -140,6 +140,69 @@ _GW_PREFIX = "google_workspace__"
 # `microsoft_365__send-mail`.
 _M365_PREFIX = "microsoft_365__"
 
+# Namespace prefix of the Linear server (a remote MCP server reached over the
+# gateway), and the tools the Executive may run on it. Its read-only endpoint,
+# https://mcp.linear.app/mcp/readonly, served exactly 35 tools when it was
+# enumerated live on 2026-10-13; 34 of them are listed here.
+#
+# The one deliberate exclusion is `extract_images`, whose only argument is a
+# `markdown` string the caller writes and whose job is to FETCH the image URLs
+# in it. That makes it a server-side fetch with a fully caller-chosen target —
+# the same "can carry data out" shape `_check_url_fetch` refuses on the Google
+# surface, and a way around `web_fetch`'s domain rules. It reads as a read, so
+# it is named here rather than merely left out: re-admit it only alongside an
+# argument gate on the URLs in that markdown.
+#
+# The list is the code-side read-only guarantee, and it is fail-closed: a
+# `linear__` tool whose bare name is not in it is refused by `call_tool` and
+# never offered by `search_tools`. So a tool Linear adds later, and the whole
+# write surface the plain `/mcp` endpoint would serve if the configured URL
+# were ever repointed at it, stay unavailable until someone adds the name here
+# on purpose. Widen the list by re-enumerating the read-only endpoint and
+# reading the new tool's schema, never to make a failing call work.
+#
+# The guarantee is keyed to the `linear__` prefix, which is the configured
+# server's name: a second entry for the same endpoint under another name
+# (`linear_rw`, `issues`) carries none of this, so the config entry must keep
+# the name `linear`.
+_LINEAR_PREFIX = "linear__"
+_LINEAR_READ_TOOLS: frozenset[str] = frozenset({
+    "get_agent_skill",
+    "get_attachment",
+    "get_document",
+    "get_issue",
+    "get_issue_status",
+    "get_milestone",
+    "get_notifications",
+    "get_project",
+    "get_release",
+    "get_release_note",
+    "get_status_updates",
+    "get_team",
+    "get_template",
+    "get_triage_responsibility",
+    "get_user",
+    "get_workspace",
+    "list_agent_skills",
+    "list_comments",
+    "list_custom_views",
+    "list_cycles",
+    "list_documents",
+    "list_issue_labels",
+    "list_issue_statuses",
+    "list_issues",
+    "list_milestones",
+    "list_project_labels",
+    "list_projects",
+    "list_release_notes",
+    "list_release_pipelines",
+    "list_releases",
+    "list_teams",
+    "list_templates",
+    "list_users",
+    "search_documentation",
+})
+
 
 def _normalize_tool_name(name: str) -> str:
     """Canonical form for gate lookups: lowercase, ``-`` and ``_`` collapsed.
@@ -665,18 +728,35 @@ def _check_acting_account(tool: str, arguments: dict[str, Any]) -> str | None:
     })
 
 
-def _refuse(tool: str, field: str, shown: str, *, reason: str) -> str:
-    """Refuse a Google Workspace call for a reason other than a recipient (a
-    blocked tool, a URL fetch, an RSVP comment). Audited like `_block`, with
-    ``shown`` in the row's address slot so /audit reads the same for every
-    refusal."""
+def _one_line(value: object, limit: int = 200) -> str:
+    """``value`` as a single short line, safe to interpolate into a log line or
+    an audit summary: any C0 control character (newline included) becomes a
+    space, then truncated. A caller-chosen tool name or argument key must not
+    be able to forge a second line in either."""
+    text = value if isinstance(value, str) else repr(value)
+    return re.sub(r"[\x00-\x1f\x7f]", " ", text)[:limit]
+
+
+def _refuse(tool: str, field: str, shown: str, *, reason: str, system: str = "Google Workspace") -> str:
+    """Refuse a call for a reason other than a recipient (a blocked tool, a
+    URL fetch, an RSVP comment). Audited like `_block`, with ``shown`` in the
+    row's address slot so /audit reads the same for every refusal. ``system``
+    names the system in the log line and the audit summary; it defaults to
+    Google Workspace, which every caller but Linear's is.
+
+    ``tool`` is truncated and flattened like ``field``, because the gates that
+    refuse by prefix rather than by exact name (Linear's allow-list, the
+    non-object `arguments` refusal) put a caller-chosen suffix in it: a
+    newline would forge a second line in the audit summary and the log, and
+    an arbitrarily long name would bloat the audit row."""
     from openexecutive.audit import log_event as audit_log
 
-    field = field[:200]
-    logger.warning("blocked google workspace call: tool=%s field=%s", tool, field)
+    field = _one_line(field)
+    tool = _one_line(tool)
+    logger.warning("blocked %s call: tool=%s field=%s", system.lower(), tool, field)
     audit_log(
         "integration_outbound_blocked",
-        f"Blocked a Google Workspace call (tool={tool} field={field})",
+        f"Blocked a {system} call (tool={tool} field={field})",
         actor="mcp_gateway",
         details={"tool": tool, "field": field, "address": shown},
     )
@@ -727,6 +807,24 @@ def _is_blocked_m365_auth_tool(tool_name: object) -> bool:
     """True for the Microsoft 365 account tools the gateway never runs
     (`_BLOCKED_M365_AUTH_TOOLS`), whatever the spelling or case."""
     return isinstance(tool_name, str) and _normalize_tool_name(tool_name) in _BLOCKED_M365_AUTH_TOOLS
+
+
+def _is_blocked_linear_tool(tool_name: object) -> bool:
+    """True for any Linear tool outside `_LINEAR_READ_TOOLS` — the fail-closed
+    half of the read-only guarantee, so a name nobody has vetted is refused
+    rather than passed through.
+
+    Read through `_normalize_tool_name` like the M365 gate, so a case or
+    hyphen respelling of a write tool (`Linear__Create-Issue`) is refused
+    too. A non-`str` name is not a Linear tool name and cannot become one:
+    `call_tool` normalizes the name before any gate runs, so a non-string
+    never reaches Linear and cannot slip past this allow-list."""
+    if not isinstance(tool_name, str):
+        return False
+    normalized = _normalize_tool_name(tool_name)
+    if not normalized.startswith(_LINEAR_PREFIX):
+        return False
+    return normalized[len(_LINEAR_PREFIX):] not in _LINEAR_READ_TOOLS
 
 
 def _check_url_fetch(tool: str, arguments: dict[str, Any]) -> str | None:
@@ -3457,17 +3555,25 @@ def _remember_drive_read(tool_name: str, arguments: dict[str, Any], result_text:
     return result_text
 
 
+def _always_refused_tool(tool_name: object) -> bool:
+    """Whether `call_tool` refuses this name whatever its arguments: the
+    Microsoft 365 account tools, and any Linear tool off the read-only
+    allow-list. The argument-dependent gates (recipients, URL fetches) are not
+    here — those tools are legitimately callable, so they stay on offer."""
+    return _is_blocked_m365_auth_tool(tool_name) or _is_blocked_linear_tool(tool_name)
+
+
 def _drop_blocked_tools(text: object) -> Any:
     """``search_tools`` output without the tools `call_tool` always refuses
-    (the Microsoft 365 account tools), so the model is never offered them.
-    Output naming none of them comes back unchanged."""
+    (see `_always_refused_tool`), so the model is never offered them. Output
+    naming none of them comes back unchanged."""
     from openexecutive.workflows.tool_catalog import filter_search_results, parse_search_results
 
     if not isinstance(text, str):
         return text
-    if not any(_is_blocked_m365_auth_tool(t.name) for t in parse_search_results(text)):
+    if not any(_always_refused_tool(t.name) for t in parse_search_results(text)):
         return text
-    return filter_search_results(text, lambda name: not _is_blocked_m365_auth_tool(name))
+    return filter_search_results(text, lambda name: not _always_refused_tool(name))
 
 
 def _is_undiscovered_refusal(tool_name: object, result_text: object) -> bool:
@@ -3826,6 +3932,21 @@ class MCPGateway:
                     "managed by the operator (ms365-mcp-launch.sh --login), not "
                     "from chat. verify-login and list-accounts still report the "
                     "signed-in account."
+                ),
+            )
+        if _is_blocked_linear_tool(tool_name):
+            # The name is caller-chosen past the prefix, so flatten it before
+            # it goes anywhere — `_refuse` does the same for the log and the
+            # audit row.
+            return _refuse(
+                tool_name, "tool", "<linear-write>", system="Linear",
+                reason=(
+                    f"{_one_line(tool_name, 120)} is not available: Linear is "
+                    "connected read-only, and the gateway runs only the read "
+                    "tools on its allow-list. Reading issues, projects, teams, "
+                    "documents and comments works; creating or changing "
+                    "anything in Linear does not. Do not retry with another "
+                    "Linear tool — say what you would have changed instead."
                 ),
             )
         if isinstance(tool_name, str) and tool_name.startswith(_GW_PREFIX):

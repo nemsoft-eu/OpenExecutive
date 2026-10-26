@@ -10292,6 +10292,58 @@ integrations:
     existing outbound→inbound DM context linkage; no Meet/Drive transcript
     integration is involved. Skipped silently when no attendee has a reachable
     DM channel. Failure to schedule never blocks the booking.
+
+    Linear (read-only, enforced in code): configured as a plain url server in
+    company/mcp_servers.json pointing at https://mcp.linear.app/mcp/readonly,
+    with a Read-scoped key on the `linear=` line of the tokens file. Both of
+    those are deploy-side facts the repo cannot see, and the config
+    deny_patterns are Google-shaped and would not match a Linear write name —
+    so the code-side guarantee is `mcp_gateway._LINEAR_READ_TOOLS`, a
+    fail-closed frozenset of 34 of the 35 tools that endpoint served when it
+    was enumerated live on 2026-10-13, every one a `get_*` / `list_*` /
+    `search_*` read. INVARIANT: a `linear__` name whose bare form is not in
+    that set is refused by `call_tool` (`_is_blocked_linear_tool`, read
+    through `_normalize_tool_name` so case and hyphen respellings are caught)
+    and dropped from `search_tools` output (`_always_refused_tool`, which the
+    M365 account tools share), so a tool Linear ships later — and the whole
+    write surface the plain `/mcp` endpoint would serve if that entry's URL
+    were ever repointed — stays unavailable until someone adds the name on
+    purpose. The refusal is audited as `integration_outbound_blocked` with
+    address `<linear-write>` and a summary naming Linear rather than Google
+    Workspace (`_refuse`'s `system` argument); because this gate matches by
+    PREFIX rather than by exact name, everything after `linear__` is
+    caller-chosen, so `_refuse` flattens control characters and truncates the
+    tool name before it reaches the log line or the audit summary — otherwise
+    a newline in a tool name forges a second audit event.
+    The 35th tool, `extract_images`, is deliberately EXCLUDED: its only
+    argument is a caller-written `markdown` string whose image URLs Linear's
+    server then fetches, which makes it a server-side fetch with an arbitrary
+    target (the shape `_check_url_fetch` refuses on the Google surface, and a
+    way around web_fetch's domain rules). Re-admit it only together with an
+    argument gate on those URLs.
+    LIMIT OF THE GUARANTEE: it is keyed to the `linear__` prefix, i.e. to the
+    config entry being named exactly `linear`. A second entry for the same
+    vendor under another name (`linear_rw`, `issues`) carries none of it, and
+    unlike Microsoft 365 — where registry.log_provider_status warns about a
+    look-alike server under another name — there is no Linear equivalent of
+    that warning yet. Keep the entry named `linear`.
+    test_linear_readonly pins both halves, including the
+    neither-read-nor-known-write case. Deliberately NOT done: pinning Linear
+    tool names into cached block 0 (the prompt-caching risk is not worth one
+    saved search_tools round trip; the generic "Other tool servers" line in
+    connected_systems already names the server and pins no tool names), and a
+    `deny_patterns` glob layer (a candidate `linear__comment*` would have
+    blocked the legitimate read `list_comments` — the globs were guesses).
+    Known limitations, both UPSTREAM behaviour of the pinned extensible-mcp
+    rev (docker/Dockerfile) that nothing in this repo tests: a url server's
+    tools are fetched once at boot (client_manager), so a revoked key or a
+    Linear outage mid-process leaves block 0 and server_names still claiming
+    Linear is connected; and the reason `load_mcp_server` cannot re-point
+    `linear` at the write endpoint is that extensible-mcp resolves a token by
+    SERVER NAME and refuses to connect a name already in use — a bump that
+    changed either would reopen that door with every test here still green.
+    Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a counting
+    answer over a large team can under-report.
   own_gmail: |
     Act as me (delegation) connects a second, separate Gmail — the
     principal's own — read and drafted into by delegation.gmail.DelegateGmail
