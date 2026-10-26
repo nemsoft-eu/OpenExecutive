@@ -123,7 +123,8 @@ system:
       does not suppress them either, even though Ollama reads unset as xhigh,
       because unset ALSO triggers that override — the two cannot both be
       satisfied from one unset value, so the override wins and an operator who
-      wants neither writes LOCAL_TEMPERATURE=off. Only the configured values
+      wants neither sets both LOCAL_TEMPERATURE=off and LOCAL_TOP_P=off (they
+      are independent switches; one alone still sends the other). Only the configured values
       are withheld; a caller's own temperature is left alone, since dropping
       response_gate's temperature=0 would make the outbound gate stochastic
       silently, which is worse than a 400 that names the field. `off`/`none`
@@ -1332,10 +1333,12 @@ routing:
     result is refused as before. A caller that
     passes no `memory_text` (unrostered email, the scheduler, evals)
     makes nothing in its message fetchable, only that turn's search
-    results: fail closed. MCP `ask_executive` passes its `message` and
-    opens its links only when the caller resolved to a person, which
-    happens in open mode alone (signed callers ask as no one): the same
-    trust the web chat route gives `x-caller-email`. The channels enter through `Executive.chat()`,
+    results: fail closed. MCP `ask_executive` passes its `message` as
+    `memory_text`, with `fetch_own_urls` only when the verified caller
+    resolved to a person, but the seeding is inert: its turn is marked
+    `from_mcp_client`, and `MCP_CLIENT_WITHHELD_TOOLS` (and the acting
+    variant) contain `PRIVATE_TURN_WITHHELD_TOOLS`, `web_fetch` included,
+    so `web_fetch` is never offered there. The channels enter through `Executive.chat()`,
     whose `fetch_own_urls` (default False) seeds `memory_text` only when
     the adapter vouches for the sender: Slack and Discord always (past
     their roster gate), Telegram for a chat matched to a person, Google
@@ -3768,7 +3771,9 @@ peer_memory:
       pass it only with files), Telegram, Discord (``_handle_message(own_words=)``),
       Google Chat (each the typed text plus ``(Attached files: …)``) and the
       CLI. A rostered email sender's is ``_email_memory_text``; an
-      unrostered sender, the scheduler, the evals and MCP pass none. Its
+      unrostered sender, the scheduler and the evals pass none (MCP's
+      `ask_executive` passes its `message`, though its turn is never
+      offered `web_fetch`). Its
       URLs open only for a sender on the roster
       (``Executive.chat(fetch_own_urls=)``, see routing.web_search); peer
       memory and the own-words gates read it either way. ``co_present_person_ids``
