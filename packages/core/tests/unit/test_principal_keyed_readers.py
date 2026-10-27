@@ -90,7 +90,7 @@ _ALLOWED: frozenset[str] = frozenset({
     # under `PRINCIPAL_DELIVERY` (the EoD digest).
     "briefing/brief_requests.py::_principal_id",
     # Private: the owner's waiting chat drafts, for a verified chat turn.
-    # Gated on a one-principal roster (context._single_principal).
+    # Gated on a one-principal roster (context.single_principal).
     "briefing/context.py::_waiting_drafts_block",
     # Shared: only the owner row's `created_at`, to date the first week.
     "briefing/first_week.py::first_week_started",

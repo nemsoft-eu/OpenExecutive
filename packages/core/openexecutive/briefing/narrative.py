@@ -734,10 +734,11 @@ def render_briefing_context(
     leave_out_block = ""
     # The raise / leave-out lists are the lowest-id principal's own words
     # (brief_requests.render_parts): left out on a co-principal roster, where
-    # the fan-out hands the same brief to every founder.
-    from openexecutive.people.store import active_principals
+    # the fan-out hands the same brief to every founder. A failed roster read
+    # leaves them out too, rather than failing the whole brief.
+    from openexecutive.briefing.context import single_principal
 
-    if brief_requests and len(active_principals()) <= 1:
+    if brief_requests and single_principal():
         from openexecutive.briefing.brief_requests import render_parts
 
         raise_block, leave_out_block = render_parts()

@@ -346,16 +346,17 @@ def render_and_trust(session: object, *, db_path: Path | None = None) -> str:
     # The drafts are the lowest-id principal's (find_principal_person): with a
     # co-principal on the roster a verified speaker may be the other founder,
     # so the block is left out rather than shown to them.
-    if verified and _single_principal():
+    if verified and single_principal():
         drafts_block = _waiting_drafts_block()
         if drafts_block:
             block = f"{block}\n\n{drafts_block}" if block else drafts_block
     return block
 
 
-def _single_principal() -> bool:
+def single_principal() -> bool:
     """Whether the roster holds at most one active principal. False on a
-    failed read: the private block stays out."""
+    failed read, so a caller gating the lowest-id principal's private lines
+    on it leaves them out."""
     try:
         from openexecutive.people.store import active_principals
 
