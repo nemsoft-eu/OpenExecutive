@@ -80,8 +80,11 @@ ASSIGN_OPEN_LOOP_TOOL: dict[str, Any] = {
         "asks you to — 'ask Ben to send me the Q3 numbers by Friday', 'put "
         "Sara down for the vendor quote', 'track that I owe the board deck "
         "Monday'. It is tracked and they are followed up automatically once "
-        "it is due; nobody is messaged now (use message_person as well if the "
-        "user wants them told). Resolve the name with list_people first. "
+        "it is due. Someone assigned a task by another person is told once, "
+        "on their own channel; the result's `notified` says whether it "
+        "reached them (sent, held for their quiet hours, or not_reached), so "
+        "say that and do not message them about it as well. Resolve the name "
+        "with list_people first. "
         "`task` must be the deliverable copied VERBATIM from the user's own "
         "message, in their language (e.g. 'send me the Q3 numbers') — never "
         "your own wording. Only for tasks the user themselves states; never "
@@ -130,15 +133,23 @@ def _audit(tool: str, ok: bool, summary: str, details: dict[str, Any]) -> None:
     )
 
 
+def _is_principal(person_id: int) -> bool:
+    from openexecutive.people.store import get_person
+
+    person = get_person(person_id)
+    return bool(person is not None and person.is_principal)
+
+
 def _is_private_surface(session: Any) -> bool:
     """Whether a reply in this session is seen only by the person asking.
 
     Web chat and 1:1 DMs are private. Slack / Discord channels and threads,
     Telegram groups (negative chat ids), Google Chat spaces and email (which can
     carry cc's) are not — a list rendered there is read by everyone present,
-    the same reason Slack keeps the alert board out of shared channels."""
+    the same reason Slack keeps the alert board out of shared channels. So is
+    a web chat its owner shared with teammates (``Session.shared_chat``)."""
     if getattr(session, "from_web_chat", False):
-        return True
+        return getattr(session, "shared_chat", False) is not True
     sid = str(getattr(session, "session_id", "") or "")
     if sid.startswith(("slack:dm:", "discord:dm:")):
         return True
@@ -387,15 +398,21 @@ async def handle_assign_open_loop(tool_input: dict[str, Any]) -> str:
     _audit(tool, True, f"assign_open_loop #{result.loop_id} for person {person_id}",
            {"loop_id": result.loop_id, "owner_person_id": person_id,
             "caller_person_id": assigner})
+    from openexecutive.attunement.assignment_notice import notify_assignee
     from openexecutive.attunement.open_loops import get_open_loop
 
     loop = get_open_loop(result.loop_id)
+    notice = await notify_assignee(
+        loop_id=result.loop_id, owner_person_id=person_id,
+        assigned_by_person_id=assigner, task=task, due_at=result.due_at,
+    )
     return json.dumps({
         "status": "assigned",
         "loop_id": result.loop_id,
         "owner_person_id": person_id,
         "owner": loop.owner_name if loop is not None else None,
         "due_at": result.due_at,
+        "notified": notice.as_dict(for_principal=_is_principal(assigner)),
     })
 
 

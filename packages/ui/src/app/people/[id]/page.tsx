@@ -1,10 +1,15 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { type FormEvent, type ReactNode, useEffect, useId, useState } from "react";
+import { type FormEvent, Fragment, type ReactNode, useCallback, useEffect, useId, useState } from "react";
 
-import { TeamModeOffer } from "@/components/people/TeamModeOffer";
+import Icon from "@/components/Icon";
+import { ChatAppPickers } from "@/components/people/ChatAppPickers";
+import { PersonContactChanges, PersonContactNote } from "@/components/people/ContactChanges";
+import { TeamModeSwitch } from "@/components/people/TeamModeSwitch";
+import { usePageCrumb } from "@/components/shell/PageCrumb";
 import Button from "@/components/ui/Button";
+import { useChatDirectory, useSlackEmailMatch } from "@/components/ui/ChatPicker";
 import OverflowMenu from "@/components/ui/OverflowMenu";
 import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
@@ -12,6 +17,8 @@ import {
   archivePerson,
   assignOpenLoop,
   closeOpenLoop,
+  getContactChanges,
+  getContactNote,
   getPeopleViewer,
   getPerson,
   getPersonOpenLoops,
@@ -21,13 +28,18 @@ import {
   savePersonWorkingStyle,
   updatePerson,
   type AvailabilityWindow,
+  type ContactChange,
+  type ContactNote,
   type OpenLoop,
   type OutreachStat,
   type Person,
   type PersonKind,
   type WorkingStyle,
 } from "@/lib/api";
-import { isContact, shouldOfferTeamMode } from "@/lib/peopleKinds";
+import { assignNoticeLine } from "@/lib/assignNotice";
+import { DETAIL_LABELS, detailHref, detailsToText, detailText, textToDetails } from "@/lib/contactChanges";
+import { isContact, shouldSwitchToTeam } from "@/lib/peopleKinds";
+import { onLeaveLine, reachLine } from "@/lib/personReach";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -46,7 +58,13 @@ const ALL_SCOPES = [
   { value: "wildcard", label: "All (wildcard)", hint: "Receives anything no one else is scoped for — usually the principal." },
 ];
 
-const CHANNELS = ["any", "slack", "discord", "telegram", "email"];
+const CHANNELS = [
+  { value: "any", label: "Where they last talked" },
+  { value: "email", label: "Email" },
+  { value: "slack", label: "Slack" },
+  { value: "discord", label: "Discord" },
+  { value: "telegram", label: "Telegram" },
+];
 
 const INPUT_CLS =
   "w-full h-11 px-3 rounded-xl bg-surface-input/60 border border-line text-[15px] text-fg placeholder-fg-subtle focus:outline-none focus:border-accent";
@@ -106,8 +124,8 @@ function OutreachSection({ personId }: { personId: number }) {
 // How I work with them — learned working style (attunement)
 // ---------------------------------------------------------------------------
 
-const MAX_STYLE_RULES = 4;
-const STYLE_TEXTAREA_ROWS = 4;
+const MAX_STYLE_RULES = 8;
+const STYLE_TEXTAREA_ROWS = 6;
 
 function WorkingStyleSection({ personId }: { personId: number }) {
   const [style, setStyle] = useState<WorkingStyle | null>(null);
@@ -182,7 +200,7 @@ function WorkingStyleSection({ personId }: { personId: number }) {
         )}
       </div>
       <p className={INTRO_CLS}>
-        How replies are written for them, learned from their own 👍/👎 and requests.
+        How replies are written for them, learned from their own 👍/👎 and what they ask for in chats.
         {style.locked
           ? " Locked — kept as is."
           : " Updated as they use it; rules you type are always kept. Lock it to stop learning."}
@@ -292,7 +310,7 @@ function OpenLoopsSection({
         );
       }
       setAssigned(
-        `Assigned — due ${new Date(loop.due_at).toLocaleDateString()}. They'll be followed up if it isn't done by then.`,
+        `Assigned, due ${new Date(loop.due_at).toLocaleDateString()}. ${assignNoticeLine(loop.notified)}`,
       );
       setTask("");
       setDueDate("");
@@ -503,7 +521,7 @@ export default function PersonDetailPage() {
   const params = useParams();
   const router = useRouter();
   const { mode } = useWorkspace();
-  const [offerFor, setOfferFor] = useState<string | null>(null);
+  const [switchedFor, setSwitchedFor] = useState<string | null>(null);
   // Only the principal may move someone between team and contacts (contacts
   // are theirs alone); for anyone else the API 404s a contact's page anyway.
   const [viewerIsPrincipal, setViewerIsPrincipal] = useState(false);
@@ -537,9 +555,11 @@ export default function PersonDetailPage() {
   const [tab, setTab] = useState<PersonTab>("overview");
   const tabsId = useId();
 
-  // Edit-mode disclosure panels
-  const [showContact, setShowContact] = useState(false);
+  // Edit mode keeps the leave date in a closed Advanced fold.
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // The chat apps fold: closed until opened, or until Slack finds them by
+  // email (null: not toggled yet).
+  const [showChat, setShowChat] = useState<boolean | null>(null);
 
   // Edit form state — mirrors the person fields we allow editing
   const [form, setForm] = useState({
@@ -549,6 +569,8 @@ export default function PersonDetailPage() {
     email: "",
     // Other addresses, one per line or comma-separated.
     email_aliases: "",
+    // Phone, website and more, one "Label: value" per line.
+    details: "",
     slack_user_id: "",
     telegram_chat_id: "",
     discord_user_id: "",
@@ -565,22 +587,45 @@ export default function PersonDetailPage() {
       .then((p) => {
         setPerson(p);
         resetForm(p);
-        // Auto-open sections that already have data so existing values aren't hidden
-        if (p.email || (p.email_aliases?.length ?? 0) > 0 || p.slack_user_id || p.discord_user_id || p.telegram_chat_id || p.preferred_channel !== "any" || p.response_sla_hours !== 24) {
-          setShowContact(true);
-        }
-        if (p.on_leave_until) {
-          setShowAdvanced(true);
-        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load"))
       .finally(() => setLoading(false));
   }, [personId]);
 
+  // What the Executive changed about this contact (the principal's alone).
+  const [contactChanges, setContactChanges] = useState<ContactChange[]>([]);
+  useEffect(() => {
+    if (isNaN(personId) || !viewerIsPrincipal) return;
+    getContactChanges(personId).then((d) => setContactChanges(d.changes), () => setContactChanges([]));
+  }, [personId, viewerIsPrincipal]);
+  // What the Executive remembers about this contact (the principal's alone).
+  const [contactNote, setContactNote] = useState<ContactNote | null>(null);
+  useEffect(() => {
+    if (isNaN(personId) || !viewerIsPrincipal) return;
+    getContactNote(personId).then(setContactNote, () => setContactNote(null));
+  }, [personId, viewerIsPrincipal]);
+  function reloadAfterUndo() {
+    getContactChanges(personId).then((d) => setContactChanges(d.changes), () => setContactChanges([]));
+    getPerson(personId).then((p) => { setPerson(p); resetForm(p); }, () => {});
+  }
+
+  // The breadcrumb names the person rather than the id in the URL.
+  usePageCrumb(person?.full_name);
+
   // Contacts are outside the team: no approvals, no reply SLA, no
   // availability windows, no departments — and nothing to chase.
   const contact = person ? isContact(person) : false;
   const formContact = form.kind === "contact" && !person?.is_principal;
+
+  // Slack, Discord and Telegram by name, while editing (the principal's alone;
+  // for anyone else there is no list and the id fields stay).
+  const chatDirectory = useChatDirectory("people", editing);
+  const slackMatch = useSlackEmailMatch(form.email, editing && !!chatDirectory?.slack.configured);
+  const setChatId = useCallback(
+    (field: "slack_user_id" | "discord_user_id" | "telegram_chat_id", id: string) =>
+      setForm((f) => (f[field] === id ? f : { ...f, [field]: id })),
+    [],
+  );
 
   function resetForm(p: Person) {
     setForm({
@@ -589,6 +634,7 @@ export default function PersonDetailPage() {
       kind: p.kind ?? "team",
       email: p.email ?? "",
       email_aliases: (p.email_aliases ?? []).join("\n"),
+      details: detailsToText(p.details ?? []),
       slack_user_id: p.slack_user_id ?? "",
       telegram_chat_id: p.telegram_chat_id ?? "",
       discord_user_id: p.discord_user_id ?? "",
@@ -653,6 +699,7 @@ export default function PersonDetailPage() {
         ...(person?.is_principal || !viewerIsPrincipal ? {} : { kind: form.kind }),
         email: form.email.trim() || null,
         email_aliases: form.email_aliases.split(/[\s,;]+/).map((a) => a.trim()).filter(Boolean),
+        details: textToDetails(form.details),
         slack_user_id: form.slack_user_id.trim() || null,
         telegram_chat_id: form.telegram_chat_id.trim() || null,
         discord_user_id: form.discord_user_id.trim() || null,
@@ -669,8 +716,8 @@ export default function PersonDetailPage() {
       setPerson(updated);
       setEditing(false);
       setSaved(true);
-      if (wasContact && !isContact(updated) && shouldOfferTeamMode(mode, updated.kind, updated.is_principal)) {
-        setOfferFor(updated.full_name);
+      if (wasContact && !isContact(updated) && shouldSwitchToTeam(mode, updated.kind, updated.is_principal)) {
+        setSwitchedFor(updated.full_name);
       }
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
@@ -717,7 +764,7 @@ export default function PersonDetailPage() {
 
   return (
     <div className="flex flex-col h-full bg-surface">
-      {offerFor && <TeamModeOffer name={offerFor} onDone={() => setOfferFor(null)} />}
+      {switchedFor && <TeamModeSwitch name={switchedFor} onDone={() => setSwitchedFor(null)} />}
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
           {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
@@ -805,6 +852,10 @@ export default function PersonDetailPage() {
               <div {...(tabs.length > 1 ? sectionPanelProps(tabsId, activeTab) : {})}>
               {activeTab === "overview" && (
                 <>
+              {viewerIsPrincipal && !editing && !person.is_principal && contactChanges.length > 0 && (
+                <PersonContactChanges changes={contactChanges} onChanged={reloadAfterUndo} />
+              )}
+              {viewerIsPrincipal && !editing && !person.is_principal && <PersonContactNote note={contactNote} />}
               {/* Core fields */}
               <section className="rounded-2xl border border-line bg-surface-elevated px-5">
                 {editing ? (
@@ -843,109 +894,97 @@ export default function PersonDetailPage() {
                       </label>
                     )}
 
-                    {/* Contact & routing */}
-                    <DisclosureSection
-                      label="Contact & routing"
-                      open={showContact}
-                      onToggle={() => setShowContact((v) => !v)}
-                    >
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                          <label className={LABEL_CLS}>
-                            Preferred channel
-                            <select
-                              value={form.preferred_channel}
-                              onChange={(e) => setForm((f) => ({ ...f, preferred_channel: e.target.value }))}
-                              className={INPUT_CLS}
-                            >
-                              {CHANNELS.map((c) => (
-                                <option key={c} value={c}>{c}</option>
-                              ))}
-                            </select>
-                          </label>
-                          <p className={HINT_CLS}>
-                            Proposals routed to this person are sent via {form.preferred_channel === "any" ? "any available channel" : form.preferred_channel}.
-                          </p>
-                        </div>
-                        {!formContact && (
-                        <div>
-                          <label className={LABEL_CLS}>
-                            Expected reply within
-                            <div className="flex items-center gap-2">
-                              <input
-                                type="number"
-                                min={1}
-                                value={form.response_sla_hours}
-                                onChange={(e) => setForm((f) => ({ ...f, response_sla_hours: e.target.value }))}
-                                className={`${INPUT_CLS} flex-1 min-w-0`}
-                              />
-                              <span className="text-sm text-fg-muted flex-shrink-0">hours</span>
-                            </div>
-                          </label>
-                          <p className={HINT_CLS}>
-                            Items show as overdue on Home after {form.response_sla_hours || 24}h with no reply.
-                          </p>
-                        </div>
-                        )}
+                    <label className={LABEL_CLS}>
+                      Email
+                      <input
+                        type="email"
+                        value={form.email}
+                        onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+                        className={INPUT_CLS}
+                      />
+                    </label>
+
+                    <label className={LABEL_CLS}>
+                      Other addresses
+                      <textarea
+                        value={form.email_aliases}
+                        onChange={(e) => setForm((f) => ({ ...f, email_aliases: e.target.value }))}
+                        rows={2}
+                        placeholder="anna.personal@gmail.com"
+                        className={`${INPUT_CLS} h-auto py-2.5`}
+                      />
+                      <span className={HINT_CLS}>
+                        One per line. Mail from these reaches them, and they can be emailed
+                        here. Only the address above signs in.
+                      </span>
+                    </label>
+
+                    <label className={LABEL_CLS}>
+                      Phone, website and more
+                      <textarea
+                        value={form.details}
+                        onChange={(e) => setForm((f) => ({ ...f, details: e.target.value }))}
+                        rows={3}
+                        placeholder={"Mobile: +1 555 010 0100\nWebsite: example.com\nAddress: 100 Main St, Springfield"}
+                        className={`${INPUT_CLS} h-auto py-2.5`}
+                      />
+                      <span className={HINT_CLS}>
+                        One per line: Phone, Mobile, Website, LinkedIn, Profile or Address.
+                      </span>
+                    </label>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className={LABEL_CLS}>
+                          Preferred channel
+                          <select
+                            value={form.preferred_channel}
+                            onChange={(e) => setForm((f) => ({ ...f, preferred_channel: e.target.value }))}
+                            className={INPUT_CLS}
+                          >
+                            {CHANNELS.map((c) => (
+                              <option key={c.value} value={c.value}>{c.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <p className={HINT_CLS}>
+                          Proposals routed to this person are sent via {form.preferred_channel === "any" ? "the app they last talked in, then any other" : (CHANNELS.find((c) => c.value === form.preferred_channel)?.label ?? form.preferred_channel)}.
+                        </p>
                       </div>
+                      {!formContact && (
+                      <div>
+                        <label className={LABEL_CLS}>
+                          Expected reply within
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              min={1}
+                              value={form.response_sla_hours}
+                              onChange={(e) => setForm((f) => ({ ...f, response_sla_hours: e.target.value }))}
+                              className={`${INPUT_CLS} flex-1 min-w-0`}
+                            />
+                            <span className="text-sm text-fg-muted flex-shrink-0">hours</span>
+                          </div>
+                        </label>
+                        <p className={HINT_CLS}>
+                          Items show as overdue on Home after {form.response_sla_hours || 24}h with no reply.
+                        </p>
+                      </div>
+                      )}
+                    </div>
 
-                      <label className={LABEL_CLS}>
-                        Email
-                        <input
-                          type="email"
-                          value={form.email}
-                          onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-                          className={INPUT_CLS}
-                        />
-                      </label>
-
-                      <label className={LABEL_CLS}>
-                        Other addresses
-                        <textarea
-                          value={form.email_aliases}
-                          onChange={(e) => setForm((f) => ({ ...f, email_aliases: e.target.value }))}
-                          rows={2}
-                          placeholder="anna.personal@gmail.com"
-                          className={`${INPUT_CLS} h-auto py-2.5`}
-                        />
-                        <span className={HINT_CLS}>
-                          One per line. Mail from these reaches them, and they can be emailed
-                          here — but only the address above signs in.
-                        </span>
-                      </label>
-
-                      <label className={LABEL_CLS}>
-                        Slack user ID
-                        <input
-                          value={form.slack_user_id}
-                          onChange={(e) => setForm((f) => ({ ...f, slack_user_id: e.target.value }))}
-                          className={INPUT_CLS}
-                          placeholder="U01ABC123"
-                        />
-                      </label>
-
-                      <label className={LABEL_CLS}>
-                        Discord user ID
-                        <input
-                          value={form.discord_user_id}
-                          onChange={(e) => setForm((f) => ({ ...f, discord_user_id: e.target.value }))}
-                          className={INPUT_CLS}
-                          placeholder="123456789012345678"
-                        />
-                        <span className={HINT_CLS}>
-                          Right-click your Discord username and &quot;Copy User ID&quot; (developer mode required).
-                        </span>
-                      </label>
-
-                      <label className={LABEL_CLS}>
-                        Telegram chat ID
-                        <input
-                          value={form.telegram_chat_id}
-                          onChange={(e) => setForm((f) => ({ ...f, telegram_chat_id: e.target.value }))}
-                          className={INPUT_CLS}
-                          placeholder="123456789"
-                        />
-                      </label>
+                    {/* Chat apps, picked by name */}
+                    <DisclosureSection
+                      label="Chat apps"
+                      open={showChat ?? !!slackMatch}
+                      onToggle={() => setShowChat(!(showChat ?? !!slackMatch))}
+                    >
+                      <ChatAppPickers
+                        ids={form}
+                        onChange={setChatId}
+                        directory={chatDirectory}
+                        slackMatch={slackMatch}
+                      />
                     </DisclosureSection>
 
                     {/* Advanced */}
@@ -963,27 +1002,63 @@ export default function PersonDetailPage() {
                           className={INPUT_CLS}
                         />
                       </label>
+
                     </DisclosureSection>
                   </div>
                 ) : (
-                  <dl className="divide-y divide-line">
+                  <ul className="divide-y divide-line">
                     {[
-                      ["Kind", contact ? "Contact — outside the team" : "Team member"],
-                      ["Preferred channel", person.preferred_channel],
-                      ...(contact ? [] : [["Expected reply within", `${person.response_sla_hours} hours`]]),
-                      ["Email", person.email ?? "—"],
-                      ["Other addresses", (person.email_aliases ?? []).join(", ") || "—"],
-                      ["Slack user ID", person.slack_user_id ?? "—"],
-                      ["Discord user ID", person.discord_user_id ?? "—"],
-                      ["Telegram chat ID", person.telegram_chat_id ?? "—"],
-                      ["On leave until", person.on_leave_until ?? "—"],
-                    ].map(([label, value]) => (
-                      <div key={label} className="flex flex-col sm:flex-row sm:items-baseline gap-0.5 sm:gap-4 py-3">
-                        <dt className="sm:w-48 flex-shrink-0 text-sm text-fg-muted">{label}</dt>
-                        <dd className="text-[15px] text-fg break-words min-w-0">{value}</dd>
-                      </div>
+                      {
+                        icon: "mail" as const,
+                        text: person.email ?? "No email",
+                        sub: (person.email_aliases ?? []).length > 0 ? `Also ${(person.email_aliases ?? []).join(", ")}` : null,
+                      },
+                      {
+                        icon: "chat" as const,
+                        text: reachLine(person, { self: viewerPersonId === personId, contact }),
+                        sub: null,
+                      },
+                      ...(onLeaveLine(person.on_leave_until)
+                        ? [{ icon: "pause" as const, text: onLeaveLine(person.on_leave_until) ?? "", sub: null }]
+                        : []),
+                    ].map((row) => (
+                      <li key={row.icon} className="flex items-start gap-3 py-3.5">
+                        <Icon name={row.icon} size="w-4 h-4" className="mt-1 text-fg-subtle flex-shrink-0" />
+                        <div className="min-w-0">
+                          <p className="text-[15px] text-fg break-words">{row.text}</p>
+                          {row.sub && <p className="text-sm text-fg-muted break-words">{row.sub}</p>}
+                        </div>
+                      </li>
                     ))}
-                  </dl>
+                    {(person.details ?? []).length > 0 && (
+                      <li className="flex items-start gap-3 py-3.5">
+                        <Icon name="user" size="w-4 h-4" className="mt-1 text-fg-subtle flex-shrink-0" />
+                        <dl className="min-w-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                          {(person.details ?? []).map((d) => {
+                            const href = detailHref(d);
+                            return (
+                              <Fragment key={`${d.kind}:${d.value}`}>
+                                <dt className="text-sm text-fg-subtle">{DETAIL_LABELS[d.kind]}</dt>
+                                <dd className="text-[15px] text-fg break-words min-w-0">
+                                  {href ? (
+                                    <a
+                                      href={href}
+                                      className="text-accent hover:underline"
+                                      {...(href.startsWith("https:") ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+                                    >
+                                      {detailText(d)}
+                                    </a>
+                                  ) : (
+                                    detailText(d)
+                                  )}
+                                </dd>
+                              </Fragment>
+                            );
+                          })}
+                        </dl>
+                      </li>
+                    )}
+                  </ul>
                 )}
               </section>
 

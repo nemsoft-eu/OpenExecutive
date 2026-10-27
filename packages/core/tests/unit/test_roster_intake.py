@@ -98,6 +98,18 @@ def test_the_granted_acknowledgement_reaches_an_address_off_the_roster(roster: S
     assert args["to"] == STRANGER and args["body"] == roster_intake.ACK_TEXT
 
 
+def test_the_acknowledgement_says_it_is_an_ai_without_naming_anyone(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.orchestrator import disclosure
+
+    monkeypatch.delenv("AI_DISCLOSURE", raising=False)
+    gateway, sent = _gateway()
+    asyncio.run(roster_intake.send_email_ack(gateway, STRANGER))
+    body = sent.await_args.args[1]["arguments"]["body"]
+    assert body == f"{roster_intake.ACK_TEXT}\n\n---\n{disclosure.BARE_MAIL_LINE}"
+
+
 @pytest.mark.parametrize("over", [
     {"body": "Anything else at all"},
     {"subject": "Re: your invoice"},
@@ -618,3 +630,34 @@ def test_the_answer_token_is_hidden_from_every_other_read_of_the_mailbox(
             return await gateway.call_tool(call)
 
     assert token in asyncio.run(_poller_read())
+
+
+def test_an_ack_send_that_timed_out_raises_uncertain() -> None:
+    gateway = AsyncMock()
+    gateway.call_tool = AsyncMock(
+        return_value='{"error": "send did not answer within 120s", "timed_out": true}'
+    )
+    with pytest.raises(roster_intake.AckUncertain):
+        asyncio.run(roster_intake.send_email_ack(gateway, STRANGER))
+    gateway.call_tool = AsyncMock(return_value='{"error": "refused"}')
+    with pytest.raises(RuntimeError):
+        asyncio.run(roster_intake.send_email_ack(gateway, STRANGER))
+
+
+def test_an_ack_that_may_have_gone_keeps_its_claim(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A send that timed out may have reached the sender: the claim stays
+    taken, so their next message draws no second acknowledgement."""
+    rows: list[str] = []
+    monkeypatch.setattr(roster_intake, "_audit", lambda event, *_a: rows.append(event))
+
+    async def _unsure(_text: str) -> None:
+        raise roster_intake.AckUncertain("timed out")
+
+    with patch.object(roster_intake, "notify_principal", new=AsyncMock()):
+        asyncio.run(roster_intake.intake(
+            "email", STRANGER, external_id="m1", payload={"message_id": "m1"}, send_ack=_unsure,
+        ))
+    assert rows.count("roster_ack_uncertain") == 1
+    assert not rr.claim_ack("email", STRANGER)

@@ -13,8 +13,11 @@ background task so they surface in future RAG retrieval sessions.
 Supported file types
 ---------------------
 Images:   image/png, image/jpeg, image/gif, image/webp
-Docs:     .pdf, .docx, .doc, .txt, .md, .rst, .csv
+Docs:     .pdf, .docx, .doc, .xlsx, .xlsm, .txt, .md, .rst, .csv
           (a scanned PDF is converted by ``knowledge.pdf_reader``)
+Audio:    voice notes (ogg, m4a, mp3, webm, wav, …), transcribed by
+          ``providers.transcription`` into the sender's words. The caller
+          may pass a ``heard`` list to collect what was heard.
 
 Limits
 ------
@@ -41,7 +44,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 _MAX_EXTRACTED_CHARS = 40_000
-_EXTRACTABLE_SUFFIXES = frozenset({".pdf", ".docx", ".doc", ".txt", ".md", ".rst", ".csv"})
+_EXTRACTABLE_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".txt", ".md", ".rst", ".csv"}
+)
 _SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
 # Strong refs so background ingest tasks aren't GC'd before they complete.
@@ -61,6 +66,9 @@ class AttachmentItem:
     content_type: str = ""
     size: int = 0
     headers: dict[str, str] = field(default_factory=dict)
+    # Recorded in the chat app by the sender, so their own speech. Any other
+    # audio (a recorded call, a forwarded clip) is read as a file's words.
+    voice_note: bool = False
 
 
 # ------------------------------------------------------------------ #
@@ -249,7 +257,23 @@ def _schedule_ingest(text: str, filename: str) -> None:
 # Per-attachment routing
 # ------------------------------------------------------------------ #
 
-def _build_image_block(data: bytes, content_type: str) -> dict[str, Any]:
+def sniff_image_type(data: bytes) -> str | None:
+    """The image type the bytes themselves say, or None if they aren't one
+    the model takes. The model API refuses an image whose bytes don't match
+    its declared type, so a misnamed file must not go by its name."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def build_image_block(data: bytes, content_type: str) -> dict[str, Any]:
+    """An Anthropic vision content block for one image."""
     return {
         "type": "image",
         "source": {
@@ -312,12 +336,46 @@ def format_attached_text(
     return wrap_untrusted(f"{label}\n{text.strip()}", source="attachment", author=filename)
 
 
+async def _voice_note_text(
+    data: bytes, filename: str, content_type: str, heard: list[str] | None
+) -> str:
+    """A voice note as the turn sees it: the sender's own words, labelled
+    as transcribed, or a line saying it could not be heard."""
+    from openexecutive.providers import transcription
+
+    try:
+        words = await transcription.transcribe(data, filename, content_type)
+    except transcription.TranscriptionError as exc:
+        return transcription.failure_line(str(exc))
+    if not words:
+        return "(A voice note had no words in it.)"
+    if heard is not None:
+        heard.append(words)
+    return f"[Voice note, transcribed]\n{words}"
+
+
+async def _audio_file_text(data: bytes, filename: str, content_type: str) -> str:
+    """An audio file's words, wrapped like a document's: someone else may
+    be speaking in it, so they are never the sender's instructions."""
+    from openexecutive.providers import transcription
+
+    try:
+        words = await transcription.transcribe(data, filename, content_type)
+    except transcription.TranscriptionError as exc:
+        return f"(Could not transcribe {filename}: {exc})"
+    if not words:
+        return f"(Attached {filename}: no words in it)"
+    return format_attached_text(filename, words, note="transcribed")
+
+
 async def build_attachment_output(
     filename: str,
     data: bytes,
     content_type: str,
     *,
     inbound: bool = True,
+    heard: list[str] | None = None,
+    voice_note: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Route one attachment to the right handler.
 
@@ -325,7 +383,9 @@ async def build_attachment_output(
     concatenate results across all attachments. ``inbound`` (the default:
     a file a channel delivered) meters a scanned PDF's conversion by the
     inbound page budget; the web upload route, where the signed-in user
-    sends it, passes False.
+    sends it, passes False. ``voice_note`` marks audio the sender recorded
+    in the chat app: its words are theirs and are added to ``heard``. Other
+    audio is transcribed into attachment text.
     """
     # Normalise content_type — some servers omit it or add parameters.
     # All normalization (non-standard aliases, suffix inference) happens once
@@ -337,8 +397,18 @@ async def build_attachment_output(
     if not ct and suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
         ct = "image/jpeg" if suffix in {".jpg", ".jpeg"} else f"image/{suffix.lstrip('.')}"
 
+    from openexecutive.providers.transcription import is_audio
+
+    if is_audio(filename, ct):
+        if voice_note:
+            return await _voice_note_text(data, filename, ct, heard), []
+        return await _audio_file_text(data, filename, ct), []
+
     if ct in _SUPPORTED_IMAGE_TYPES:
-        return "", [_build_image_block(data, ct)]
+        sniffed = sniff_image_type(data)
+        if sniffed is None:
+            return f"(Could not read {filename}: not a PNG, JPG, GIF or WebP image)", []
+        return "", [build_image_block(data, sniffed)]
 
     if suffix in _EXTRACTABLE_SUFFIXES:
         text, note, converted = await _extract_text(data, filename, inbound=inbound)
@@ -356,7 +426,7 @@ async def build_attachment_output(
         _schedule_ingest(text, filename)
         return extra_text, []
 
-    return f"(Could not read {filename}: unsupported type — supported: PDF, DOCX, TXT, MD, PNG, JPG, GIF, WebP)", []
+    return f"(Could not read {filename}: unsupported type — supported: PDF, DOCX, XLSX, TXT, MD, CSV, PNG, JPG, GIF, WebP, voice notes)", []
 
 
 # ------------------------------------------------------------------ #
@@ -366,12 +436,15 @@ async def build_attachment_output(
 async def process_attachments(
     items: list[AttachmentItem],
     max_bytes: int = _DEFAULT_MAX_BYTES,
+    *,
+    heard: list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Download and process a list of attachments.
 
     Returns ``(extra_text, image_blocks)``.  Items that fail to download
     or process are skipped with a log message — a single bad attachment
-    must not prevent the user from getting a response.
+    must not prevent the user from getting a response. Voice notes' words
+    are added to ``heard``.
     """
     all_text_parts: list[str] = []
     all_image_blocks: list[dict[str, Any]] = []
@@ -396,7 +469,8 @@ async def process_attachments(
 
         try:
             extra_text, image_blocks = await build_attachment_output(
-                item.filename, data, item.content_type
+                item.filename, data, item.content_type, heard=heard,
+                voice_note=item.voice_note,
             )
         except Exception:
             logger.exception("attachments: processing failed for %s", item.filename)

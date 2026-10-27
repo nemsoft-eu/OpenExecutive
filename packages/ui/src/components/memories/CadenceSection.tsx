@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   cancelScheduledAction,
@@ -154,7 +155,7 @@ export function activityLine(item: ActivityItem): { verb: string; subject: strin
     case "nudge_sent":
       return { verb: "nudged", subject: item.target ?? "a stalled item" };
     case "cadence_sent":
-      return { verb: "ran cadence for", subject: item.department ?? "a department" };
+      return { verb: "checked in with", subject: item.department ?? "a team" };
     case "workflow_resumed":
       return { verb: "resumed workflow with", subject: item.target ?? "someone" };
     case "proposal_routed":
@@ -166,7 +167,8 @@ export function activityLine(item: ActivityItem): { verb: string; subject: strin
     case "advice_given":
       return { verb: "advised on", subject: item.summary };
     case "workflow_done":
-      return { verb: "completed", subject: item.summary };
+      // The summary already says what it did ("Researched your market").
+      return { verb: "", subject: item.summary };
     case "initiative_started":
       return { verb: "kicked off initiative:", subject: item.summary };
     case "decision_resolved":
@@ -177,6 +179,9 @@ export function activityLine(item: ActivityItem): { verb: string; subject: strin
       return { verb: "took the lead:", subject: item.summary };
     case "sent_as_you":
       return { verb: "sent as you:", subject: item.summary };
+    case "contacts_kept":
+      // The summary says it; the detail has the counts.
+      return { verb: "", subject: item.summary };
     default:
       return { verb: "acted on", subject: item.summary };
   }
@@ -195,7 +200,19 @@ export const SUMMARY_KINDS = new Set([
   "alert_raised",
   "took_the_lead",
   "sent_as_you",
+  "contacts_kept",
 ]);
+
+/** Where a finished run's write-up opens, when it kept one. */
+export function writeUpHref(item: ActivityItem): string | null {
+  if (item.kind === "contacts_kept") return "/people?tab=contacts";
+  return item.artifact_id ? `/artifacts/${encodeURIComponent(item.artifact_id)}` : null;
+}
+
+/** What the link after a row's detail says. */
+export function writeUpLabel(item: ActivityItem): string {
+  return item.kind === "contacts_kept" ? "See changes" : "Read it";
+}
 
 // Take the lead and Handle it for me rows say whose name it acted in.
 export function actingAs(item: ActivityItem): string | null {
@@ -297,7 +314,7 @@ export function RecentActivity() {
                       <span className="text-xs font-semibold text-fg-muted">{actingAs(it)}</span>
                     </>
                   )}
-                  <span className="text-sm text-fg-muted">{verb}</span>
+                  {verb && <span className="text-sm text-fg-muted">{verb}</span>}
                   {!subjectIsSummary && (
                     <span className="text-sm text-fg" title={subject}>{subject}</span>
                   )}
@@ -310,6 +327,19 @@ export function RecentActivity() {
                 {it.summary && (
                   <p className="text-[15px] text-fg leading-snug break-words line-clamp-2 mt-0.5" title={it.summary}>
                     {it.summary}
+                  </p>
+                )}
+                {(it.detail || writeUpHref(it)) && (
+                  <p className="text-sm text-fg-muted leading-snug break-words mt-0.5">
+                    {it.detail}
+                    {writeUpHref(it) && (
+                      <>
+                        {it.detail && " "}
+                        <Link href={writeUpHref(it)!} className="font-semibold text-accent hover:underline whitespace-nowrap">
+                          {writeUpLabel(it)}
+                        </Link>
+                      </>
+                    )}
                   </p>
                 )}
               </li>

@@ -78,14 +78,47 @@ _SCOPE: tuple[str, ...] = (
 _ALLOWED: frozenset[str] = frozenset({
     # The principal's own chat titles, for the brief's CONVERSATIONS block.
     "briefing/live_signals.py::_conversations",
-    # Today's events on the principal's own calendar (their address is the
-    # `calendar_id`), for TOP THREE TODAY and the brief's CALENDAR block.
-    "briefing/top_three.py::read_todays_calendar",
     # The owner's Always-in-the-loop notes. Gated on `PRINCIPAL_DELIVERY`
     # directly, which the scheduler sets only for a single recipient.
     "memory/history_brief.py::owner_keeping_notes",
     # The principal's own dated commitments, for solo's DUE THIS WEEK.
     "attunement/open_loops.py::principal_due_soon",
+    # Added by the 2026-10-26 upstream sync, each decided:
+    # Private: the owner's raise / leave-out lines. Rendered only under
+    # `own_private_ok` (the morning brief passes it as `brief_requests`, and
+    # narrative.render_briefing_context also needs a one-principal roster) or
+    # under `PRINCIPAL_DELIVERY` (the EoD digest).
+    "briefing/brief_requests.py::_principal_id",
+    # Private: the owner's waiting chat drafts, for a verified chat turn.
+    # Gated on a one-principal roster (context._single_principal).
+    "briefing/context.py::_waiting_drafts_block",
+    # Shared: only the owner row's `created_at`, to date the first week.
+    "briefing/first_week.py::first_week_started",
+    # Private: the owner's chat drafts. Behind `include_private`, which the
+    # morning brief passes as `own_private_ok` and the EoD digest only under
+    # `PRINCIPAL_DELIVERY`.
+    "briefing/live_signals.py::_drafts",
+    # Shared: the owner's addresses, to pick their own rows out of the shared
+    # inbound audit; their own lines render only with `include_private`.
+    "briefing/live_signals.py::_principal",
+    # Shared: marks the owner's sent or deleted drafts settled; nothing it
+    # reads reaches the brief. Called only under `own_private_ok`.
+    "briefing/live_signals.py::settle_principal_drafts",
+    # Private (who the brief speaks to): used as the reader only on a
+    # one-principal roster (morning_brief._now_and_reader, the EoD digest).
+    "briefing/reader.py::principal_reader",
+    # Private: today's events on the owner's own calendar (their address is
+    # the `calendar_id`), for TOP THREE TODAY and the brief's CALENDAR block.
+    # Moved here from `read_todays_calendar` upstream; reached only through it
+    # and `build_top_three`, both under `own_private_ok`.
+    "briefing/top_three.py::_read_executive_calendar",
+    # Private, and sent to the owner alone (`runner._deliver_to_principal`).
+    "briefing/value_summary.py::summarize",
+    # Private: replies the owner is waiting on, behind `include_private`.
+    "briefing/waiting_on.py::cached",
+    # Private: the owner's chats and live blocks, read only under
+    # `PRINCIPAL_DELIVERY`.
+    "workflows/end_of_day_digest.py::_the_day",
 })
 
 _READER = "find_principal_person"

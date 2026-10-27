@@ -51,6 +51,12 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     # assigning one starts it
     "close_open_loop",
     "assign_open_loop",
+    # Corrections (orchestrator/correction_tools.py): a brief item left out,
+    # a follow-up cancelled or moved, a chat draft marked sent
+    "leave_out_of_brief",
+    "cancel_followup",
+    "move_followup",
+    "mark_draft_sent",
     # Department goal mutations (Phase B — chat-driven progress updates)
     "update_department_goal",
     # A new goal (and, when its area did not exist, a new area)
@@ -66,6 +72,8 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "ack_alert",
     # Universal workflow launcher (any built-in / custom workflow from chat)
     "run_workflow",
+    # Saves a workflow, or leaves a card for a change to one (workflow_change)
+    "save_workflow",
     # Research artifacts flagged for review
     "draft_artifact",
     # MCP — generic, classified by underlying tool name at runtime
@@ -73,10 +81,21 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "load_mcp_server",
     # Act as me: a draft saved in the speaker's own Gmail (nothing sent)
     "ghostwrite_email",
+    # Act as me: a file from their mail copied to the Executive's storage,
+    # shared with them alone
+    "save_my_email_attachment",
     # Act as me: a reminder to the speaker alone
     "remind_me",
     # Act as me: a card of actions left for the speaker to approve
     "propose_actions",
+    # Meetings: booked, or proposed on an approval card
+    "create_calendar_event",
+    "create_instant_meeting",
+    "cancel_calendar_event",
+    # App control (orchestrator/app_control.py): done, or a card waiting for a
+    # tap; and a link to a screen
+    "do_in_app",
+    "open_in_app",
 })
 
 
@@ -128,6 +147,29 @@ def _humanize_iso(iso_ts: str) -> str:
         # Render the weekday — relative to "now" within a week.
         return f"on {dt.strftime('%a')}"
     return f"in {int(delta_s // 86_400)}d"
+
+
+def _draft_fields(parsed: dict[str, Any]) -> dict[str, Any]:
+    """What the chat shows under a draft written as the speaker, with its
+    Send button: the draft's row (what the tap names, never the model), who
+    it goes to, its subject and the start of its text, all from the draft
+    as saved. Nothing when the row wasn't kept: then it is sent from the
+    mailbox only."""
+    row = parsed.get("draft_row")
+    if not isinstance(row, int) or isinstance(row, bool) or row <= 0:
+        return {}
+
+    def addresses(key: str) -> list[str]:
+        value = parsed.get(key)
+        return [str(a) for a in value if isinstance(a, str)] if isinstance(value, list) else []
+
+    return {"draft": {
+        "row": row,
+        "to": addresses("to"),
+        "cc": addresses("cc"),
+        "subject": str(parsed.get("subject") or ""),
+        "preview": str(parsed.get("preview") or ""),
+    }}
 
 
 def summarize_action(
@@ -198,6 +240,18 @@ def summarize_action(
     }
     if iteration is not None:
         payload["iteration"] = iteration
+    if (
+        parsed is not None
+        and parsed.get("status") == "waiting_for_approval"
+        and tool_name not in ("propose_actions", "do_in_app", "save_workflow")
+        and not extension
+    ):
+        # Held for someone's approval (a team member's send or change, the
+        # department gate): nothing happened yet, so no "done" chip. An
+        # extension's tool is never held there; what it waits on is its
+        # chip's to describe.
+        payload["summary"] = "Waiting for approval"
+        return payload
     if extension:
         # An installed extension's tool (orchestrator/extensions.py) words
         # its own chip; a link stays inside the app.
@@ -235,6 +289,18 @@ def summarize_action(
         # Built server-side from a fixed prefix (delegation.gmail.mailbox_link).
         if isinstance(link, str) and link.startswith(MAILBOX_LINK_PREFIXES):
             payload["link"] = link
+        payload.update(_draft_fields(parsed or {}))
+    elif tool_name == "save_my_email_attachment":
+        # Only a saved copy earns a chip. No link or name: the link opens
+        # outside the app, and the name is whatever the sender called it.
+        status = (parsed or {}).get("status")
+        if status not in ("saved", "saved_not_shared"):
+            return None
+        where = str((parsed or {}).get("where") or "")
+        payload["summary"] = "Saved a file from your email to OneDrive" if "OneDrive" in where else (
+            "Saved a file from your email to Google Drive"
+        )
+        payload["target"] = None
     elif tool_name == "remind_me":
         # Only a stored reminder earns a chip.
         if (parsed or {}).get("status") != "set":
@@ -268,6 +334,27 @@ def summarize_action(
         decision_id = (parsed or {}).get("decision_id")
         if isinstance(decision_id, int) and not isinstance(decision_id, bool):
             payload["decision_id"] = decision_id
+    elif tool_name == "cancel_calendar_event":
+        if (parsed or {}).get("status") != "cancelled":
+            return None
+        payload["summary"] = "Cancelled the meeting"
+    elif tool_name in ("create_calendar_event", "create_instant_meeting"):
+        title = str(tool_input.get("title") or "").strip()[:80]
+        status = (parsed or {}).get("status")
+        if status == "created":
+            payload["summary"] = f"Booked: {title}" if title else "Booked the meeting"
+            return payload
+        if status not in ("proposed", "already_proposed"):
+            return None
+        here = (parsed or {}).get("approve_here") is True
+        lead = "Waiting for your approval" if here else "Sent for approval"
+        payload["summary"] = f"{lead}: {title}" if title else lead
+        payload["link"] = "/today"
+        # The chat shows the approval card itself under its message, by this
+        # id, when the person chatting is the one who approves it.
+        decision_id = (parsed or {}).get("decision_instance_id")
+        if here and isinstance(decision_id, int) and not isinstance(decision_id, bool):
+            payload["decision_id"] = decision_id
     elif tool_name == "message_person":
         pid = tool_input.get("person_id")
         payload["summary"] = (
@@ -295,6 +382,18 @@ def summarize_action(
         payload["target"] = full_name or None
         if isinstance(pid, int):
             payload["link"] = f"/people/{pid}"
+    elif tool_name == "leave_out_of_brief":
+        item = " ".join(str(tool_input.get("item", "") or "").split())[:60]
+        payload["summary"] = f"Left out of your brief: {item}" if item else "Left an item out of your brief"
+    elif tool_name == "cancel_followup":
+        payload["summary"] = "Cancelled a follow-up"
+    elif tool_name == "move_followup":
+        moved_to = (parsed or {}).get("run_at")
+        payload["summary"] = (
+            f"Moved a follow-up to {_humanize_iso(str(moved_to))}" if moved_to else "Moved a follow-up"
+        )
+    elif tool_name == "mark_draft_sent":
+        payload["summary"] = "Marked your draft sent"
     elif tool_name == "close_open_loop":
         loop_id = tool_input.get("loop_id")
         payload["summary"] = f"Closed open loop #{loop_id}" if loop_id else "Closed an open loop"
@@ -329,7 +428,9 @@ def summarize_action(
         if slug:
             payload["link"] = f"/departments/{slug}"
     elif tool_name == "update_department_goal":
-        slug = tool_input.get("department_slug", "")
+        # The handler's result names the goal's real department (none for a
+        # goal that stands on its own), whatever the model passed.
+        slug = str((parsed or {}).get("department_slug") or tool_input.get("department_slug") or "")
         # The handler always returns `from_status`/`to_status` (when status
         # wasn't supplied, `to_status == from_status`). To tell a real
         # status transition from a current-only edit, compare the two
@@ -353,11 +454,14 @@ def summarize_action(
             # fallback; the handler rejects this combo so this branch
             # should never fire in practice.
             payload["summary"] = f"Touched {slug} goal"
+        elif status_changed:
+            payload["summary"] = f"Updated a goal → {str(to_status).replace('_', ' ')}"
+        elif current_updated:
+            payload["summary"] = "Updated goal progress"
         else:
-            payload["summary"] = "Updated a department goal"
+            payload["summary"] = "Updated a goal"
         payload["target"] = slug or None
-        if slug:
-            payload["link"] = f"/departments/{slug}"
+        payload["link"] = f"/departments/{slug}" if slug else "/goals"
     elif tool_name == "create_goal":
         # The handler's result names the area the goal landed in — which may
         # be one it just created — so prefer it over the model's input.
@@ -373,10 +477,11 @@ def summarize_action(
         else:
             payload["summary"] = "Added a goal"
         payload["target"] = slug or None
-        if workspace_mode == "solo":
-            # Solo's nav has Goals (every goal grouped by area), not Departments.
+        if workspace_mode == "solo" or not slug:
+            # Solo's nav has Goals, not Departments; and a goal with no
+            # department lives only on the Goals page.
             payload["link"] = "/goals"
-        elif slug:
+        else:
             payload["link"] = f"/departments/{slug}"
     elif tool_name == "record_decision_outcome":
         # The handler's result names the decision it wrote to.
@@ -464,6 +569,43 @@ def summarize_action(
         url = tool_input.get("url", "")
         payload["summary"] = f"Connected MCP server: {url}" if url else "Connected MCP server"
         payload["target"] = url or None
+    elif tool_name == "do_in_app":
+        status = (parsed or {}).get("status")
+        if status == "done":
+            payload["summary"] = str((parsed or {}).get("did") or "Done")
+        elif status == "waiting_for_approval":
+            card = str((parsed or {}).get("card") or "")
+            payload["summary"] = f"Waiting for your OK: {card}" if card else "Waiting for your OK"
+            # The chat shows the card itself under its message, by this id.
+            decision_id = (parsed or {}).get("decision_id")
+            if isinstance(decision_id, int) and not isinstance(decision_id, bool):
+                payload["decision_id"] = decision_id
+        else:
+            return None
+    elif tool_name == "open_in_app":
+        link = (parsed or {}).get("link")
+        if (parsed or {}).get("status") != "link" or not isinstance(link, str) or not link.startswith("/") or link.startswith("//"):
+            return None
+        payload["summary"] = f"Open {(parsed or {}).get('screen') or 'it'}"
+        payload["link"] = link
+    elif tool_name == "save_workflow":
+        status = (parsed or {}).get("status")
+        name = str((parsed or {}).get("name") or "").replace("_", " ")
+        if status == "waiting_for_approval":
+            payload["summary"] = "Waiting for your OK: a change to a workflow"
+            # The chat shows the card itself under its message, by this id.
+            decision_id = (parsed or {}).get("decision_id")
+            if isinstance(decision_id, int) and not isinstance(decision_id, bool):
+                payload["decision_id"] = decision_id
+        elif status == "saved":
+            payload["summary"] = f"Saved the workflow {name}" if name else "Saved the workflow"
+        elif status == "saved_pending_review":
+            payload["summary"] = f"Saved the workflow {name}, switched off" if name else "Saved the workflow, switched off"
+        else:
+            return None
+        link = (parsed or {}).get("name")
+        if isinstance(link, str) and link and status != "waiting_for_approval":
+            payload["link"] = f"/jobs/{link}"
     elif tool_name == "run_workflow":
         wf = str(tool_input.get("workflow", "")).replace("_", " ")
         run_id = (parsed or {}).get("run_id")

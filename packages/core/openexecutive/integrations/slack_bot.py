@@ -5,6 +5,7 @@ import contextlib
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import Any
 
 from openexecutive.audit.redaction import ERROR_DETAIL_LEN
@@ -45,6 +46,35 @@ _MAX_CONCURRENT_HANDLERS = 5
 # the per-session lock in discord_bot.py. Unbounded growth matches both of
 # those; a conversation's lock is a few dozen bytes.
 _session_locks: dict[str, asyncio.Lock] = {}
+
+# Event ids already taken. Slack sends an event again when it thinks the first
+# delivery wasn't acknowledged in time (and Socket Mode can redeliver on a
+# reconnect); without this the Executive would answer the same message twice.
+_SEEN_EVENTS_MAX = 2000
+_seen_event_ids: OrderedDict[str, None] = OrderedDict()
+
+
+def _first_delivery(event_id: str) -> bool:
+    """Record ``event_id``; False when it was already taken."""
+    if not event_id:
+        return True
+    if event_id in _seen_event_ids:
+        _seen_event_ids.move_to_end(event_id)
+        return False
+    _seen_event_ids[event_id] = None
+    while len(_seen_event_ids) > _SEEN_EVENTS_MAX:
+        _seen_event_ids.popitem(last=False)
+    return True
+
+
+def _delivered_to(body: dict) -> set[str]:
+    """The workspace ids an Events API payload says it was delivered for."""
+    teams = {str(body.get("team_id") or "")}
+    for authorization in body.get("authorizations") or []:
+        if isinstance(authorization, dict):
+            teams.add(str(authorization.get("team_id") or ""))
+    teams.discard("")
+    return teams
 
 
 def bot_user_id() -> str | None:
@@ -401,7 +431,9 @@ def _file_name(file: dict) -> str:
     return str(file.get("name") or file.get("title") or "file")
 
 
-async def _read_shared_files(files: list[dict]) -> tuple[str, list[dict]]:
+async def _read_shared_files(
+    files: list[dict], heard: list[str] | None = None
+) -> tuple[str, list[dict]]:
     """Download and read the files a rostered sender shared — documents to
     text (a scanned PDF converted), images to vision blocks — through the
     same ``process_attachments`` path Discord uses. Needs the bot's
@@ -429,21 +461,135 @@ async def _read_shared_files(files: list[dict]) -> tuple[str, list[dict]]:
                 content_type=str(f.get("mimetype") or ""),
                 size=size if isinstance(size, int) else 0,
                 headers={"Authorization": f"Bearer {token}"},
+                # A clip recorded in Slack; an uploaded audio file is not.
+                voice_note=f.get("subtype") == "slack_audio",
             )
         )
     text = ""
     blocks: list[dict] = []
     if items:
         try:
-            text, blocks = await process_attachments(items)
+            text, blocks = await process_attachments(items, heard=heard)
         except Exception:
             logger.exception("Slack: attachment processing failed")
             notes.append("(Could not process the attached files)")
     return "\n\n".join(p for p in (*notes, text) if p), blocks
 
 
+# A card's buttons (integrations.channel_cards): one action id each, the
+# card's id and choice in the button's value.
+_CARD_ACTION_APPROVE = "oe_card_approve"
+_CARD_ACTION_SKIP = "oe_card_skip"
+_CARD_ACTION_RE = re.compile(rf"^({_CARD_ACTION_APPROVE}|{_CARD_ACTION_SKIP})$")
+_MAX_CARD_TEXT = 2900
+
+
+def _card_blocks(text: str, decision_id: int | None = None) -> list[dict[str, Any]]:
+    """A card as Slack blocks: its text as plain text (it may quote what
+    someone else wrote, so never mrkdwn), with the two buttons while it waits."""
+    from openexecutive.integrations import channel_cards
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "plain_text", "text": text[:_MAX_CARD_TEXT], "emoji": False}},
+    ]
+    if decision_id is not None:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "action_id": _CARD_ACTION_APPROVE, "style": "primary",
+             "text": {"type": "plain_text", "text": "Approve"},
+             "value": channel_cards.callback_data(decision_id, channel_cards.APPROVE)},
+            {"type": "button", "action_id": _CARD_ACTION_SKIP,
+             "text": {"type": "plain_text", "text": "Skip"},
+             "value": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
+        ]})
+    return blocks
+
+
+async def _send_cards(client: Any, channel: str, cards: list[int]) -> None:
+    """Post each card a DM reply left, with Approve and Skip buttons."""
+    from openexecutive.integrations import channel_cards
+
+    if not channel:
+        return
+    for decision_id in cards[: channel_cards.MAX_CARDS]:
+        try:
+            text = await asyncio.to_thread(channel_cards.card_text, decision_id)
+            if text:
+                await client.chat_postMessage(
+                    channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id),
+                    unfurl_links=False, unfurl_media=False,
+                )
+        except Exception:
+            logger.exception("Slack: couldn't send card %d", decision_id)
+
+
+async def _is_own_dm(client: Any, user_id: str, channel_id: str) -> bool:
+    """Whether ``channel_id`` is the bot's DM with ``user_id``: Slack's own
+    answer, not the payload's."""
+    if not user_id or not channel_id.startswith("D"):
+        return False
+    try:
+        opened = await client.conversations_open(users=user_id)
+    except Exception:
+        logger.warning("Slack: couldn't check the DM for a card tap", exc_info=True)
+        return False
+    return str(((opened or {}).get("channel") or {}).get("id") or "") == channel_id
+
+
+async def handle_card_tap(body: dict[str, Any], client: Any) -> None:
+    """A tap on a card's Approve or Skip button (``channel_cards``). Slack
+    signed it; it counts only in the tapper's own DM with the bot, from
+    someone on the roster, and ``decisions.resolve_in_chat`` decides whether
+    the card is theirs."""
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.integrations import channel_cards
+    from openexecutive.people.store import find_person_by_slack_id
+
+    user_id = str((body.get("user") or {}).get("id") or "")
+    channel_id = str((body.get("channel") or {}).get("id") or "")
+    message = body.get("message") or {}
+    ts = str((body.get("container") or {}).get("message_ts") or message.get("ts") or "")
+    actions = body.get("actions") or []
+    parsed = channel_cards.parse_callback(actions[0].get("value") if actions else None)
+    person = await asyncio.to_thread(find_person_by_slack_id, user_id) if user_id else None
+    if parsed is None or person is None or not await _is_own_dm(client, user_id, channel_id):
+        logger.warning("Slack: ignored a card tap that isn't from its own DM")
+        if user_id and channel_id:
+            try:
+                await client.chat_postEphemeral(channel=channel_id, user=user_id,
+                                                text="This card is no longer there.")
+            except Exception:
+                logger.warning("Slack: couldn't answer an ignored card tap", exc_info=True)
+        return
+    decision_id, approve = parsed
+    line = await channel_cards.resolve(decision_id, person, approve=approve)
+    choice = "approve" if approve else "skip"
+    await asyncio.to_thread(
+        audit_log,
+        "integration_inbound",
+        f"Slack card {decision_id}: tapped {choice.capitalize()}: {line[:120]}",
+        actor="slack",
+        details={"channel": "slack", "slack_user": user_id, "decision_id": decision_id,
+                 "choice": choice, "outcome": channel_cards.outcome_of(line), "person_id": person.id},
+    )
+    if line == channel_cards.BUSY or not ts:
+        return
+    # The card keeps what it said, with the outcome under it and no buttons.
+    shown = ""
+    for block in message.get("blocks") or []:
+        if block.get("type") == "section":
+            shown = str((block.get("text") or {}).get("text") or "")
+            break
+    text = f"{shown}\n\n{line}" if shown else line
+    try:
+        await client.chat_update(channel=channel_id, ts=ts, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text))
+    except Exception:
+        logger.exception("Slack: couldn't update card %d after the tap", decision_id)
+
+
 async def create_slack_app():
-    """Build the async Bolt app and its Socket Mode handler.
+    """Build the async Bolt app and how it hears Slack: a Socket Mode handler
+    with ``SLACK_APP_TOKEN``, else an ``slack_events.HttpEventsListener`` that
+    takes Slack's events at ``POST /webhook/slack`` (``SLACK_SIGNING_SECRET``).
 
     Async Bolt (not the sync ``App``) so every handler awaits on the caller's
     event loop. That matters because the app is started from the FastAPI
@@ -457,19 +603,42 @@ async def create_slack_app():
     Imports stay deferred inside the factory so the module imports cleanly
     where slack_bolt is absent — the helper unit tests rely on that.
     """
-    from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_bolt.async_app import AsyncApp
 
     from openexecutive.config import get_settings
 
     settings = get_settings()
 
-    if not settings.slack_bot_token or not settings.slack_app_token:
+    if not settings.slack_bot_token or not (
+        settings.slack_app_token or settings.slack_signing_secret
+    ):
         raise RuntimeError(
-            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set to run the Slack bot"
+            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN (Socket Mode) or SLACK_SIGNING_SECRET "
+            "(events over HTTP) must be set to run the Slack bot"
         )
+    # Socket Mode wins when both are set: it needs no public address.
+    over_http = not settings.slack_app_token
 
-    app = AsyncApp(token=settings.slack_bot_token)
+    # In HTTP mode Bolt checks every request's signature with the signing
+    # secret before any middleware or listener below runs.
+    app = AsyncApp(
+        token=settings.slack_bot_token,
+        signing_secret=settings.slack_signing_secret if over_http else None,
+        request_verification_enabled=over_http,
+    )
+    _seen_event_ids.clear()
+
+    @app.middleware
+    async def _once_per_event_from_this_workspace(body: dict, context, ack, next) -> Any:
+        if body.get("type") == "event_callback":
+            own_team = str(getattr(context.authorize_result, "team_id", None) or "")
+            if own_team and own_team not in _delivered_to(body):
+                logger.warning("Slack: dropped an event delivered for another workspace")
+                return await ack()
+            if not _first_delivery(str(body.get("event_id") or "")):
+                logger.info("Slack: dropped a repeat delivery of event %s", body.get("event_id"))
+                return await ack()
+        return await next()
 
     # Resolve and cache the bot's own user_id at startup. Failure here
     # disables thread auto-continuation until a later retry succeeds (see
@@ -783,7 +952,7 @@ async def create_slack_app():
 
                 speaker_label = (
                     getattr(sender_person, "display_name", None)
-                    or getattr(sender_person, "name", None)
+                    or getattr(sender_person, "full_name", None)
                     or slack_user_id
                 )
                 decision = await should_respond(
@@ -825,17 +994,15 @@ async def create_slack_app():
         # Fork the inbound message into the alerts triage pipeline. Runs in a
         # background thread/task so the reactive reply path is not delayed.
         try:
-            from openexecutive.alerts.models import AlertEvent
-            from openexecutive.alerts.pipeline import schedule_evaluation
+            from openexecutive.alerts.pipeline import schedule_chat_message_evaluation
 
-            schedule_evaluation(
-                AlertEvent(
-                    source="slack",
-                    external_id=str(event.get("ts") or thread_ts or ""),
-                    channel=event.get("channel"),
-                    user=slack_user_id,
-                    body=cleaned,
-                )
+            schedule_chat_message_evaluation(
+                source="slack",
+                external_id=str(event.get("ts") or thread_ts or ""),
+                channel=event.get("channel"),
+                body=cleaned,
+                sender=sender_person,
+                fallback_name=slack_user_id,
             )
         except Exception:
             logger.exception("Failed to schedule alert evaluation for Slack message")
@@ -845,8 +1012,11 @@ async def create_slack_app():
         # turn — so no one off the roster can make the bot download anything.
         att_text = ""
         att_image_blocks: list[dict] = []
+        heard: list[str] = []
         if files:
-            att_text, att_image_blocks = await _read_shared_files(files)
+            att_text, att_image_blocks = await _read_shared_files(files, heard)
+            # A voice note's words are the sender's own words.
+            own_words = "\n\n".join(p for p in (*heard, own_words) if p)
 
         try:
             from openexecutive.integrations.channel_context import (
@@ -960,6 +1130,13 @@ async def create_slack_app():
                     # Before the words, as Discord and Telegram inline it.
                     chat_user_message = f"{att_text}\n\n{chat_user_message}"
 
+                from openexecutive.integrations.channel_cards import shows_cards
+
+                # A DM shows the reply's cards with Approve and Skip buttons
+                # (SLACK_CARD_BUTTONS, integrations.channel_cards).
+                cards_here = mode == "dm" and shows_cards(session)
+                cards: list[int] = []
+
                 executive = Executive(mcp_gateway=get_active_gateway())
                 response = await executive.chat(
                     user_message=chat_user_message,
@@ -967,7 +1144,8 @@ async def create_slack_app():
                     retrieved_context=retrieved_context,
                     episodic_context=episodic_context,
                     briefing_context=briefing_context,
-                    channel_context_block=build_channel_context_block("slack"),
+                    channel_context_block=build_channel_context_block("slack", cards_here=cards_here),
+                    cards=cards if cards_here else None,
                     person_id=person_id,
                     co_present_person_ids=co_present_person_ids or None,
                     attachment_blocks=att_image_blocks or None,
@@ -980,7 +1158,14 @@ async def create_slack_app():
 
                 # No unfurls: Slack would fetch a link in the reply on its own,
                 # and a reply can quote mail a sender wrote to carry data out in one.
-                await say(text=response, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+                from openexecutive.orchestrator.disclosure import with_chat_line
+
+                await say(
+                    text=with_chat_line(response, f"slack:{session_id}"),
+                    thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+                )
+                if cards and client is not None:
+                    await _send_cards(client, str(event.get("channel") or ""), cards)
 
                 # Persist AFTER the reply lands, and never let a persistence
                 # failure trigger the user-facing error path — the user
@@ -1077,6 +1262,11 @@ async def create_slack_app():
                     session_id,
                 )
 
+    @app.action(_CARD_ACTION_RE)
+    async def card_tap(ack, body: dict, client) -> None:
+        await ack()
+        await handle_card_tap(body, client)
+
     @app.event("app_mention")
     async def handle_mention(event: dict, say, client) -> None:
         # Bolt auto-injects `client` (an AsyncWebClient) when listed in the
@@ -1156,6 +1346,15 @@ async def create_slack_app():
     from openexecutive.integrations.roster_intake import register_replayer
 
     register_replayer("slack", _replay_held)
+
+    if over_http:
+        from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
+
+        from openexecutive.integrations.slack_events import HttpEventsListener
+
+        return app, HttpEventsListener(AsyncSlackRequestHandler(app), settings.slack_signing_secret or "")
+
+    from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     return app, handler

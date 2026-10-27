@@ -24,8 +24,10 @@ from openexecutive.api.routes import (
     artifacts,
     audit,
     chat,
+    chat_directory,
     clients,
     company_profile,
+    contacts,
     decisions,
     delegation,
     departments,
@@ -38,10 +40,13 @@ from openexecutive.api.routes import (
     health,
     history,
     knowledge,
+    may_do,
+    notifications,
     onboarding,
     people,
     personas,
     python_jobs,
+    reflection,
     review,
     saved_tools,
     scheduled,
@@ -60,7 +65,9 @@ from openexecutive.api.routes import (
     auth as auth_route,
 )
 from openexecutive.integrations.google_chat import router as google_chat_router
+from openexecutive.integrations.slack_events import router as slack_events_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
+from openexecutive.observability import configure_tracing
 from openexecutive.utils.deployment import is_local_login, is_public_deployment
 
 if TYPE_CHECKING:
@@ -161,11 +168,11 @@ _configure_logging()
 # the /webhook/* routes are called by external services (Google, Telegram) and
 # carry their own verification.
 _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
-    {"/health", "/webhook/telegram", "/webhook/google-chat"}
+    {"/health", "/webhook/telegram", "/webhook/google-chat", "/webhook/slack"}
 )
 
 
-# How long the MCP gateway gets to come up. The child is
+# How long the MCP gateway gets to come up, per attempt. The child is
 # `uvx --from git+https://…/extensible-mcp`, which resolves and may clone that
 # repo on a cold start, so this is generous; what it must not be is unbounded.
 # `MCPGateway.start` builds `ClientSession` with no `read_timeout_seconds`, so
@@ -173,33 +180,10 @@ _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
 # lifespan that never yields is a healthcheck that never passes, which is
 # #122's symptom with none of its traceback. A dead child is already fine
 # (the session's receive loop fails every pending request on close); it is the
-# silent one that needs a clock.
+# silent one that needs a clock. A failed attempt is retried in the
+# background with backoff (orchestrator/gateway_boot.py), so one slow or
+# faulty start no longer costs the whole process its MCP tools.
 _MCP_START_TIMEOUT_S = 120.0
-# Tearing down a gateway that just failed walks the same stdio machinery that
-# failed, so it gets a clock too.
-_MCP_CLOSE_TIMEOUT_S = 10.0
-
-
-async def _close_mcp_gateway_quietly(gateway: Any, log: logging.Logger) -> None:
-    """Reap a gateway that failed to start. Never raises, never hangs.
-
-    `MCPGateway.close` suppresses `Exception` around each step, which is not
-    enough here: anyio raises `BaseExceptionGroup` as soon as one sub-exception
-    is a `BaseException` such as `CancelledError`, and that is not an
-    `Exception`. Since this runs from inside an `except` block, anything it
-    raises replaces the actionable log we just wrote with the crash that log
-    exists to prevent.
-    """
-    try:
-        await asyncio.wait_for(gateway.close(), timeout=_MCP_CLOSE_TIMEOUT_S)
-    except asyncio.CancelledError:
-        raise
-    except BaseException:
-        log.warning(
-            "MCP gateway teardown after a failed start did not finish cleanly; "
-            "continuing shutdown of the failed gateway anyway",
-            exc_info=True,
-        )
 
 
 async def _start_mcp_gateway(
@@ -208,7 +192,11 @@ async def _start_mcp_gateway(
     """Bring the MCP gateway up, or leave MCP off and say why.
 
     Sets ``app.state.mcp_gateway`` — the gateway on success, ``None`` otherwise
-    — and returns the email-poller task that rides on it, or ``None``.
+    — and returns the email-poller task that rides on it, or ``None``. The
+    supervisor that made the attempt stays on ``app.state.mcp_supervisor``:
+    when the first attempt fails it keeps retrying with backoff, and a later
+    success wires the gateway, the pinned-tool priming and the email poller
+    exactly as a first-time success does here; ``/health`` reports its state.
 
     Never raises and never blocks indefinitely. The gateway spawns
     extensible-mcp as a subprocess, and a failure there used to propagate out
@@ -216,24 +204,22 @@ async def _start_mcp_gateway(
     that is a crash loop whose only outward symptom is a healthcheck that never
     passes (#122). Booting without MCP costs the Gmail/Calendar/Drive tool
     surface and the email poller; refusing to boot costs everything, so degrade
-    and log loudly enough to alert on.
-
-    ``except BaseException`` rather than ``except Exception``, with real
-    cancellation re-raised first: the failure in #122 surfaced from anyio, and
-    anyio wraps a task group's failures in ``BaseExceptionGroup`` as soon as one
-    of them is a ``BaseException`` such as ``CancelledError``. That group is not
-    an ``Exception``, so ``except Exception`` would let through the single
-    exception shape this function exists to contain.
+    and log loudly enough to alert on. The supervisor contains the same
+    failure shapes (``except BaseException`` with real cancellation re-raised
+    first: anyio wraps a task group's failures in ``BaseExceptionGroup`` as
+    soon as one of them is a ``CancelledError``, and that group is not an
+    ``Exception``).
     """
     app.state.mcp_gateway = None
+    app.state.mcp_supervisor = None
     if not settings.mcp_enabled:
         return None
 
     from openexecutive.config import mcp_config_file_present
+    from openexecutive.orchestrator.gateway_boot import GatewaySupervisor
     from openexecutive.orchestrator.mcp_gateway import (
-        MCPGateway,
         configured_server_names,
-        set_active_gateway,
+        set_gateway_supervisor,
     )
 
     log = logging.getLogger("openexecutive")
@@ -267,37 +253,23 @@ async def _start_mcp_gateway(
         )
         return None
 
-    gateway = MCPGateway()
-    try:
-        await asyncio.wait_for(
-            gateway.start(config_path), timeout=_MCP_START_TIMEOUT_S
-        )
-    except asyncio.CancelledError:
-        raise
-    except BaseException:
-        log.exception(
-            "MCP gateway failed to start within %.0fs; continuing WITHOUT MCP "
-            "tools and without the email poller. config=%s servers=[%s] (%s)",
-            _MCP_START_TIMEOUT_S, config_path, ", ".join(servers), why,
-        )
-        await _close_mcp_gateway_quietly(gateway, log)
+    supervisor = GatewaySupervisor(
+        config_path=config_path,
+        servers=servers,
+        app_state=app.state,
+        start_timeout_s=_MCP_START_TIMEOUT_S,
+        why=why,
+    )
+    app.state.mcp_supervisor = supervisor
+    set_gateway_supervisor(supervisor)
+    if not await supervisor.start():
         return None
-
-    app.state.mcp_gateway = gateway
-    set_active_gateway(gateway)
-    if "google_workspace" in servers:
-        # Discover the pinned Google tools now, so the model's first direct
-        # call_tool doesn't wait on the search. Held on app.state: a bare
-        # create_task is only weakly referenced.
-        app.state.mcp_prime_task = asyncio.create_task(gateway.prime_pinned_tools())
 
     # Say which mail/calendar backends the fixed code paths will use, and warn
     # (never fail) when a chosen backend's server is not in the config.
     from openexecutive.integrations.workspace.registry import log_provider_status
     log_provider_status(settings, config_path)
-
-    from openexecutive.integrations.email_poller import run_email_poller
-    return asyncio.create_task(run_email_poller(gateway))
+    return supervisor.poller_task
 
 
 # How long the lifespan waits for the Slack socket to cancel its pending
@@ -405,6 +377,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     initialize_db()
     initialize_alerts_db()
+    # A card approval still running was cut off by the restart: mark it
+    # failed so the card can be approved again (alerts/approvals.py).
+    from openexecutive.alerts import approvals as alert_approvals
+
+    alert_approvals.fail_stale_running()
 
     # Solo / team mode and the user's time zone (memory.workspace_settings).
     # Right after the episodic DB so every bootstrap below reads it.
@@ -425,6 +402,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # departments code references person IDs (FK ordering).
     from openexecutive.people.store import initialize_db as initialize_people_db
     initialize_people_db()
+    # Telegram chats the bot has seen, for the People and department pickers.
+    from openexecutive.integrations.telegram_chats import (
+        initialize_db as initialize_telegram_chats_db,
+    )
+    initialize_telegram_chats_db()
     # Replays of held roster-request messages run on this loop, whichever
     # thread resolves the request (integrations.roster_intake).
     from openexecutive.integrations.roster_intake import bind_loop
@@ -454,7 +436,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logging.getLogger("openexecutive").exception("chat-app conversation split failed")
 
-    # Departments: persistent state layer over the 8 specialist agents. Init
+    # Departments: persistent state layer over the specialist agents. Init
     # AFTER episodic_db so the additive ALTERs (department column on decisions,
     # initiatives, advice_given, scheduled_actions) have already run by the
     # time anything else writes to those tables.
@@ -612,6 +594,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     email_poller_task = await _start_mcp_gateway(app, settings)
 
+    # Mail read from anywhere but the Executive's own mailbox: whatever a
+    # deployment registered (integrations.mail_sources). None by default.
+    from openexecutive.integrations.mail_sources import start_mail_sources
+
+    mail_source_tasks = start_mail_sources()
+
     if settings.scheduler_enabled:
         from openexecutive.scheduler import run_scheduler
 
@@ -673,9 +661,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # only uvicorn + the UI, so Slack silently never listened unless someone
     # ran `python -m openexecutive.integrations.slack_bot` by hand (#131).
     #
-    # Requires BOTH tokens: the bot token authenticates the Web API calls,
-    # the app-level token opens the Socket Mode connection.
-    if settings.slack_bot_token and settings.slack_app_token:
+    # Needs the bot token (it authenticates the Web API calls) and a way to
+    # hear Slack: the app-level token opens the Socket Mode connection, or the
+    # signing secret lets Slack post events to /webhook/slack instead.
+    if settings.slack_bot_token and (settings.slack_app_token or settings.slack_signing_secret):
         _slack_log = logging.getLogger("openexecutive")
         try:
             # Imported inside the try, not above it: slack_bolt is itself
@@ -707,6 +696,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     _slack_log.error(
                         "Slack socket mode connect failed", exc_info=exc
                     )
+                elif getattr(slack_handler, "mode", None) == "http":
+                    _slack_log.info("Slack events accepted at /webhook/slack")
                 else:
                     _slack_log.info("Slack socket mode listener connected")
 
@@ -794,10 +785,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if slack_connect_task is not None and not slack_connect_task.done():
                 slack_connect_task.cancel()
 
+    # The supervisor owns the poller it started (at boot or on a retry), the
+    # priming task and the retries themselves; closing it stops all three
+    # and the gateway. The task returned at boot is the same object, so the
+    # cancel below is a no-op after this.
+    supervisor = getattr(app.state, "mcp_supervisor", None)
+    if supervisor is not None:
+        from openexecutive.orchestrator.mcp_gateway import set_gateway_supervisor
+
+        set_gateway_supervisor(None)
+        with contextlib.suppress(Exception):
+            await supervisor.close()
+
     if email_poller_task is not None:
         email_poller_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await email_poller_task
+
+    for task in mail_source_tasks:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     if scheduler_task is not None:
         scheduler_task.cancel()
@@ -850,10 +858,11 @@ _READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 def _webhook_verifies_its_caller(path: str) -> bool:
     """Whether this webhook authenticates its caller by itself. Google Chat
-    always checks the signed JWT; Telegram only when TELEGRAM_WEBHOOK_SECRET is
+    always checks the signed JWT and Slack its signature (the route answers
+    503 unless a signing secret is set); Telegram only when TELEGRAM_WEBHOOK_SECRET is
     set to a value Telegram can send — without it, it accepts anyone's
     update."""
-    if path == "/webhook/google-chat":
+    if path in ("/webhook/google-chat", "/webhook/slack"):
         return True
     if path == "/webhook/telegram":
         from openexecutive.config import get_settings
@@ -862,25 +871,32 @@ def _webhook_verifies_its_caller(path: str) -> bool:
     return False
 
 
+# The UI `make dev` serves. Allowed only off a public deployment: there,
+# anything listening on a visitor's localhost:3000 (another dev server, a
+# local tool) could otherwise read this API's answers with their cookies.
+_DEV_UI_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
+
+
+def _cors_origins() -> list[str]:
+    """Origins allowed through CORS: the ones in BACKEND_ALLOWED_ORIGINS
+    (comma-separated, e.g. "https://exec.example.com,https://exec.mycompany.com"),
+    plus the `make dev` UI unless OE_PUBLIC_DEPLOYMENT is set."""
+    extra = [o.strip() for o in os.environ.get("BACKEND_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    dev = [] if _is_public_deployment() else list(_DEV_UI_ORIGINS)
+    return [*dev, *extra]
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.5.4",  # x-release-please-version
+        version="0.6.5",  # x-release-please-version
         lifespan=lifespan,
     )
 
-    # Allowed UI origins: localhost for `make dev`, plus any production
-    # origins listed in BACKEND_ALLOWED_ORIGINS (comma-separated, e.g.
-    # "https://exec.example.com,https://exec.mycompany.com").
-    extra_origins = [
-        o.strip()
-        for o in os.environ.get("BACKEND_ALLOWED_ORIGINS", "").split(",")
-        if o.strip()
-    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", *extra_origins],
+        allow_origins=_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -920,6 +936,9 @@ def create_app() -> FastAPI:
             provided = request.headers.get("x-api-key", "")
             if not provided or not hmac.compare_digest(provided, shared_secret):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
+            # What the MCP server reads before it lets a request turn on
+            # "may act" (mcp_server.may_act): this request passed the check.
+            request.state.shared_secret_ok = True
             return await call_next(request)
     else:
         logging.getLogger("openexecutive").warning(
@@ -984,17 +1003,23 @@ def create_app() -> FastAPI:
     app.include_router(decisions.router, tags=["decisions"])
     app.include_router(delegation.router, tags=["delegation"])
     app.include_router(take_the_lead.router, tags=["take-the-lead"])
+    app.include_router(may_do.router, tags=["delegation"])
     app.include_router(history.router, tags=["memories"])
+    app.include_router(reflection.router, tags=["memories"])
     app.include_router(audit.router, tags=["audit"])
     app.include_router(departments.router, tags=["departments"])
     app.include_router(people.router, tags=["people"])
+    app.include_router(contacts.router, tags=["people"])
+    app.include_router(chat_directory.router, tags=["people"])
     app.include_router(today.router, tags=["today"])
     app.include_router(scheduled.router, tags=["scheduled"])
     app.include_router(executive.router, tags=["executive"])
     app.include_router(workspace.router, tags=["workspace"])
+    app.include_router(notifications.router, tags=["notifications"])
     app.include_router(watchlist.router, tags=["watchlist"])
     app.include_router(google_chat_router, tags=["google-chat"])
     app.include_router(telegram_router, tags=["telegram"])
+    app.include_router(slack_events_router, tags=["slack"])
     app.include_router(architecture.router, tags=["architecture"])
     app.include_router(guide.router, tags=["guide"])
     app.include_router(health.router, tags=["health"])
@@ -1006,6 +1031,8 @@ def create_app() -> FastAPI:
     # x-api-key. Mounting also lazily creates mcp.session_manager, which the
     # lifespan runs (see above).
     mcp_server.mount(app)
+
+    configure_tracing(app)
 
     return app
 

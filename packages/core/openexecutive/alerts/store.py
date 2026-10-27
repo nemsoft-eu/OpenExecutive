@@ -131,6 +131,10 @@ def initialize_db(db_path: Path | None = None) -> None:
             );
 
         """)
+        # Who approved which card, and what came of it (alerts/approvals.py).
+        from openexecutive.alerts.approvals import ensure_schema as ensure_approvals_schema
+
+        ensure_approvals_schema(conn)
 
 
 def _now() -> str:
@@ -353,6 +357,20 @@ def set_status(alert_id: int, status: str, db_path: Path | None = None) -> bool:
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
             "UPDATE alerts SET status = ? WHERE id = ?", (status, alert_id)
+        )
+        return cursor.rowcount > 0
+
+
+def set_snoozed_until(
+    alert_id: int, until: str | None, db_path: Path | None = None
+) -> bool:
+    """Hide an ``unread`` alert from the live queue until ``until`` (ISO), or
+    clear the snooze with ``None``. Returns False when the row is missing or
+    no longer ``unread`` (a closed card has nothing to snooze)."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET snoozed_until = ? WHERE id = ? AND status = 'unread'",
+            (until, alert_id),
         )
         return cursor.rowcount > 0
 

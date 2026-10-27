@@ -14,7 +14,9 @@ match drafted departments onto existing ones and create only what is
 genuinely new.
 
 A new install has no departments until this step runs, so the draft decides
-which ones exist: none for a solo workspace or a team that names none. A new
+which ones exist: none for a solo workspace, and none unless the user's own
+words listed people by department. Goals stand on their own: the draft's goals
+are saved with an owner, inside a department only when one was drafted. A new
 department named after a specialist's area ("Finance", "HR") is wired to that
 specialist, the same rule the Executive's ``create_goal`` tool uses, so its
 goals get check-ins.
@@ -24,13 +26,14 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from typing import TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from openexecutive.utils.slug import DEPARTMENT_SLUG_FALLBACK, slugify
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from openexecutive.memory.company_profile import CompanyProfile
-    from openexecutive.onboarding.interview import DepartmentDraft, PersonDraft
+    from openexecutive.onboarding.interview import DepartmentDraft, GoalDraft, PersonDraft
     from openexecutive.people.models import AuthorityScope
 
 logger = logging.getLogger(__name__)
@@ -183,7 +186,9 @@ class OwnerEmailError(ValueError):
     fixed, input-free string, safe to return as an HTTP detail."""
 
 
-def check_owner_email(raw: str | None, principal_name: str) -> str | None:
+def check_owner_email(
+    raw: str | None, principal_name: str, *, caller_email: str | None = None
+) -> str | None:
     """Normalise the owner's sign-in email, or return None when left blank.
 
     Runs BEFORE the commit writes anything, and setup only ever FILLS IN a
@@ -216,6 +221,11 @@ def check_owner_email(raw: str | None, principal_name: str) -> str | None:
         logger.warning("check_owner_email: lookup failed (%s)", type(exc).__name__)
         raise OwnerEmailError("Could not check that email just now. Try again.") from exc
     if holder is not None and (own_row is None or holder.id != own_row.id):
+        if own_row is None and _is_own_seat(holder, email, caller_email):
+            # The signed-in owner's own entry under another name (the one a
+            # hosted sign-up seeds from the address, or an old spelling).
+            # adopt_owner_row renames it before the roster is saved.
+            return email
         if holder.is_principal:
             raise OwnerEmailError(
                 "That email is on the current owner's People entry, but setup would update "
@@ -233,6 +243,49 @@ def check_owner_email(raw: str | None, principal_name: str) -> str | None:
             "the People page."
         )
     return email
+
+
+def _is_own_seat(holder: Any, email: str, caller_email: str | None) -> bool:
+    """Whether ``holder`` is the signed-in caller's own principal entry: it is
+    the principal, it carries the address being saved, and that address is
+    the one the caller signed in with."""
+    return bool(
+        holder.is_principal
+        and caller_email
+        and email == caller_email.strip().lower()
+        and (holder.email or "").strip().lower() == email
+    )
+
+
+def adopt_owner_row(email: str | None, principal_name: str, caller_email: str | None) -> bool:
+    """Rename the caller's own principal entry to the name setup drafted.
+
+    A hosted sign-up seeds the owner's People entry from the sign-in address
+    when no name was given ("ada" for ada@example.com), and the interview
+    drafts the real name. The name-keyed upsert would then add a second row
+    and the email check would reject the save, so the matched entry takes
+    the drafted name first; the upsert finds it by that name and updates it.
+    Returns True when a row was renamed. Best-effort: a failure leaves the
+    roster as it was and the save goes on.
+    """
+    email = (email or "").strip().lower()
+    key = principal_name.strip().lower()
+    if not email or not key:
+        return False
+    from openexecutive.people.store import find_person_by_address, list_people, update_person
+
+    try:
+        holder = find_person_by_address(email)
+        if holder is None or holder.id is None or not _is_own_seat(holder, email, caller_email):
+            return False
+        if holder.full_name.strip().lower() == key:
+            return False
+        if any(p.full_name.strip().lower() == key for p in list_people()):
+            return False
+        return update_person(holder.id, full_name=principal_name.strip())
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("adopt_owner_row failed (%s)", type(exc).__name__)
+        return False
 
 
 def owner_change_blocked(principal_name: str, caller_person_id: int | None) -> bool:
@@ -439,16 +492,92 @@ def reconcile_onboarding_departments(
                 logger.warning("onboarding: department registry invalidate failed")
 
 
+def save_onboarding_goals(
+    drafts: list[GoalDraft],
+    person_ids: dict[str, int],
+    principal_id: int | None,
+) -> int:
+    """Add the drafted goals for this year. Returns how many were created.
+
+    Additive like the departments: a goal whose wording matches one already
+    set for this year or ongoing (any department, case-insensitive) is left
+    alone, so re-running setup does not duplicate goals. A goal's owner is the named
+    person, else the principal; its department is the drafted one it names,
+    matched the way reconcile_onboarding_departments matched it, else none.
+    Best-effort: logs the exception type only and keeps what was saved.
+    """
+    created = 0
+    try:
+        from openexecutive.departments.store import (
+            initialize_db as init_departments_db,
+        )
+        from openexecutive.departments.store import (
+            insert_goal,
+            list_all_goals,
+            list_departments,
+            match_department,
+        )
+        from openexecutive.memory.workspace_settings import get_user_timezone
+
+        named = [g for g in drafts if g.title.strip()]
+        if not named:
+            return 0
+        init_departments_db()
+        known = [d.config for d in list_departments()]
+        year = str(datetime.now(get_user_timezone()).year)
+        # Only this year's goals (any period label naming the year, e.g.
+        # "2026", "Q3 2026") and ongoing ones count: last year's goal with
+        # the same wording is a new goal this year.
+        seen = {
+            g.key_result.strip().lower()
+            for g in list_all_goals()
+            if g.period_type == "ongoing" or year in g.period_value
+        }
+        ids = {name.strip().lower(): pid for name, pid in person_ids.items()}
+
+        for draft in named:
+            title = draft.title.strip()
+            if title.lower() in seen:
+                continue
+            seen.add(title.lower())
+            owner = ids.get(draft.owner_name.strip().lower()) if draft.owner_name.strip() else None
+            department = (
+                match_department(draft.department_title.strip(), known)
+                if draft.department_title.strip()
+                else None
+            )
+            insert_goal(
+                department.slug if department is not None else None,
+                period_type="year",
+                period_value=year,
+                key_result=title,
+                target=draft.target.strip(),
+                # Explicit even for the principal: a goal in a department
+                # would otherwise fall to its head, not to whoever was named.
+                owner_person_id=owner if owner is not None else principal_id,
+            )
+            created += 1
+        return created
+    except Exception as exc:
+        logger.warning(
+            "save_onboarding_goals failed (%s) after %d goal(s)", type(exc).__name__, created
+        )
+        return created
+
+
 def derive_org_structure(
     profile: CompanyProfile,
     people: list[PersonDraft],
     departments: list[DepartmentDraft],
+    goals: list[GoalDraft] | None = None,
 ) -> CompanyProfile:
-    """Fill ``profile.org_structure`` from the people and department drafts.
+    """Fill ``profile.org_structure`` from the people and department drafts,
+    and this year's priorities from the goals when there are any.
 
-    The onboarding review screen hides the Org Structure section precisely so
-    this stays a derived value — otherwise the user would have two places to
-    edit the same list and they would silently diverge.
+    The onboarding review screen hides the Org Structure and priorities
+    sections precisely so these stay derived values — otherwise the user
+    would have two places to edit the same list and they would silently
+    diverge.
     """
     titles = [d.title.strip() for d in departments if d.title.strip()]
     leadership = [
@@ -459,4 +588,10 @@ def derive_org_structure(
     org = profile.org_structure.model_copy(
         update={"departments": titles, "leadership_team": leadership}
     )
-    return profile.model_copy(update={"org_structure": org})
+    update: dict[str, Any] = {"org_structure": org}
+    goal_titles = [g.title.strip() for g in goals or [] if g.title.strip()]
+    if goal_titles:
+        update["strategic_priorities"] = profile.strategic_priorities.model_copy(
+            update={"current_year": goal_titles}
+        )
+    return profile.model_copy(update=update)

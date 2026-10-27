@@ -18,6 +18,7 @@ def test_telegram_messages_turn_previews_off(monkeypatch: pytest.MonkeyPatch) ->
 
     class Resp:
         is_error = False
+        status_code = 200
 
         def json(self) -> dict[str, Any]:
             return {"result": {"message_id": 7}}
@@ -34,7 +35,7 @@ def test_telegram_messages_turn_previews_off(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_slack_replies_do_not_unfurl() -> None:
     source = inspect.getsource(slack_bot)
-    assert "await say(text=response, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)" in source
+    assert "thread_ts=thread_ts, unfurl_links=False, unfurl_media=False," in source
 
 
 def test_discord_replies_suppress_embeds() -> None:

@@ -1,5 +1,7 @@
 import logging
+import os
 import re
+import threading
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -112,6 +114,9 @@ class Settings(BaseSettings):
     # the request carries an `anthropic-workspace-id` header (#128). A
     # workspace-scoped key needs no value here.
     anthropic_workspace_id: str | None = Field(None, alias="ANTHROPIC_WORKSPACE_ID")
+    # Pydantic Logfire write token. Unset (the default) leaves request tracing
+    # off entirely; see openexecutive.observability for what a trace records.
+    logfire_token: str | None = Field(None, alias="LOGFIRE_TOKEN")
 
     default_model: str = Field("claude-sonnet-5-5", alias="DEFAULT_MODEL")
     # The model the specialists with deep reasoning on by default (CFO, legal,
@@ -157,6 +162,11 @@ class Settings(BaseSettings):
     )
     knowledge_builtin_n_results: int = Field(5, alias="KNOWLEDGE_BUILTIN_N_RESULTS")
     knowledge_company_n_results: int = Field(3, alias="KNOWLEDGE_COMPANY_N_RESULTS")
+    # Total characters of knowledge excerpts a chat turn carries (web chat,
+    # Telegram, Discord, Google Chat). The closest matches are kept first.
+    # Every excerpt is re-sent on each model call of the turn, so a long tail
+    # of weak matches costs on every call. 0 = no cap.
+    knowledge_chat_max_chars: int = Field(6000, ge=0, alias="KNOWLEDGE_CHAT_MAX_CHARS")
     # A specialist's own retrieval (router._retrieve_for_call) takes fewer
     # chunks than the Executive's: it answers one narrow question. The company
     # count also caps each synced source (Notion, Drive, OneDrive, Confluence).
@@ -231,6 +241,21 @@ class Settings(BaseSettings):
     openrouter_catalog_refresh_s: float = Field(
         _DEFAULT_OPENROUTER_CATALOG_REFRESH_S, alias="OPENROUTER_CATALOG_REFRESH_S"
     )
+
+    # ---- Speech to text (voice notes, the chat mic) ---------------------
+    # Any server with the standard POST /audio/transcriptions call (OpenAI,
+    # Groq, OpenRouter, a self-hosted Whisper server). Unset, it uses
+    # OpenRouter when OPENROUTER_API_KEY is set; with neither there is no
+    # transcription and voice notes get a line asking for text instead.
+    transcription_base_url: str | None = Field(None, alias="TRANSCRIPTION_BASE_URL")
+    transcription_api_key: str | None = Field(None, alias="TRANSCRIPTION_API_KEY")
+    # Blank: elevenlabs/scribe-v2 on OpenRouter, whisper-1 elsewhere.
+    transcription_model: str | None = Field(None, alias="TRANSCRIPTION_MODEL")
+    # Longest voice note transcribed, in seconds.
+    transcription_max_seconds: int = Field(300, alias="TRANSCRIPTION_MAX_SECONDS")
+    # Audio sent to the speech server per UTC day, in MB (0 = no limit). The
+    # servers bill by length, which a file can misstate; bytes it can't.
+    transcription_max_mb_per_day: int = Field(200, alias="TRANSCRIPTION_MAX_MB_PER_DAY")
 
     @field_validator("anthropic_workspace_id", mode="before")
     @classmethod
@@ -372,6 +397,12 @@ class Settings(BaseSettings):
         Literal["none", "minimal", "low", "medium", "high"] | None
     ) = Field(None, alias="LOCAL_REASONING_EFFORT")
 
+    # The model that scores eval answers (`make eval` and the Evals page).
+    # Unset = Claude Opus. Any slug the registry routes works, so a slug in
+    # LOCAL_MODELS runs the judge on the local server too, for a run with no
+    # hosted API at all.
+    eval_judge_model: str | None = Field(None, alias="EVAL_JUDGE_MODEL")
+
     @field_validator("local_models", mode="before")
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
@@ -491,6 +522,12 @@ class Settings(BaseSettings):
     # typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
 
+    # How often a streaming chat turn sends an SSE comment while nothing else
+    # is going out (a slow tool call, a long specialist round). Browsers and
+    # proxies drop an idle stream, often after 30-60s, well inside the
+    # whole-turn deadline above. 0 turns it off.
+    chat_stream_keepalive_s: float = Field(15.0, alias="CHAT_STREAM_KEEPALIVE_S", ge=0)
+
     # Per-call ceiling for the onboarding interview. It used to borrow
     # chat_stream_timeout_s, which meant raising that to 300s would have let the
     # wizard's 2-attempt retry loop hang for up to 600s before surfacing
@@ -523,6 +560,14 @@ class Settings(BaseSettings):
 
     slack_bot_token: str | None = Field(None, alias="SLACK_BOT_TOKEN")
     slack_app_token: str | None = Field(None, alias="SLACK_APP_TOKEN")
+    # The other way to hear Slack: with this set and no SLACK_APP_TOKEN, Slack
+    # posts events to POST /webhook/slack, signed with the app's signing secret.
+    slack_signing_secret: str | None = Field(None, alias="SLACK_SIGNING_SECRET")
+    # Approve and Skip buttons on the cards a reply leaves in a Slack DM
+    # (integrations.channel_cards). Needs Interactivity turned on in the Slack
+    # app's settings (with SLACK_SIGNING_SECRET, its Request URL is
+    # /webhook/slack); off, a DM points to the web app instead.
+    slack_card_buttons: bool = Field(False, alias="SLACK_CARD_BUTTONS")
     # Company-wide broadcast channels — when set, OE can post to "the
     # whole team" on a given integration without picking a specific
     # human or department. Used by `send_company_broadcast`. Each is
@@ -548,7 +593,35 @@ class Settings(BaseSettings):
     # identity addendum so the model has a concrete self-name and never
     # falls back to signing as a person from the company People roster.
     exec_display_name: str = Field("Open Executive", alias="EXEC_DISPLAY_NAME")
+    # AI disclosure (orchestrator.disclosure): a line on the mail and chat
+    # messages the Executive sends saying it is an AI assistant. On unless
+    # turned off. The texts replace the built-in wording; one that doesn't
+    # say "AI" is ignored, so the line can't be reworded into hiding it.
+    ai_disclosure: bool = Field(True, alias="AI_DISCLOSURE")
+    ai_disclosure_mail_text: str = Field("", alias="AI_DISCLOSURE_MAIL_TEXT", max_length=500)
+    ai_disclosure_chat_text: str = Field("", alias="AI_DISCLOSURE_CHAT_TEXT", max_length=200)
+    # Where each person's own switches start (delegation.disclosure): a line
+    # on the replies Handle it for me sends as them on its own, and on the
+    # drafts they approve and send themselves. Each person can change theirs.
+    ai_disclosure_handle_it: bool = Field(True, alias="AI_DISCLOSURE_HANDLE_IT")
+    ai_disclosure_approved_sends: bool = Field(False, alias="AI_DISCLOSURE_APPROVED_SENDS")
     email_poll_interval_seconds: int = Field(60, alias="EMAIL_POLL_INTERVAL_SECONDS")
+    # Whole-turn ceiling for the Executive's answer to one inbound email. The
+    # poller handles mail one message at a time, so a turn with no ceiling held
+    # every message behind it. A timed-out message is marked read and not tried
+    # again: the turn may already have replied.
+    email_turn_timeout_s: float = Field(300.0, alias="EMAIL_TURN_TIMEOUT_S", gt=0)
+    # Ceiling on one call through the MCP gateway (Gmail, Calendar, Drive,
+    # Outlook, OneDrive, tool search). A call past it is abandoned and reported
+    # as not answered, so a hung workspace server can't hold a turn, a brief or
+    # the email poller.
+    mcp_tool_timeout_s: float = Field(120.0, alias="MCP_TOOL_TIMEOUT_S", gt=0)
+    # Lets `ask_executive` over Open Executive's own MCP server act
+    # (`Session.mcp_client_may_act`) on an install with no
+    # BACKEND_SHARED_SECRET. With a secret configured this is ignored, and only
+    # the `x-mcp-client-actions: on` header on a request the secret
+    # authenticated turns it on (`mcp_server.may_act`).
+    mcp_client_actions: bool = Field(False, alias="MCP_CLIENT_ACTIONS")
 
     # Which Google services the co-located workspace-mcp child loads, and at
     # which tier. These are the same two variables `docker/workspace-mcp-launch.sh`
@@ -691,7 +764,7 @@ class Settings(BaseSettings):
     google_chat_project_number: str | None = Field(None, alias="GOOGLE_CHAT_PROJECT_NUMBER")
 
     @field_validator(
-        "slack_bot_token", "slack_app_token", "telegram_bot_token",
+        "slack_bot_token", "slack_app_token", "slack_signing_secret", "telegram_bot_token",
         "discord_bot_token", "discord_app_id", "google_chat_project_number",
         "google_chat_service_account_file", "google_chat_service_account_email",
         mode="before",
@@ -876,7 +949,7 @@ class Settings(BaseSettings):
     mcp_servers_config_path: Path = Field(
         _ROOT / "company" / "mcp_servers.json", alias="MCP_SERVERS_CONFIG_PATH"
     )
-    # Directories a workflow action step's `oe__read_file` tool may read —
+    # Directories `read_document` (a workflow step's `oe__read_document`) may read —
     # where tools that download files (e.g. Gmail attachments via
     # workspace-mcp) save them. Comma-separated. Empty means workspace-mcp's
     # own default: $WORKSPACE_ATTACHMENT_DIR, else ~/.workspace-mcp/attachments.
@@ -1199,6 +1272,27 @@ class Settings(BaseSettings):
     # loop the nudge engine's commitment source chases once it is due, and a
     # later "sent it" from the same person closes it. Rows live in
     # scheduled_actions (kind="open_loop"); see attunement/open_loops.py.
+    # Do what it says (orchestrator/claim_check.py): a reply that claims a
+    # change no tool call made gets one more round to make it or say it
+    # can't. One small ROUTING_MODEL call, only when the reply uses a word
+    # that can claim a change.
+    claim_check_enabled: bool = Field(True, alias="CLAIM_CHECK_ENABLED")
+    # Conversation review (memory.chat_review): once a chat has been quiet
+    # this long, one small tool loop reads the new part and fixes what the
+    # replies left undone, from the person's own quoted words. Empty model =
+    # ROUTING_MODEL.
+    chat_review_enabled: bool = Field(True, alias="CHAT_REVIEW_ENABLED")
+    chat_review_quiet_minutes: int = Field(30, ge=1, alias="CHAT_REVIEW_QUIET_MINUTES")
+    chat_review_max_per_day: int = Field(10, ge=0, alias="CHAT_REVIEW_MAX_PER_DAY")
+    chat_review_model: str = Field("", alias="CHAT_REVIEW_MODEL")
+    # Replay of the misses (memory.replay): nightly, the turns the review
+    # graded a miss run again with today's lessons and facts, in a dry run,
+    # and a judge says whether they would now go right. At most MAX_CASES a
+    # night within MINUTES; empty judge model = EVAL_JUDGE_MODEL, else Sonnet.
+    chat_replay_enabled: bool = Field(True, alias="CHAT_REPLAY_ENABLED")
+    chat_replay_max_cases: int = Field(30, ge=0, alias="CHAT_REPLAY_MAX_CASES")
+    chat_replay_minutes: int = Field(20, ge=1, alias="CHAT_REPLAY_MINUTES")
+    chat_replay_judge_model: str = Field("", alias="CHAT_REPLAY_JUDGE_MODEL")
     attunement_enabled: bool = Field(True, alias="ATTUNEMENT_ENABLED")
     attunement_open_loops_enabled: bool = Field(True, alias="ATTUNEMENT_OPEN_LOOPS_ENABLED")
     # When no due date is stated, the loop is due this many days after it opens.
@@ -1208,6 +1302,16 @@ class Settings(BaseSettings):
     attunement_loop_ttl_days: int = Field(21, alias="ATTUNEMENT_LOOP_TTL_DAYS")
     attunement_max_open_loops_per_person: int = Field(
         15, alias="ATTUNEMENT_MAX_OPEN_LOOPS_PER_PERSON"
+    )
+    # Tell a person, once, when someone else assigns them a task
+    # (attunement/assignment_notice.py). Chasing it stays the nudge engine's.
+    attunement_assign_notify_enabled: bool = Field(
+        True, alias="ATTUNEMENT_ASSIGN_NOTIFY_ENABLED"
+    )
+    # The owner's monthly "what your Executive did" message, on the first
+    # weekday of the month (briefing/value_summary.py). Both workspace modes.
+    value_summary_monthly_enabled: bool = Field(
+        True, alias="VALUE_SUMMARY_MONTHLY_ENABLED"
     )
     # Ceiling on open-loop extraction model calls per UTC day, across everyone.
     attunement_max_calls_per_day: int = Field(200, alias="ATTUNEMENT_MAX_CALLS_PER_DAY")
@@ -1263,6 +1367,12 @@ class Settings(BaseSettings):
     # drafts limit above. Past it, replies wait on cards as before.
     delegation_handle_it_max_sends_per_day: int = Field(
         20, alias="DELEGATION_HANDLE_IT_MAX_SENDS_PER_DAY", ge=1, le=500
+    )
+    # Workflows that send email as their creator (delegation.workflow_email,
+    # oe__send_email_as_me): the most such emails a day per person, within
+    # the drafts limit above. Past it the step is told to stop.
+    delegation_workflow_max_sends_per_day: int = Field(
+        20, alias="DELEGATION_WORKFLOW_MAX_SENDS_PER_DAY", ge=1, le=500
     )
     # Whether the owner may let team members use Act as me for themselves
     # (Delegate → Act as me → "Let team members use it", off until they turn
@@ -1621,5 +1731,41 @@ def mcp_config_file_present(config_path: Path) -> bool:
         return False
 
 
+# get_settings() is called hundreds of times a minute (every key decrypt,
+# every per-tenant check), and building Settings re-parses the environment
+# and .env for every field: ~5 ms each, most of an idle server's CPU. So it
+# is built once and rebuilt only when what it reads changes: the
+# environment, the working directory (relative path defaults), the .env
+# file, and whether the MCP config file exists (_resolve_mcp).
+_settings_lock = threading.Lock()
+_settings_cache: tuple[tuple[object, ...], bool, Settings] | None = None
+
+
+def _settings_key() -> tuple[object, ...]:
+    try:
+        stat = _ENV_FILE.stat()
+        env_file: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        env_file = None
+    try:
+        cwd: str | None = os.getcwd()
+    except OSError:
+        cwd = None
+    return (tuple(os.environ.items()), cwd, env_file)
+
+
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    """The current settings. Each call returns its own copy, so a caller that
+    changes a field never changes anyone else's."""
+    global _settings_cache
+    key = _settings_key()
+    with _settings_lock:
+        cached = _settings_cache
+    if cached is not None:
+        cached_key, mcp_file, settings = cached
+        if cached_key == key and mcp_config_file_present(settings.mcp_servers_config_path) == mcp_file:
+            return settings.model_copy(deep=True)
+    settings = Settings()  # type: ignore[call-arg]
+    with _settings_lock:
+        _settings_cache = (key, mcp_config_file_present(settings.mcp_servers_config_path), settings)
+    return settings.model_copy(deep=True)

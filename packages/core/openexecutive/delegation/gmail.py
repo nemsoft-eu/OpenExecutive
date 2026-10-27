@@ -13,7 +13,12 @@ named from a hash of the address and written by
 {refresh_token, client_id, client_secret, token_uri}}``. It is never in
 ``WORKSPACE_MCP_CREDENTIALS_DIR`` — workspace-mcp picks a credential there by
 address, which would hand the model this mailbox. Scopes: ``gmail.readonly``
-and ``gmail.compose``.
+and ``gmail.compose``, and a calendar scope when they connected with
+``--calendar`` for Read my calendar (``delegation.calendar``; ``list_events``
+refuses with ``CalendarNotGranted`` without it): ``calendar.events`` now,
+which also lets it answer a meeting invite as them (``answer_invite``,
+``delegation.invites``); a sign-in made with ``calendar.readonly`` before
+keeps reading, and ``answer_invite`` refuses with ``CalendarWriteNotGranted``.
 
 **One way to send.** It reads mail and saves or deletes drafts. The only
 send is ``send_draft``: an existing draft, by its id, exactly as it is in
@@ -62,6 +67,16 @@ DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPE_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPE_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
 SCOPES: tuple[str, ...] = (SCOPE_READONLY, SCOPE_COMPOSE)
+# Read my calendar (delegation.calendar): optional, so a mail-only sign-in still works.
+SCOPE_CALENDAR = "https://www.googleapis.com/auth/calendar.readonly"
+# What --calendar asks for now: reads, and answers a meeting invite as them
+# (delegation.invites). Either scope reads; only this one (or the full
+# calendar scope) answers.
+SCOPE_CALENDAR_EVENTS = "https://www.googleapis.com/auth/calendar.events"
+_SCOPE_CALENDAR_FULL = "https://www.googleapis.com/auth/calendar"
+CALENDAR_READ_SCOPES = frozenset({SCOPE_CALENDAR, SCOPE_CALENDAR_EVENTS, _SCOPE_CALENDAR_FULL})
+CALENDAR_WRITE_SCOPES = frozenset({SCOPE_CALENDAR_EVENTS, _SCOPE_CALENDAR_FULL})
+CALENDAR_BASE = "https://www.googleapis.com/calendar/v3/calendars/primary"
 CREDENTIAL_VERSION = 1
 PROVIDER = "google"
 
@@ -115,6 +130,8 @@ STATUS_MESSAGES: dict[str, str] = {
 
 # Gmail ids are short hex strings; anything else never reaches a URL path.
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Google Calendar event ids: base32hex, with an instance's "_" suffix.
+_EVENT_ID_RE = re.compile(r"[A-Za-z0-9_]{1,1024}")
 # A forward's attached files, at most (Gmail's own message limit is 25 MB).
 FORWARD_MAX_FILES = 10
 FORWARD_MAX_BYTES = 20 * 1024 * 1024
@@ -128,6 +145,10 @@ _FETCH_CONCURRENCY = 5
 
 # Access tokens by (address, refresh token) — never written anywhere.
 _TOKENS: dict[str, tuple[str, float]] = {}
+# The scopes Google said each of those tokens carries ("" when it didn't say).
+_GRANTED: dict[str, str] = {}
+# Events one calendar read returns, at most.
+MAX_EVENTS = 100
 
 
 class GmailError(Exception):
@@ -164,6 +185,21 @@ class DraftChanged(GmailError):
         self.reason = reason
 
 
+class CalendarNotGranted(GmailError):
+    """Their saved sign-in doesn't let the Executive read their calendar:
+    they connected without it (``--calendar``), or took it back."""
+
+
+class CalendarWriteNotGranted(GmailError):
+    """Their saved sign-in reads their calendar but can't answer an invite:
+    it was made with read-only access (``calendar.readonly``,
+    ``Calendars.Read``). Connecting again with ``--calendar`` adds it."""
+
+
+class GmailChanged(GmailError):
+    """The item changed since it was read (an ``If-Match`` didn't match)."""
+
+
 class GmailAuthError(GmailError):
     """Google refused the credential: revoked, expired, or missing a scope."""
 
@@ -175,6 +211,74 @@ class GmailCredential:
     client_id: str
     client_secret: str
     token_uri: str = DEFAULT_TOKEN_URI
+
+
+@dataclass(frozen=True)
+class CalendarEvent:
+    """One event on someone's own calendar, as Read my calendar shows it.
+    ``start`` / ``end`` are ISO 8601 (a date alone for an all-day event)."""
+
+    id: str
+    title: str
+    start: str
+    end: str
+    all_day: bool = False
+    location: str = ""
+    organizer: str = ""
+    attendees: tuple[str, ...] = ()
+    # Their own answer: accepted, declined, tentative, needs_action, organizer.
+    response: str = ""
+
+
+_ATTENDEES_MAX = 25
+
+
+def _google_who(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    name = clean_header(str(entry.get("displayName") or ""))
+    address = normalize_email(str(entry.get("email") or ""))
+    return f"{name} <{address}>" if name and address else (name or address)
+
+
+def _google_when(value: Any) -> tuple[str, bool]:
+    if not isinstance(value, dict):
+        return "", False
+    if value.get("dateTime"):
+        return str(value["dateTime"]), False
+    return str(value.get("date") or ""), True
+
+
+def parse_google_event(raw: dict[str, Any]) -> CalendarEvent | None:
+    """A Google Calendar event, or None for one that isn't on their day
+    (cancelled, or a working-location marker)."""
+    if raw.get("status") == "cancelled" or raw.get("eventType") == "workingLocation":
+        return None
+    start, all_day = _google_when(raw.get("start"))
+    end, _ = _google_when(raw.get("end"))
+    if not start:
+        return None
+    attendees = [a for a in raw.get("attendees") or [] if isinstance(a, dict)]
+    own = next((a for a in attendees if a.get("self")), None)
+    organizer_raw = raw.get("organizer")
+    organizer: dict[str, Any] = organizer_raw if isinstance(organizer_raw, dict) else {}
+    if organizer.get("self"):
+        response = "organizer"
+    else:
+        response = {
+            "accepted": "accepted", "declined": "declined", "tentative": "tentative", "needsAction": "needs_action",
+        }.get(str((own or {}).get("responseStatus") or ""), "")
+    return CalendarEvent(
+        id=str(raw.get("id") or ""),
+        title=clean_header(str(raw.get("summary") or "")) or "(no title)",
+        start=start,
+        end=end,
+        all_day=all_day,
+        location=clean_header(str(raw.get("location") or "")),
+        organizer=_google_who(organizer),
+        attendees=tuple(w for w in (_google_who(a) for a in attendees[:_ATTENDEES_MAX] if not a.get("self")) if w),
+        response=response,
+    )
 
 
 @dataclass
@@ -224,6 +328,16 @@ class MailMessage:
     # (``list_attachments``).
     attachments: list[MailAttachment] = field(default_factory=list)
     has_attachments: bool = False
+    # The display name each To / Cc address was written with, as the
+    # sender's own mail app put it ("" for none). Names a contact the
+    # person writes to (``people.contact_keeper``).
+    names: dict[str, str] = field(default_factory=dict)
+    # A calendar invite's own iCalendar method (REQUEST, CANCEL, REPLY, ...)
+    # and event UID, from its text/calendar part ("" when it has none, or
+    # it is only attached as a file). Outlook leaves them empty: Graph
+    # names the event itself (``find_invite``).
+    invite_method: str = ""
+    invite_uid: str = ""
 
 
 @dataclass
@@ -238,6 +352,17 @@ class ThreadSummary:
     subject: str
     sender: str
     date: str
+    # The mail service found the sender's domain authenticated
+    # (``MailMessage.sender_authenticated``); False when it can't tell.
+    sender_authenticated: bool = False
+
+
+# The headers a search reads of each thread's newest message: what it lists,
+# and what proving its sender takes (``headers_authenticated``, which a list's
+# own headers make fail).
+_SUMMARY_HEADERS = (
+    "Subject", "From", "Date", "Authentication-Results", "List-Id", "X-Google-Group-Id", "Mailing-List",
+)
 
 
 @dataclass
@@ -479,6 +604,15 @@ def _addresses(value: str) -> list[str]:
     return [normalize_email(addr) for _, addr in getaddresses([value]) if "@" in addr]
 
 
+def _names(*values: str) -> dict[str, str]:
+    """Each address in the ``values`` headers with the name written next to it."""
+    out: dict[str, str] = {}
+    for name, addr in getaddresses(list(values)):
+        if "@" in addr:
+            out.setdefault(normalize_email(addr), clean_header(name))
+    return out
+
+
 def _hide_tokens(text: str) -> str:
     """``text`` with the Executive's one-time answer tokens hidden. The
     owner's own mailbox holds the roster and standing-fact confirmation
@@ -495,6 +629,47 @@ _BULK_PRECEDENCE = frozenset({"bulk", "junk", "list", "auto_reply"})
 # Set by out-of-office and other auto-responders.
 _AUTOREPLY_HEADERS = ("x-autoreply", "x-autorespond", "x-autoresponder")
 _CALENDAR_TYPES = frozenset({"text/calendar", "application/ics"})
+_ICS_UID_MAX = 1024
+
+
+def ics_invite(text: str) -> tuple[str, str]:
+    """An iCalendar text's method and its first event's UID, ``("", "")``
+    when it has neither. Only these two are read: nothing else in the file
+    (its title, its description) is used from here."""
+    unfolded = re.sub(r"\r?\n[ \t]", "", text or "")
+    method = uid = ""
+    in_event = False
+    for line in unfolded.splitlines():
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = name.split(";", 1)[0].strip().upper()
+        if key == "BEGIN" and value.strip().upper() == "VEVENT":
+            in_event = True
+        elif key == "END" and value.strip().upper() == "VEVENT":
+            if uid:
+                break
+            in_event = False
+        elif key == "METHOD" and not in_event and not method:
+            method = value.strip().upper()[:20]
+        elif key == "UID" and in_event and not uid:
+            candidate = value.strip()
+            if 0 < len(candidate) <= _ICS_UID_MAX and candidate.isprintable():
+                uid = candidate
+    return method, uid
+
+
+def _invite_part(payload: dict[str, Any]) -> tuple[str, str]:
+    """The method and UID of the message's inline text/calendar part."""
+    stack = [payload]
+    while stack:
+        part = stack.pop(0)
+        if str(part.get("mimeType") or "").lower() in _CALENDAR_TYPES:
+            found = ics_invite(_part_text(part))
+            if found[1]:
+                return found
+        stack.extend(p for p in part.get("parts") or [] if isinstance(p, dict))
+    return "", ""
 
 
 def _header_message(payload: dict[str, Any]) -> Message:
@@ -572,6 +747,7 @@ def parse_message(raw: dict[str, Any]) -> MailMessage:
     types = _part_types(payload)
     local_part = normalize_email(from_addr).partition("@")[0]
     attachments = _attachments(payload)
+    invite_method, invite_uid = _invite_part(payload) if types & _CALENDAR_TYPES else ("", "")
     return MailMessage(
         id=str(raw.get("id") or ""),
         thread_id=str(raw.get("threadId") or ""),
@@ -598,6 +774,9 @@ def parse_message(raw: dict[str, Any]) -> MailMessage:
         sender_authenticated=headers_authenticated(header_msg, normalize_email(from_addr)),
         attachments=attachments,
         has_attachments=bool(attachments),
+        names=_names(headers.get("to", ""), headers.get("cc", "")),
+        invite_method=invite_method,
+        invite_uid=invite_uid,
     )
 
 
@@ -794,6 +973,7 @@ class DelegateGmail:
         if granted and not set(SCOPES) <= set(granted.split()):
             raise GmailAuthError("missing_scope")
         _TOKENS[key] = (token, time.time() + ttl)
+        _GRANTED[key] = granted
         return token
 
     async def _get(
@@ -809,15 +989,20 @@ class DelegateGmail:
         *,
         params: Any = None,
         json_body: dict[str, Any] | None = None,
+        base: str = GMAIL_BASE,
+        if_match: str | None = None,
     ) -> dict[str, Any]:
         token = await self._access_token(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        if if_match:
+            headers["If-Match"] = if_match
         try:
             resp = await client.request(
                 method,
-                f"{GMAIL_BASE}{path}",
+                f"{base}{path}",
                 params=params,
                 json=json_body,
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Never reached Google: nothing was done.
@@ -833,6 +1018,8 @@ class DelegateGmail:
             raise GmailRateLimited(f"gmail {method} returned {resp.status_code}")
         if resp.status_code == 404:
             raise GmailNotFound(f"gmail {method} returned 404")
+        if resp.status_code == 412:
+            raise GmailChanged(f"gmail {method} returned 412")
         if resp.status_code >= 500:
             raise GmailError(f"gmail {method} returned {resp.status_code}", maybe_done=True)
         if resp.status_code >= 400:
@@ -854,6 +1041,8 @@ class DelegateGmail:
     async def search_threads(self, query: str, *, max_results: int = 5) -> list[ThreadSummary]:
         """Threads matching a Gmail search, newest first: subject, sender and
         date only (no body text)."""
+        from openexecutive.integrations.fact_confirmation import headers_authenticated
+
         async with self._client() as client:
             data = await self._get(
                 client, "/threads", {"q": query[:300], "maxResults": max(1, min(max_results, 10))}
@@ -864,16 +1053,22 @@ class DelegateGmail:
                 meta = await self._get(
                     client,
                     f"/threads/{thread_id}",
-                    [("format", "metadata"), ("metadataHeaders", "Subject"),
-                     ("metadataHeaders", "From"), ("metadataHeaders", "Date")],
+                    [("format", "metadata"),
+                     *(("metadataHeaders", name) for name in _SUMMARY_HEADERS)],
                 )
                 messages = [m for m in meta.get("messages") or [] if isinstance(m, dict)]
-                headers = _headers(messages[-1].get("payload") or {}) if messages else {}
+                payload = (messages[-1].get("payload") or {}) if messages else {}
+                headers = _headers(payload)
+                sender = getaddresses([headers.get("from", "")])
+                from_addr = sender[0][1] if sender else ""
                 summaries.append(ThreadSummary(
                     id=thread_id,
                     subject=_hide_tokens(headers.get("subject", "")),
                     sender=headers.get("from", ""),
                     date=headers.get("date", ""),
+                    sender_authenticated=headers_authenticated(
+                        _header_message(payload), normalize_email(from_addr)
+                    ),
                 ))
         return summaries
 
@@ -954,6 +1149,15 @@ class DelegateGmail:
         if not _EMAIL_RE.fullmatch(target):
             return False
         return bool(await self.list_message_ids(f"in:sent to:{target}", max_results=1))
+
+    async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
+        """The newest mail ``address`` sent the person in the last ``days``,
+        or None."""
+        target = normalize_email(address)
+        if not _EMAIL_RE.fullmatch(target):
+            return None
+        found = await self.list_message_ids(f"from:{target} -in:chats newer_than:{int(days)}d", max_results=1)
+        return await self.get_message(found[0][0]) if found else None
 
     async def get_message(self, message_id: str) -> MailMessage:
         if not valid_id(message_id):
@@ -1041,10 +1245,14 @@ class DelegateGmail:
                 return False
         return True
 
-    async def update_draft_text(self, draft_id: str, expected_version: str, text: str) -> str:
+    async def update_draft_text(
+        self, draft_id: str, expected_version: str, text: str, *,
+        to: list[str] | None = None, cc: list[str] | None = None,
+    ) -> str:
         """Replace the words of the draft ``draft_id`` with ``text``, keeping
         every header (who it goes to, the subject, the thread), when it is
-        still the version ``expected_version``. Returns its new version (the
+        still the version ``expected_version``. With ``to`` it goes to ``to``
+        and ``cc`` instead. Returns its new version (the
         message id Gmail gives the edited draft). Raises ``GmailNotFound``
         when it is gone and ``DraftChanged`` when it changed meanwhile or is
         more than plain text. Nothing is sent."""
@@ -1068,6 +1276,12 @@ class DelegateGmail:
             if not isinstance(msg, EmailMessage) or msg.is_multipart() or msg.get_content_type() != "text/plain":
                 raise DraftChanged("not_plain")
             msg.set_content(text)
+            if to is not None:
+                del msg["To"]
+                del msg["Cc"]
+                msg["To"] = ", ".join(clean_header(a) for a in to)
+                if cc:
+                    msg["Cc"] = ", ".join(clean_header(a) for a in cc)
             message: dict[str, Any] = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")}
             thread_id = current.get("threadId")
             if isinstance(thread_id, str) and valid_id(thread_id):
@@ -1115,6 +1329,148 @@ class DelegateGmail:
             thread_id=str(created.get("threadId") or spec.thread_id or ""),
             skipped_attachments=skipped,
         )
+
+
+    async def _granted_scopes(self, client: httpx.AsyncClient) -> str:
+        await self._access_token(client)
+        return _GRANTED.get(_token_key(self._cred()), "")
+
+    async def calendar_granted(self) -> bool | None:
+        """Whether their saved sign-in reads their calendar
+        (``calendar.readonly`` or ``calendar.events``); None when Google
+        didn't say which scopes it carries."""
+        async with self._client() as client:
+            granted = await self._granted_scopes(client)
+        return bool(CALENDAR_READ_SCOPES & set(granted.split())) if granted else None
+
+    async def calendar_write_granted(self) -> bool | None:
+        """Whether their saved sign-in can answer a meeting invite
+        (``calendar.events``); None when Google didn't say."""
+        async with self._client() as client:
+            granted = await self._granted_scopes(client)
+        return bool(CALENDAR_WRITE_SCOPES & set(granted.split())) if granted else None
+
+    async def list_events(self, start: datetime, end: datetime, *, max_results: int = MAX_EVENTS) -> list[CalendarEvent]:
+        """The events on their primary calendar between ``start`` and ``end``,
+        recurring ones expanded, in order. A read (``calendar.readonly`` or
+        ``calendar.events``)."""
+        async with self._client() as client:
+            granted = await self._granted_scopes(client)
+            if granted and not CALENDAR_READ_SCOPES & set(granted.split()):
+                raise CalendarNotGranted("calendar.readonly not granted")
+            params = {
+                "timeMin": start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "timeMax": end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "maxResults": str(max(1, min(max_results, MAX_EVENTS))),
+            }
+            try:
+                data = await self._request(client, "GET", "/events", params=params, base=CALENDAR_BASE)
+            except GmailAuthError as exc:
+                if str(exc) != "forbidden":
+                    raise
+                # With the scope granted, a refusal is the project's (the API
+                # not enabled, a quota), and reconnecting wouldn't fix it.
+                if CALENDAR_READ_SCOPES & set(granted.split()):
+                    raise GmailError("calendar read refused with the scope granted") from exc
+                raise CalendarNotGranted("calendar read refused") from exc
+        items_raw = data.get("items")
+        items: list[Any] = items_raw if isinstance(items_raw, list) else []
+        events = [parse_google_event(item) for item in items if isinstance(item, dict)]
+        return [e for e in events if e is not None]
+
+    async def _invite_uid(self, message: MailMessage) -> tuple[str, str]:
+        """The invite's method and UID: from its inline part, else from its
+        attached .ics file."""
+        if message.invite_uid:
+            return message.invite_method, message.invite_uid
+        for attachment in message.attachments:
+            if attachment.mime_type in _CALENDAR_TYPES or attachment.name.lower().endswith(".ics"):
+                _meta, data = await self.attachment_bytes(message.id, attachment.index)
+                found = ics_invite(data[:200_000].decode("utf-8", errors="replace"))
+                if found[1]:
+                    return found
+        return "", ""
+
+    async def find_invite(self, message: MailMessage) -> CalendarEvent | None:
+        """The event a meeting invite ``message`` asks them to, as it is on
+        their own primary calendar (found by its iCalendar UID), or None:
+        not a request (a cancellation, someone's answer), or not on their
+        calendar. A read."""
+        method, uid = await self._invite_uid(message)
+        if not uid or method not in ("", "REQUEST"):
+            return None
+        async with self._client() as client:
+            granted = await self._granted_scopes(client)
+            if granted and not CALENDAR_READ_SCOPES & set(granted.split()):
+                raise CalendarNotGranted("calendar.readonly not granted")
+            try:
+                data = await self._request(
+                    client, "GET", "/events", params={"iCalUID": uid, "maxResults": "5"}, base=CALENDAR_BASE,
+                )
+            except GmailAuthError as exc:
+                if str(exc) != "forbidden":
+                    raise
+                if CALENDAR_READ_SCOPES & set(granted.split()):
+                    raise GmailError("calendar read refused with the scope granted") from exc
+                raise CalendarNotGranted("calendar read refused") from exc
+        items_raw = data.get("items")
+        items: list[Any] = items_raw if isinstance(items_raw, list) else []
+        for item in items:
+            if isinstance(item, dict) and _EVENT_ID_RE.fullmatch(str(item.get("id") or "")):
+                event = parse_google_event(item)
+                if event is not None:
+                    return event
+        return None
+
+    async def answer_invite(self, event_id: str, *, accept: bool) -> None:
+        """Answer the invite to ``event_id`` on their primary calendar, as
+        them: their own attendee entry's answer becomes accepted or declined,
+        and Google tells the organizer (``sendUpdates=all``). Nothing else on
+        the event changes: the write carries the event's ``etag``, so a change
+        made since it was read (a guest added, another answer) is read again
+        rather than overwritten, once. Called only by ``delegation.invites``,
+        on the person's tap or under Handle it for me (accept only).
+        Answering twice is the same as once. Raises ``CalendarWriteNotGranted`` for a
+        read-only sign-in, ``GmailNotFound`` when the event or their place on
+        it is gone."""
+        if not _EVENT_ID_RE.fullmatch(event_id or ""):
+            raise GmailError("invalid event id")
+        async with self._client() as client:
+            granted = await self._granted_scopes(client)
+            if granted and not CALENDAR_WRITE_SCOPES & set(granted.split()):
+                raise CalendarWriteNotGranted("calendar.events not granted")
+            path = f"/events/{event_id}"
+            try:
+                for attempt in range(2):
+                    event = await self._request(client, "GET", path, base=CALENDAR_BASE)
+                    attendees = [dict(a) for a in event.get("attendees") or [] if isinstance(a, dict)]
+                    mine = next((a for a in attendees if a.get("self") is True), None)
+                    if mine is None:
+                        mine = next(
+                            (a for a in attendees if normalize_email(str(a.get("email") or "")) == self.email),
+                            None,
+                        )
+                    if mine is None:
+                        raise GmailNotFound("not an attendee")
+                    mine["responseStatus"] = "accepted" if accept else "declined"
+                    try:
+                        await self._request(
+                            client, "PATCH", path, params={"sendUpdates": "all"},
+                            json_body={"attendees": attendees}, base=CALENDAR_BASE,
+                            if_match=str(event.get("etag") or "") or None,
+                        )
+                        return
+                    except GmailChanged:
+                        if attempt:
+                            raise
+            except GmailAuthError as exc:
+                if str(exc) != "forbidden":
+                    raise
+                if CALENDAR_WRITE_SCOPES & set(granted.split()):
+                    raise GmailError("calendar write refused with the scope granted") from exc
+                raise CalendarWriteNotGranted("calendar write refused") from exc
 
 
 def gmail_for(email: str) -> Any:

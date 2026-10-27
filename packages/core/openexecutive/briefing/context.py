@@ -306,7 +306,12 @@ def render_and_trust(session: object, *, db_path: Path | None = None) -> str:
         from openexecutive.orchestrator.artifact_records import viewer_for_person
         from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
 
-        verified = is_principal_on_verified_surface(session)
+        # Not in a shared web chat: everyone in it reads the reply, and the
+        # private cards (their mail, a teammate's private asks, roster
+        # requests) are the principal's alone, as in a chat app's channel.
+        verified = is_principal_on_verified_surface(session) and (
+            getattr(session, "shared_chat", False) is not True
+        )
         block = format_open_alerts_for_prompt(
             db_path=db_path, trusted_ids=trusted,
             # Alerts private to the principal only on their own verified turn.
@@ -338,7 +343,66 @@ def render_and_trust(session: object, *, db_path: Path | None = None) -> str:
             logger.exception("briefing_context.trust_record_failed")
     if roster_block:
         block = f"{block}\n\n{roster_block}" if block else roster_block
+    # The drafts are the lowest-id principal's (find_principal_person): with a
+    # co-principal on the roster a verified speaker may be the other founder,
+    # so the block is left out rather than shown to them.
+    if verified and _single_principal():
+        drafts_block = _waiting_drafts_block()
+        if drafts_block:
+            block = f"{block}\n\n{drafts_block}" if block else drafts_block
     return block
+
+
+def _single_principal() -> bool:
+    """Whether the roster holds at most one active principal. False on a
+    failed read: the private block stays out."""
+    try:
+        from openexecutive.people.store import active_principals
+
+        return len(active_principals()) <= 1
+    except Exception:
+        logger.exception("briefing_context.principals_read_failed")
+        return False
+
+
+def _waiting_drafts_block() -> str:
+    """The principal's chat drafts still in their Drafts, as the brief names
+    them, so a brief line about a draft can be discussed. Their own turn
+    only. Never raises."""
+    try:
+        from openexecutive.briefing.live_signals import draft_line
+        from openexecutive.delegation import drafts
+        from openexecutive.memory import episodic
+        from openexecutive.memory.workspace_settings import get_user_timezone
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        if principal is None or principal.id is None:
+            return ""
+        if not episodic._resolve_db_path(None).exists():
+            return ""
+        now = datetime.now(UTC)
+        waiting = drafts.waiting_drafts(principal.id, now - drafts.SETTLE_WINDOW)
+        if not waiting:
+            return ""
+        from openexecutive.orchestrator.content_trust import wrap_untrusted
+
+        tz = get_user_timezone()
+        # Only the ones a settle pass has read: a bare time names nothing.
+        lines = [f"- {draft_line(d, tz, now)}" for d in waiting if d.to or d.subject]
+        if not lines:
+            return ""
+        email = str(getattr(principal, "email", "") or "")
+    except Exception:
+        logger.exception("briefing_context.waiting_drafts_failed")
+        return ""
+    # A reply draft's subject is the sender's own ("Re: …"): quoted data.
+    return (
+        "Email drafts you saved in their own mailbox from chat, not sent yet "
+        "(newest first). A brief line about a draft waiting for review means "
+        "one of these; open it with search_my_email and read_my_email:\n"
+        + wrap_untrusted("\n".join(lines), source="email", author=email)
+    )
 
 
 _MAX_ROSTER_REQUESTS = 10

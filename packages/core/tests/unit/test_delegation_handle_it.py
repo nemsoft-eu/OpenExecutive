@@ -129,6 +129,34 @@ def test_off_it_leaves_a_card_as_before(owner: Any, models: dict[str, Any]) -> N
 # ── sending on its own ────────────────────────────────────────────────────────
 
 
+def test_a_reply_sent_on_its_own_says_an_ai_wrote_it(
+    owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import disclosure
+
+    monkeypatch.delenv("AI_DISCLOSURE", raising=False)
+    _on(owner)
+    mailbox, result = _scan_one(owner)
+    assert result.handled == 1
+    (spec,) = mailbox.specs
+    assert spec.body.endswith(disclosure.LINE)
+    assert inbox.card_payload(_only_card(owner))["draft_body"] == spec.body
+
+
+def test_a_reply_waiting_for_them_has_no_ai_line_unless_they_asked(
+    owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import disclosure
+
+    monkeypatch.delenv("AI_DISCLOSURE", raising=False)
+    mailbox, _ = _scan_one(owner)
+    assert disclosure.LINE not in mailbox.specs[0].body
+    disclosure.set_(owner.id, approved_sends=True, updated_by="test")
+    mailbox, _ = _scan_one(owner, _msg("m2", "t2"))
+    assert mailbox.specs[0].body.endswith(disclosure.LINE)
+
+
+
 def test_on_it_sends_a_reply_to_someone_they_know(db: Path, owner: Any, models: dict[str, Any]) -> None:
     _on(owner)
     mailbox, result = _scan_one(owner)
@@ -555,7 +583,7 @@ def test_get_shows_the_switch(client: TestClient, owner: Any) -> None:
         "available": True, "sent_today": 0,
         "lead": False, "lead_available": True,
     }
-    assert body["training"] == {"replies": False, "follow_ups": False, "actions": False, "drafts": False, "learned": []}
+    assert body["training"] == {"replies": False, "follow_ups": False, "actions": False, "drafts": False, "actions_on": False, "learned": []}
 
 
 def test_turning_it_on_needs_the_inbox_watcher(client: TestClient, owner: Any) -> None:
@@ -751,3 +779,37 @@ def test_handled_route_lists_the_callers_own(client: TestClient, owner: Any, mod
     replies = client.get("/delegation/handled", headers=HEADERS).json()["replies"]
     assert len(replies) == 1 and replies[0]["to_email"] == DANA
     assert replies[0]["gmail_link"]
+
+
+# ── the last look for an email that steers an assistant ──────────────────────
+
+
+def test_an_email_that_steers_an_assistant_waits_for_them(owner: Any, models: dict[str, Any]) -> None:
+    _on(owner)
+    models["steers"] = True
+    mailbox, result = _scan_one(owner)
+    assert result.drafted == 1 and result.handled == 0 and mailbox.sent == []
+    card = _only_card(owner)
+    assert card.gate_mode == "propose" and inbox.card_payload(card)["handle_it_reason"] == "suspicious"
+    assert "suspicious" in handle_it.REASONS
+    # It read the email as data, in its own block.
+    assert models["checked"] and "<email>" in models["checked"][0]
+
+
+def test_a_check_that_fails_holds_the_reply(owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.delegation import injection_check
+
+    async def broken(model: str, turn: str) -> dict[str, Any]:
+        raise RuntimeError("model down")
+
+    monkeypatch.setattr(injection_check, "_call_model", broken)
+    _on(owner)
+    mailbox, result = _scan_one(owner)
+    assert result.handled == 0 and mailbox.sent == []
+    assert inbox.card_payload(_only_card(owner))["handle_it_reason"] == "suspicious"
+
+
+def test_the_check_runs_only_when_a_reply_would_go(owner: Any, models: dict[str, Any]) -> None:
+    # Handle it for me off: every reply waits anyway, so nothing is checked.
+    _scan_one(owner)
+    assert models["checked"] == []

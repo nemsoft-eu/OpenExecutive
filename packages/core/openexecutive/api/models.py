@@ -170,6 +170,23 @@ class SyncedDocContent(BaseModel):
     content: str
 
 
+class GatewayHealth(BaseModel):
+    """The MCP gateway (orchestrator/gateway_boot.py): ``off`` (MCP not
+    enabled), ``no_servers`` (enabled, config names none), ``starting`` (an
+    attempt is running), ``up``, or ``down`` (every attempt failed so far;
+    ``next_retry_at`` says when the next one is). ``attempts`` counts starts
+    tried. The failure's text stays in the log and the owner's Setup notice:
+    the route is open to anyone. ``email_poller`` is whether the poller that
+    rides on the gateway runs."""
+
+    state: str
+    attempts: int = 0
+    last_failed_at: str | None = None
+    up_since: str | None = None
+    next_retry_at: str | None = None
+    email_poller: bool = False
+
+
 class HealthResponse(BaseModel):
     status: str
     builtin_knowledge_chunks: int
@@ -183,7 +200,11 @@ class HealthResponse(BaseModel):
     # Setup status says which. A non-empty list means a workspace-mcp rename or
     # a tool the configured services and tier never loaded.
     google_tools_missing: list[str] | None = None
-    version: str = "0.5.4"  # x-release-please-version
+    # The MCP gateway's state (``GatewayHealth``). A hosted instance whose
+    # gateway failed to start used to look healthy here while no email went
+    # out or came in.
+    gateway: GatewayHealth | None = None
+    version: str = "0.6.5"  # x-release-please-version
 
 
 class VersionResponse(BaseModel):
@@ -261,6 +282,21 @@ class SessionSummary(BaseModel):
     # words (0 when only the title does) and the newest one around the match.
     match_count: int | None = None
     snippet: str | None = None
+    # Set on the plain list: the chat's last message as one line, "You: "
+    # before the person's own words, for a list that says what each chat is.
+    preview: str | None = None
+    # When its owner pinned it to the top of their list; absent when not.
+    pinned_at: str | None = None
+    # The owner's topic this chat is filed under (`GET /sessions/topics`);
+    # absent when none, and on a chat shared with the caller.
+    topic_id: int | None = None
+    # A chat someone shared with the caller (`GET /sessions/shared-with-me`,
+    # or opened by id): they read it and write in it with its owner, but only
+    # the owner renames, pins, shares or deletes it. `shared_by` names the
+    # owner and `shared_at` says when.
+    shared_with_you: bool | None = None
+    shared_by: str | None = None
+    shared_at: str | None = None
 
 
 class TargetCustomerData(BaseModel):
@@ -296,6 +332,7 @@ class FinancialsData(BaseModel):
 
 class CompanyProfileResponse(BaseModel):
     name: str
+    website: str = ""
     industry: str
     stage: str
     founding_year: int | None
@@ -315,6 +352,7 @@ class CompanyProfileResponse(BaseModel):
 
 class CompanyProfileUpdateRequest(BaseModel):
     name: str | None = None
+    website: str | None = Field(default=None, max_length=300)
     industry: str | None = None
     stage: str | None = None
     founding_year: int | None = None
@@ -354,6 +392,9 @@ class WorkspaceResponse(BaseModel):
     # only to the principal, like the role; empty for anyone else.
     company_domains: list[str] = Field(default_factory=list)
     company_domains_custom: bool = False
+    # Whether any department exists. The UI shows the Departments tab only
+    # then: goals stand on their own, so a workspace may never need one.
+    has_departments: bool = False
 
 
 class WorkspaceUpdateRequest(BaseModel):
@@ -442,6 +483,18 @@ class OnboardSessionRequest(BaseModel):
     session_id: str
 
 
+class OnboardReviseRequest(BaseModel):
+    """Change one of the person's earlier answers and carry on from there."""
+
+    session_id: str
+    # Which of the person's own answers, oldest first: 0 is the description.
+    # Defaulted so a missing one gets the route's fixed 404, not a 422 that
+    # echoes the whole body (message included).
+    answer: int = -1
+    # No Field(max_length=...) — see ONBOARD_MESSAGE_MAX_CHARS above.
+    message: str
+
+
 # No Field(max_length=...) on any of the draft models below, for the same
 # reason as ONBOARD_MESSAGE_MAX_CHARS above: FastAPI's 422 body echoes the
 # rejected value, and a commit body carries the company's financials. Lengths
@@ -466,6 +519,19 @@ class OnboardDepartmentDraft(BaseModel):
     authority_level: str = "propose_only"
 
 
+class OnboardGoalDraft(BaseModel):
+    """One of this year's goals: saved with an owner (a drafted person's
+    name, empty = the owner of the workspace) and, when departments were
+    drafted, optionally inside one."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str
+    target: str = ""
+    owner_name: str = ""
+    department_title: str = ""
+
+
 class OnboardTranscriptTurn(BaseModel):
     role: str
     text: str
@@ -479,11 +545,17 @@ class OnboardTurnResponse(BaseModel):
     max_questions: int
     question: str | None = None
     question_hint: str | None = None
+    # Suggested answers to the question, shown as buttons to tap.
+    question_options: list[str] = Field(default_factory=list)
     draft: CompanyProfileResponse | None = None
     draft_people: list[OnboardPersonDraft] = Field(default_factory=list)
     draft_departments: list[OnboardDepartmentDraft] = Field(default_factory=list)
+    draft_goals: list[OnboardGoalDraft] = Field(default_factory=list)
     confidence_notes: list[str] = Field(default_factory=list)
     summary: str | None = None
+    # The website pages setup read for this session (e.g. "example.com/team"),
+    # on the opening turn only. Empty with a website given: it couldn't be read.
+    website_pages: list[str] = Field(default_factory=list)
 
 
 class OnboardSessionResponse(OnboardTurnResponse):
@@ -498,6 +570,7 @@ class OnboardCommitRequest(BaseModel):
     profile: CompanyProfileUpdateRequest
     people: list[OnboardPersonDraft] = Field(default_factory=list)
     departments: list[OnboardDepartmentDraft] = Field(default_factory=list)
+    goals: list[OnboardGoalDraft] = Field(default_factory=list)
     # The principal's sign-in email, confirmed by the user on the review
     # screen (pre-filled from their own login). The one contact detail setup
     # saves: without it the signed-in owner matches no Person, so their chat

@@ -2,15 +2,17 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { getActivity, getHistory, listStandingFacts, type ActivityItem } from "@/lib/api";
+import { getActivity, getHistory, getReflection, listStandingFacts, type ActivityItem } from "@/lib/api";
 import Icon from "@/components/Icon";
 import { upcomingLabel, whenLabel, type MemoryView } from "@/lib/pulseView";
-import { SUMMARY_KINDS, activityLine } from "./CadenceSection";
+import { SUMMARY_KINDS, activityLine, writeUpHref, writeUpLabel } from "./CadenceSection";
 import type { PulseData } from "./PulseHeader";
 import { Skeleton, metaFor } from "./shared";
+import { MonthCountLine } from "./ValueSection";
 
 // The Pulse overview's three blocks under the heartbeat: the next few things
-// the Executive will do (Coming up), the last few it did (Done recently), and
+// the Executive will do (Coming up), the month's count and the last few it
+// did (Done for you), and
 // a tile per kind of memory. Each links to its full list on its own screen
 // (`/memories?tab=…`), so the overview stays short.
 
@@ -52,12 +54,17 @@ function PreviewRow({
   title,
   detail,
   chip,
+  href,
+  linkLabel = "Read it",
 }: {
   when: string;
   upcoming: boolean;
   title: string;
   detail?: string;
   chip?: string;
+  /** A finished run's write-up: "Read it" after the detail. */
+  href?: string | null;
+  linkLabel?: string;
 }) {
   return (
     <li className="flex items-start gap-3 py-3 border-t border-line first:border-t-0">
@@ -77,9 +84,17 @@ function PreviewRow({
             </span>
           )}
         </div>
-        {detail && (
-          <div className="text-sm text-fg-muted mt-0.5 line-clamp-1" title={detail}>
+        {(detail || href) && (
+          <div className={`text-sm text-fg-muted mt-0.5 ${href ? "line-clamp-3" : "line-clamp-1"}`} title={detail}>
             {detail}
+            {href && (
+              <>
+                {detail && " "}
+                <Link href={href} className="font-semibold text-accent hover:underline whitespace-nowrap">
+                  {linkLabel}
+                </Link>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -151,8 +166,9 @@ function capitalise(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-/** The last few things it did on its own. */
-export function DoneRecently() {
+/** This month's count, then the last few things it did on its own, each
+ *  saying what came of it. */
+export function DoneForYou() {
   const [items, setItems] = useState<ActivityItem[] | null>(null);
 
   useEffect(() => {
@@ -170,7 +186,8 @@ export function DoneRecently() {
   }, []);
 
   return (
-    <PreviewCard title="Done recently" href="/memories?tab=activity" linkLabel="All activity">
+    <PreviewCard title="Done for you" href="/memories?tab=activity" linkLabel="All activity">
+      <MonthCountLine />
       {items === null ? (
         <RowsSkeleton />
       ) : items.length === 0 ? (
@@ -182,8 +199,11 @@ export function DoneRecently() {
             // For summary-style kinds the subject IS the summary, so the
             // detail line says only what kind of thing it was.
             // A plain "action" has nothing to add beyond its summary.
+            // A finished run says what came of it (and links its write-up).
             const detail =
-              it.kind === "action"
+              it.kind === "workflow_done" || it.kind === "contacts_kept"
+                ? (it.detail ?? undefined)
+                : it.kind === "action"
                 ? undefined
                 : SUMMARY_KINDS.has(it.kind)
                   ? capitalise(verb.replace(/:$/, ""))
@@ -195,6 +215,8 @@ export function DoneRecently() {
                 when={whenLabel(it.at)}
                 title={it.summary || detail || capitalise(verb)}
                 detail={it.summary ? detail : undefined}
+                href={writeUpHref(it)}
+                linkLabel={writeUpLabel(it)}
               />
             );
           })}
@@ -250,6 +272,8 @@ export function MemoryTiles({ pulse }: { pulse: PulseData }) {
   const [facts, setFacts] = useState<{ active: number; toApprove: number } | null>(null);
   // undefined while loading; null when this viewer has no notes (the tile goes).
   const [notes, setNotes] = useState<number | null | undefined>(undefined);
+  // Likewise for Learning (the conversation review's grades).
+  const [misses, setMisses] = useState<number | null | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +294,13 @@ export function MemoryTiles({ pulse }: { pulse: PulseData }) {
       })
       .catch(() => {
         if (!cancelled) setNotes(null);
+      });
+    getReflection()
+      .then((state) => {
+        if (!cancelled) setMisses(state ? state.misses.length : null);
+      })
+      .catch(() => {
+        if (!cancelled) setMisses(null);
       });
     return () => {
       cancelled = true;
@@ -315,13 +346,21 @@ export function MemoryTiles({ pulse }: { pulse: PulseData }) {
       detail: "Only you see these",
     });
   }
+  if (misses !== null) {
+    tiles.push({
+      view: "reflection",
+      label: "Learning",
+      count: misses ?? null,
+      detail: "Fell short, and what it learned",
+    });
+  }
 
   return (
     <section aria-labelledby="pulse-memory-heading">
       <h2 id="pulse-memory-heading" className="text-lg font-semibold text-fg mb-3">
         What it remembers
       </h2>
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         {tiles.map((t, i) => (
           // An odd last tile spans the phone's two columns.
           <Tile key={t.view} spec={t} wide={tiles.length % 2 === 1 && i === tiles.length - 1} />

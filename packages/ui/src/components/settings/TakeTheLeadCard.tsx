@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { MeetingAskFirstRow } from "@/components/settings/WorkspaceCard";
 import LeadRulesEditor from "@/components/settings/LeadRulesEditor";
 import SettingsCard from "@/components/settings/SettingsCard";
 import Switch from "@/components/Switch";
@@ -70,6 +71,10 @@ export default function TakeTheLeadCard() {
     return (
       <SettingsCard>
         <p className="text-sm text-fg-muted">Couldn&apos;t load Take the lead.</p>
+        {/* The meeting row has its own endpoint, so it still works here. */}
+        <ul className="mt-3 flex flex-col">
+          <MeetingAskFirstRow />
+        </ul>
       </SettingsCard>
     );
   }
@@ -101,7 +106,7 @@ export default function TakeTheLeadCard() {
         !lead.available
           ? "Needs signed sign-ins on this server before it can be turned on."
           : mode === "training"
-            ? "In training, everything it would do comes to you as a card on Today first. What you allow, it does on its own from then on."
+            ? "In training, everything it would do comes to you as a card on Home first. What you allow, it does on its own from then on."
             : mode === "on"
               ? "It acts on what it finds while it looks over your day: it messages people, books meetings and starts workflows. Anything below waits for a yes first."
               : "Off: when it looks over your day it tells you what it would do, and you do it."
@@ -136,8 +141,7 @@ export default function TakeTheLeadCard() {
           <div>
             <h3 className="text-[15px] font-semibold text-fg">What it&apos;s learned</h3>
             <p className="mt-1 text-sm text-fg-muted">
-              In training it does these on its own. Use Approve + allow on a card, or Send + allow on an Act as me
-              reply, to add one.
+              In training it does these on its own. Tick &ldquo;on its own next time&rdquo; on a card to add one.
             </p>
             {lead.learned.length === 0 && lead.suggested.length === 0 ? (
               <p className="mt-3 text-sm text-fg-muted">Nothing yet.</p>
@@ -192,40 +196,40 @@ export default function TakeTheLeadCard() {
           </div>
         )}
         {lead.enabled && (
-          <>
-            <p className="rounded-xl bg-surface-overlay/60 px-4 py-3 text-sm leading-relaxed text-fg-muted">
-              Department approval levels still apply. A department on Proposes still sends its meetings to its head for
-              a yes. Set a department to Acts on its own to let it book without asking.
-            </p>
-            <div>
-              <h3 className="text-[15px] font-semibold text-fg">Always asks first</h3>
-              <p className="mt-1 text-sm text-fg-muted">
-                These wait for you, or for whoever approves that area (like spending or hiring), with a card on Today.
-              </p>
-              <ul className="mt-3 flex flex-col divide-y divide-line rounded-xl border border-line">
-                {lead.ask_first.map((item) => {
-                  const id = `ask-first-${item.kind}`;
-                  return (
-                    <li key={item.kind} className="flex min-h-touch items-center justify-between gap-3 px-4 py-2">
-                      <span className="min-w-0">
-                        <span id={id} className="block text-[15px]">
-                          {item.label}
-                        </span>
-                        <span className="mt-0.5 block text-[13px] leading-snug text-fg-muted">{item.hint}</span>
-                      </span>
-                      <Switch
-                        checked={item.on}
-                        onChange={() => void save({ ask_first: { [item.kind]: !item.on } })}
-                        disabled={busy}
-                        labelledBy={id}
-                      />
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-          </>
+          <p className="rounded-xl bg-surface-overlay/60 px-4 py-3 text-sm leading-relaxed text-fg-muted">
+            Department levels don&apos;t hold what it does here: the switches and rules below do. A meeting it thinks
+            of always waits for a yes.
+          </p>
         )}
+        <div>
+          <h3 className="text-[15px] font-semibold text-fg">Always asks first</h3>
+          <p className="mt-1 text-sm text-fg-muted">
+            These wait for you, or for whoever approves that area (like spending or hiring), with a card on Home.
+            {!lead.enabled && " While Take the lead is off, only the last one applies: the rest are kept for when it's on."}
+          </p>
+          <ul className="mt-3 flex flex-col divide-y divide-line rounded-xl border border-line">
+            {lead.ask_first.map((item) => {
+              const id = `ask-first-${item.kind}`;
+              return (
+                <li key={item.kind} className="flex min-h-touch items-center justify-between gap-3 px-4 py-2">
+                  <span className="min-w-0">
+                    <span id={id} className="block text-[15px]">
+                      {item.label}
+                    </span>
+                    <span className="mt-0.5 block text-[13px] leading-snug text-fg-muted">{item.hint}</span>
+                  </span>
+                  <Switch
+                    checked={item.on}
+                    onChange={() => void save({ ask_first: { [item.kind]: !item.on } })}
+                    disabled={busy}
+                    labelledBy={id}
+                  />
+                </li>
+              );
+            })}
+            <MeetingAskFirstRow />
+          </ul>
+        </div>
         <div>
           <h3 className="text-[15px] font-semibold text-fg">Company rules</h3>
           <p className="mt-1 mb-3 text-sm text-fg-muted">

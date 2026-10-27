@@ -253,6 +253,19 @@ async def _process_and_reply(
     # (chat_turn, specialist_consult, tool_invocation) shares a grouping key
     # with the integration_inbound row.
     session_id = f"google_chat:{space_name}:{thread_name}"
+    # The sender's People row, by the Google account email on the event (the
+    # JWT proves the event is Google's, so the email is Google's word). None
+    # for someone who isn't on People; the department gate then holds their
+    # sends and edits for approval.
+    sender_person = None
+    if sender_email:
+        try:
+            from openexecutive.people.store import find_person_by_email
+
+            sender_person = find_person_by_email(sender_email)
+        except Exception:
+            logger.exception("Google Chat: failed to look up the sender on People")
+
     from openexecutive.audit import log_event as audit_log
     audit_log(
         "integration_inbound",
@@ -265,22 +278,23 @@ async def _process_and_reply(
             "thread_name": thread_name,
             "message_name": message_name,
             "sender": sender_name,
+            # Who it is by People, not by display name: the brief tells the
+            # owner's own chat from a namesake's by this (briefing.live_signals).
+            "sender_person_id": sender_person.id if sender_person is not None else None,
             "text_len": len(message_text),
         },
     )
 
     # Fork into alert triage pipeline (fire-and-forget, same pattern as Slack/email).
     try:
-        from openexecutive.alerts.models import AlertEvent
-        from openexecutive.alerts.pipeline import schedule_evaluation
+        from openexecutive.alerts.pipeline import schedule_chat_message_evaluation
 
-        schedule_evaluation(
-            AlertEvent(
-                source="google_chat",
-                external_id=message_name,
-                body=message_text,
-                user=sender_name,
-            )
+        schedule_chat_message_evaluation(
+            source="google_chat",
+            external_id=message_name,
+            body=message_text,
+            sender=sender_person,
+            fallback_name=sender_name,
         )
     except Exception:
         logger.exception("Google Chat: failed to schedule alert evaluation")
@@ -301,13 +315,17 @@ async def _process_and_reply(
             session_id=session_id,
             company_profile=profile if not profile.is_empty() else None,
             # Names the surface for logging and the `<channel>` block. This
-            # adapter has no roster gate (the webhook authenticates Google,
-            # not the sender) and never populates trusted_alert_ids, so
+            # adapter turns no sender away (anyone in a space can post) and
+            # never populates trusted_alert_ids, so
             # `ack_alert` refuses here — matching what the channel block
             # already tells the model about this surface.
             origin_channel="google_chat",
+            # The sender's People row, for the department gate alone: this
+            # surface isn't one `people_tools` verifies, so it is never
+            # `caller_person_id` and grants nothing else.
+            gate_sender_person_id=sender_person.id if sender_person else None,
         )
-        retrieved_context = retrieve(query=message_text)
+        retrieved_context = retrieve(query=message_text, max_chars=get_settings().knowledge_chat_max_chars)
         episodic_context = format_for_prompt()
 
         chat_message = message_text
@@ -350,8 +368,11 @@ async def _process_and_reply(
             memory_text=own_words,
             fetch_own_urls=on_roster,
         )
+        from openexecutive.orchestrator.disclosure import with_chat_line
+
         await asyncio.to_thread(
-            send_reply, space_name, thread_name, response, service_account_file, service_account_email
+            send_reply, space_name, thread_name, with_chat_line(response, session_id),
+            service_account_file, service_account_email,
         )
     except Exception:
         logger.exception("Google Chat: handler error for message %s", message_name)

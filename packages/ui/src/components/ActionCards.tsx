@@ -3,6 +3,9 @@
 import { useCallback, useEffect, useState } from "react";
 
 import Button from "@/components/ui/Button";
+import NextTimeTick from "@/components/NextTimeTick";
+import ChatAppActionCard from "@/components/ChatAppActionCard";
+import ChatMeetingCard from "@/components/ChatMeetingCard";
 import FeatureName from "@/components/FeatureName";
 import {
   approveActionCard,
@@ -27,7 +30,7 @@ export function useActionCards() {
     const controller = new AbortController();
     getActionCards(controller.signal)
       .then(setCards)
-      .catch(() => { /* no card is better than a broken one */ });
+      .catch(() => setCards([])); // no card is better than a broken one
     return () => controller.abort();
   }, []);
 
@@ -35,19 +38,20 @@ export function useActionCards() {
     setCards((prev) => (prev ?? []).filter((c) => c.decision_id !== decisionId));
   }, []);
 
-  return { cards: cards ?? [], gone };
+  return { cards: cards ?? [], loaded: cards !== null, gone };
 }
 
 // What the action cards are, for the Needs you header's tip.
 export const ACTION_CARDS_TIP =
   "Things your email called for that the Executive can't do on its own after reading it: " +
-  "a meeting, a message to someone, a new contact. Each is shown exactly as it will happen, " +
+  "a meeting, a message to someone, a new contact, a rename or move in Drive. Each is shown exactly as it will happen, " +
   "and nothing happens until you tap Approve. Untick anything you don't want. Only you see these.";
 
 const KIND_LABEL: Record<string, string> = {
   invite: "Meeting",
   message: "Message",
   add_contact: "New contact",
+  drive_files: "Drive files",
 };
 
 const RESULT_LABEL: Record<string, string> = {
@@ -86,7 +90,9 @@ export function ActionCardItem({
       return next;
     });
 
-  // `allow`: Approve + allow, with Suggested actions in training.
+  // `nextTime`: the "on its own next time" tick, with Suggested actions in
+  // training: Approve then also allows the same kind with the same people.
+  const [nextTime, setNextTime] = useState(false);
   const [allowed, setAllowed] = useState(false);
   const approve = async (allow = false) => {
     setBusy("Doing it…");
@@ -183,19 +189,30 @@ export function ActionCardItem({
           </Button>
         </div>
       ) : (
+        <>
+        {card.can_allow && (
+          <NextTimeTick
+            className="mt-4"
+            checked={nextTime}
+            disabled={busy !== null}
+            onChange={setNextTime}
+            label={ticked.size > 1 ? "Do these on their own next time" : "Do this on its own next time"}
+            help="Same kind, same people. You can undo this in Act as me."
+          />
+        )}
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <Button variant="primary" onClick={() => void approve()} disabled={busy !== null || ticked.size === 0}>
+          <Button
+            variant="primary"
+            onClick={() => void approve(Boolean(card.can_allow) && nextTime)}
+            disabled={busy !== null || ticked.size === 0}
+          >
             {busy ?? (ticked.size === card.actions.length ? "Approve" : `Approve ${ticked.size}`)}
           </Button>
-          {card.can_allow && busy === null && (
-            <Button variant="secondary" onClick={() => void approve(true)} disabled={ticked.size === 0}>
-              Approve + allow
-            </Button>
-          )}
           <Button variant="ghost" className="ml-auto" onClick={() => void dismiss()} disabled={busy !== null}>
             Dismiss
           </Button>
         </div>
+        </>
       )}
       {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
     </article>
@@ -206,13 +223,23 @@ export function ActionCardItem({
 // ids), shown under it while they wait. A card already approved, dismissed
 // or expired shows nothing here; its chip still links to Today.
 export function ChatActionCards({ ids }: { ids: number[] }) {
-  const { cards, gone } = useActionCards();
+  const { cards, loaded, gone } = useActionCards();
   const shown = cards.filter((c) => ids.includes(c.decision_id));
-  if (shown.length === 0) return null;
+  // Any other id is an approval of another kind (a meeting, something asked
+  // for in chat), shown by its own card once the action cards are known not to
+  // hold it. Each card shows only its own kind.
+  const others = loaded ? ids.filter((id) => !cards.some((c) => c.decision_id === id)) : [];
+  if (shown.length === 0 && others.length === 0) return null;
   return (
     <div className="mt-3 space-y-3">
       {shown.map((card) => (
         <ActionCardItem key={card.decision_id} card={card} onGone={gone} />
+      ))}
+      {others.map((id) => (
+        <div key={id}>
+          <ChatMeetingCard id={id} />
+          <ChatAppActionCard id={id} />
+        </div>
       ))}
     </div>
   );

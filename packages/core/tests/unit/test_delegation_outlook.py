@@ -16,6 +16,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from openexecutive.delegation import gmail as gm
 from openexecutive.delegation import outlook as ol
 from openexecutive.delegation.gmail import (
+    CalendarNotGranted,
     DelegateGmail,
     DraftSpec,
     GmailAuthError,
@@ -83,6 +85,7 @@ def test_the_script_writes_what_the_client_reads(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert load_credential(EMAIL, directory=tmp_path / "creds") == OutlookCredential(
         email=EMAIL, refresh_token="r1", client_id="cid", tenant="11111111-2222-3333-4444-555555555555",
+        scopes=frozenset({"user.read", "mail.readwrite", "mail.send"}),
     )
     # No secret is ever written into a person's file, and the token stays out of a repr.
     assert "client_secret" not in path.read_text()
@@ -446,6 +449,25 @@ def test_search_threads_lists_each_conversation_once() -> None:
     assert asyncio.run(graph.client().search_threads("in:inbox")) == []
 
 
+def test_search_threads_proves_each_sender() -> None:
+    def found(address: str, **extra: Any) -> dict[str, Any]:
+        return {"conversationId": f"c-{len(graph.listing)}", "subject": "Pilot",
+                "from": {"emailAddress": {"name": "Dana", "address": address}},
+                "internetMessageHeaders": [
+                    {"name": "From", "value": f"Dana <{address}>"},
+                    {"name": "Authentication-Results", "value": EXCHANGE_PASS},
+                ], **extra}
+
+    graph = FakeGraph()
+    graph.listing = []
+    graph.listing.append(found("dana@northpeak.example"))
+    graph.listing.append(found("dana@elsewhere.example"))  # a verdict for another domain
+    graph.listing.append(found("dana@northpeak.example", isDraft=True))
+    proven = asyncio.run(graph.client().search_threads("pilot"))
+    assert [t.sender_authenticated for t in proven] == [True, False, False]
+    assert "internetMessageHeaders" in graph.graph_calls()[-1].url.params["$select"]
+
+
 def test_list_sent_reads_sent_items_as_sent() -> None:
     graph = FakeGraph()
     graph.listing = [_msg("s1", sender=EMAIL, parentFolderId=SENT_FOLDER)]
@@ -490,10 +512,43 @@ def test_exchange_authenticated_reads_only_its_own_verdict() -> None:
     assert exchange_authenticated(_headers(doubled), "dana@northpeak.example") is False
     assert exchange_authenticated(_headers("mx.google.com; " + EXCHANGE_PASS), "dana@northpeak.example") is False
     assert exchange_authenticated(_headers(EXCHANGE_PASS), "other@northpeak.example") is False
-    # A header the sender wrote that EOP never stamped has no compauth verdict.
+    # A stamp without EOP's compauth= verdict is not EOP's shape.
     unstamped = "spf=pass smtp.mailfrom=northpeak.example; dmarc=pass action=none header.from=northpeak.example"
     assert exchange_authenticated(_headers(unstamped), "dana@northpeak.example") is False
     assert exchange_authenticated(_headers(EXCHANGE_PASS + ";compauth=pass reason=100"), "dana@northpeak.example") is False
+
+
+EXCHANGE_NO_DMARC = ("spf=pass (sender IP is 1.2.3.4) smtp.mailfrom=northpeak.example; dkim=pass (signature was "
+                     "verified) header.d=northpeak.example;dmarc=none action=none header.from=northpeak.example;"
+                     "compauth=pass reason=102")
+
+
+def test_a_domain_without_dmarc_passes_on_its_own_dkim_only() -> None:
+    dana = "dana@northpeak.example"
+    assert exchange_authenticated(_headers(EXCHANGE_NO_DMARC), dana) is True
+    best_guess = EXCHANGE_NO_DMARC.replace("dmarc=none", "dmarc=bestguesspass")
+    assert exchange_authenticated(_headers(best_guess), dana) is True
+    # Microsoft 365's default key is the tenant's onmicrosoft.com domain: not theirs.
+    default_key = EXCHANGE_NO_DMARC.replace("header.d=northpeak.example", "header.d=northpeak.onmicrosoft.com")
+    assert exchange_authenticated(_headers(default_key), dana) is False
+    # SPF alone, a failed signature, or dmarc=none for another domain.
+    assert exchange_authenticated(_headers(EXCHANGE_NO_DMARC.replace("dkim=pass", "dkim=none")), dana) is False
+    assert exchange_authenticated(_headers(EXCHANGE_NO_DMARC.replace("dkim=pass", "dkim=fail")), dana) is False
+    other = EXCHANGE_NO_DMARC.replace("header.from=northpeak", "header.from=evil")
+    assert exchange_authenticated(_headers(other), dana) is False
+    # A HELO echo carrying a signature of its own, ahead of Exchange's real one.
+    helo = ("spf=none (sender IP is 203.0.113.9) smtp.helo=x;dkim=pass header.d=northpeak.example; "
+            "dkim=none (message not signed) header.d=none;dmarc=none action=none "
+            "header.from=northpeak.example;compauth=fail reason=001")
+    assert exchange_authenticated(_headers(helo), dana) is False
+    two = EXCHANGE_NO_DMARC.replace("dkim=pass", "dkim=none header.d=none;dkim=pass", 1)
+    assert exchange_authenticated(_headers(two), dana) is False
+
+
+def test_mail_a_list_resent_never_passes() -> None:
+    msg = _headers(EXCHANGE_PASS)
+    msg["List-Id"] = "<all.northpeak.example>"
+    assert exchange_authenticated(msg, "dana@northpeak.example") is False
 
 
 def test_a_parsed_message_carries_the_verdict() -> None:
@@ -619,6 +674,20 @@ def test_update_draft_text_changes_only_the_version_it_saw() -> None:
     assert graph.messages["d1"]["body"]["content"] == "Friday at 10 works."
 
 
+
+def test_update_draft_text_can_change_who_it_goes_to() -> None:
+    graph = FakeGraph()
+    graph.messages["d1"] = _msg("d1", isDraft=True)
+    client = graph.client()
+    asyncio.run(client.update_draft_text(
+        "d1", ol.draft_version("d1", "ck1"), "Hi", to=["dana@x.example"], cc=["ben@x.example"],
+    ))
+    patch = next(r for r in graph.graph_calls() if r.method == "PATCH")
+    sent = json.loads(patch.content)
+    assert sent["toRecipients"] == [{"emailAddress": {"address": "dana@x.example"}}]
+    assert sent["ccRecipients"] == [{"emailAddress": {"address": "ben@x.example"}}]
+
+
 @pytest.mark.parametrize("fields", [
     {"hasAttachments": True},
     {"body": {"contentType": "html", "content": "<p>Hi</p>"}},
@@ -699,3 +768,283 @@ def test_a_chat_chip_links_to_an_outlook_draft() -> None:
     evil = json.dumps({"status": "drafted", "to": [], "gmail_link": "https://outlook.office.com.evil.example/mail/"})
     chip = summarize_action(tool_name="ghostwrite_email", tool_input={}, tool_result=evil)
     assert chip is not None and chip["link"] is None
+
+
+
+# --------------------------------------------------------------------------- #
+# Read my calendar
+# --------------------------------------------------------------------------- #
+
+
+_DAY = (datetime(2026, 10, 14, 7, tzinfo=UTC), datetime(2026, 10, 15, 7, tzinfo=UTC))
+_CALENDAR = {
+    "value": [
+        {"id": "e1", "subject": "Pilot review", "isAllDay": False,
+         "start": {"dateTime": "2026-10-14T16:00:00.0000000", "timeZone": "UTC"},
+         "end": {"dateTime": "2026-10-14T16:30:00.0000000", "timeZone": "UTC"},
+         "location": {"displayName": "Room 4"},
+         "organizer": {"emailAddress": {"name": "Dana", "address": "dana@northpeak.example"}},
+         "responseStatus": {"response": "tentativelyAccepted"}},
+        {"id": "e2", "subject": "Gone", "isCancelled": True, "start": {"dateTime": "2026-10-14T17:00:00"}},
+        {"id": "e3", "subject": "Offsite", "isAllDay": True, "start": {"dateTime": "2026-10-14T00:00:00.0000000"},
+         "end": {"dateTime": "2026-10-15T00:00:00.0000000"}},
+    ],
+}
+
+
+def _calendar_graph(scope: str, *, status: int = 200) -> tuple[list[httpx.Request], DelegateOutlook]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "login.microsoftonline.com":
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3600, "scope": scope})
+        return httpx.Response(status, json=_CALENDAR if status == 200 else {"error": {"code": "x"}})
+
+    cred = OutlookCredential(email=EMAIL, refresh_token="r1", client_id="cid", tenant="common")
+    return seen, DelegateOutlook(EMAIL, credential=cred, transport=httpx.MockTransport(handler))
+
+
+_MAIL = "https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send"
+
+
+def test_their_outlook_calendar_is_read_in_utc() -> None:
+    seen, client = _calendar_graph(f"{_MAIL} https://graph.microsoft.com/Calendars.Read")
+    events = asyncio.run(client.list_events(*_DAY))
+    assert [e.id for e in events] == ["e1", "e3"]
+    pilot, offsite = events
+    assert pilot.start == "2026-10-14T16:00:00+00:00" and pilot.response == "tentative"
+    assert pilot.location == "Room 4" and pilot.organizer == "Dana <dana@northpeak.example>"
+    assert offsite.all_day and offsite.start == "2026-10-14"
+    call = seen[-1]
+    assert call.url.path == "/v1.0/me/calendarView" and call.headers["Prefer"] == 'outlook.timezone="UTC"'
+
+
+def test_an_outlook_sign_in_without_the_calendar_says_so() -> None:
+    seen, client = _calendar_graph(_MAIL)
+    with pytest.raises(CalendarNotGranted):
+        asyncio.run(client.list_events(*_DAY))
+    assert all(r.url.host == "login.microsoftonline.com" for r in seen)
+    _seen, refused = _calendar_graph("", status=403)
+    with pytest.raises(CalendarNotGranted):
+        asyncio.run(refused.list_events(*_DAY))
+
+
+def test_an_outlook_sign_in_says_whether_it_includes_the_calendar() -> None:
+    _seen, with_it = _calendar_graph(f"{_MAIL} https://graph.microsoft.com/Calendars.Read")
+    assert asyncio.run(with_it.calendar_granted()) is True
+    ol._TOKENS.clear()
+    _seen, without = _calendar_graph(_MAIL)
+    assert asyncio.run(without.calendar_granted()) is False
+
+
+def test_the_outlook_script_asks_for_the_calendar_only_with_the_flag() -> None:
+    script = _script()
+    assert "Calendars.Read" not in script.SCOPE
+    assert "https://graph.microsoft.com/Calendars.Read" in script.scope_for((*script.GRAPH_SCOPES, script.CALENDAR_SCOPE))
+
+
+def test_the_refresh_asks_for_the_calendar_only_when_it_was_granted(tmp_path: Path) -> None:
+    script = _script()
+    payload = script.credential_payload(
+        EMAIL, "r1", "cid", "common", personal=False, graph_scopes=(*script.GRAPH_SCOPES, script.CALENDAR_SCOPE),
+    )
+    script.write_credential(tmp_path, EMAIL, payload)
+    with_calendar = load_credential(EMAIL, directory=tmp_path)
+    assert with_calendar is not None
+    # --calendar asks for Calendars.ReadWrite now (it answers invites), and
+    # the refresh keeps asking for it.
+    assert unquote(_refresh_form(with_calendar)["scope"]).endswith("https://graph.microsoft.com/Calendars.ReadWrite")
+    _write(tmp_path)
+    mail_only = load_credential(EMAIL, directory=tmp_path)
+    assert mail_only is not None and "Calendars" not in unquote(_refresh_form(mail_only)["scope"])
+
+
+def _refresh_form(cred: OutlookCredential) -> dict[str, str]:
+    """The form one token refresh for ``cred`` posts."""
+    forms: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        forms.append(dict(pair.split("=", 1) for pair in request.content.decode().split("&")))
+        return httpx.Response(200, json={"access_token": "at", "expires_in": 3600, "scope": ""})
+
+    async def refresh() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            await DelegateOutlook(EMAIL, credential=cred)._access_token(http)
+
+    ol._TOKENS.clear()
+    asyncio.run(refresh())
+    return forms[0]
+
+
+def test_an_outlook_all_day_event_keeps_its_day_east_and_west_of_utc() -> None:
+    def day(start: str, end: str, zone: str) -> tuple[str, str]:
+        event = ol.parse_event({"id": "e", "subject": "Offsite", "isAllDay": True,
+                                "start": {"dateTime": start}, "end": {"dateTime": end}}, ZoneInfo(zone))
+        assert event is not None
+        return event.start, event.end
+
+    # The 14th's midnight, shown in UTC: Tokyo 15:00 and Auckland (+13) 11:00
+    # on the 13th, New York 04:00 on the 14th.
+    assert day("2026-10-13T15:00:00.0000000", "2026-10-14T15:00:00.0000000", "Asia/Tokyo") == ("2026-10-14", "2026-10-15")
+    assert day("2026-10-13T11:00:00.0000000", "2026-10-14T11:00:00.0000000", "Pacific/Auckland") == (
+        "2026-10-14", "2026-10-15",
+    )
+    assert day("2026-10-14T04:00:00.0000000", "2026-10-15T04:00:00.0000000", "America/New_York") == (
+        "2026-10-14", "2026-10-15",
+    )
+
+
+def _new_draft_graph() -> tuple[list[httpx.Request], Any]:
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "login.microsoftonline.com":
+            return FakeGraph().handle(request)
+        seen.append(request)
+        path = unquote(request.url.path)
+        if request.method == "POST" and path == "/v1.0/me/messages":
+            return httpx.Response(201, json={"id": "new1", "changeKey": "k1", "conversationId": "c9"})
+        if request.method == "POST" and path == "/v1.0/me/messages/new1/attachments":
+            return httpx.Response(201, json={"id": "a1"})
+        if request.method == "GET" and path == "/v1.0/me/messages/new1":
+            return httpx.Response(200, json={"id": "new1", "changeKey": "k3", "conversationId": "c9"})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(400)
+
+    return seen, handle
+
+
+def test_a_new_draft_carries_its_files_and_leaves_off_one_too_large() -> None:
+    seen, handle = _new_draft_graph()
+    client = DelegateOutlook(EMAIL, credential=OutlookCredential(EMAIL, "r1", "cid", "common"),
+                             transport=httpx.MockTransport(handle))
+    big = b"x" * (ol.OUTLOOK_ATTACHMENT_MAX_BYTES + 1)
+    created = asyncio.run(client.create_draft(DraftSpec(
+        to=["dana@northpeak.example"], subject="Bills", body="Attached.",
+        attachments=[("bill.pdf", "application/pdf", b"%PDF-1"), ("huge.pdf", "application/pdf", big)],
+    )))
+    uploads = [r for r in seen if r.url.path.endswith("/attachments")]
+    assert len(uploads) == 1
+    body = json.loads(uploads[0].content)
+    assert body["name"] == "bill.pdf" and base64.b64decode(body["contentBytes"]) == b"%PDF-1"
+    # The version moved with the upload, so a later edit compares the right one.
+    assert created.message_id == "new1.k3" and created.skipped_attachments == 1
+
+
+def test_a_draft_whose_file_fails_is_removed() -> None:
+    seen, handle = _new_draft_graph()
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/attachments"):
+            seen.append(request)
+            return httpx.Response(500, json={"error": {"code": "x"}})
+        return handle(request)
+
+    client = DelegateOutlook(EMAIL, credential=OutlookCredential(EMAIL, "r1", "cid", "common"),
+                             transport=httpx.MockTransport(failing))
+    with pytest.raises(GmailError):
+        asyncio.run(client.create_draft(DraftSpec(
+            to=["a@b.example"], subject="x", body="y", attachments=[("a.pdf", "application/pdf", b"1")],
+        )))
+    assert any(r.method == "DELETE" and r.url.path.endswith("/messages/new1") for r in seen)
+
+
+def test_latest_from_asks_for_one_senders_newest_inbox_mail() -> None:
+    graph = FakeGraph()
+    graph.listing = [_msg("in1", sender="o'neil@x.example")]
+    found = asyncio.run(graph.client().latest_from("O'Neil@x.example"))
+    assert found is not None and found.id == "in1"
+    call = graph.graph_calls()[-1]
+    assert call.url.path == "/v1.0/me/mailFolders/inbox/messages"
+    flt = call.url.params["$filter"]
+    assert flt.startswith("receivedDateTime ge ") and flt.endswith("from/emailAddress/address eq 'o''neil@x.example'")
+    assert call.url.params["$orderby"] == "receivedDateTime desc"
+    graph.listing = []
+    assert asyncio.run(graph.client().latest_from("dana@northpeak.example")) is None
+    assert asyncio.run(graph.client().latest_from("not an address")) is None
+
+
+def test_each_recipient_keeps_the_name_it_was_written_with() -> None:
+    raw = _msg("m1", toRecipients=[{"emailAddress": {"name": "Priya Shah", "address": "Priya@N.example"}}],
+               ccRecipients=[{"emailAddress": {"address": "bare@x.example"}}])
+    assert ol.parse_message(raw, SENT_FOLDER, EMAIL).names == {"priya@n.example": "Priya Shah", "bare@x.example": ""}
+
+
+# --------------------------------------------------------------------------- #
+# Meeting invites (delegation.invites)
+# --------------------------------------------------------------------------- #
+
+
+def _invite_graph(scope: str, message: dict[str, Any] | None = None) -> tuple[list[httpx.Request], DelegateOutlook]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "login.microsoftonline.com":
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3600, "scope": scope})
+        if request.method == "POST":
+            return httpx.Response(202)
+        return httpx.Response(200, json=message or {})
+
+    cred = OutlookCredential(email=EMAIL, refresh_token="r1", client_id="cid", tenant="common")
+    return seen, DelegateOutlook(EMAIL, credential=cred, transport=httpx.MockTransport(handler))
+
+
+def test_an_outlook_invite_is_its_own_event() -> None:
+    from openexecutive.delegation.gmail import MailMessage
+
+    ol._TOKENS.clear()
+    message = {
+        "id": "m1", "meetingMessageType": "meetingRequest",
+        "event": {"id": "ev1", "subject": "Pilot review", "isAllDay": False,
+                  "start": {"dateTime": "2026-10-14T16:00:00.0000000", "timeZone": "UTC"},
+                  "end": {"dateTime": "2026-10-14T16:30:00.0000000", "timeZone": "UTC"},
+                  "organizer": {"emailAddress": {"name": "Dana", "address": "dana@northpeak.example"}},
+                  "responseStatus": {"response": "notResponded"}},
+    }
+    seen, client = _invite_graph(f"{_MAIL} https://graph.microsoft.com/Calendars.ReadWrite", message)
+    event = asyncio.run(client.find_invite(MailMessage(id="m1", thread_id="c1", calendar_invite=True)))
+    assert event is not None and (event.id, event.response) == ("ev1", "needs_action")
+    assert event.start == "2026-10-14T16:00:00+00:00"
+    call = seen[-1]
+    assert call.url.path == "/v1.0/me/messages/m1" and "eventMessage/event" in call.url.params["$expand"]
+    ol._TOKENS.clear()
+    _seen, cancelled = _invite_graph(_MAIL + " https://graph.microsoft.com/Calendars.ReadWrite",
+                                     {**message, "meetingMessageType": "meetingCancelled"})
+    assert asyncio.run(cancelled.find_invite(MailMessage(id="m1", thread_id="c1"))) is None
+
+
+def test_an_outlook_answer_is_graphs_accept_or_decline() -> None:
+    ol._TOKENS.clear()
+    seen, client = _invite_graph(f"{_MAIL} https://graph.microsoft.com/Calendars.ReadWrite")
+    assert asyncio.run(client.calendar_write_granted()) is True
+    asyncio.run(client.answer_invite("ev1", accept=True))
+    asyncio.run(client.answer_invite("ev1", accept=False))
+    posts = [r for r in seen if r.method == "POST" and r.url.host == "graph.microsoft.com"]
+    assert [r.url.path for r in posts] == ["/v1.0/me/events/ev1/accept", "/v1.0/me/events/ev1/decline"]
+    assert all(json.loads(r.content) == {"sendResponse": True} for r in posts)
+
+
+def test_an_outlook_read_only_sign_in_cannot_answer() -> None:
+    from openexecutive.delegation.gmail import CalendarWriteNotGranted
+
+    ol._TOKENS.clear()
+    seen, client = _invite_graph(f"{_MAIL} https://graph.microsoft.com/Calendars.Read")
+    assert asyncio.run(client.calendar_granted()) is True
+    assert asyncio.run(client.calendar_write_granted()) is False
+    with pytest.raises(CalendarWriteNotGranted):
+        asyncio.run(client.answer_invite("ev1", accept=True))
+    assert all(r.url.host == "login.microsoftonline.com" for r in seen)
+
+
+def test_an_older_read_only_credential_keeps_asking_for_read(tmp_path: Path) -> None:
+    script = _script()
+    payload = script.credential_payload(
+        EMAIL, "r1", "cid", "common", personal=False, graph_scopes=(*script.GRAPH_SCOPES, "Calendars.Read"),
+    )
+    script.write_credential(tmp_path, EMAIL, payload)
+    older = load_credential(EMAIL, directory=tmp_path)
+    assert older is not None
+    assert unquote(_refresh_form(older)["scope"]).endswith("https://graph.microsoft.com/Calendars.Read")

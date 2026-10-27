@@ -99,6 +99,62 @@ def test_drift_waiver_needs_own_line_and_reason(text: str) -> None:
     assert _level(pr_checks.check_arch_drift, changed=changed, waiver_text=text) == "FAIL"
 
 
+# --- guide-drift -------------------------------------------------------------
+
+UI = "packages/ui/src/"
+GUIDE = PKG + "guide/prebuilt/"
+
+
+def test_guide_drift_fails_when_a_screen_changes_without_its_section() -> None:
+    changed = {UI + "app/chats/page.tsx", GUIDE + "people.json"}
+    result = pr_checks.check_guide_drift(Change(changed=changed))
+    assert result.level == "FAIL"
+    assert "app/chats/page.tsx" in result.detail and "chat" in result.detail
+
+
+def test_guide_drift_passes_when_its_section_changes() -> None:
+    changed = {UI + "components/sessions/ShareDialog.tsx", GUIDE + "chat.json"}
+    assert _level(pr_checks.check_guide_drift, changed=changed) == "PASS"
+
+
+def test_guide_drift_longest_prefix_wins() -> None:
+    changed = {UI + "app/settings/tools/page.tsx", GUIDE + "settings.json"}
+    assert _level(pr_checks.check_guide_drift, changed=changed) == "FAIL"
+    changed = {UI + "app/settings/tools/page.tsx", GUIDE + "custom_tools.json"}
+    assert _level(pr_checks.check_guide_drift, changed=changed) == "PASS"
+
+
+def test_guide_drift_ignores_unmapped_paths_tests_and_styles() -> None:
+    changed = {
+        UI + "components/shell/AppShell.tsx",
+        UI + "app/chats/chats.test.ts",
+        UI + "app/globals.css",
+        UI + "app/api/chat/route.ts",
+        PKG + "orchestrator/executive.py",
+    }
+    assert _level(pr_checks.check_guide_drift, changed=changed) == "PASS"
+
+
+@pytest.mark.parametrize("text", ["Guide: n/a - spacing only", "x\n\nguide: N/A — refactor"])
+def test_guide_drift_waiver_line_passes(text: str) -> None:
+    changed = {UI + "app/people/page.tsx"}
+    assert _level(pr_checks.check_guide_drift, changed=changed, waiver_text=text) == "PASS"
+
+
+@pytest.mark.parametrize("text", ["see Guide: n/a - x", "Guide: n/a", "Arch-Docs: n/a - x"])
+def test_guide_drift_waiver_needs_own_line_and_reason(text: str) -> None:
+    changed = {UI + "app/people/page.tsx"}
+    assert _level(pr_checks.check_guide_drift, changed=changed, waiver_text=text) == "FAIL"
+
+
+def test_guide_drift_ids_are_guide_sections() -> None:
+    from openexecutive.guide.sections import GUIDE_SECTIONS
+
+    ids = {s.id for s in GUIDE_SECTIONS}
+    for prefix, sections in pr_checks.GUIDE_FOR.items():
+        assert sections <= ids, prefix
+
+
 # --- no-stubs ----------------------------------------------------------------
 
 
@@ -298,6 +354,55 @@ def test_tests_present_warns_only() -> None:
     assert _level(pr_checks.check_tests_present, changed=changed) == "WARN"
     changed.add("packages/core/tests/unit/test_store.py")
     assert _level(pr_checks.check_tests_present, changed=changed) == "PASS"
+
+
+# --- pinned-actions ----------------------------------------------------------
+
+_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "      - uses: actions/checkout@v7",
+        "        uses: astral-sh/setup-uv@v7.6.0",
+        "      - uses: 'actions/setup-node@main'",
+        "      - uses: actions/checkout@3d3c42e  # short sha",
+    ],
+)
+def test_pinned_actions_fails_on_a_tag_or_branch(line: str) -> None:
+    lines = {".github/workflows/ci.yml": [line]}
+    assert _level(pr_checks.check_pinned_actions, changed=set(lines), added_lines=lines) == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"      - uses: actions/checkout@{_SHA} # v7.0.1",
+        f'        uses: "actions/checkout@{_SHA}"',
+        "      - uses: ./.github/actions/setup",
+        "      - uses: docker://alpine:3.20",
+        "      - run: echo uses: actions/checkout@v7",
+    ],
+)
+def test_pinned_actions_passes_shas_and_local_actions(line: str) -> None:
+    lines = {".github/workflows/ci.yml": [line]}
+    assert _level(pr_checks.check_pinned_actions, changed=set(lines), added_lines=lines) == "PASS"
+
+
+def test_pinned_actions_only_reads_workflow_files() -> None:
+    lines = {"docs/ci.md": ["- uses: actions/checkout@v7"]}
+    assert _level(pr_checks.check_pinned_actions, changed=set(lines), added_lines=lines) == "PASS"
+
+
+def test_every_workflow_in_the_repo_pins_its_actions() -> None:
+    root = _SCRIPT.parents[1]
+    lines = {
+        str(p.relative_to(root)): p.read_text().splitlines()
+        for p in (root / ".github").rglob("*.y*ml")
+    }
+    result = pr_checks.check_pinned_actions(Change(changed=set(lines), added_lines=lines))
+    assert result.level == "PASS", result.detail
 
 
 # --- git plumbing ------------------------------------------------------------

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openexecutive.alerts import approvals
 from openexecutive.alerts import store as alert_store
 from openexecutive.audit import logger as audit_logger_module
 from openexecutive.departments import registry as dept_registry
@@ -114,6 +115,9 @@ def test_propose_only_creates_alert_no_dispatch() -> None:
     assert len(alerts) == 1
     assert alerts[0].routed_to_person_id == approver_id
     assert "department:finance" in alerts[0].topic_tags
+    # Approving the card queues this exact action (POST /alerts/{id}/approve).
+    assert approvals.held_action_id(alerts[0].id) == action.id
+    assert alerts[0].source == "authority_gate"
     # The "If you approve:" line is now a concrete executive action,
     # not the old circular "Review and approve or reject this action."
     assert alerts[0].suggested_action.startswith("Send this")
@@ -269,7 +273,7 @@ def test_escalate_creates_urgent_alert_and_holds() -> None:
     ) as mock_chat:
         asyncio.run(_execute_action(action, gateway=None))
 
-    # Nothing is sent: "Escalates to a human" promises the specialist will not act.
+    # Nothing is sent: "Escalates to a person" promises the specialist will not act.
     mock_chat.assert_not_called()
 
     # An urgent card went to the approver instead.
@@ -279,6 +283,7 @@ def test_escalate_creates_urgent_alert_and_holds() -> None:
     assert alerts[0].severity == "high"  # ranks above routine proposals
     assert alerts[0].routed_to_person_id == principal_id
     assert "department:legal" in alerts[0].topic_tags
+    assert approvals.held_action_id(alerts[0].id) == action.id
     # Escalation phrasing is the concrete action with an urgency tail — what
     # approving the card will do, not something already done.
     assert alerts[0].suggested_action.startswith("Send this")
@@ -635,6 +640,63 @@ def test_check_in_failure_after_retries_still_chains(monkeypatch: pytest.MonkeyP
     assert _status(action) == "failed"
     pending = _pending_cadences()
     assert len(pending) == 1 and pending[0].id != action.id
+    # Nobody watched it fail: one card on Home offers Run again.
+    (card,) = alert_store.list_alerts()
+    assert card.source == "workflow_failed"
+    assert card.headline == "Finance check-in didn't finish"
+    (run,) = wf_persistence.list_runs(workflow_name="department_check_in")
+    assert f"failed_run:{run['run_id']}" in card.topic_tags
+
+
+def test_a_retried_attempt_files_no_card_and_repeat_failures_share_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dept_store.seed_default_departments()
+    dept_store.insert_goal(
+        "finance", period_value="Q3 2026", key_result="Close the round", target="$2M",
+    )
+    dept_registry.invalidate()
+    _check_in_calls(monkeypatch, fail=True)
+
+    asyncio.run(_execute_action(_cadence_action(), gateway=None))
+    assert alert_store.list_alerts() == []  # retries left: not a failure yet
+
+    with episodic._get_conn(episodic.DB_PATH) as conn:
+        conn.execute("UPDATE scheduled_actions SET status = 'cancelled'")
+    for _ in range(2):
+        asyncio.run(_execute_action(_cadence_action(attempts=3), gateway=None))
+        with episodic._get_conn(episodic.DB_PATH) as conn:
+            conn.execute("UPDATE scheduled_actions SET status = 'cancelled'")
+    (card,) = alert_store.list_alerts()
+    assert card.occurrence_count == 2
+
+
+def test_run_again_runs_once_past_the_skip_rule_and_adds_no_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.workflows.failure_alerts import file_failed_run_card, queue_rerun
+
+    dept_store.seed_default_departments()  # no goals: a scheduled fire is skipped
+    dept_registry.invalidate()
+    calls = _check_in_calls(monkeypatch)
+    wf_persistence.create_run(
+        "r-failed", "department_check_in", "Check-in: finance",
+        {"department_slug": "finance", "period_label": "2026-10-12"},
+    )
+    wf_persistence.fail_run("r-failed", "boom")
+    file_failed_run_card(
+        run_id="r-failed", workflow_name="department_check_in", title="Finance check-in",
+        scope="finance",
+    )
+    queue_rerun(wf_persistence.get_run("r-failed") or {})
+    (action,) = episodic.claim_due_actions(_now())
+    assert action.scope_key == "rerun:r-failed"
+
+    asyncio.run(_execute_action(action, gateway=None))
+
+    assert calls == ["finance"]
+    assert _status(action) == "done"
+    assert len(_pending_cadences()) == 1  # the next occurrence, once
 
 
 def test_final_attempt_that_chained_before_failing_does_not_chain_twice(

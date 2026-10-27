@@ -39,6 +39,13 @@ _SENSITIVE_SUBSTRINGS = (
     "apikey",
     # Email/chat content tools — bodies are too long and may contain PII.
     "get_gmail_message_content",
+    # The rest of Gmail's readers: a thread, a batch, a search listing
+    # (subjects and senders) and an attachment.
+    "gmail_thread",
+    "gmail_threads",
+    "gmail_messages_content",
+    "search_gmail_messages",
+    "gmail_attachment",
     "read_file_content",
     "download_file_content",
     "get_thread",
@@ -71,8 +78,10 @@ _SENSITIVE_SUBSTRINGS = (
     # out of them too — the tool writes its own metadata-only row.
     "ghostwrite",
     # Act as me: search_my_email, read_my_email, read_my_email_attachment and
-    # my_email_awaiting_reply return the speaker's own mail.
+    # my_email_awaiting_reply return the speaker's own mail; my_calendar
+    # their own calendar.
     "my_email",
+    "my_calendar",
     # Always in the loop: recall_history returns the speaker's own notes,
     # private to them.
     "recall_history",

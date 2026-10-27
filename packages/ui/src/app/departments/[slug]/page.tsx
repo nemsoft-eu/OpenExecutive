@@ -1,26 +1,39 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AddGoalForm, GoalRow } from "@/components/goals/GoalEditor";
 import Button from "@/components/ui/Button";
+import ChatPicker, { useChatDirectory } from "@/components/ui/ChatPicker";
 import OverflowMenu from "@/components/ui/OverflowMenu";
 import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import SidePanel from "@/components/ui/SidePanel";
+import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import {
   deleteDepartment,
   getDepartment,
   listPeople,
   updateDepartment,
   type DepartmentConfig,
-  type DepartmentState,
+  type DepartmentDetail,
   type Goal,
   type Person,
 } from "@/lib/api";
+import { type ChatProvider, closestOption, findOption } from "@/lib/chatDirectory";
+import {
+  WEEKDAYS,
+  checkInSpec,
+  describeCheckIn,
+  formatNextCheckIn,
+  parseCheckIn,
+  withKind,
+  type CheckInChoice,
+  type Weekday,
+} from "@/lib/checkInCadence";
 
 // Auto-refresh cadence for the detail page. The `dept_cadence` scheduler
-// fires at most once per department per cadence (default daily), so any
+// fires at most once per department per cadence (default weekly), so any
 // poll faster than ~30s is overkill for review-driven status changes
 // but keeps the page feeling live for cross-tab edits.
 const POLL_INTERVAL_MS = 30_000;
@@ -48,7 +61,7 @@ const AUTHORITY_META: Record<
     hint: "The specialist drafts actions and routes them to a person for approval before anything happens.",
   },
   escalate: {
-    label: "Escalates to a human",
+    label: "Escalates to a person",
     hint: "The specialist will not act — it forwards everything to a human.",
   },
 };
@@ -74,6 +87,91 @@ const LABEL_CLS = "text-sm text-fg-muted flex flex-col gap-1.5";
 const HINT_CLS = "text-[13px] text-fg-subtle";
 const SECTION_INTRO_CLS = "text-[15px] text-fg-muted mb-4";
 
+const CHECK_IN_KINDS: { id: "daily" | "weekly" | "off"; label: string }[] = [
+  { id: "daily", label: "Daily" },
+  { id: "weekly", label: "Weekly" },
+  { id: "off", label: "Off" },
+];
+
+/**
+ * Daily / Weekly (a day and a time) / Off for the department's check-in.
+ * A spec the picker can't show (a quarterly one) stays as it is until one of
+ * the three is picked.
+ */
+function CheckInPicker({
+  value,
+  onChange,
+}: {
+  value: CheckInChoice;
+  onChange: (next: CheckInChoice) => void;
+}) {
+  const segCls = (active: boolean) =>
+    cls(
+      "flex-1 h-11 px-4 text-[15px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60",
+      active ? "bg-accent/15 text-fg" : "text-fg-muted hover:text-fg hover:bg-surface-overlay",
+    );
+  return (
+    <fieldset className="space-y-3">
+      <legend className="text-sm text-fg-muted mb-1.5">Recurring check-in</legend>
+      <div role="radiogroup" aria-label="How often it checks in" className="flex rounded-xl border border-line overflow-hidden divide-x divide-line">
+        {CHECK_IN_KINDS.map((k) => (
+          <button
+            key={k.id}
+            type="button"
+            role="radio"
+            aria-checked={value.kind === k.id}
+            onClick={() => onChange(withKind(value, k.id))}
+            className={segCls(value.kind === k.id)}
+          >
+            {k.label}
+          </button>
+        ))}
+      </div>
+      {value.kind === "custom" && (
+        <p className={HINT_CLS}>
+          Currently <code className="font-mono">{value.spec}</code>. Pick Daily, Weekly or Off to change it.
+        </p>
+      )}
+      {(value.kind === "daily" || value.kind === "weekly") && (
+        <div className="flex flex-wrap gap-3">
+          {value.kind === "weekly" && (
+            <label className={cls(LABEL_CLS, "flex-1 min-w-[10rem]")}>
+              Day
+              <select
+                value={value.day}
+                onChange={(e) => onChange({ ...value, day: e.target.value as Weekday })}
+                className={FIELD_CLS}
+              >
+                {WEEKDAYS.map((d) => (
+                  <option key={d.id} value={d.id}>{d.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className={cls(LABEL_CLS, "flex-1 min-w-[10rem]")}>
+            Time (UTC)
+            <input
+              type="time"
+              step={60}
+              required
+              value={value.time}
+              onChange={(e) => {
+                if (e.target.value) onChange({ ...value, time: e.target.value.slice(0, 5) });
+              }}
+              className={FIELD_CLS}
+            />
+          </label>
+        </div>
+      )}
+      <p className={HINT_CLS}>
+        {value.kind === "off"
+          ? "No scheduled check-ins. The specialist still answers when you ask."
+          : "The specialist reviews this department\u2019s goals on this schedule. You\u2019ll see it on Home."}
+      </p>
+    </fieldset>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
@@ -82,8 +180,9 @@ export default function DepartmentDetailPage() {
   const params = useParams();
   const slug = params?.slug as string;
   const router = useRouter();
+  const { mode, effectiveTimezone, refresh: refreshWorkspace } = useWorkspace();
 
-  const [dept, setDept] = useState<DepartmentState | null>(null);
+  const [dept, setDept] = useState<DepartmentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -95,7 +194,7 @@ export default function DepartmentDetailPage() {
   const [settingsForm, setSettingsForm] = useState({
     authority_level: "propose_only" as DepartmentConfig["authority_level"],
     mission: "",
-    cadences: {} as Record<string, string>,
+    checkIn: { kind: "off" } as CheckInChoice,
     headcount: "",
     budget_usd: "",
     head_person_id: null as number | null,
@@ -106,6 +205,31 @@ export default function DepartmentDetailPage() {
     watched_entities: "",
   });
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("charter");
+
+  // Slack, Discord and Telegram rooms by name (the principal's alone; for
+  // anyone else there is no list and the id fields stay).
+  const channelDirectory = useChatDirectory("channels");
+  const channelList = (p: ChatProvider) =>
+    channelDirectory === undefined ? undefined : (channelDirectory?.[p] ?? null);
+  // The room named most like the department, pre-selected while none is set.
+  const channelSuggestion = (p: "slack" | "discord") => {
+    const best = dept ? closestOption(dept.config.title, channelDirectory?.[p].options ?? []) : null;
+    return best ? { option: best, reason: "Closest match" } : null;
+  };
+  const channelName = (p: ChatProvider, id: string) =>
+    findOption(channelDirectory?.[p].options ?? [], id)?.name ?? id;
+  const setSlackChannel = useCallback(
+    (id: string) => setSettingsForm((f) => (f.slack_channel_id === id ? f : { ...f, slack_channel_id: id })),
+    [],
+  );
+  const setDiscordChannel = useCallback(
+    (id: string) => setSettingsForm((f) => (f.discord_channel_id === id ? f : { ...f, discord_channel_id: id })),
+    [],
+  );
+  const setTelegramGroup = useCallback(
+    (id: string) => setSettingsForm((f) => (f.telegram_chat_id === id ? f : { ...f, telegram_chat_id: id })),
+    [],
+  );
   const settingsTabsId = useId();
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsErr, setSettingsErr] = useState<string | null>(null);
@@ -142,7 +266,7 @@ export default function DepartmentDetailPage() {
     if (!slug) return;
     let cancelled = false;
 
-    function applyDept(d: DepartmentState, isInitial: boolean) {
+    function applyDept(d: DepartmentDetail, isInitial: boolean) {
       if (cancelled) return;
       setDept(d);
       // Don't replace `goals` while any row is being edited — the row
@@ -157,7 +281,7 @@ export default function DepartmentDetailPage() {
         setSettingsForm({
           authority_level: d.config.authority_level,
           mission: d.config.charter.mission,
-          cadences: { ...d.config.cadences },
+          checkIn: parseCheckIn(d.config.cadences.check_in),
           headcount: d.headcount != null ? String(d.headcount) : "",
           budget_usd: d.budget_usd != null ? String(d.budget_usd) : "",
           head_person_id: d.config.head_person_id,
@@ -223,7 +347,7 @@ export default function DepartmentDetailPage() {
     setSettingsForm({
       authority_level: dept.config.authority_level,
       mission: dept.config.charter.mission,
-      cadences: { ...dept.config.cadences },
+      checkIn: parseCheckIn(dept.config.cadences.check_in),
       headcount: dept.headcount != null ? String(dept.headcount) : "",
       budget_usd: dept.budget_usd != null ? String(dept.budget_usd) : "",
       head_person_id: dept.config.head_person_id,
@@ -239,12 +363,15 @@ export default function DepartmentDetailPage() {
   async function removeDepartment() {
     if (!dept) return;
     if (!window.confirm(
-      `Delete "${dept.config.title}"? This will also remove all its Goals and cannot be undone.`
+      `Delete "${dept.config.title}"? Its goals stay on the Goals page with no department, ` +
+        "each on its owner (or on the department's lead). This cannot be undone."
     )) return;
     setDeleting(true);
     setDeleteErr(null);
     try {
       await deleteDepartment(slug);
+      // The Departments tab hides once the last department is gone.
+      void refreshWorkspace();
       router.push("/departments");
     } catch (e) {
       setDeleteErr(e instanceof Error ? e.message : "Delete failed");
@@ -266,7 +393,8 @@ export default function DepartmentDetailPage() {
           scope: dept.config.charter.scope,
           out_of_scope: dept.config.charter.out_of_scope,
         },
-        cadences: settingsForm.cadences,
+        // The other named cadences ride along unchanged; "Off" is an empty spec.
+        cadences: { ...dept.config.cadences, check_in: checkInSpec(settingsForm.checkIn) },
         headcount: headcountNum,
         budget_usd: budgetNum,
         head_person_id: settingsForm.head_person_id,
@@ -355,9 +483,9 @@ export default function DepartmentDetailPage() {
                       : []),
                     ...(dept.headcount != null ? [["Headcount", String(dept.headcount)]] : []),
                     ...(dept.budget_usd != null ? [["Budget", `$${dept.budget_usd.toLocaleString()}`]] : []),
-                    ...(dept.config.slack_channel_id ? [["Slack channel", dept.config.slack_channel_id]] : []),
-                    ...(dept.config.discord_channel_id ? [["Discord channel", dept.config.discord_channel_id]] : []),
-                    ...(dept.config.telegram_chat_id ? [["Telegram chat", dept.config.telegram_chat_id]] : []),
+                    ...(dept.config.slack_channel_id ? [["Slack channel", channelName("slack", dept.config.slack_channel_id)]] : []),
+                    ...(dept.config.discord_channel_id ? [["Discord channel", channelName("discord", dept.config.discord_channel_id)]] : []),
+                    ...(dept.config.telegram_chat_id ? [["Telegram group", channelName("telegram", dept.config.telegram_chat_id)]] : []),
                     ...((dept.config.watched_entities ?? []).length > 0
                       ? [["Watched entities", (dept.config.watched_entities ?? []).join(", ")]]
                       : []),
@@ -367,18 +495,25 @@ export default function DepartmentDetailPage() {
                       <dd className="text-[15px] text-fg min-w-0 break-words">{value}</dd>
                     </div>
                   ))}
-                  {Object.entries(dept.config.cadences).length > 0 && (
-                    <div className="flex flex-col sm:flex-row sm:items-baseline gap-1 sm:gap-4 py-3">
-                      <dt className="sm:w-40 flex-shrink-0 text-sm text-fg-muted">Recurring check-in</dt>
-                      <dd className="flex flex-wrap gap-1.5 min-w-0">
-                        {Object.entries(dept.config.cadences).map(([n, s]) => (
-                          <span key={n} className="px-2.5 py-1 rounded-lg bg-surface-overlay border border-line text-sm font-mono text-fg break-all">
-                            {n}: {s}
-                          </span>
-                        ))}
-                      </dd>
-                    </div>
-                  )}
+                  <div className="flex flex-col sm:flex-row sm:items-baseline gap-0.5 sm:gap-4 py-3">
+                    <dt className="sm:w-40 flex-shrink-0 text-sm text-fg-muted">Recurring check-in</dt>
+                    <dd className="min-w-0">
+                      <div className="text-[15px] text-fg">
+                        {describeCheckIn(parseCheckIn(dept.config.cadences.check_in))}
+                      </div>
+                      {mode === "solo" ? (
+                        <div className="text-sm text-fg-muted mt-0.5">
+                          Paused while you use Open Executive just for yourself.
+                        </div>
+                      ) : (
+                        formatNextCheckIn(dept.next_check_in_at, effectiveTimezone) && (
+                          <div className="text-sm text-fg-muted mt-0.5">
+                            Next: {formatNextCheckIn(dept.next_check_in_at, effectiveTimezone)}
+                          </div>
+                        )
+                      )}
+                    </dd>
+                  </div>
                 </dl>
               </section>
 
@@ -556,37 +691,17 @@ export default function DepartmentDetailPage() {
                             </label>
                           );
                         })}
+                        <p className={HINT_CLS}>
+                          This covers the department&apos;s check-ins, scheduled messages and alerts, and what its team
+                          members ask for in chat; Operations also covers meetings people ask for. It doesn&apos;t cover
+                          what the Executive does on its own under Take the lead: Always asks first holds that.
+                        </p>
                       </fieldset>
 
-                      <div>
-                        <div className="text-sm text-fg-muted mb-1.5">Recurring check-in</div>
-                        {Object.entries(settingsForm.cadences).map(([name, spec]) => (
-                          <div key={name} className="flex items-center gap-2 mb-2">
-                            <input
-                              value={name}
-                              readOnly
-                              aria-label="Check-in name"
-                              className={`${FIELD_CLS} flex-1 min-w-0 font-mono text-sm text-fg-muted`}
-                            />
-                            <input
-                              value={spec}
-                              aria-label={`Schedule for ${name}`}
-                              onChange={(e) =>
-                                setSettingsForm((f) => ({
-                                  ...f,
-                                  cadences: { ...f.cadences, [name]: e.target.value },
-                                }))
-                              }
-                              className={`${FIELD_CLS} flex-1 min-w-0 font-mono text-sm`}
-                              placeholder="daily@09:00"
-                            />
-                          </div>
-                        ))}
-                        <p className={HINT_CLS}>
-                          When set, the specialist posts a check-in on this schedule. You&apos;ll see it on Home.
-                          Examples (UTC): <code className="font-mono">daily@09:00</code>, <code className="font-mono">weekly@mon@09:00</code>, <code className="font-mono">quarterly@01-09:00</code>.
-                        </p>
-                      </div>
+                      <CheckInPicker
+                        value={settingsForm.checkIn}
+                        onChange={(checkIn) => setSettingsForm((f) => ({ ...f, checkIn }))}
+                      />
                     </div>
                   )}
 
@@ -623,47 +738,39 @@ export default function DepartmentDetailPage() {
                   {settingsTab === "channels" && (
                     <>
                       <p className={SECTION_INTRO_CLS}>
-                        When set, the Executive can post department-scoped updates to these rooms via{" "}
-                        <code className="font-mono text-sm">send_department_message</code>. Leave blank to have OE
-                        fall back to DMing the department head.
+                        The Executive posts this department&apos;s updates in these rooms. Leave one empty and it
+                        messages the department head instead. A suggested room is only saved when you press Save.
                       </p>
-                      <div className="space-y-4">
-                        <label className={LABEL_CLS}>
-                          Slack channel ID
-                          <input
-                            type="text"
-                            value={settingsForm.slack_channel_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, slack_channel_id: e.target.value }))
-                            }
-                            placeholder="C01234ABCDE"
-                            className={`${FIELD_CLS} font-mono`}
-                          />
-                        </label>
-                        <label className={LABEL_CLS}>
-                          Discord channel ID
-                          <input
-                            type="text"
-                            value={settingsForm.discord_channel_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, discord_channel_id: e.target.value }))
-                            }
-                            placeholder="123456789012345678"
-                            className={`${FIELD_CLS} font-mono`}
-                          />
-                        </label>
-                        <label className={LABEL_CLS}>
-                          Telegram chat ID
-                          <input
-                            type="text"
-                            value={settingsForm.telegram_chat_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, telegram_chat_id: e.target.value }))
-                            }
-                            placeholder="-1001234567890"
-                            className={`${FIELD_CLS} font-mono`}
-                          />
-                        </label>
+                      <div className="space-y-5">
+                        <ChatPicker
+                          label="Slack channel"
+                          value={settingsForm.slack_channel_id}
+                          onChange={setSlackChannel}
+                          list={channelList("slack")}
+                          suggestion={channelSuggestion("slack")}
+                          rawLabel="Slack channel ID"
+                          rawPlaceholder="C01234ABCDE"
+                        />
+                        <ChatPicker
+                          label="Discord channel"
+                          value={settingsForm.discord_channel_id}
+                          onChange={setDiscordChannel}
+                          list={channelList("discord")}
+                          suggestion={channelSuggestion("discord")}
+                          unavailableText="No text channels in the bot's servers."
+                          rawLabel="Discord channel ID"
+                          rawPlaceholder="123456789012345678"
+                        />
+                        <ChatPicker
+                          label="Telegram group"
+                          value={settingsForm.telegram_chat_id}
+                          onChange={setTelegramGroup}
+                          list={channelList("telegram")}
+                          unavailableText="The bot hasn't seen any groups yet."
+                          notListedHint="Not listed? Add the bot to the group and send any message there."
+                          rawLabel="Telegram chat ID"
+                          rawPlaceholder="-1001234567890"
+                        />
                       </div>
                     </>
                   )}

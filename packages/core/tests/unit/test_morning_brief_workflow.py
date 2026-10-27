@@ -466,7 +466,7 @@ async def test_morning_brief_holds_back_a_fabricated_colleague_and_cites_figures
     assert "'Marcus Lee', '52'" in repair.calls[0]["messages"][0]["content"]  # type: ignore[index]
     assert "Marcus" not in artifact
     assert "- Renew Acme lease for 48 [1] units" in artifact
-    assert "_Held back 1 line " in artifact
+    assert "_I left out 1 line " in artifact
     assert "- [1] Needs you — Renew Acme lease for 48 units" in artifact
     step = next(e for e in events if e.type == "step_done" and e.step_id == "synthesize")
     assert "1 line(s) held back" in step.summary
@@ -498,7 +498,7 @@ async def test_eod_digest_keeps_a_repair_that_grounds_it(monkeypatch: pytest.Mon
     assert len(provider.calls) == 2
     assert provider.calls[1]["system"] == provider.calls[0]["system"]
     assert artifact.startswith("**Still pending**\n- Acme lease, 48 [1] units")
-    assert "Marcus" not in artifact and "Held back" not in artifact
+    assert "Marcus" not in artifact and "I left out" not in artifact
     [row] = rows
     assert row["details"]["repaired"] is True  # type: ignore[index]
     assert row["details"]["held_back"] == []  # type: ignore[index]
@@ -530,7 +530,7 @@ async def test_solo_sections_are_left_out_of_a_shared_brief(
         lambda **kw: due_calls.append(kw) or [],
     )
 
-    async def _top_three(_due: object) -> tuple[list[object], object]:
+    async def _top_three(_due: object, **_kw: object) -> tuple[list[object], object]:
         top_calls.append(_due)
         return [], None
 
@@ -579,7 +579,7 @@ async def test_a_co_principal_running_the_brief_sees_no_private_solo_sections(
         lambda **kw: due_calls.append(kw) or [],
     )
 
-    async def _top_three(_due: object) -> tuple[list[object], object]:
+    async def _top_three(_due: object, **_kw: object) -> tuple[list[object], object]:
         raise AssertionError("top three built for a co-principal reader")
 
     monkeypatch.setattr("openexecutive.briefing.top_three.build_top_three", _top_three)
@@ -635,7 +635,7 @@ async def test_a_co_principal_reader_gets_no_owner_keyed_live_signals(
     monkeypatch.setattr(
         live_signals,
         "_conversations",
-        lambda since, tz: conversation_reads.append(since) or ([], []),
+        lambda since, tz, now=None: conversation_reads.append(since) or ([], []),
     )
     calendar_reads: list[object] = []
 
@@ -681,3 +681,148 @@ async def test_a_co_principal_reader_gets_no_owner_keyed_live_signals(
 
     assert len(conversation_reads) == 1
     assert len(calendar_reads) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_first_week_block_reaches_the_brief_its_fingerprint_and_privacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.briefing import first_week
+    from openexecutive.workflows import morning_brief
+
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+    asked: list[bool] = []
+
+    async def _getting_started(*, include_inbox: bool, now: object = None, solo: bool = False) -> object:
+        asked.append(include_inbox)
+        if include_inbox:
+            return first_week.GettingStarted(
+                text=f"{first_week.HEADER}\nWAITING ON YOU IN YOUR OWN INBOX (…):\n- Dana Reyes: Renewal",
+                keys=["inbox:m1"], private=True,
+            )
+        return first_week.GettingStarted()
+
+    plain = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    monkeypatch.setattr(first_week, "getting_started", _getting_started)
+    shared = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+    assert first_week.HEADER not in str(calls[-1]["rendered_context"])
+    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
+    try:
+        delivered = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(force_full=True), MagicMock())]
+    finally:
+        morning_brief.PRINCIPAL_DELIVERY.reset(token)
+    assert asked == [False, True]
+    assert "- Dana Reyes: Renewal" in str(calls[-1]["rendered_context"])
+
+    def result(events: list[object]) -> dict[str, object]:
+        return next(e for e in events if e.type == "result").data  # type: ignore[attr-defined]
+
+    assert result(shared)["private_to_principal"] is False
+    assert result(delivered)["private_to_principal"] is True
+    assert result(shared)["brief_fingerprint"] == result(plain)["brief_fingerprint"]
+    assert result(delivered)["brief_fingerprint"] != result(shared)["brief_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_the_brief_knows_now_and_who_reads_it(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a NOW line a subject's "call tomorrow" from yesterday read as
+    today's, and without THE READER the brief named its own reader."""
+    from openexecutive.people import store as people_store
+
+    db = tmp_path / "people.db"
+    monkeypatch.setattr(people_store, "DB_PATH", db)
+    people_store.initialize_db(db)
+    people_store.upsert_person(full_name="Pat Owner", email="pat@x.com", is_principal=True)
+    calls = _capture(monkeypatch)
+    _stub_aggregators(monkeypatch)
+
+    [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
+
+    rendered = str(calls[-1]["rendered_context"])
+    assert "\nNOW: " in rendered and " local time" in rendered
+    assert "THE READER (the person this is written for" in rendered
+    assert "Pat Owner (pat@x.com)" in rendered
+    assert getattr(calls[-1]["reader"], "name", None) == "Pat Owner"
+
+
+@pytest.mark.asyncio
+async def test_the_eod_digest_knows_who_reads_it(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive import providers
+    from openexecutive.people import store as people_store
+    from openexecutive.workflows.end_of_day_digest import (
+        EndOfDayDigestInput,
+        EndOfDayDigestWorkflow,
+    )
+
+    db = tmp_path / "people.db"
+    monkeypatch.setattr(people_store, "DB_PATH", db)
+    people_store.initialize_db(db)
+    people_store.upsert_person(full_name="Pat Owner", email="pat@x.com", is_principal=True)
+    _stub_lease_board(monkeypatch)
+    provider = _SeqProvider(["Quiet day — nothing carrying forward."])
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    [e async for e in EndOfDayDigestWorkflow().run(EndOfDayDigestInput(), MagicMock())]
+
+    content = provider.calls[0]["messages"][0]["content"]  # type: ignore[index]
+    assert content.startswith("THE READER (the person this is written for")
+    assert "Pat Owner (pat@x.com)" in content.splitlines()[0]
+    assert "pat@x.com" not in "\n".join(content.splitlines()[1:])
+    assert "Never write their name" in str(provider.calls[0]["system"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_principal", [True, False])
+async def test_eod_digest_is_written_to_its_reader(
+    monkeypatch: pytest.MonkeyPatch, has_principal: bool,
+) -> None:
+    from openexecutive import providers
+    from openexecutive.api.routes.today import ProposalItem
+    from openexecutive.briefing.reader import Reader
+    from openexecutive.workflows import end_of_day_digest
+    from openexecutive.workflows.end_of_day_digest import (
+        EndOfDayDigestInput,
+        EndOfDayDigestWorkflow,
+    )
+
+    _ground_in_isolation(monkeypatch)
+    monkeypatch.setattr(
+        today_route, "_build_today",
+        lambda **_kw: TodayResponse(departments=[], people=[], proposals=[
+            ProposalItem(
+                alert_id=1, headline="Pat Owner (pat@x.com) asked to renew the Acme lease",
+                body="b", routed_to_person_id=None, suggested_action="",
+                created_at="2099-01-01T00:00:00+00:00", topic_tags=[],
+            ),
+        ]),
+    )
+    monkeypatch.setattr(
+        today_route, "_build_activity", lambda limit, since=None, **_kw: ActivityResponse(items=[])
+    )
+    pat = Reader("Pat Owner", ("pat@x.com",)) if has_principal else None
+    monkeypatch.setattr(end_of_day_digest, "principal_reader", lambda: pat)
+    draft = "**Still pending**\n- Pat Owner emailed the Executive about the Acme lease."
+    provider = _SeqProvider([draft, draft])
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    events = [e async for e in EndOfDayDigestWorkflow().run(EndOfDayDigestInput(), MagicMock())]
+    artifact = next(e for e in events if e.type == "artifact").content
+    sent = str(provider.calls[0]["messages"][0]["content"])  # type: ignore[index]
+
+    if has_principal:
+        assert sent.startswith("THE READER")
+        body = sent.split("\n", 1)[1]
+        assert "Pat Owner" not in body and "pat@x.com" not in body
+        assert "the reader (the reader) asked to renew the Acme lease" in body
+        assert "- You emailed me about the Acme lease." in artifact
+    else:
+        assert not sent.startswith("THE READER")
+        assert "Pat Owner (pat@x.com) asked to renew" in sent
+        assert "- Pat Owner emailed the Executive about the Acme lease." in artifact

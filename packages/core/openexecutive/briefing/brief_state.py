@@ -38,6 +38,12 @@ connected since clears it), and ``not_written`` stays run-level because the
 artifact did not exist for anyone. A brief that reached one founder and not
 the other therefore names the one it missed, on both surfaces, instead of
 telling the founder holding it that it reached nobody.
+
+A failure also carries what happened in a line (``detail``: the tool's own
+error, or why no channel could be tried), run-level and per recipient, and
+``gateway_down`` names email that is set up while the MCP gateway that sends
+it is not running. ``render_problems`` appends the detail where it is known
+(``describe_problem`` words a single reason the same way).
 """
 from __future__ import annotations
 
@@ -45,7 +51,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
@@ -147,13 +153,17 @@ def record_delivered(kind: str, fingerprint: str, text: str) -> None:
 
 # How a brief's latest run ended: sent, or why not (``not_written`` — the run
 # failed or produced nothing; the others are scheduler.runner.
-# PrincipalDelivery.reason).
-DeliveryReason = Literal["delivered", "no_owner", "no_channel", "send_failed", "not_written"]
+# PrincipalDelivery.reason). ``gateway_down`` is email set up but the MCP
+# gateway that sends it not running, which used to read as ``no_channel``
+# and so blamed the owner's setup for the Executive's own fault.
+DeliveryReason = Literal[
+    "delivered", "no_owner", "no_channel", "gateway_down", "send_failed", "not_written"
+]
 # The reasons that are a PROBLEM to report. `delivered` is the one reason with
 # no copy in `DELIVERY_PROBLEMS`, so keeping it out of this alias is what makes
 # "there is nothing to say about a delivered brief" a fact the type checker
 # enforces rather than a `KeyError` waiting in a renderer.
-DeliveryProblem = Literal["no_owner", "no_channel", "send_failed", "not_written"]
+DeliveryProblem = Literal["no_owner", "no_channel", "gateway_down", "send_failed", "not_written"]
 _DELIVERY_REASONS: frozenset[str] = frozenset(get_args(DeliveryReason))
 DELIVERY_SCOPE_PREFIX = "brief_delivery:"
 # The daily briefs (their send times show on the Setup status page).
@@ -178,6 +188,11 @@ DELIVERY_PROBLEMS: dict[DeliveryProblem, tuple[str, str]] = {
     "no_channel": (
         "nothing is set up to send it to you",
         "Connect Gmail, or add your Slack, Telegram or Discord to your People profile.",
+    ),
+    "gateway_down": (
+        "the Executive's mail connection wasn't running",
+        "It keeps retrying on its own; if the Gmail light on the Setup status page stays red, "
+        "the API log says why.",
     ),
     "send_failed": (
         "every way of sending it failed",
@@ -216,6 +231,10 @@ _PARTIAL_PROBLEMS: dict[DeliveryProblem, tuple[str, str]] = {
     "no_channel": (
         "nothing is set up to send it to {who}",
         "Connect Gmail, or add their Slack, Telegram or Discord to their People profile.",
+    ),
+    "gateway_down": (
+        "the Executive's mail connection wasn't running, so it didn't reach {who}",
+        DELIVERY_PROBLEMS["gateway_down"][1],
     ),
     "send_failed": (
         "every way of sending it to {who} failed",
@@ -276,6 +295,9 @@ class RecipientOutcome:
     # would otherwise manufacture "Slack didn't work for Ada" about a channel
     # nothing ever tried. See `backup_channel_problem`.
     first_tried: str | None = None
+    # What happened when it didn't reach them, in a line (the run-level
+    # ``DeliveryOutcome.detail``, for this recipient). None once delivered.
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +314,9 @@ class DeliveryOutcome:
     # reason is reported run-level). An EMPTY tuple is a different fact: the
     # run is known to have reached nobody.
     recipients: tuple[RecipientOutcome, ...] | None = None
+    # What happened when it wasn't sent, in a line: the tool's error, or why
+    # no channel could be tried. None for a delivered brief.
+    detail: str | None = None
 
 
 # Failure reasons worst first. Which one summarises a fan-out must not depend
@@ -299,8 +324,26 @@ class DeliveryOutcome:
 # anyone could see — and the aggregate is no longer where attribution lives,
 # since `recipients` carries that, so a fixed severity is enough.
 _REASON_SEVERITY: tuple[DeliveryReason, ...] = (
-    "not_written", "send_failed", "no_channel", "no_owner", "delivered",
+    "not_written", "send_failed", "gateway_down", "no_channel", "no_owner", "delivered",
 )
+
+# The longest detail kept: a line for the notice, not a traceback.
+DETAIL_MAX_CHARS = 300
+# A grant that died shows in the detail like this (orchestrator.mcp_gateway.
+# grant_failure); the notice's fix then says to reconnect rather than to
+# look at the status page.
+_RECONNECT_HINT_RE = re.compile(
+    r"invalid_grant|expired|revoked|reconnect|unauthori[sz]ed|authentication", re.IGNORECASE
+)
+_RECONNECT_FIX = (
+    "The Executive's sign-in to its mailbox expired or was revoked: connect it again, "
+    "then the next brief goes out."
+)
+
+
+def _detail_line(detail: str | None) -> str | None:
+    """A failure detail as stored: one line, at most ``DETAIL_MAX_CHARS``."""
+    return " ".join(detail.split())[:DETAIL_MAX_CHARS] if detail else None
 
 
 def delivery_summary(
@@ -344,6 +387,7 @@ def record_delivery_outcome(
     reason: DeliveryReason,
     channel: str | None,
     recipients: Sequence[RecipientOutcome] | None = None,
+    detail: str | None = None,
 ) -> None:
     """Remember how this brief's latest run ended. Never raises.
 
@@ -352,13 +396,18 @@ def record_delivery_outcome(
     run that reached nobody (no principal at all, or an artifact that was never
     written), which is a different fact from ``None`` — ``None`` writes the
     pre-per-recipient shape, whose reason can only be reported run-level.
+    ``detail`` is the run's failure line; each recipient carries its own.
     """
+    detail = _detail_line(detail)
     try:
         if recipients is None:
-            text = channel or ""
+            # Upstream's run-level shape: a bare channel, or the JSON a
+            # failure with a detail writes.
+            text = json.dumps({"channel": channel or "", "detail": detail}) if detail else (channel or "")
         else:
             text = json.dumps({
                 "channel": channel,
+                "detail": detail,
                 "recipients": [
                     {
                         "person_id": r.person_id,
@@ -366,6 +415,7 @@ def record_delivery_outcome(
                         "reason": r.reason,
                         "channel": r.channel,
                         "first_tried": r.first_tried,
+                        "detail": _detail_line(r.detail),
                     }
                     for r in recipients
                 ],
@@ -382,28 +432,36 @@ def record_delivery_outcome(
 
 def _read_outcome_payload(
     text: str,
-) -> tuple[str | None, tuple[RecipientOutcome, ...] | None]:
-    """``(channel, recipients)`` from a stored ``narrative_text``.
+) -> tuple[str | None, tuple[RecipientOutcome, ...] | None, str | None]:
+    """``(channel, recipients, detail)`` from a stored ``narrative_text``.
 
     A bare channel name is the pre-per-recipient shape and reads back with
-    ``recipients=None``. A payload that opens with ``{`` but will not parse (a
-    truncated write, a hand-edited row) is read as unreadable rather than
-    raised on: the reason in ``input_hash`` still stands, and reporting it
+    ``recipients=None``, and so does the run-level JSON a failure without a
+    per-recipient list writes (``{channel, detail}``). A payload that opens
+    with ``{`` but will not parse (a truncated write, a hand-edited row) is
+    read as unreadable rather than raised on: the reason in ``input_hash`` still stands, and reporting it
     run-level is what a legacy row does anyway. One unreadable ENTRY is
     skipped while the others still count — dropping the whole list would hide
     the founders it could still name.
     """
     if not text.startswith("{"):
-        return (text or None), None
+        return (text or None), None, None
     try:
         payload = json.loads(text)
-        raw = payload["recipients"]
+        raw = payload.get("recipients")
         channel = payload.get("channel")
-        if not isinstance(raw, list) or not (channel is None or isinstance(channel, str)):
+        detail = payload.get("detail")
+        # No list is upstream's run-level shape, which always carries a detail.
+        if raw is None and "detail" not in payload:
+            raise ValueError("unexpected brief_delivery payload shape")
+        if not (raw is None or isinstance(raw, list)) or not (channel is None or isinstance(channel, str)):
             raise ValueError("unexpected brief_delivery payload shape")
     except Exception:
         logger.warning("brief_state: unreadable delivery payload, read as legacy")
-        return None, None
+        return None, None, None
+    detail = detail if isinstance(detail, str) and detail else None
+    if raw is None:
+        return (channel or None), None, detail
     out: list[RecipientOutcome] = []
     for entry in raw:
         if not isinstance(entry, dict) or entry.get("reason") not in _DELIVERY_REASONS:
@@ -420,8 +478,23 @@ def _read_outcome_payload(
             reason=cast(DeliveryReason, entry["reason"]),  # checked above
             channel=entry_channel if entry_channel in CHANNEL_NAMES else None,
             first_tried=first_tried if first_tried in CHANNEL_NAMES else None,
+            detail=_detail_line(d) if isinstance(d := entry.get("detail"), str) else None,
         ))
-    return (channel or None), tuple(out)
+    return (channel or None), tuple(out), detail
+
+
+def describe_problem(reason: DeliveryProblem, detail: str | None = None) -> tuple[str, str]:
+    """``(problem, fix)`` for the notice: the reason in the user's words,
+    with what happened appended when it is known, and a fix that names a
+    reconnect when the detail shows a grant that died."""
+    problem, fix = DELIVERY_PROBLEMS[reason]
+    if not detail:
+        return problem, fix
+    if reason in ("send_failed", "gateway_down"):
+        problem = f"{problem} ({detail})"
+        if reason == "send_failed" and _RECONNECT_HINT_RE.search(detail):
+            fix = _RECONNECT_FIX
+    return problem, fix
 
 
 def last_delivery_outcome() -> DeliveryOutcome | None:
@@ -438,17 +511,48 @@ def last_delivery_outcome() -> DeliveryOutcome | None:
         at = parse_aware(row.generated_at) if row is not None else None
         if row is None or at is None or row.input_hash not in _DELIVERY_REASONS:
             continue
-        channel, recipients = _read_outcome_payload(row.narrative_text)
+        channel, recipients, detail = _read_outcome_payload(row.narrative_text or "")
         outcome = DeliveryOutcome(
             kind=kind,
             reason=cast(DeliveryReason, row.input_hash),  # checked above
             channel=channel,
             at=at,
             recipients=recipients,
+            detail=detail,
         )
         if latest is None or outcome.at > latest.at:
             latest = outcome
     return latest
+
+
+def current_problem(
+    outcome: DeliveryOutcome | None,
+    *,
+    has_owner: bool,
+    can_deliver: bool,
+    gateway_down: bool = False,
+) -> DeliveryReason | None:
+    """What still keeps the latest brief from the owner, or None.
+
+    A failed send, or a brief that couldn't be written, stays reported until
+    the next brief records a new outcome. Having nowhere to send it is judged
+    from now (``has_owner``, ``can_deliver``, ``gateway_down``: email is set
+    up but the gateway that sends it is not running), not from the record, so
+    a partial fix reports the problem that is left: once a channel exists the
+    next brief will go, and there is nothing to report.
+
+    The one-recipient reading. The Briefing notice and the Setup light read
+    ``outstanding_problems``, which asks the same of every principal.
+    """
+    if outcome is None or outcome.reason == "delivered":
+        return None
+    if outcome.reason in ("send_failed", "not_written"):
+        return outcome.reason
+    if can_deliver:
+        return None
+    if not has_owner:
+        return "no_owner"
+    return "gateway_down" if gateway_down else "no_channel"
 
 
 def _names_unless_all(
@@ -506,10 +610,14 @@ def outstanding_problems(
     * ``no_channel`` — the roster as it stands NOW
       (``scheduler.runner.unreachable_principals``), never the record, so a
       channel connected since clears it and a founder added since counts.
+    * ``gateway_down`` — the unreachable ones whose only way was email that
+      is set up while its gateway is not running
+      (``scheduler.runner.mail_gateway_problem``): the Executive's fault, not
+      a missing channel, so it is not blamed on their setup.
     * ``not_written`` — run-level by nature: the artifact did not exist for
       anyone, so it is legitimately single-valued.
     """
-    from openexecutive.scheduler.runner import unreachable_principals
+    from openexecutive.scheduler.runner import mail_gateway_problem, unreachable_principals
 
     if not roster and (outcome is None or outcome.reason != "delivered"):
         return [("no_owner", ())]
@@ -547,19 +655,61 @@ def outstanding_problems(
         elif outcome.reason == "send_failed":
             problems.append(("send_failed", ()))
     unreachable = unreachable_principals(roster, email_ready=email_ready)
-    if unreachable:
-        problems.append(("no_channel", _names_unless_all(unreachable, roster)))
+    blocked = [p for p in unreachable if mail_gateway_problem(p, with_error=False) is not None]
+    nothing = [p for p in unreachable if p not in blocked]
+    if blocked:
+        problems.append(("gateway_down", _names_unless_all(blocked, roster)))
+    if nothing:
+        problems.append(("no_channel", _names_unless_all(nothing, roster)))
     return problems
+
+
+def problem_details(
+    outcome: DeliveryOutcome | None,
+    roster: Sequence[Person] = (),
+    *,
+    reader_id: int | None = None,
+) -> dict[DeliveryProblem, str]:
+    """What happened, in a line, for the problems that have a detail to say:
+    ``send_failed`` from the record (each failing recipient's own line, else
+    the run's) and ``gateway_down`` from the gateway as it stands now, asked
+    the way ``outstanding_problems`` asks it (``scheduler.runner.
+    mail_gateway_problem``, over ``roster``). For ``render_problems``.
+
+    ``reader_id``: on a roster of several principals only that reader's own
+    send failure is quoted. Its text can name their chat id or address, which
+    is theirs, not the other founder's to read."""
+    from openexecutive.scheduler.runner import mail_gateway_problem
+
+    details: dict[DeliveryProblem, str] = {}
+    if outcome is not None:
+        own_only = reader_id is not None and len(roster) > 1
+        lines = list(dict.fromkeys(
+            r.detail for r in outcome.recipients or ()
+            if r.reason == "send_failed" and r.detail
+            and (not own_only or r.person_id == reader_id)
+        ))
+        if not lines and outcome.reason == "send_failed" and outcome.detail:
+            lines = [outcome.detail]
+        if lines:
+            details["send_failed"] = "; ".join(lines)
+    blocked = next((b for p in roster if (b := mail_gateway_problem(p)) is not None), None)
+    if blocked:
+        details["gateway_down"] = blocked
+    return details
 
 
 def render_problems(
     problems: Sequence[tuple[DeliveryProblem, Sequence[str]]],
+    details: Mapping[DeliveryProblem, str] | None = None,
 ) -> tuple[str, str]:
     """One ``(problem, fix)`` pair for a whole ``outstanding_problems`` list.
 
     The clauses are joined with "; " and the fixes de-duplicated in order, so
     two founders with the same problem get one instruction and two different
-    problems get both.
+    problems get both. ``details`` (``problem_details``) adds what happened to
+    a ``send_failed`` or ``gateway_down`` clause, and a grant that died turns
+    the fix into a reconnect, as ``describe_problem`` does for one reason.
 
     Shared by the Briefing notice and the Setup light so the same problem is
     always worded the same way. Not a guarantee that the two surfaces always
@@ -573,6 +723,11 @@ def render_problems(
         problem, fix = (
             partial_delivery_problem(names, reason) if names else DELIVERY_PROBLEMS[reason]
         )
+        detail = (details or {}).get(reason)
+        if detail and reason in ("send_failed", "gateway_down"):
+            problem = f"{problem} ({detail})"
+            if reason == "send_failed" and _RECONNECT_HINT_RE.search(detail):
+                fix = _RECONNECT_FIX
         clauses.append(problem)
         if fix not in fixes:
             fixes.append(fix)
@@ -767,6 +922,7 @@ def build_brief_fingerprint(
     reflection_flags: str = "",
     teammate_changes: str = "",
     owner_notes: list[Any] | None = None,
+    getting_started: list[str] | None = None,
 ) -> str:
     """Stable hash of everything the brief would say. Deliberately free of
     dates and timestamps so an unchanged day yields the same fingerprint
@@ -792,7 +948,8 @@ def build_brief_fingerprint(
     a correction a teammate made since the last brief un-suppresses it, since
     the principal hears of it nowhere else. ``owner_notes`` (the FROM YOUR
     NOTES keys, ``history_brief.NotesBlock.keys``: note ids and states, no
-    dates) likewise, only when non-empty."""
+    dates) likewise, only when non-empty, and ``getting_started`` (the first
+    week's GETTING STARTED keys, ``first_week.GettingStarted.keys``)."""
     new, carried = split_proposals(today_data.get("proposals", []), since)
     payload = {
         "new": sorted(int(p.get("alert_id") or 0) for p in new),
@@ -844,6 +1001,8 @@ def build_brief_fingerprint(
         payload["teammate_changes"] = teammate_changes
     if owner_notes:
         payload["owner_notes"] = [list(k) if isinstance(k, tuple) else k for k in owner_notes]
+    if getting_started:
+        payload["getting_started"] = sorted(getting_started)
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -924,6 +1083,8 @@ __all__ = [
     "DeliveryReason",
     "RecipientOutcome",
     "backup_channel_problem",
+    "current_problem",
+    "describe_problem",
     "brief_name",
     "build_brief_fingerprint",
     "channel_phrase",
@@ -933,6 +1094,7 @@ __all__ = [
     "last_delivery_outcome",
     "outstanding_problems",
     "partial_delivery_problem",
+    "problem_details",
     "pending_watch_suggestions",
     "record_delivered",
     "record_delivery_outcome",

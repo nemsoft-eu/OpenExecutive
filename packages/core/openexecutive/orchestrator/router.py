@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
 from openexecutive.audit import log_event as audit_log
+from openexecutive.observability import trace_span
 
 if TYPE_CHECKING:
     from openexecutive.memory.workspace_settings import PrincipalRole
@@ -51,13 +52,34 @@ SPECIALIST_DESCRIPTIONS = {
     "triage": "Chief of Staff — evaluates inbound events (email/Slack/docs) for significance and decides alerting",
 }
 
+# One line per specialist for the consult_specialist tool. The chat re-sends
+# the tool list on every call, so these are shorter than
+# SPECIALIST_DESCRIPTIONS (shown once, in the Agent Council and workflow
+# designer) but keep each area's routing cues.
+SPECIALIST_SHORT = {
+    "cso": "strategy, competition, M&A, positioning, OKRs",
+    "cfo": "finance, unit economics, fundraising, cash flow",
+    "chro": "hiring, compensation, performance, culture, org design",
+    "gc": "contracts, IP, employment law, compliance",
+    "coo": "processes, vendors, scaling, operating metrics",
+    "cmo": "GTM, brand, messaging, PR, crisis communications",
+    "cpo": "roadmap, prioritization, product strategy",
+    "sales": "pipeline, discovery, pricing and discounting, proposals, forecasting",
+    "board_comms": "board decks, investor relations, governance",
+    "triage": "whether an inbound event is significant",
+}
+
+_SPECIALIST_OPTIONS = "; ".join(f"{k} ({v})" for k, v in SPECIALIST_SHORT.items())
+
 SPECIALIST_TOOLS: list[dict[str, Any]] = [
     {
         "name": "consult_specialist",
         "description": (
-            "Consult a specialist executive agent for domain-specific analysis. "
-            "Use this to get deep expertise from the relevant functional leader. "
-            "You may call this multiple times in parallel for cross-domain questions."
+            "Consult a specialist executive for analysis in their area whenever a "
+            "question asks for judgment: a decision, a plan, an analysis, a negotiation, "
+            "a hire, a contract term, a pricing or fundraising move, a board message. "
+            "Not for lookups, scheduling, status or routine drafting. Call several in "
+            "parallel for cross-domain questions."
         ),
         "input_schema": {
             "type": "object",
@@ -65,7 +87,7 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
                 "specialist": {
                     "type": "string",
                     "enum": sorted(SPECIALIST_REGISTRY.keys()),
-                    "description": f"Which specialist to consult. Options: {', '.join(f'{k} ({v})' for k, v in SPECIALIST_DESCRIPTIONS.items())}",
+                    "description": f"Which specialist to consult: {_SPECIALIST_OPTIONS}.",
                 },
                 "query": {
                     "type": "string",
@@ -262,6 +284,17 @@ def load_principal_role() -> str:
         return ""
 
 
+def _lessons_for_call(query: str) -> str:
+    """The speaker's lessons that match this call, as a section of the
+    failure-cases block; "" when there is no resolved speaker."""
+    from openexecutive.memory.lessons import lessons_for_query
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    session = current_session.get()
+    person_id = getattr(session, "caller_person_id", None) if session is not None else None
+    return lessons_for_query(person_id, query)
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -322,18 +355,19 @@ async def route_to_specialist(
         from openexecutive.memory.facts import render_facts_for_prompt
 
         standing_facts = await asyncio.to_thread(render_facts_for_prompt)
-    return await agent.analyze(
-        query=query,
-        context=context,
-        retrieved_knowledge=retrieved_knowledge,
-        episodic_context=episodic_context,
-        failure_cases=failure_cases,
-        department_memory=department_memory,
-        company_stage=company_stage,
-        principal_role=principal_role,
-        standing_facts=standing_facts,
-        actor=actor,
-    )
+    with trace_span("specialist {specialist}", specialist=specialist_name, actor=actor):
+        return await agent.analyze(
+            query=query,
+            context=context,
+            retrieved_knowledge=retrieved_knowledge,
+            episodic_context=episodic_context,
+            failure_cases=failure_cases,
+            department_memory=department_memory,
+            company_stage=company_stage,
+            principal_role=principal_role,
+            standing_facts=standing_facts,
+            actor=actor,
+        )
 
 
 # Tool_result returned for consult_specialist calls past the per-turn fan-out
@@ -417,14 +451,17 @@ async def _retrieve_for_call(
 
 
 async def _retrieve_failures_for_call(call: dict[str, str]) -> str:
-    """Domain-filtered failure case retrieval for one specialist call. Degrades
+    """Domain-filtered failure case retrieval for one specialist call, with
+    what this workspace asked for before (memory.lessons) under it. Degrades
     to no failure cases on error, for the same reason as `_retrieve_for_call`."""
     from openexecutive.knowledge.retriever import retrieve_failures
 
     try:
-        return await asyncio.to_thread(
+        shipped = await asyncio.to_thread(
             retrieve_failures, query=call["query"], specialist_name=call["specialist"]
         )
+        own = await asyncio.to_thread(_lessons_for_call, call["query"])
+        return "\n\n".join(part for part in (shipped, own) if part)
     except Exception:
         logger.warning(
             "failure-case retrieval for %s failed; answering without it",

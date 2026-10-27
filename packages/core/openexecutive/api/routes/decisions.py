@@ -23,6 +23,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -70,6 +71,11 @@ class ApproveBody(BaseModel):
     were shown) and ``thread_moved_on: true``; and Send + allow in training:
     ``allow: true``, with ``example: true`` to keep an edited draft as an
     example (``delegation.training``).
+
+    For a meeting invite card (``delegation_invite``): ``answer``, ``accept``
+    (the default) or ``decline``, answered in the person's own calendar; and
+    ``allow: true`` with accept, in training, to accept that sender's
+    invites on their own from now on (``delegation.invites``).
     """
     edits: dict[str, Any] | None = None
 
@@ -350,10 +356,38 @@ def get_decision(instance_id: int, request: Request) -> DecisionInstance:
     return _visible_instance(instance_id, request)
 
 
+def _check_booking_edits(payload: dict[str, Any], edits: dict[str, Any]) -> None:
+    """An edited booking keeps the shape the tool would have accepted: an
+    edited title of 1-200 characters, and a start and end it can read (naive
+    times count as UTC, as in ``calendar_tools._parse_iso``), end after start.
+    422 otherwise."""
+    from openexecutive.orchestrator.calendar_tools import _parse_iso
+
+    if "title" in edits:
+        title = edits["title"]
+        if not isinstance(title, str) or not title.strip() or len(title) > 200:
+            raise HTTPException(status_code=422, detail="Give the meeting a title of up to 200 characters.")
+    raw_start, raw_end = payload.get("start"), payload.get("end")
+    start = _parse_iso(raw_start) if isinstance(raw_start, str) else None
+    end = _parse_iso(raw_end) if isinstance(raw_end, str) else None
+    if start is None or end is None:
+        raise HTTPException(status_code=422, detail="Start and end must be dates and times.")
+    if end <= start:
+        raise HTTPException(status_code=422, detail="The end has to be after the start.")
+
+
 async def _approve_booking(
     instance: DecisionInstance, body: ApproveBody, request: Request, resolver: int | None
 ) -> DecisionInstance:
     """Meeting booking: create the calendar event, then record the approval."""
+    return await _book(instance, body, by_principal=_approver_is_principal(request), resolver=resolver)
+
+
+async def _book(
+    instance: DecisionInstance, body: ApproveBody, *, by_principal: bool, resolver: int | None
+) -> DecisionInstance:
+    """Book ``instance``'s meeting and record the approval. Contacts go on
+    the invite only when ``by_principal``."""
     instance_id = instance.id
     original_payload = _parse_payload(instance)
     final_payload = dict(original_payload)
@@ -363,6 +397,7 @@ async def _approve_booking(
         for key in ("title", "start", "end", "description"):
             if key in body.edits:
                 final_payload[key] = body.edits[key]
+        _check_booking_edits(final_payload, body.edits)
         if "attendee_emails" in body.edits:
             final_payload["attendee_emails"] = body.edits["attendee_emails"]
 
@@ -390,9 +425,7 @@ async def _approve_booking(
 
     # Create the actual calendar event. Contacts on the invite only when the
     # principal is the one approving.
-    result = await _execute_booking(
-        instance, final_payload, by_principal=_approver_is_principal(request)
-    )
+    result = await _execute_booking(instance, final_payload, by_principal=by_principal)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
 
@@ -440,7 +473,13 @@ async def _approve_booking(
 async def _cancel_booking(instance: DecisionInstance) -> None:
     """Meeting booking: delete the event an approval created, if any."""
     if not instance.external_event_id:
-        return
+        if instance.status == STATUS_PROPOSED:
+            return
+        # Booked, but the event id was never read: refuse rather than report
+        # a cancel that leaves the meeting on everyone's calendar.
+        from openexecutive.orchestrator.calendar_tools import _NO_EVENT_ID
+
+        raise HTTPException(status_code=409, detail=_NO_EVENT_ID)
     from openexecutive.orchestrator.calendar_tools import _do_delete_event
     from openexecutive.orchestrator.mcp_gateway import get_active_gateway
 
@@ -670,9 +709,190 @@ _DELEGATED_ACTIONS = DecisionClassSpec(
     after_reject=_actions_dismissed,
 )
 
+async def _answer_invite(
+    instance: DecisionInstance, body: ApproveBody, request: Request, resolver: int | None
+) -> DecisionInstance:
+    """Accept or decline a meeting invite in its person's own calendar, on
+    their tap (``delegation.invites``, which checks the caller and the card
+    again first). ``edits.answer``: accept (the default) or decline."""
+    from openexecutive.delegation.invites import AnswerRefused, answer
+
+    edits = body.edits or {}
+    try:
+        await answer(
+            instance, caller=api_caller.caller(request), resolver=resolver,
+            answer=edits.get("answer", "accept"), allow=edits.get("allow") is True,
+        )
+    except AnswerRefused as refused:
+        raise HTTPException(
+            status_code=refused.status, detail={"code": refused.code, "message": refused.message},
+        ) from None
+    return _refresh(instance.id)
+
+
+async def _invite_dismissed(instance: DecisionInstance) -> None:
+    from openexecutive.delegation.invites import dismissed
+
+    await dismissed(instance)
+
+
+# A meeting invite from someone the person knows (delegation.invites): theirs
+# alone, like a reply card, and never an alert. Dismiss answers nothing.
+_DELEGATED_INVITE = DecisionClassSpec(
+    name="delegation_invite",
+    principal_only=False,
+    approver_only=True,
+    alert_source=None,
+    approve=_answer_invite,
+    after_reject=_invite_dismissed,
+)
+
+async def _carry_out_department_action(
+    instance: DecisionInstance, body: ApproveBody, request: Request, resolver: int | None
+) -> DecisionInstance:
+    """A team member's send or edit their department held
+    (orchestrator.department_gate): do that exact call, once (claimed first),
+    as it stands, and record who approved it."""
+    from openexecutive.audit import log_event
+    from openexecutive.memory.decision_ledger import claim_for_execution, finish_execution
+    from openexecutive.orchestrator import take_the_lead
+
+    payload = _parse_payload(instance)
+    if not claim_for_execution(instance.id, resolver_person_id=resolver):
+        raise HTTPException(status_code=409, detail="Someone else resolved this decision first.")
+    try:
+        result = await take_the_lead.carry_out(payload, by_principal=_approver_is_principal(request))
+    except Exception as exc:
+        logger.exception("decisions/approve: department action %d failed", instance.id)
+        finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": type(exc).__name__})
+        _clear_decision_alert(instance.id, "dismissed")
+        _audit_department_action(log_event, "department_action_failed", instance, payload, resolver)
+        raise HTTPException(
+            status_code=502,
+            detail="Something went wrong, so it may not have gone through. Check before trying again.",
+        ) from None
+    failed = take_the_lead.result_failed(result)
+    finish_execution(
+        instance.id,
+        STATUS_FAILED if failed else STATUS_APPROVED_UNCHANGED,
+        final_payload={**payload, "result": result[:2000]},
+    )
+    _clear_decision_alert(instance.id, "dismissed" if failed else "ack")
+    _audit_department_action(
+        log_event, "department_action_failed" if failed else "department_action_done",
+        instance, payload, resolver,
+    )
+    if failed:
+        raise HTTPException(status_code=502, detail=f"It couldn't do that: {result[:300]}")
+    return _refresh(instance.id)
+
+
+def _audit_department_action(
+    log_event: Any, event_type: str, instance: DecisionInstance, payload: dict[str, Any],
+    resolver: int | None,
+) -> None:
+    verb = {
+        "department_action_done": "Approved and done",
+        "department_action_failed": "Approved, but it failed",
+        "department_action_declined": "Declined",
+    }[event_type]
+    try:
+        log_event(
+            event_type,
+            f"{verb}: {payload.get('summary') or payload.get('tool')}"[:240],
+            actor=f"person:{resolver}" if resolver is not None else "user",
+            details={
+                "decision_id": instance.id,
+                "tool": payload.get("tool"),
+                "requested_by_person_id": payload.get("requested_by_person_id"),
+                "department": payload.get("department"),
+                "resolved_by_person_id": resolver,
+            },
+            department=str(payload.get("department") or "") or None,
+            private=True,
+        )
+    except Exception:
+        logger.warning("decisions: couldn't audit department action %d", instance.id, exc_info=True)
+
+
+async def _department_action_declined(instance: DecisionInstance) -> None:
+    from openexecutive.audit import log_event
+
+    _audit_department_action(
+        log_event, "department_action_declined", instance, _parse_payload(instance),
+        instance.resolver_person_id,
+    )
+
+
+# A send or edit a team member asked for in chat that their department's
+# authority held (orchestrator.department_gate), for the approver it went to
+# or the principal. What it says quotes the conversation, so nobody else on
+# the team sees it.
+_DEPARTMENT_ACTION = DecisionClassSpec(
+    name="department_action",
+    principal_only=False,
+    principal_and_approver=True,
+    alert_source=DECISION_ALERT_SOURCE,
+    approve=_carry_out_department_action,
+    after_reject=_department_action_declined,
+)
+
+async def _carry_out_app_action(
+    instance: DecisionInstance, body: ApproveBody, request: Request, resolver: int | None
+) -> DecisionInstance:
+    """Something the person asked for in chat that waits for their tap
+    (``orchestrator.app_control``: a delete, a share, turning on something
+    that acts as them): do it with this request, the tapper's own, through
+    the route its button calls, which checks them again. Claimed first, so it
+    runs once; a card older than a day is turned down instead."""
+    from openexecutive.audit import log_event
+    from openexecutive.memory.decision_ledger import claim_for_execution, finish_execution
+    from openexecutive.orchestrator import app_control
+
+    payload = _parse_payload(instance)
+    if app_control.card_stale(instance.created_at):
+        mark_resolved(instance.id, STATUS_REJECTED, resolver_person_id=resolver)
+        raise HTTPException(
+            status_code=409, detail="This was more than a day ago, so it wasn't done. Ask again in chat.",
+        )
+    if not claim_for_execution(instance.id, resolver_person_id=resolver):
+        raise HTTPException(status_code=409, detail="Someone else resolved this decision first.")
+    details = {"decision_id": instance.id, "action": payload.get("action"), "id": payload.get("id")}
+    try:
+        did = await app_control.carry_out(payload, request)
+    except (app_control.Refused, HTTPException) as exc:
+        reason = app_control.refusal_text(exc) if isinstance(exc, HTTPException) else str(exc)
+        finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": reason})
+        log_event("app_action_refused", f"Card {instance.id} refused", actor="user", details=details)
+        status_code = exc.status_code if isinstance(exc, HTTPException) and exc.status_code < 500 else 409
+        raise HTTPException(status_code=status_code, detail=reason) from None
+    except Exception:
+        logger.exception("decisions/approve: app action %d failed", instance.id)
+        finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": "failed"})
+        raise HTTPException(
+            status_code=502, detail="That didn't go through. Check before trying again.",
+        ) from None
+    finish_execution(instance.id, STATUS_APPROVED_UNCHANGED, final_payload={**payload, "did": did})
+    log_event("app_action_done", did[:200], actor="user", details=details)
+    return _refresh(instance.id)
+
+
+# Something asked for in chat that waits for its person's tap
+# (orchestrator.app_control): theirs alone, and never an alert.
+_APP_ACTION = DecisionClassSpec(
+    name="app_action",
+    principal_only=False,
+    approver_only=True,
+    alert_source=None,
+    approve=_carry_out_app_action,
+)
+
 DECISION_CLASSES: dict[str, DecisionClassSpec] = {
     spec.name: spec
-    for spec in (_MEETING_BOOKING, _DELEGATED_REPLY, _TAKE_THE_LEAD, _DELEGATED_ACTIONS)
+    for spec in (
+        _MEETING_BOOKING, _DELEGATED_REPLY, _TAKE_THE_LEAD, _DELEGATED_ACTIONS, _DEPARTMENT_ACTION,
+        _APP_ACTION, _DELEGATED_INVITE,
+    )
 }
 
 
@@ -696,6 +916,13 @@ async def reject_decision(instance_id: int, body: RejectBody, request: Request) 
     instance = _visible_instance(instance_id, request)
     spec = _spec_for(instance)
     resolver = _resolver(instance, request)
+    return await _reject(instance, spec, resolver)
+
+
+async def _reject(
+    instance: DecisionInstance, spec: DecisionClassSpec, resolver: int | None
+) -> DecisionInstance:
+    instance_id = instance.id
     if instance.status != STATUS_PROPOSED:
         raise HTTPException(
             status_code=409,
@@ -711,6 +938,79 @@ async def reject_decision(instance_id: int, body: RejectBody, request: Request) 
         except Exception:
             logger.exception("decisions/reject: after-reject step failed for instance %d", instance_id)
     return updated
+
+
+# The cards a chat app shows with Approve and Skip buttons
+# (integrations.channel_cards): the two a chat reply leaves for the person
+# chatting, as the web chat shows them under its reply.
+CHAT_CARD_CLASSES = frozenset({_CALENDAR_CLASS, "delegation_actions", "app_action"})
+# Of the app_action cards (orchestrator.app_control), the ones a chat app's
+# tap may carry out: those whose action checks the tapper itself, not a
+# signed request (a workflow change, workflow_change.run).
+CHAT_APP_ACTIONS = frozenset({"change_workflow"})
+
+
+def shown_in_chat(instance: DecisionInstance) -> bool:
+    """Whether a chat app shows this card with Approve and Skip buttons."""
+    if instance.decision_class not in CHAT_CARD_CLASSES:
+        return False
+    if instance.decision_class != _APP_ACTION.name:
+        return True
+    return _parse_payload(instance).get("action") in CHAT_APP_ACTIONS
+
+
+class _ChatTapRequest:
+    """What an app_action card's action reads on a chat app's tap: the
+    proven tap, and no signed caller (``workflow_change._tapper``)."""
+
+    def __init__(self, tap: Any) -> None:
+        self.state = SimpleNamespace(chat_tap=tap)
+        self.headers: dict[str, str] = {}
+        self.query_params: dict[str, str] = {}
+        self.client = None
+
+
+async def resolve_in_chat(instance_id: int, person: Any, *, approve: bool) -> DecisionInstance:
+    """Approve or skip a card tapped in a chat app, for ``person``: the one the
+    adapter proved tapped it. The rule is the web chat's (``_resolver``): a
+    card of actions is its person's alone; a meeting is the principal's, or
+    its approver's unless it is the principal's private booking. Raises
+    HTTPException, as the routes do."""
+    from openexecutive.delegation.action_cards import ApproveRefused
+    from openexecutive.delegation.action_cards import approve as approve_actions
+    from openexecutive.delegation.gmail import normalize_email
+    from openexecutive.delegation.verified import ChatTap
+    from openexecutive.people.store import find_principal_person
+
+    instance = get_decision_instance(instance_id)
+    if instance is None or not shown_in_chat(instance) or person.id is None:
+        raise HTTPException(status_code=404, detail="This card is no longer there.")
+    spec = _spec_for(instance)
+    principal = find_principal_person()
+    is_principal = principal is not None and principal.id == person.id
+    if _approver_only(instance):
+        allowed = person.id == instance.approver_person_id
+    else:
+        allowed = is_principal or (person.id == instance.approver_person_id and not _is_private(instance))
+    if not allowed:
+        # As the routes: a card that isn't theirs is not there.
+        raise HTTPException(status_code=404, detail="This card is no longer there.")
+    if not approve:
+        return await _reject(instance, spec, person.id)
+    if instance.status != STATUS_PROPOSED:
+        raise HTTPException(status_code=409, detail="This card was already handled.")
+    if instance.decision_class == _CALENDAR_CLASS:
+        return await _book(instance, ApproveBody(), by_principal=is_principal, resolver=person.id)
+    if instance.decision_class == _APP_ACTION.name:
+        tap = ChatTap(normalize_email(person.email or ""))
+        return await _carry_out_app_action(instance, ApproveBody(), _ChatTapRequest(tap), person.id)  # type: ignore[arg-type]
+    try:
+        await approve_actions(
+            instance, caller=ChatTap(normalize_email(person.email or "")), resolver=person.id,
+        )
+    except ApproveRefused as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.message) from None
+    return _refresh(instance.id)
 
 
 @router.post("/decisions/{instance_id}/cancel", response_model=DecisionInstance)

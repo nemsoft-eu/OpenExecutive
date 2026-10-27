@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openexecutive.alerts import dispatcher, preferences, store
 from openexecutive.alerts.models import (
@@ -14,6 +14,9 @@ from openexecutive.alerts.models import (
     AlertEvent,
     TriageDecision,
 )
+
+if TYPE_CHECKING:
+    from openexecutive.people.models import Person
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +136,16 @@ def _ground_decision(
     )
 
 
+def _label_team_raised(decision: TriageDecision, name: str) -> TriageDecision:
+    """``decision`` with its body led by who raised it, so a card a team
+    member raised from chat never reads as news from anywhere else."""
+    label = f"Raised by {name}."
+    body = decision.body.strip()
+    if body.startswith(label):
+        return decision
+    return decision.model_copy(update={"body": f"{label} {body}".strip()})
+
+
 async def evaluate_and_dispatch(
     event: AlertEvent,
     db_path: Path | None = None,
@@ -210,14 +223,25 @@ async def evaluate_and_dispatch(
     # dispatch: keep only what the event itself (or the profile, or the
     # initiatives triage was shown) supports.
     decision = _ground_decision(decision, event, initiatives)
+    if event.raised_by:
+        decision = _label_team_raised(decision, event.raised_by)
 
     effective_channels = preferences.resolve_channels(
         decision.channels, decision.severity, prefs
     )
+    if event.raised_by:
+        # People and departments only: a company-wide post stays with the
+        # owner, whatever triage made of what the team member wrote.
+        effective_channels = [
+            c for c in effective_channels if c != AlertChannel.COMPANY_BROADCAST
+        ]
 
     # A producer that knows the stable identity of the situation (a watch
     # slug) wins over the model's free-text key.
     dedup_key = event.dedup_hint or decision.dedup_key
+    if event.raised_by:
+        # One team member's alert never folds into another's card.
+        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{dedup_key}"
     topic_tags = _with_department_tag(
         decision.topic_tags, event.department or event.channel,
     )
@@ -307,6 +331,40 @@ async def evaluate_and_dispatch(
         broadcast_integration=decision.broadcast_integration,
     )
     return decision, alert_id
+
+
+def schedule_chat_message_evaluation(
+    *,
+    source: str,
+    external_id: str,
+    body: str,
+    sender: Person | None,
+    fallback_name: str,
+    channel: str | None = None,
+) -> None:
+    """Triage one inbound chat-app message, naming the sender as the roster does.
+
+    A chat app's own name for the sender is whatever they typed into it, so
+    a linked person is named by their People record instead: otherwise the
+    principal writing from an account called something else reads to triage
+    (and then to their own brief) as a stranger. ``fallback_name`` is used
+    only when nobody on the roster matched.
+
+    The principal's own messages to their Executive are a conversation with
+    it, not news for their brief, so they are not triaged at all.
+    """
+    if sender is not None and sender.is_principal:
+        return
+    name = sender.full_name if sender is not None else fallback_name
+    schedule_evaluation(
+        AlertEvent(
+            source=source,
+            external_id=external_id,
+            body=body,
+            channel=channel,
+            user=name or None,
+        )
+    )
 
 
 def schedule_evaluation(event: AlertEvent) -> None:

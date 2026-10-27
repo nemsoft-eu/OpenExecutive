@@ -19,6 +19,7 @@ import Button from "@/components/ui/Button";
 import OverflowMenu from "@/components/ui/OverflowMenu";
 import CorrectionsTab from "./CorrectionsTab";
 import HistoryTab from "./HistoryTab";
+import ReflectionTab from "./ReflectionTab";
 import type { MemoryView } from "@/lib/pulseView";
 import { DOMAINS, STATUSES, EmptyState, formatDate } from "./shared";
 
@@ -36,6 +37,9 @@ export default function MemoryList({ view }: { view: MemoryView }) {
   // with none to see (not signed in, not on the roster) gets a plain message.
   const [historyAvailable, setHistoryAvailable] = useState(true);
   const onHistoryAvailable = useCallback((available: boolean) => setHistoryAvailable(available), []);
+
+  // Learning lays out its own cards: its numbers, then the list.
+  if (view === "reflection") return <ReflectionTab />;
 
   return (
     <div className="rounded-2xl border border-line bg-surface-elevated px-4 sm:px-5 py-1">

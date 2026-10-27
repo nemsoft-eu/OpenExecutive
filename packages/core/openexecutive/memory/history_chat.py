@@ -99,6 +99,11 @@ def verified_speaker(session: Any, person: Any) -> bool:
             or getattr(session, "private_to_principal", False) is True
             or bool(getattr(session, "email_from", None))
             or isinstance(getattr(session, "delegation_override", None), DelegationOverride)
+            # Another AI app's text, even on a turn allowed to act: never
+            # noted as the person's own words. Nor a host origin's turn,
+            # which a script on that host's page could have written.
+            or getattr(session, "from_mcp_client", False) is True
+            or getattr(session, "from_host", False) is True
         ):
             return False
         if getattr(session, "caller_person_id", None) != person.id:
@@ -227,6 +232,9 @@ def schedule_chat_notes(speaker_text: str, *, session: Any, person_id: int | Non
     says so; the switch and the cap inside the task. Never raises."""
     try:
         if person_id is None or session is None:
+            return
+        # A replay of a graded turn (memory.replay) leaves no notes.
+        if getattr(session, "replay", False) is True:
             return
         from openexecutive.delegation.settings import own_words
 

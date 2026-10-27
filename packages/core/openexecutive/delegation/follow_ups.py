@@ -130,6 +130,7 @@ async def _follow_up(
     was made."""
     from openexecutive.config import get_settings
     from openexecutive.delegation import caps, card_drafts, drafts, handle_it, inbox
+    from openexecutive.delegation import disclosure as ai_disclosure
     from openexecutive.delegation.ghostwriter import ComposeError, Recipient, compose
     from openexecutive.delegation.gmail import DraftSpec, references_header
     from openexecutive.delegation.inbox_classifier import Verdict
@@ -175,15 +176,22 @@ async def _follow_up(
         except ComposeError:
             inbox._retry_later(person.id, sent.id, "compose_failed")
             return False
+        from openexecutive.delegation.answers import suggest
+
         reply = inbox.Reply(
             to=to, cc=cc, subject=composed.subject, body=composed.body,
             open_questions=list(composed.open_questions), flags=list(composed.flags),
+            question_choices=await suggest(
+                person, list(composed.open_questions), composed.question_choices, mailbox=client, now=now,
+            ),
             in_reply_to=sent.message_id_header or None,
             references=references_header(sent.references, sent.message_id_header),
+            gist=composed.gist,
         )
         held = handle_it.follow_up_refusal(
             person.id, sent, reply, relation=relation, own=own, exec_address=exec_address, now=now,
         )
+        reply.body = ai_disclosure.sign(person.id, reply.body, on_its_own=held is None)
         spec = DraftSpec(
             to=reply.to, cc=reply.cc, subject=reply.subject, body=reply.body, thread_id=thread.id,
             in_reply_to=reply.in_reply_to, references=reply.references,

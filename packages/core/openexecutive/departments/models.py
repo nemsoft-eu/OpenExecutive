@@ -27,7 +27,12 @@ PeriodType = Literal["week", "month", "quarter", "year", "ongoing"]
 
 
 class Goal(BaseModel):
-    """A single Goal row for one department, scoped to a period.
+    """A single Goal, scoped to a period.
+
+    A goal stands on its own: ``department_slug`` is optional (None = no
+    department) and ``owner_person_id`` names who it is on. An unset owner
+    means the department's lead, or the principal when there is no lead or
+    no department (``departments.goals.effective_owner_id``).
 
     `period_type` says how to interpret `period_value`:
       • week → e.g. "Week of May 18"
@@ -38,7 +43,8 @@ class Goal(BaseModel):
     """
 
     id: int | None = None
-    department_slug: str
+    department_slug: str | None = None
+    owner_person_id: int | None = None
     period_type: PeriodType = "quarter"
     period_value: str
     key_result: str
@@ -75,7 +81,7 @@ class DepartmentConfig(BaseModel):
     title: str
     # Key into orchestrator.router.SPECIALIST_REGISTRY. Nullable: some org
     # structures (nonprofits, SMBs) have departments that do not map to one
-    # of the 8 specialist agents — e.g. "Volunteer Coordination", "Family
+    # of the specialist agents — e.g. "Volunteer Coordination", "Family
     # Services". Those departments render as informational rows in the UI
     # and are skipped by specialist-routing workflows.
     specialist_key: str | None = None
@@ -83,7 +89,8 @@ class DepartmentConfig(BaseModel):
     authority_level: AuthorityLevel = AuthorityLevel.PROPOSE_ONLY
     head_person_id: int | None = None
     head_persona_slug: str | None = None
-    # cadence_name -> spec, e.g. {"check_in": "daily@09:00"}. Parsed by Phase 5.
+    # cadence_name -> spec, e.g. {"check_in": "weekly@mon@09:00"}; an empty spec
+    # means the check-in is off. Parsed by departments/cadence.py.
     cadences: dict[str, str] = Field(default_factory=dict)
     # Department-scoped broadcast channels. When set, OE can post to the
     # department's team room via `send_department_message` instead of (or

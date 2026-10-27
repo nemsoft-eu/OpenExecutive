@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from openexecutive.agents import overrides as agent_overrides
+from openexecutive.delegation.settings import DelegationOverride
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
 from openexecutive.memory import episodic as episodic_module
@@ -379,6 +380,31 @@ def test_unverified_surfaces_cannot_change_the_roster(
         result = _call(handle_upsert_person, {"full_name": "Mallory"})
     assert result["status"] == "refused"
     assert "web app" in result["detail"]
+    assert "Mallory" not in _names()
+
+
+def test_owner_on_a_channel_its_adapter_verified_can_change_the_roster(owner_id: int) -> None:
+    with _turn(Session(origin_channel="otherchat", caller_person_id=owner_id, speaker_verified=True)):
+        result = _call(handle_upsert_person, {"full_name": "Cindy Lee"})
+    assert result["status"] == "ok"
+
+
+@pytest.mark.parametrize("surface", [
+    # No People entry resolved, or a turn an email started: the adapter's
+    # flag vouches for neither.
+    {"origin_channel": "otherchat", "speaker_verified": True, "caller_person_id": None},
+    {"origin_channel": "otherchat", "speaker_verified": True, "email_from": "owner@co.example"},
+    {"origin_channel": "otherchat", "speaker_verified": True, "unattended": True},
+    {"origin_channel": "otherchat", "speaker_verified": True, "private_to_principal": True},
+    {"origin_channel": "otherchat", "speaker_verified": True, "delegation_override": DelegationOverride(enabled=True)},
+], ids=["no_caller", "email", "unattended", "private_to_principal", "eval_override"])
+def test_an_adapter_flag_alone_is_not_a_verified_surface(
+    owner_id: int, surface: dict[str, Any]
+) -> None:
+    kwargs = {"caller_person_id": owner_id, **surface}
+    with _turn(Session(**kwargs)):
+        result = _call(handle_upsert_person, {"full_name": "Mallory"})
+    assert result["status"] == "refused"
     assert "Mallory" not in _names()
 
 

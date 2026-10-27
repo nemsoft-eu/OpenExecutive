@@ -62,6 +62,8 @@ curl -F "url=https://<your-api-host>/webhook/telegram" \
 
 Expected response: `{"ok":true,"result":true,"description":"Webhook was set"}`.
 
+Leave `allowed_updates` out (or include both `message` and `callback_query`): taps on a card's **Approve** and **Skip** buttons arrive as `callback_query` updates. With the secret set, a meeting to book or a card of actions the Executive leaves in a private chat comes with those buttons.
+
 Re-run this command whenever the host URL or the secret changes. Verify the registration with:
 
 ```bash
@@ -75,6 +77,8 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 ## Step 6 — Grant Access
 
 Access is roster-driven. The bot only answers a chat whose ID matches the `telegram_chat_id` of a non-archived Person — add or edit the Person in the **/people** UI. Messages from any other chat are dropped without a reply.
+
+The easy way: ask the person to send the bot any message, then pick them by name under **Telegram** on their People page. For a department's group, add the bot to the group, send any message there, and pick it under **Telegram group** in the department's **Channels** settings. The bot remembers chats only when `TELEGRAM_WEBHOOK_SECRET` is set.
 
 To find a chat ID, message the bot once and check the API logs for:
 

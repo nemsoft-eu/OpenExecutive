@@ -20,7 +20,20 @@ Routes:
                                     watcher's switch and health
   PUT    /delegation              — {enabled}; turning it on needs the caller's
                                     own Gmail connected (409 otherwise); turning
-                                    it off turns the inbox watcher off too
+                                    it off turns the inbox watcher and Read my
+                                    calendar off too
+  PUT    /delegation/calendar     — {enabled}: Read my calendar
+                                    (delegation.calendar); on needs Act as me
+                                    on and a calendar read that works (409
+                                    calendar_not_granted when their sign-in
+                                    lacks it, 503 when it can't be reached)
+  PUT    /delegation/reach        — {step}: How far it goes as you, one dial
+                                    over Act as me, the inbox watcher, Handle
+                                    it for me and its level, and Everything
+                                    (off, when_asked, inbox, careful,
+                                    balanced, bold, everything). Down turns
+                                    the higher switches off; up turns each on
+                                    through its own route and its checks
   PUT    /delegation/inbox        — {enabled?, mailbox_drafts?}: "Draft
                                     replies to my inbox"; turning it on needs
                                     Act as me on and Gmail connected (409),
@@ -31,11 +44,30 @@ Routes:
                                     switch is off or a check is running)
   GET    /delegation/replies      — the reply cards waiting for the caller
                                     (from the database; no Gmail call)
+  POST   /delegation/drafts/{id}/send — {thread_moved_on?}: send a draft
+                                    chat wrote as the caller, on their tap,
+                                    exactly as written (their own only; 404
+                                    otherwise). Needs a caller the API knows
+                                    is that person, like a card's Send (409
+                                    ``caller_signing_required``); 409
+                                    ``confirm`` asks a second yes when the
+                                    conversation moved on, and
+                                    ``draft_changed`` when it was edited in
+                                    the mailbox
   PUT    /delegation/replies/{id}/text — {text}: change a reply's words
+  PUT    /delegation/replies/{id}/recipients — {everyone}: the sender only,
+         or everyone the email went to
                                     before Send, on its card and in their
                                     Drafts when it is there too. Needs a
                                     caller the API knows is that person, like
                                     Send (delegation.card_drafts)
+  POST   /delegation/replies/{id}/answer — {answers: [{question_index,
+                                    answer_text}]}: answer what the reply
+                                    left to decide; one model call rewrites
+                                    the draft with it, saved like the text
+                                    route (same checks); returns the card
+                                    with changed_sentences. 429 past the
+                                    hourly limit (delegation.answers)
   PUT    /delegation/handle-it    — {enabled?, mode?}: Handle it for me,
                                     the inbox watcher sending some replies on
                                     its own, mode careful | balanced | bold
@@ -46,14 +78,15 @@ Routes:
                                     turning it on needs Draft replies to my
                                     inbox on (409). Turning the inbox watcher
                                     off turns it off too
-  PUT    /delegation/training     — {replies?, follow_ups?, actions?, drafts?}:
-                                    put Act as me's settings in or out of
-                                    training (delegation.training). Needs a
+  PUT    /delegation/training     — {replies?, follow_ups?, actions?, drafts?,
+                                    actions_on?}: put Act as me's settings in
+                                    or out of training, or Suggested actions
+                                    On (delegation.training). Needs a
                                     caller the API knows is that person, but
                                     for a change that only holds more back
   DELETE /delegation/learned/{id} — forget one thing it learned in training
-                                    (Send + allow, Approve + allow, an
-                                    example). The caller's own only
+                                    (the "on its own next time" tick on a
+                                    card, or an example). The caller's own only
   PUT    /delegation/take-the-lead — {enabled}: Take the lead as you, the
                                     owner's alone for now: Handle it for
                                     me's setting gives way to the added rules
@@ -62,9 +95,16 @@ Routes:
   GET|POST /delegation/take-the-lead/rules, DELETE …/rules/{id}
                                   — the caller's own rules for it (removing
                                     one needs the same provable caller)
+  GET    /delegation/invites      — the meeting invite cards waiting for the
+                                    caller (delegation.invites; from the
+                                    database, no calendar call). Accept and
+                                    Decline are POST /decisions/{id}/approve
+                                    with edits.answer
   GET    /delegation/handled      — the caller's replies sent on its own in
                                     the last 7 days, with the questions each
-                                    left for them
+                                    left for them, and the invites it
+                                    accepted on its own (source "invite",
+                                    with a one-line summary)
   GET    /delegation/voice        — "How I write"
   POST   /delegation/voice/learn  — learn it from the caller's sent mail (409
                                     in_progress / locked / too_soon /
@@ -97,7 +137,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -199,6 +239,8 @@ class TrainingOut(BaseModel):
     follow_ups: bool
     actions: bool
     drafts: bool
+    # Suggested actions On: carried out with no allow (false while in training).
+    actions_on: bool = False
     # The caller's own, newest first.
     learned: list[LearnedOut] = []
 
@@ -210,6 +252,7 @@ class TrainingUpdate(BaseModel):
     follow_ups: bool | None = None
     actions: bool | None = None
     drafts: bool | None = None
+    actions_on: bool | None = None
 
 
 class HandleItOut(BaseModel):
@@ -257,6 +300,41 @@ class HandleItUpdate(BaseModel):
     mode: str | None = None
 
 
+class DisclosureOut(BaseModel):
+    """The AI line on replies sent as the caller (delegation.disclosure):
+    on those Handle it for me sends on its own, and on drafts they send.
+    ``enabled`` is the install's AI_DISCLOSURE: off, neither is added."""
+
+    enabled: bool
+    handle_it: bool
+    approved_sends: bool
+    line: str
+
+
+class CalendarOut(BaseModel):
+    """Read my calendar (delegation.calendar): the caller's own switch,
+    whether their mailbox sign-in includes the calendar (None when their
+    mailbox isn't connected or the provider didn't say), and the command that
+    connects it with calendar access."""
+
+    enabled: bool
+    granted: bool | None = None
+    connect_command: str
+
+
+class CalendarUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class DisclosureUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    handle_it: bool | None = None
+    approved_sends: bool | None = None
+
+
 class HandledReplyOut(BaseModel):
     decision_id: int
     sent_at: str
@@ -266,8 +344,12 @@ class HandledReplyOut(BaseModel):
     body: str
     open_questions: list[str]
     gmail_link: str
-    # "follow_up" for a follow-up to the caller's own unanswered email.
+    # "follow_up" for a follow-up to the caller's own unanswered email;
+    # "invite" for a meeting invite it accepted on its own.
     source: str = ""
+    # What it did, in one line, for an invite: "Accepted Dana's Pilot
+    # review, Wed 21 Oct, 14:30".
+    summary: str = ""
 
 
 class HandledOut(BaseModel):
@@ -282,6 +364,10 @@ class DelegationOut(BaseModel):
     handle_it: HandleItOut | None = None
     # Absent on a backend that predates per-setting training.
     training: TrainingOut | None = None
+    # Absent on a backend that predates the AI line on replies.
+    disclosure: DisclosureOut | None = None
+    # Absent on a backend that predates Read my calendar.
+    calendar: CalendarOut | None = None
     # The principal's "Let team members use Act as me", while the install
     # allows it; None for anyone else.
     team: TeamOut | None = None
@@ -299,6 +385,18 @@ class InboxUpdate(BaseModel):
     enabled: bool | None = None
     # Also save each reply in the caller's mailbox's Drafts.
     mailbox_drafts: bool | None = None
+
+
+class ReplyQuestionOut(BaseModel):
+    """One thing a reply card leaves the caller to decide."""
+
+    text: str
+    # 2 to 4 short answers to tap, or none.
+    choices: list[str] = Field(default_factory=list)
+    # Where the choices came from: their calendar or a document ("" for none).
+    source: str = ""
+    # The answer they gave from the card ("" while it is open).
+    answer: str = ""
 
 
 class ReplyCardOut(BaseModel):
@@ -331,6 +429,19 @@ class ReplyCardOut(BaseModel):
     in_mailbox: bool = True
     # Which of their mailboxes it sends from: "Gmail" or "Outlook".
     mailbox: str = "Gmail"
+    # The open questions with what can be tapped to answer each; on a card
+    # made before choices, each has none.
+    questions: list[ReplyQuestionOut] = Field(default_factory=list)
+    # Changed by hand on the card: what is left open no longer holds Send.
+    questions_settled: bool = False
+    # POST .../answer only: the sentences its rewrite added or changed.
+    changed_sentences: list[str] = Field(default_factory=list)
+    # Everyone else the email went to: Reply to: Everyone adds them. Empty
+    # when there is no choice to make.
+    reply_others: list[str] = Field(default_factory=list)
+    # What the email asks and what the draft says, in a line or two, for the
+    # card's closed view ("" on a card drafted before it).
+    gist: str = ""
 
 
 class RepliesOut(BaseModel):
@@ -343,6 +454,37 @@ class ReplyTextUpdate(BaseModel):
     text: str = Field(max_length=20_000)
 
 
+class ChatDraftSendIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The second yes for a reply whose conversation moved on since.
+    thread_moved_on: bool = False
+
+
+class ChatDraftSentOut(BaseModel):
+    sent: bool = True
+
+
+class ReplyRecipientsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # True: everyone the email went to; False: the sender only.
+    everyone: bool
+
+
+class ReplyAnswerIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_index: int = Field(ge=0, le=20)
+    answer_text: str = Field(min_length=1, max_length=500)
+
+
+class ReplyAnswersIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answers: list[ReplyAnswerIn] = Field(min_length=1, max_length=6)
+
+
 class CardActionOut(BaseModel):
     index: int
     # invite, message or add_contact.
@@ -350,6 +492,37 @@ class CardActionOut(BaseModel):
     summary: str
     # A message's text as it will be sent, or a meeting's description.
     text: str
+
+
+class InviteCardOut(BaseModel):
+    decision_id: int
+    status: str
+    created_at: str
+    from_name: str
+    from_email: str
+    relation: str
+    title: str
+    # When, as the caller reads it: "Wed 21 Oct, 14:30–15:00".
+    when: str
+    start: str
+    end: str
+    all_day: bool
+    # Busy times on their calendar that overlap it ("14:00–14:30"); times only.
+    clashes: list[str]
+    # False: their calendar couldn't be read for clashes.
+    clash_checked: bool
+    # False: their sign-in reads the calendar but can't answer invites, so the
+    # card says to connect again (connect_command) instead of offering Accept.
+    can_answer: bool
+    # In training: the "Accept from them on its own next time" tick.
+    can_allow: bool
+    # Why Handle it for me left it for them, in words ("" when it was off).
+    waited_because: str
+    connect_command: str
+
+
+class InviteCardsOut(BaseModel):
+    cards: list[InviteCardOut]
 
 
 class ActionCardOut(BaseModel):
@@ -438,19 +611,24 @@ def _refuse(status_code: int, code: str, message: str) -> HTTPException:
 
 
 def _caller(request: Request) -> Person:
-    """The signed-in caller, when they may have Act as me; else 403."""
-    from openexecutive.people.store import find_person_by_email, find_principal_person
+    """The signed-in caller, when they may have Act as me; else 403. Found
+    through the app's one caller resolver (``chat._resolve_caller_person_id``),
+    so a deployment that maps a signed-in account to its person there is
+    followed here too. A request that names no one only counts as the
+    principal under local login."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.people.store import find_principal_person, get_person
 
     who = api_caller.caller(request)
+    if not who.email and not (who.defaults_to_principal and local_login()):
+        raise _refuse(403, "sign_in_required", "Sign in to change Act as me.")
     try:
-        if who.email:
-            person = find_person_by_email(who.email)
-        elif who.defaults_to_principal and local_login():
-            person = find_principal_person()
-        else:
-            raise _refuse(403, "sign_in_required", "Sign in to change Act as me.")
-    except HTTPException:
-        raise
+        person_id = _resolve_caller_person_id(request)
+        if person_id is None:
+            # The resolver reads a roster it can't open as "no one"; read it
+            # once more so an outage answers 503, not "not for you".
+            find_principal_person()
+        person = get_person(person_id) if person_id is not None else None
     except Exception as exc:
         logger.exception("delegation: caller lookup failed")
         raise _refuse(503, "roster_unavailable", "Couldn't read the People list.") from exc
@@ -479,6 +657,23 @@ def _connect_command(email: str | None) -> str:
 def _outlook_connect_command(email: str | None) -> str:
     target = email or "you@example.com"
     return f"uv run python scripts/connect-own-outlook.py --email {target}"
+
+
+async def _calendar_out(person: Person, status: str) -> CalendarOut:
+    from openexecutive.delegation import calendar
+
+    email = person.email or ""
+    outlook = bool(email) and credential_provider(email) == "microsoft"
+    command = _outlook_connect_command(email) if outlook else _connect_command(email)
+    granted: bool | None = None
+    if status == "connected":
+        # The status check just refreshed the sign-in, so this reads the
+        # scopes it came back with rather than asking again.
+        try:
+            granted = await gmail_for(email).calendar_granted()
+        except Exception:
+            logger.warning("delegation: couldn't tell whether the sign-in includes the calendar", exc_info=True)
+    return CalendarOut(enabled=calendar.enabled(person.id), granted=granted, connect_command=f"{command} --calendar")
 
 
 def _inbox_out(person_id: int) -> InboxOut:
@@ -544,7 +739,20 @@ async def _state(person: Person) -> DelegationOut:
         inbox=_inbox_out(_person_id(person)),
         handle_it=_handle_it_out(_person_id(person)),
         training=_training_out(_person_id(person)),
+        disclosure=_disclosure_out(_person_id(person)),
+        calendar=await _calendar_out(person, status),
         team=_team_out(person),
+    )
+
+
+def _disclosure_out(person_id: int) -> DisclosureOut:
+    from openexecutive.delegation import disclosure
+    from openexecutive.orchestrator.disclosure import enabled
+
+    switches = disclosure.get(person_id)
+    return DisclosureOut(
+        enabled=enabled(), handle_it=switches.handle_it, approved_sends=switches.approved_sends,
+        line=disclosure.LINE,
     )
 
 
@@ -589,7 +797,7 @@ def _training_out(person_id: int) -> TrainingOut:
         learned = []
     return TrainingOut(
         replies=switches.replies, follow_ups=switches.follow_ups, actions=switches.actions,
-        drafts=switches.drafts, learned=learned,
+        drafts=switches.drafts, actions_on=switches.actions_without_asking, learned=learned,
     )
 
 
@@ -650,6 +858,7 @@ async def update_delegation(request: Request, body: DelegationUpdate) -> Delegat
         # The inbox watcher needs Act as me; off here, it starts from scratch
         # (watch_since) when turned on again, never catching up.
         _set_inbox(person_id, False)
+        _set_calendar(person_id, False)
         # Where their emails are (read_my_email's list): only kept while it's on.
         # Best-effort, so a failure here never keeps Act as me on.
         from openexecutive.delegation import mail_reads
@@ -821,6 +1030,98 @@ async def update_delegation_reply_text(request: Request, decision_id: int, body:
     return ReplyCardOut(**{k: v for k, v in asdict(card).items() if k in ReplyCardOut.model_fields})
 
 
+@router.post("/delegation/drafts/{row_id}/send", response_model=ChatDraftSentOut)
+async def send_chat_draft(request: Request, row_id: int, body: ChatDraftSendIn) -> ChatDraftSentOut:
+    """Send a draft chat wrote as the caller, on their tap, exactly as it was
+    written (``delegation.reply_send.send_chat_draft``, which checks
+    everything again first). Their own drafts only."""
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.delegation.reply_send import send_chat_draft as send
+
+    person = _caller(request)
+    try:
+        await send(
+            person, row_id, caller=api_caller.caller(request),
+            confirm={"thread_moved_on": True} if body.thread_moved_on else None,
+        )
+    except SendRefused as refused:
+        raise HTTPException(
+            status_code=refused.status, detail={"code": refused.code, "message": refused.message, **refused.extra},
+        ) from None
+    return ChatDraftSentOut()
+
+
+@router.put("/delegation/replies/{decision_id}/recipients", response_model=ReplyCardOut)
+async def update_delegation_reply_recipients(
+    request: Request, decision_id: int, body: ReplyRecipientsUpdate,
+) -> ReplyCardOut:
+    """Send one of the caller's replies to the sender only, or to everyone the
+    email went to: on the card, and in their mailbox's Drafts when it is there
+    too (``delegation.card_drafts.set_recipients``). Only the lists the card
+    was written with; no address comes from the request. Their own cards
+    only; sends nothing."""
+    from openexecutive.delegation import card_drafts
+    from openexecutive.delegation.inbox import DECISION_CLASS
+    from openexecutive.delegation.replies import cards
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    instance = get_decision_instance(decision_id)
+    if instance is None or instance.decision_class != DECISION_CLASS or instance.approver_person_id != person_id:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    try:
+        await card_drafts.set_recipients(
+            instance, caller=api_caller.caller(request), resolver=person_id, everyone=body.everyone,
+        )
+    except SendRefused as refused:
+        raise HTTPException(
+            status_code=refused.status, detail={"code": refused.code, "message": refused.message, **refused.extra},
+        ) from None
+    card = next((c for c in cards(person) if c.decision_id == decision_id), None)
+    if card is None:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    return ReplyCardOut(**{k: v for k, v in asdict(card).items() if k in ReplyCardOut.model_fields})
+
+
+@router.post("/delegation/replies/{decision_id}/answer", response_model=ReplyCardOut)
+async def answer_delegation_reply(request: Request, decision_id: int, body: ReplyAnswersIn) -> ReplyCardOut:
+    """Answer what one of the caller's reply cards left them to decide:
+    the draft is rewritten with the answers in their voice and saved like a
+    change of its words (``delegation.answers.answer`` through
+    ``card_drafts.edit``: the same caller and card checks, and the same
+    update in their Drafts when it is there). Their own cards only; sends
+    nothing. 429 past ``answers.ANSWERS_PER_HOUR`` rewrites an hour."""
+    from openexecutive.delegation import answers
+    from openexecutive.delegation.inbox import DECISION_CLASS
+    from openexecutive.delegation.replies import cards
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    instance = get_decision_instance(decision_id)
+    if instance is None or instance.decision_class != DECISION_CLASS or instance.approver_person_id != person_id:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    try:
+        _, changed = await answers.answer(
+            instance,
+            caller=api_caller.caller(request),
+            resolver=person_id,
+            answers=[answers.Answer(question_index=a.question_index, text=a.answer_text) for a in body.answers],
+        )
+    except SendRefused as refused:
+        raise HTTPException(
+            status_code=refused.status, detail={"code": refused.code, "message": refused.message, **refused.extra},
+        ) from None
+    card = next((c for c in cards(person) if c.decision_id == decision_id), None)
+    if card is None:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    out = ReplyCardOut(**{k: v for k, v in asdict(card).items() if k in ReplyCardOut.model_fields})
+    return out.model_copy(update={"changed_sentences": changed})
+
+
 @router.get("/delegation/actions", response_model=ActionCardsOut)
 def get_delegation_actions(request: Request) -> ActionCardsOut:
     """The action cards waiting for the caller to approve. Their own only:
@@ -841,6 +1142,22 @@ def get_delegation_actions(request: Request) -> ActionCardsOut:
         )
         for card in found
     ])
+
+
+@router.get("/delegation/invites", response_model=InviteCardsOut)
+def get_delegation_invites(request: Request) -> InviteCardsOut:
+    """The meeting invite cards waiting for the caller to accept or decline.
+    Their own only: everyone else gets the 403 every route here gives."""
+    from openexecutive.delegation.invites import cards
+
+    person = _caller(request)
+    _person_id(person)
+    try:
+        found = cards(person)
+    except Exception as exc:
+        logger.exception("delegation: reading the invite cards failed")
+        raise _refuse(503, "unavailable", "Couldn't read the invites waiting for you.") from exc
+    return InviteCardsOut(cards=[InviteCardOut(**asdict(card)) for card in found])
 
 
 def _set_handle_it(person_id: int, *, enabled: bool | None, mode: str | None) -> None:
@@ -901,18 +1218,93 @@ async def update_delegation_handle_it(request: Request, body: HandleItUpdate) ->
     return await _state(person)
 
 
+def _set_calendar(person_id: int, enabled: bool) -> None:
+    from openexecutive.delegation import calendar
+
+    if calendar.enabled(person_id) == enabled:
+        return
+    calendar.set_enabled(person_id, enabled, updated_by=f"person:{person_id}")
+    _audit(
+        "delegation_calendar_changed",
+        f"Read my calendar turned {'on' if enabled else 'off'} by person {person_id}",
+        {"person_id": person_id, "enabled": enabled},
+    )
+
+
+@router.put("/delegation/calendar", response_model=DelegationOut)
+async def update_delegation_calendar(request: Request, body: CalendarUpdate) -> DelegationOut:
+    """Read my calendar, for the caller alone. On needs Act as me on and a
+    calendar read that works (their sign-in must include the calendar); off
+    always works."""
+    from datetime import UTC, datetime, timedelta
+
+    from openexecutive.delegation import calendar
+    from openexecutive.delegation.gmail import CalendarNotGranted
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    if body.enabled:
+        if not is_enabled(person_id):
+            raise _refuse(409, "act_as_me_off", "Turn Act as me on first.")
+        status = await gmail_status(person.email)
+        if status != "connected":
+            raise _refuse(409, _BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+        now = datetime.now(UTC)
+        try:
+            await gmail_for(person.email or "").list_events(now, now + timedelta(hours=1), max_results=1)
+        except CalendarNotGranted as exc:
+            raise _refuse(409, "calendar_not_granted", calendar.NOT_GRANTED) from exc
+        except GmailAuthError as exc:
+            raise _refuse(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+        except GmailError as exc:
+            logger.warning("delegation: calendar check failed for person %s", person_id, exc_info=True)
+            raise _refuse(503, "calendar_error", "Couldn't reach your calendar just now. Try again in a moment.") from exc
+    _set_calendar(person_id, body.enabled)
+    return await _state(person)
+
+
+@router.put("/delegation/disclosure", response_model=DelegationOut)
+async def update_delegation_disclosure(request: Request, body: DisclosureUpdate) -> DelegationOut:
+    """The caller's own switches for the AI line on replies sent as them.
+    Turning one on only adds the line, so it needs no signed sign-in;
+    turning one off does, so nobody else can take it off their mail."""
+    from openexecutive.delegation import disclosure
+
+    changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    person = _signed_caller(request, narrowing=all(changes.values()))
+    person_id = _person_id(person)
+    before = disclosure.get(person_id)
+    changed = {k: v for k, v in changes.items() if getattr(before, k) != v}
+    if changed:
+        disclosure.set_(person_id, **changed, updated_by=f"person:{person_id}")
+        _audit(
+            "delegation_disclosure_changed", f"AI line on replies changed for person {person_id}",
+            {"person_id": person_id, **changed},
+        )
+    return await _state(person)
+
+
 @router.put("/delegation/training", response_model=DelegationOut)
 async def update_delegation_training(request: Request, body: TrainingUpdate) -> DelegationOut:
-    """Put Act as me's settings in or out of training. Putting Replies or
-    Follow-ups in only holds more back, and taking Suggested actions out
-    stops cards being carried out on their own, so those need no signed
-    sign-in; anything else does. Putting Replies or Follow-ups in turns Take
+    """Put Act as me's settings in or out of training, or Suggested actions
+    On (``actions_on``: carried out with no allow). Putting Replies or
+    Follow-ups in only holds more back, and taking Suggested actions out of
+    training or On stops cards being carried out on their own, so those need
+    no signed sign-in; anything else does. Putting Replies or Follow-ups in turns Take
     the lead as you off: in training only what the person allowed goes."""
     from openexecutive.delegation import training
 
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    # Suggested actions is one of Always ask, In training or On: picking one
+    # leaves the other.
+    if changes.get(training.ACTIONS_ON) is True:
+        changes[training.ACTIONS] = False
+    elif training.ACTIONS in changes:
+        # Out of training without asking for On is Always ask, never On.
+        changes[training.ACTIONS_ON] = False
     narrowing = all(
-        (v is True and k in (training.REPLIES, training.FOLLOW_UPS)) or (v is False and k == training.ACTIONS)
+        (v is True and k in (training.REPLIES, training.FOLLOW_UPS))
+        or (v is False and k in (training.ACTIONS, training.ACTIONS_ON))
         for k, v in changes.items()
     )
     person = _signed_caller(request, narrowing=narrowing)
@@ -999,6 +1391,82 @@ async def update_take_the_lead_as_you(request: Request, body: LeadUpdate) -> Del
     return await _state(person)
 
 
+# How far it goes as you: one dial over Write drafts as me, Draft replies to
+# my inbox, Handle it for me and its level, and Everything (Take the lead as
+# you). Each step adds to the one before it.
+REACH_STEPS: tuple[str, ...] = ("off", "when_asked", "inbox", "careful", "balanced", "bold", "everything")
+_SENDING_FROM = REACH_STEPS.index("careful")
+
+
+class ReachUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: Literal["off", "when_asked", "inbox", "careful", "balanced", "bold", "everything"]
+
+
+def reach_of(person_id: int) -> str:
+    """Where ``person_id`` is on the dial, from the switches it sets."""
+    from openexecutive.delegation import handle_it, inbox, training
+
+    if not is_enabled(person_id):
+        return "off"
+    if not inbox.get_watch(person_id).enabled:
+        return "when_asked"
+    stored = handle_it.get(person_id)
+    if not stored.enabled:
+        return "inbox"
+    if not training.get(person_id).replies and handle_it.leading(person_id):
+        return "everything"
+    return stored.mode
+
+
+@router.put("/delegation/reach", response_model=DelegationOut)
+async def update_delegation_reach(request: Request, body: ReachUpdate) -> DelegationOut:
+    """Move the dial. Going down turns the higher switches off first, top
+    down, and needs no signed sign-in. Going up turns each one on in order
+    through its own route, so every check that switch makes still applies
+    (the mailbox connected, signed sign-ins, the owner alone for Everything,
+    not in training); the first one that refuses stops the move there, at a
+    step that is itself whole. Training is left as it is."""
+    from openexecutive.delegation import handle_it
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    target = REACH_STEPS.index(body.step)
+    current = REACH_STEPS.index(reach_of(person_id))
+    if target == current:
+        return await _state(person)
+
+    # Down: highest first, so nothing is ever on above a switch that's off.
+    if target < REACH_STEPS.index("everything"):
+        _lead_off(person_id)
+    if target < _SENDING_FROM:
+        _set_handle_it(person_id, enabled=False, mode=None)
+    if target < REACH_STEPS.index("inbox"):
+        _set_inbox(person_id, False)
+    if target < REACH_STEPS.index("when_asked"):
+        return await update_delegation(request, DelegationUpdate(enabled=False))
+
+    # Up, or across the sending steps: each switch through its own route.
+    if not is_enabled(person_id):
+        await update_delegation(request, DelegationUpdate(enabled=True))
+    if target >= REACH_STEPS.index("inbox"):
+        from openexecutive.delegation import inbox
+
+        if not inbox.get_watch(person_id).enabled:
+            await update_delegation_inbox(request, InboxUpdate(enabled=True))
+    if target >= _SENDING_FROM:
+        mode = body.step if body.step in handle_it.MODES else None
+        stored = handle_it.get(person_id)
+        if stored.enabled and mode is not None and handle_it.MODES.index(mode) < handle_it.MODES.index(stored.mode):
+            # A lower level only holds more back: no signed sign-in needed.
+            _set_handle_it(person_id, enabled=None, mode=mode)
+        elif not stored.enabled or (mode is not None and mode != stored.mode):
+            await update_delegation_handle_it(request, HandleItUpdate(enabled=True, mode=mode))
+    if body.step == "everything":
+        await update_take_the_lead_as_you(request, LeadUpdate(enabled=True))
+    return await _state(person)
+
 def _rules_out(person_id: int) -> LeadRulesOut:
     from openexecutive.orchestrator import take_the_lead
 
@@ -1064,6 +1532,7 @@ def get_delegation_handled(request: Request) -> HandledOut:
             subject=h.subject, body=h.body, open_questions=h.open_questions,
             gmail_link=mailbox_link(email, thread_id=h.thread_id) if email and h.thread_id else "",
             source=h.source,
+            summary=h.summary,
         )
         for h in found
     ])
