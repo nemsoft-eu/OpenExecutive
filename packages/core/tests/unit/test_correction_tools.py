@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -175,6 +176,24 @@ def test_a_co_principal_roster_gets_no_owners_lines(db: Path, roster: SimpleName
     people_registry.invalidate()
     text = render_briefing_context(period_label="p", today_data={}, activity=[], standing_facts="")
     assert "Close it?" not in text
+
+
+def test_a_failed_roster_read_leaves_the_owners_lines_out_and_the_brief_standing(
+    db: Path, roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whether the lines are the reader's own cannot be told without the
+    roster, so a failed read leaves them out instead of failing the brief."""
+    from openexecutive.briefing.narrative import render_briefing_context
+
+    brief_requests.add(brief_requests.KIND_RAISE, "You said the invoice was paid. Close it?",
+                       source_quote="q", person_id=roster.principal.id, db_path=db)
+
+    def broken(*_a: object, **_k: object) -> list[object]:
+        raise sqlite3.OperationalError("no such table: people")
+
+    monkeypatch.setattr(people_store, "active_principals", broken)
+    text = render_briefing_context(period_label="p", today_data={}, activity=[], standing_facts="")
+    assert "Close it?" not in text and "(No org activity" in text
 
 
 def test_a_raise_line_alone_is_not_a_quiet_day(db: Path, roster: SimpleNamespace) -> None:

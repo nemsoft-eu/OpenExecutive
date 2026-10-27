@@ -549,7 +549,7 @@ def test_waiting_drafts_reach_the_principals_own_turn_only(
     monkeypatch.setattr(episodic, "DB_PATH", path)
     owner = SimpleNamespace(id=1, email="owner@example.com")
     monkeypatch.setattr(people_store, "find_principal_person", lambda *a, **k: owner)
-    # One principal: the drafts are then the speaker's own (context._single_principal).
+    # One principal: the drafts are then the speaker's own (context.single_principal).
     roster = [owner, SimpleNamespace(id=2, email="co@example.com")] if co_principal else [owner]
     monkeypatch.setattr(people_store, "active_principals", lambda *a, **k: roster)
     monkeypatch.setattr(people_tools, "is_principal_on_verified_surface", lambda _s: verified)
