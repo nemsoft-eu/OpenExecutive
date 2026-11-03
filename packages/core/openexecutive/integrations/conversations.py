@@ -90,8 +90,11 @@ def record_delivery(
             session_id, title, datetime.now(UTC).isoformat(),
             caller_person_id=owner_person_id, db_path=path,
         )
-        if private:
-            mark_mail_private(session_id, owner_person_id, db_path=path)
+        # Someone else's row is left unmarked (the chat id moved to another
+        # person), so their conversation doesn't get this person's private text.
+        if private and mark_mail_private(session_id, owner_person_id, db_path=path) != owner_person_id:
+            logger.warning("conversations: left a private delivery out of %s, another person's", base_id)
+            return None
         save_message(session_id, "assistant", text, db_path=path)
         update_session_timestamp(session_id, db_path=path)
     except Exception:

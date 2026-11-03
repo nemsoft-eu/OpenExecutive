@@ -63,6 +63,9 @@ def test_a_private_delivery_marks_its_conversation_its_owners_alone(db: Path) ->
     sid = record_delivery(BASE, DIGEST, owner_person_id=OWNER, title="Morning brief", private=True, db_path=db)
     assert sid == BASE and session_store.session_mail_private(BASE, db_path=db) is True
     assert _roles(db, BASE)[-1] == ("assistant", DIGEST)
+    # Never into a conversation someone else owns.
+    assert record_delivery(BASE, "private", owner_person_id=OWNER + 1, title="x", private=True, db_path=db) is None
+    assert ("assistant", "private") not in _roles(db, BASE)
     other = "telegram:999"
     assert record_delivery(other, DIGEST, owner_person_id=OWNER, title="Update", db_path=db) == other
     assert session_store.session_mail_private(other, db_path=db) is False

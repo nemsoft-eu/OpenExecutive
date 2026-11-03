@@ -133,15 +133,16 @@ def conversation_file(name: str) -> tuple[str, bytes] | None:
     from openexecutive.orchestrator import conversation_files
     from openexecutive.workflows import turn_files
 
+    # Either way: a job's result made from mail can replace a file sent this
+    # turn (``turn_files.replace``) and must still hold the turn.
     data = turn_files.get(name)
-    if data is not None:
-        return turn_files.safe_name(name), data
-    data = conversation_files.get(_session_id(), name)
-    if data is not None:
-        if conversation_files.from_mail(_session_id(), name):
-            _hold_as_mail_read()
-        return turn_files.safe_name(name), data
-    return None
+    if data is None:
+        data = conversation_files.get(_session_id(), name)
+    if data is None:
+        return None
+    if conversation_files.from_mail(_session_id(), name):
+        _hold_as_mail_read()
+    return turn_files.safe_name(name), data
 
 
 def _hold_as_mail_read() -> None:

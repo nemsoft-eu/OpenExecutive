@@ -312,7 +312,9 @@ def test_a_save_files_card_shows_who_else_sees_it_and_saves_on_the_tap(
     assert base64.b64decode(created[0]["base64_content"]) == b"page one"
 
 
-def test_a_jobs_result_replaces_a_file_of_the_same_name_sent_this_turn(company: Session) -> None:
+def test_a_jobs_result_replaces_a_file_of_the_same_name_sent_this_turn(
+    company: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with turn_files.bind({"report.csv": b"original", "other.csv": b"other"}):
         reply = asyncio.run(python_job._keep({"report.csv": b"corrected", "new.csv": b"new"}))
         assert {f["handle"] for f in reply["files"]} == {"file:report.csv", "file:new.csv"}
@@ -320,6 +322,12 @@ def test_a_jobs_result_replaces_a_file_of_the_same_name_sent_this_turn(company: 
         # What a later job in the turn is given too; the rest stay as sent.
         assert turn_files.get("report.csv") == b"corrected" and turn_files.get("other.csv") == b"other"
         assert turn_files.names() == ["other.csv", "report.csv"]
+        # A result made from mail still holds the turn when it replaces an upload.
+        conversation_files.keep(company.session_id, {"report.csv": b"corrected"}, from_mail=True)
+        held = SimpleNamespace(read_mail=False, touched_mail=False, unchecked_mail=False)
+        monkeypatch.setattr("openexecutive.delegation.settings.turn_delegation", lambda _s: held)
+        assert file_refs.conversation_file("report.csv") == ("report.csv", b"corrected")
+        assert held.unchecked_mail is True
 
 
 def test_a_save_files_card_names_everyone_its_tap_approves(
