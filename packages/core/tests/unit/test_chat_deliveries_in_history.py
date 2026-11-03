@@ -59,6 +59,15 @@ def test_a_delivery_joins_the_open_conversation(db: Path) -> None:
     assert conversations.current_conversation(BASE, db_path=db) == BASE
 
 
+def test_a_private_delivery_marks_its_conversation_its_owners_alone(db: Path) -> None:
+    sid = record_delivery(BASE, DIGEST, owner_person_id=OWNER, title="Morning brief", private=True, db_path=db)
+    assert sid == BASE and session_store.session_mail_private(BASE, db_path=db) is True
+    assert _roles(db, BASE)[-1] == ("assistant", DIGEST)
+    other = "telegram:999"
+    assert record_delivery(other, DIGEST, owner_person_id=OWNER, title="Update", db_path=db) == other
+    assert session_store.session_mail_private(other, db_path=db) is False
+
+
 def test_after_a_quiet_stretch_the_delivery_opens_the_conversation_the_reply_joins(db: Path) -> None:
     _turn(db, BASE, datetime.now(UTC) - timedelta(hours=5))
     sid = record_delivery(BASE, DIGEST, owner_person_id=OWNER, title="Evening digest", db_path=db)
@@ -101,6 +110,9 @@ def _principal() -> Person:
     return Person(id=OWNER, full_name="Dana", is_principal=True, telegram_chat_id="4242")
 
 
+privacy: list[bool] = []
+
+
 def _run_send(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> list[tuple[Any, ...]]:
     saved: list[tuple[Any, ...]] = []
 
@@ -109,6 +121,7 @@ def _run_send(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> list[t
 
     def fake_record(base_id: str, text: str, **kw: Any) -> str:
         saved.append((base_id, text, kw["owner_person_id"], kw["title"]))
+        privacy.append(kw["private"])
         return base_id
 
     monkeypatch.setattr(schedule_tools, "handle_send_telegram_message", fake_send)
@@ -119,8 +132,19 @@ def _run_send(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> list[t
 
 
 def test_a_brief_sent_to_telegram_is_saved_into_the_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    privacy.clear()
     saved = _run_send(monkeypatch, {"status": "sent", "chat_id": 4242})
     assert saved == [(BASE, DIGEST, OWNER, "Evening digest")]
+    assert privacy == [False]
+
+
+def test_a_delivery_private_to_the_principal_is_saved_as_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
+
+    privacy.clear()
+    with restrict_to_principal():
+        _run_send(monkeypatch, {"status": "sent", "chat_id": 4242})
+    assert privacy == [True]
 
 
 def test_a_held_message_is_saved_only_when_it_goes_out(monkeypatch: pytest.MonkeyPatch) -> None:

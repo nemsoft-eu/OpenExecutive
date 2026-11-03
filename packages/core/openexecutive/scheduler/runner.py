@@ -2734,9 +2734,11 @@ async def _remember_in_chat(
         if _json.loads(result_json).get("status") != "sent":
             return
         from openexecutive.integrations.conversations import record_delivery
+        from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
 
         await asyncio.to_thread(
             record_delivery, base_id, text, owner_person_id=person.id, title=label,
+            private=turn_is_private_to_principal(),
         )
     except Exception:
         logger.exception("scheduler: couldn't save the delivery into %s", base_id)

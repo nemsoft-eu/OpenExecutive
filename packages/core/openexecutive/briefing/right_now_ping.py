@@ -171,9 +171,11 @@ async def _maybe_ping(
     if hold_for(principal.id, source=SOURCE_RIGHT_NOW, now=now) is not None:
         return PingResult("quiet"), len(points)
     from openexecutive.attunement.outcomes import tag_proactive
+    from openexecutive.orchestrator.people_tools import restrict_to_principal
     from openexecutive.scheduler.runner import deliver_to_person
 
-    with tag_proactive(SOURCE_RIGHT_NOW):
+    # Built from their own mail and chats: only they may get it or read it back.
+    with tag_proactive(SOURCE_RIGHT_NOW), restrict_to_principal():
         delivery = await deliver_to_person(principal, text, label=LABEL, chat_only=True)
     if not delivery.ok:
         status = "no_chat_app" if delivery.reason == "no_channel" else "not_reached"

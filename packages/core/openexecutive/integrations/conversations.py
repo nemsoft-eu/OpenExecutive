@@ -53,6 +53,7 @@ def record_delivery(
     *,
     owner_person_id: int | None,
     title: str,
+    private: bool = False,
     db_path: Path | None = None,
 ) -> str | None:
     """Save ``text``, which the Executive just sent into ``base_id``'s stream
@@ -63,8 +64,11 @@ def record_delivery(
     stream was quiet for a while the reply even starts a new conversation.
     Saving it also counts as activity, so the reply lands in this same
     conversation. ``title`` names a conversation this message starts; an
-    existing one keeps its name. Returns the conversation's id, or None when
-    it couldn't be saved. Sync (SQLite); never raises.
+    existing one keeps its name. ``private``: it is its owner's alone (a brief
+    or ping built from their mail), so the conversation is marked before the
+    words are saved, and no other principal reads it. Returns the
+    conversation's id, or None when it couldn't be saved. Sync (SQLite); never
+    raises.
     """
     if not is_rolling(base_id) or not (text or "").strip():
         return None
@@ -74,6 +78,7 @@ def record_delivery(
     from openexecutive.memory.conversations import current_conversation
     from openexecutive.memory.session_store import (
         create_session,
+        mark_mail_private,
         save_message,
         update_session_timestamp,
     )
@@ -85,6 +90,8 @@ def record_delivery(
             session_id, title, datetime.now(UTC).isoformat(),
             caller_person_id=owner_person_id, db_path=path,
         )
+        if private:
+            mark_mail_private(session_id, owner_person_id, db_path=path)
         save_message(session_id, "assistant", text, db_path=path)
         update_session_timestamp(session_id, db_path=path)
     except Exception:

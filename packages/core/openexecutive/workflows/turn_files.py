@@ -84,6 +84,15 @@ def names() -> list[str]:
     return sorted(_files.get() or {})
 
 
+def replace(files: dict[str, bytes]) -> None:
+    """A job's results under a name sent this turn take that file's place, so
+    the ``file:`` handle the job returned means the result (``get`` is read
+    before the conversation's copy)."""
+    bound = _files.get()
+    if bound:
+        bound.update({name: data for name, data in files.items() if name in bound})
+
+
 def offer(filename: str, data: bytes) -> None:
     """Hold a file a chat app read for the next turn this context runs."""
     pending = _offered.get()

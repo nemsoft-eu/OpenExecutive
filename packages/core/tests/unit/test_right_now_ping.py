@@ -56,6 +56,21 @@ async def test_a_new_point_that_needs_them_is_sent_on_their_chat_app(env: dict[s
     assert label == "Right now" and chat_only is True
 
 
+async def test_a_ping_is_sent_as_private_to_the_principal(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator.people_tools import turn_is_private_to_principal
+    from openexecutive.scheduler import runner
+
+    seen: list[bool] = []
+
+    async def deliver(*_a: Any, **_k: Any) -> Any:
+        seen.append(turn_is_private_to_principal())
+        return runner.PrincipalDelivery(True, "42", "delivered", "telegram")
+
+    monkeypatch.setattr(runner, "deliver_to_person", deliver)
+    await right_now_ping.maybe_ping([ANDY, BOARD], {point_key(ANDY)}, earlier_today=True, now=NOW)
+    assert seen == [True] and turn_is_private_to_principal() is False
+
+
 async def test_everything_sends_every_new_point_in_one_message(env: dict[str, Any]) -> None:
     env["settings"] = NotificationSettings(right_now="everything")
     await right_now_ping.maybe_ping([ANDY, BOARD], set(), earlier_today=True, now=NOW)

@@ -8919,7 +8919,9 @@ integrations:
       • What the Executive sends into the stream on its own (a brief,
         the evening digest, a workflow report, a reminder; the
         scheduler's _send_on_plan) is saved into the current
-        conversation as its message once sent (record_delivery; a held
+        conversation as its message once sent (record_delivery; one sent
+        inside restrict_to_principal, a brief or ping, marks it mail_private
+        first; a held
         message when it goes out) and counts as activity, so the reply
         joins it with the message in view. Without this a reply like
         "can you fix it?" reached a turn with nothing before it.

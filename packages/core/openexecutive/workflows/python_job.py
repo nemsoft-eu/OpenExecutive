@@ -783,6 +783,7 @@ async def _keep(files: dict[str, bytes]) -> dict[str, Any]:
         await asyncio.to_thread((folder / name).write_bytes, data)
     session_id = getattr(current_session.get(), "session_id", None)
     from openexecutive.orchestrator.file_refs import turn_used_mail_files
+    from openexecutive.workflows.turn_files import replace as replace_in_turn
     from openexecutive.workflows.turn_files import safe_name
 
     kept = set(await asyncio.to_thread(
@@ -791,6 +792,7 @@ async def _keep(files: dict[str, bytes]) -> dict[str, Any]:
             from_mail=turn_used_mail_files(),
         )
     ))
+    replace_in_turn({safe_name(n): d for n, d in files.items() if safe_name(n) in kept})
     return {
         "files": [
             {"name": n, "bytes": len(d),

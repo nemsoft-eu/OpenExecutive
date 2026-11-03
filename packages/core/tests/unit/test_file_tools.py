@@ -21,7 +21,7 @@ from openexecutive.orchestrator import conversation_files, file_refs, file_tools
 from openexecutive.orchestrator import mail_file_save as save
 from openexecutive.orchestrator.schedule_tools import current_session
 from openexecutive.orchestrator.session import Session
-from openexecutive.workflows import python_job
+from openexecutive.workflows import python_job, turn_files
 
 ACCOUNT = "ceo.test@example.com"
 FOLDER = "1LoisFolderId000000"
@@ -310,6 +310,16 @@ def test_a_save_files_card_shows_who_else_sees_it_and_saves_on_the_tap(
     created = [a for n, a in shared_drive[1:] if n.endswith("create_drive_file")]
     assert created[0]["file_name"] == "Willow Court 2026 Tax Bill.pdf" and created[0]["folder_id"] == FOLDER
     assert base64.b64decode(created[0]["base64_content"]) == b"page one"
+
+
+def test_a_jobs_result_replaces_a_file_of_the_same_name_sent_this_turn(company: Session) -> None:
+    with turn_files.bind({"report.csv": b"original", "other.csv": b"other"}):
+        reply = asyncio.run(python_job._keep({"report.csv": b"corrected", "new.csv": b"new"}))
+        assert {f["handle"] for f in reply["files"]} == {"file:report.csv", "file:new.csv"}
+        assert file_refs.conversation_file("report.csv") == ("report.csv", b"corrected")
+        # What a later job in the turn is given too; the rest stay as sent.
+        assert turn_files.get("report.csv") == b"corrected" and turn_files.get("other.csv") == b"other"
+        assert turn_files.names() == ["other.csv", "report.csv"]
 
 
 def test_a_save_files_card_names_everyone_its_tap_approves(
