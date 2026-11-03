@@ -305,10 +305,13 @@ async def _send_checked(
                 raise SendRefused(
                     409, "learned_full", "It has learned as much as it can hold. Remove something first.",
                 )
-    if not is_enabled(person.id) or not get_watch(person.id).enabled:
+    # The watcher's switch governs what goes without a tap. A tap is the
+    # person's own act, on a card that may be one they asked for from Home
+    # (inbox.draft_on_request), which that switch never had a say in.
+    if not is_enabled(person.id) or (on_its_own and not get_watch(person.id).enabled):
         raise SendRefused(
             409, "inbox_off",
-            "Turn on Act as me and Draft replies to my inbox to send from here, or send it from your mailbox.",
+            "Turn on Act as me to send from here, or send it from your mailbox.",
         )
     if _client_slot_active():
         raise SendRefused(409, "client_slot", "Sending from here is paused while a client is active. Send it from your mailbox.")

@@ -389,9 +389,10 @@ async def _edit(
                 502, "gmail_error", "Couldn't save your change in your mailbox. Try again in a moment.",
             ) from exc
         changed[EDITED_VERSION] = version
-        if not by_hand and not payload.get(EDITED_VERSION):
-            # Still the Executive's own draft: the mailbox's new version is
-            # the one Send compares with to tell whether the person changed it.
+        if not by_hand and not payload.get(EDITED_ON_CARD):
+            # Still the Executive's own draft, however many times it caught
+            # up: the mailbox's new version is the one Send compares with to
+            # tell whether the person changed it.
             changed["draft_message_id"] = version
     if not update_open_payload(instance.id, changed, expected_json=instance.proposed_payload_json):
         raise SendRefused(409, "already_handled", "This reply changed or was sent meanwhile. Look at it again.")

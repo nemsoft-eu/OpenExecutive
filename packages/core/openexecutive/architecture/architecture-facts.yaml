@@ -9410,9 +9410,9 @@ integrations:
     conversation of its own person once (``chat_card_pushes``), after two
     minutes and within a day, to the approver's first chat app that proves
     taps (``chat_for``), outside quiet hours, five a person a pass; a failed
-    send is tried again on later passes, three tries in all; audit ``chat_card_sent``. A reply, Take the lead or
-    department card is shown whole (the whole draft, every field of the held
-    call) or not at all: over CARD_MAX (1800) it is neither pushed nor
+    send is tried again on later passes, three tries in all; audit ``chat_card_sent``. A reply, action, Take the lead or
+    department card is shown whole (the whole draft, each action's text,
+    every field of the held call) or not at all: over CARD_MAX (1800) it is neither pushed nor
     approvable from a chat.
 
     Chat messages asking the principal. ``slack_bot.note_chat_ask`` runs on
@@ -12704,7 +12704,8 @@ delegation:
     none) and questions_settled. Why choices: tapping an answer beats
     rewriting the draft by hand on a phone. Send is POST /decisions/{id}/approve (edits carry the
     second yes; 409 confirm / caller_signing_required / draft_gone /
-    you_replied / inbox_off / client_slot / the Gmail codes, 429
+    you_replied / inbox_off (Act as me off; only send_on_its_own also needs
+    the watcher's switch) / client_slot / the Gmail codes, 429
     rate_limited, 502 gmail_error / send_unconfirmed); Dismiss is POST
     /decisions/{id}/reject. PUT /delegation/handle-it {enabled?, mode?}
     (422 bad_mode) and GET /delegation/handled ({replies: [...]}, each with

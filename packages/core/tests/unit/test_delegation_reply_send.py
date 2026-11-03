@@ -150,11 +150,20 @@ def test_only_the_person_it_was_written_for(owner: Any, models: dict[str, Any]) 
     assert mailbox.sent == []
 
 
-def test_both_switches_gmail_and_no_client_slot(owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    mailbox, card = _card(owner)
+def test_a_tap_sends_with_the_inbox_watcher_off(owner: Any, models: dict[str, Any]) -> None:
+    """When I ask: the card a person asked for from Home stays theirs to send
+    without turning on drafting for their whole inbox."""
+    mailbox = FakeInbox()
+    mailbox.add(_msg("m1", "t1"))
     inbox.set_watch(owner.id, False, updated_by="test")
-    assert _refused(card, mailbox, owner).code == "inbox_off"
-    inbox.set_watch(owner.id, True, updated_by="test")
+    decision_id = asyncio.run(inbox.draft_on_request(owner, "t1", "m1", gmail=mailbox, now=NOW))
+    assert isinstance(decision_id, int)
+    card = ledger.get_decision_instance(decision_id)
+    assert _send(card, mailbox, owner) == "sent-d1" and mailbox.sent == ["d1"]
+
+
+def test_act_as_me_gmail_and_no_client_slot(owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    mailbox, card = _card(owner)
     set_enabled(owner.id, False, updated_by="test")
     assert _refused(card, mailbox, owner).code == "inbox_off"
     set_enabled(owner.id, True, updated_by="test")

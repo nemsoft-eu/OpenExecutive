@@ -177,6 +177,52 @@ def test_in_the_mailbox_an_edit_rewrites_the_draft_there(db: Path, owner: Any, m
     assert mailbox.drafts["d1"].message.text == "Friday at 10 works."
 
 
+def _catch_up(card: Any, mailbox: FakeInbox, owner: Any, text: str) -> None:
+    async def write(_person: Any, _payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return text, {}
+
+    asyncio.run(card_drafts.redraft(_fresh(card), owner, mailbox, write))
+
+
+def test_catching_up_again_and_again_stays_the_executives_own(db: Path, owner: Any, models: dict[str, Any]) -> None:
+    inbox.set_mailbox_drafts(owner.id, True, updated_by="test")
+    mailbox, card = _card(owner)
+    _catch_up(card, mailbox, owner, "First catch-up.")
+    _catch_up(card, mailbox, owner, "Second catch-up.")
+    payload = inbox.card_payload(_fresh(card))
+    assert payload["draft_message_id"] == mailbox.drafts["d1"].message.id == payload["edited_version"]
+    assert _send(card, mailbox, owner) == "sent-d1"
+    # Not taken for the person's change, so never kept as how they write.
+    assert _fresh(card).status == "approved_unchanged"
+
+
+def test_a_change_by_hand_stays_theirs_through_a_catch_up(db: Path, owner: Any, models: dict[str, Any]) -> None:
+    inbox.set_mailbox_drafts(owner.id, True, updated_by="test")
+    mailbox, card = _card(owner)
+    before = inbox.card_payload(card)["draft_message_id"]
+    _catch_up(card, mailbox, owner, "First catch-up.")
+    baseline = inbox.card_payload(_fresh(card))["draft_message_id"]
+    assert baseline != before
+    _edit(card, mailbox, owner, "Friday works.")
+    _catch_up(card, mailbox, owner, "Second catch-up.")
+    payload = inbox.card_payload(_fresh(card))
+    assert payload["edited_on_card"] is True and payload["draft_message_id"] == baseline
+    assert _send(card, mailbox, owner) == "sent-d1"
+    assert _fresh(card).status == "approved_with_edit"
+
+
+def test_a_change_in_the_mailbox_is_not_caught_up_over(db: Path, owner: Any, models: dict[str, Any]) -> None:
+    inbox.set_mailbox_drafts(owner.id, True, updated_by="test")
+    mailbox, card = _card(owner)
+    _catch_up(card, mailbox, owner, "First catch-up.")
+    mailbox.edit("d1")
+    with pytest.raises(SendRefused) as err:
+        _catch_up(card, mailbox, owner, "Second catch-up.")
+    assert err.value.code == "draft_changed"
+    assert _send(card, mailbox, owner) == "sent-d1"
+    assert _fresh(card).status == "approved_with_edit"
+
+
 def test_an_edited_mailbox_draft_dismissed_on_its_card_is_deleted(
     db: Path, owner: Any, models: dict[str, Any]
 ) -> None:

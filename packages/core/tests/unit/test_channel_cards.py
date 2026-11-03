@@ -145,6 +145,37 @@ def test_a_card_is_approved_by_its_person_and_skipped_cards_do_nothing(
     assert len(sends) == 1
 
 
+def test_a_card_of_actions_shows_what_its_tap_would_do(
+    roster: SimpleNamespace, sends: list[Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_enabled(roster.principal, True, updated_by="t")
+    card = _card(_session(FakeMailbox()), [_message(roster.teammate, "The pilot moves to Friday.")])
+    assert channel_cards.card_text(card.id).endswith("- Message Ben Teammate\nThe pilot moves to Friday.")
+
+    # The files and everyone who can open the folder, whole.
+    save = {"kind": "save_files", "summary": "Save 1 file to Partner folder",
+            "text": "Bill.pdf\nAlso open to: dana@partner.example"}
+    stored = SimpleNamespace(
+        decision_class="delegation_actions", status="proposed", proposed_payload_json=json.dumps({"actions": [save]}),
+    )
+    monkeypatch.setattr("openexecutive.memory.decision_ledger.get_decision_instance", lambda _id: stored)
+    assert channel_cards.card_text(1) == (
+        "Waiting for your approval\n- Save 1 file to Partner folder\nBill.pdf\nAlso open to: dana@partner.example"
+    )
+
+
+def test_a_card_of_actions_too_long_for_a_chat_is_not_approved_there(
+    roster: SimpleNamespace, sends: list[Any],
+) -> None:
+    set_enabled(roster.principal, True, updated_by="t")
+    card = _card(_session(FakeMailbox()), [_message(roster.teammate, "x" * channel_cards.CARD_MAX)])
+    assert channel_cards.card_text(card.id) is None
+    line = asyncio.run(channel_cards.resolve(card.id, get_person(roster.principal), approve=True))
+    assert "too long" in line and sends == []
+    # Skip still works.
+    assert asyncio.run(channel_cards.resolve(card.id, get_person(roster.principal), approve=False)) == "Skipped."
+
+
 def test_a_team_members_card_is_theirs_alone(
     roster: SimpleNamespace, sends: list[Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

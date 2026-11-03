@@ -312,6 +312,24 @@ def test_a_save_files_card_shows_who_else_sees_it_and_saves_on_the_tap(
     assert base64.b64decode(created[0]["base64_content"]) == b"page one"
 
 
+def test_a_save_files_card_names_everyone_its_tap_approves(
+    company: Session, shared_drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import action_cards
+
+    outside = [f"p{i}@partner.example" for i in range(12)]
+    monkeypatch.setattr(file_tools, "folder_check", lambda *_a: (None, outside))
+    conversation_files.keep(company.session_id, {"bill.pdf": b"page"})
+    checked = action_cards.check(
+        [{"kind": "save_files", "folder": FOLDER, "files": [{"file": "file:bill.pdf"}]}],
+        SimpleNamespace(id=1, is_principal=True), now=datetime.now(UTC),
+    )
+    assert isinstance(checked, list)
+    assert asyncio.run(action_cards.describe_save_files(checked, company.session_id)) is None
+    assert checked[0]["input"]["outside"] == outside
+    assert checked[0]["text"] == f"bill.pdf\nAlso open to: {', '.join(outside)}"
+
+
 def test_a_save_files_card_refuses_what_it_shouldnt_hold(
     company: Session, shared_drive: list, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

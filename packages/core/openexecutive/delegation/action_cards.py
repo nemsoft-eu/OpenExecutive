@@ -437,8 +437,8 @@ async def describe_save_files(actions: list[dict[str, Any]], session_id: str | N
         stored["outside"] = outside
         count = f"{len(stored['files'])} file" + ("" if len(stored["files"]) == 1 else "s")
         action["summary"] = f"Save {count} to {folder_name}"
-        shown = ", ".join(outside[:10]) + (f" and {len(outside) - 10} more" if len(outside) > 10 else "")
-        action["text"] = "\n".join([*(f["name"] for f in stored["files"]), f"Also open to: {shown}"])
+        # Everyone: the tap approves exactly this list (file_tools._google).
+        action["text"] = "\n".join([*(f["name"] for f in stored["files"]), f"Also open to: {', '.join(outside)}"])
     return None
 
 

@@ -68,12 +68,11 @@ _CLASS_LABEL = {
 # they aren't Approve and Approved.
 _APPROVE_LABEL = {"delegation_reply": "Send", "delegation_invite": "Accept"}
 _DONE_TEXT = {"delegation_reply": "Sent.", "delegation_invite": "Accepted."}
-# A card waiting outside any chat is shown whole or not at all: its tap
-# sends or does exactly what is stored, so a card cut short would approve
-# what it never showed. This fits every chat app's message (Discord's 2000
-# is the smallest).
+# These cards are shown whole or not at all: a tap sends or does exactly what
+# is stored, so a card cut short would approve what it never showed. This fits
+# every chat app's message (Discord's 2000 is the smallest).
 CARD_MAX = 1800
-_WHOLE_CLASSES = frozenset({"delegation_reply", "take_the_lead_action", "department_action"})
+_WHOLE_CLASSES = frozenset({"delegation_actions", "delegation_reply", "take_the_lead_action", "department_action"})
 
 
 def telegram_proves_taps() -> bool:
@@ -223,7 +222,12 @@ def card_text(decision_id: int) -> str | None:
             lines.append(why)
         for action in payload.get("actions") or []:
             if isinstance(action, dict) and action.get("summary"):
-                lines.append(f"- {str(action['summary'])[:400]}")
+                lines.append(f"- {str(action['summary'])}")
+                # As the web card shows it: a message's words, the files and
+                # who else can open their folder.
+                detail = str(action.get("text") or "").strip()
+                if detail:
+                    lines.append(detail)
     text = "\n".join(lines)
     if instance.decision_class in _WHOLE_CLASSES and len(text) > CARD_MAX:
         # Too long to show whole: it waits in the app instead.
