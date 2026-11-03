@@ -111,9 +111,10 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # does opens a link or reaches anyone else, which is all this turn fences.
     "save_my_email_attachment",
     # Any file (orchestrator.file_refs) into a folder of the Executive's own
-    # Drive or OneDrive that belongs to it or the team: only when the speaker
-    # asked for file work in their own words this turn, every call built in
-    # code (orchestrator.file_tools). Nothing it does opens a link.
+    # Drive that belongs to it or the team, every call built in code. While
+    # this lock holds its handler keeps the file from anyone it can see outside
+    # the team: a folder people outside can open waits for a tap, and Documents
+    # and OneDrive are refused (orchestrator.file_tools._turn_held).
     "save_file",
     # A Python job runs with no network (Deno with no net permission, or a
     # Sprite whose network is shut), and read_document reads files already on

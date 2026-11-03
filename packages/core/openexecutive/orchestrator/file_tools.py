@@ -17,7 +17,11 @@ the model chooses the file, the folder and the name:
   drive, whose upload path can't reach another drive; a name already there
   gets " (2)". Or, with ``folder`` ``documents``, the company's Documents
   (the Knowledge page's uploads, ``_documents``), indexed like an upload.
-- **When:** whenever the person asks.
+- **When:** whenever the person asks. Once words from outside may be steering
+  the turn (``_turn_held``), nothing goes where it could leave the team or be
+  trusted later: a folder people outside the team can open waits for a tap on
+  a ``save_files`` card, and one that hides who can open it, Documents and
+  OneDrive, which no card covers, are refused.
 
 The calls go through the gateway like any other (``mcp_gateway.code_built_call``),
 so its gates (the acting account, writes kept to the Executive's own drives)
@@ -94,6 +98,27 @@ def _named(raw: Any, fallback: str) -> str:
     return clean_name(wanted, 1)
 
 
+def _turn_held() -> bool:
+    """Whether words from outside may be steering the turn in progress: the
+    mail lock on the owner's mail, or a read from outside the team, such as the
+    Executive's own inbox, that holds the turn at the owner's safety level
+    (``outside_content.read_outside``, the same gate the other writes obey).
+    Asked after the file's handle is resolved, since using a file from mail
+    marks the turn. Never raises; fails closed."""
+    from openexecutive.delegation.lockdown import mail_lock_holds
+    from openexecutive.delegation.settings import turn_delegation
+    from openexecutive.orchestrator import outside_content
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    try:
+        if mail_lock_holds(turn_delegation(current_session.get())):
+            return True
+        return outside_content.read_outside()
+    except Exception:
+        logger.warning("save_file: couldn't read what the turn has read", exc_info=True)
+        return True
+
+
 def _team_emails() -> set[str]:
     from openexecutive.people.store import list_people
 
@@ -106,6 +131,28 @@ def _team_emails() -> set[str]:
 
 
 SHARED_OUTSIDE = "That folder is shared with someone outside the team, so I don't save into it"
+NEEDS_CARD = (
+    "This turn read mail or outside content and people outside the team can open that "
+    "folder, so it waits for their tap: propose_actions with a save_files action."
+)
+HELD_UNSEEN = (
+    "Drive won't say who can open that folder, so it isn't saved there while this turn's "
+    "mail or outside content is in play. Pick another folder, or root."
+)
+HELD_DOCUMENTS = (
+    "This turn read mail or outside content and Documents is what later answers trust, "
+    "so it isn't saved there. Save it to a Drive folder, or they can upload it on the "
+    "Knowledge page."
+)
+HELD_ONEDRIVE = (
+    "This turn read mail or outside content and I can't see who else can open a OneDrive "
+    "folder, so it isn't saved there. save_my_email_attachment keeps an attached file in "
+    "a folder shared with them alone."
+)
+# What get_drive_file_permissions says for a folder whose permissions Drive
+# doesn't list to this account, which may still be shared with anyone. Found
+# anywhere in the answer, so a name holding these words can only refuse.
+_NO_PERMISSIONS_LISTED = "No additional permissions"
 
 
 # How the folder's permissions name anyone with the link, and a whole domain.
@@ -186,12 +233,13 @@ def folder_refusal(info: str, folder: str, account: str, team: set[str]) -> str 
 
 async def _google(
     gateway: Any, item: Any, folder: str, name: str, *, tapped: bool = False, shown: list[str] | None = None,
+    held: bool = False,
 ) -> dict[str, Any]:
     """Save ``item`` into ``folder`` of the Executive's Google Drive. A
     folder the company owns is saved into whoever else it is shared with
-    (the answer names them, ``also_open_to``); one someone outside the
-    company owns is refused. ``tapped`` and ``shown`` are kept for cards
-    left before saves stopped waiting on a tap; they change nothing."""
+    (the answer names them, ``also_open_to``), unless ``held`` (``_turn_held``)
+    sends that to a card; one someone outside the company owns is refused. A
+    tap (``tapped``) approves only the people its card showed (``shown``)."""
     from openexecutive.orchestrator.drive_attach import INFO_TOOL
     from openexecutive.orchestrator.mail_file_save import (
         _CREATED_RE,
@@ -219,6 +267,13 @@ async def _google(
                 f"That folder is open to {public[0].lower() if public[0].startswith('Anyone') else public[0]}, "
                 "so I don't save into it. Pick a folder shared with named people, or change its sharing."
             )
+        if (held or tapped) and _NO_PERMISSIONS_LISTED in info:
+            raise SaveFailed(HELD_UNSEEN)
+        if held and outside:
+            raise SaveFailed(NEEDS_CARD)
+        unseen = [who for who in outside if who not in (shown or [])] if tapped else []
+        if unseen:
+            raise SaveFailed(f"That folder is now open to {unseen[0]} too, who wasn't on the card. Ask again in the chat.")
     made = await _call(gateway, "google_workspace__create_drive_file", {
         "user_google_email": account,
         "file_name": name,
@@ -352,7 +407,10 @@ async def handle_save_file(tool_input: dict[str, Any]) -> str:
     name = _named(tool_input.get("name"), item.name)
     gateway = await ensure_active_gateway()
     provider = save.storage_for(gateway)
+    held = _turn_held()
     if folder.lower() == DOCUMENTS:
+        if held:
+            return json.dumps({"status": "failed", "detail": f"Couldn't save {name}. {HELD_DOCUMENTS}"})
         provider = DOCUMENTS
     elif provider is None:
         return json.dumps({
@@ -367,7 +425,9 @@ async def handle_save_file(tool_input: dict[str, Any]) -> str:
             if provider == DOCUMENTS:
                 saved = await _documents(item, name)
             elif provider == save.GOOGLE:
-                saved = await _google(gateway, item, folder, name)
+                saved = await _google(gateway, item, folder, name, held=held)
+            elif held:
+                raise save.SaveFailed(HELD_ONEDRIVE)
             else:
                 saved = await _microsoft(gateway, item, folder, name)
     except save.NoStorage:

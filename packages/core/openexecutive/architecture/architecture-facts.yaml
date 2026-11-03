@@ -7766,9 +7766,9 @@ workflows:
     the Executive's account or a team member; the folder's
     get_drive_file_permissions answer must have exactly one ID line, Type and
     Owners read at fixed offsets from it, since the name comes first and may
-    hold anything; a folder an outsider owns is refused, and one shared with
-    an outsider, group, domain or by link is saved into, the answer naming
-    them as also_open_to (file_tools.folder_check). The gateway's own Drive
+    hold anything; a folder an outsider owns or one open by link or to a domain
+    is refused, and one shared with an outsider or group is saved into, the
+    answer naming them as also_open_to (file_tools.folder_check). The gateway's own Drive
     write check (mcp_gateway._company_owned) likewise looks at who owns a
     file or folder, not who else it is shared with;
     in its own drive and never overwrite a name). Opening a mail: file sets TurnDelegation.unchecked_mail, which
@@ -7785,7 +7785,7 @@ workflows:
     are read as text. run_python_job
     (no network) and read_document (files on the machine only) moved to
     MAIL_TOUCHED_ALLOWED_TOOLS with save_file, which saves whenever asked,
-    whatever words were used. read_document and save_file take files up to
+    whatever words were used, within the held-turn limits below. read_document and save_file take files up to
     100 MB (file_refs.READ_MAX_BYTES); drafts stay at what mail carries.
     Why - on 2026-10-30 an ask to split a signed LOI PDF from an email, file
     both halves in a Drive folder and attach them to a reply was refused five
@@ -7797,6 +7797,14 @@ workflows:
     gateway's sharing check, a one-word answer didn't count as asking, and
     "my Drive" had nowhere to go. The owner asked for fewer protections, so
     sharing no longer blocks a save and no file word is needed.
+    On a held turn (file_tools._turn_held: mail_lock_holds or read_outside, asked
+    after the handle resolves because a mail file marks the turn) a folder people outside can open fails with NEEDS_CARD, which names the
+    save_files card; the tap saves only if nobody the card didn't show can open
+    it. A folder Drive won't list permissions for is refused, as are Documents,
+    which indexes unmarked into the company collection, and OneDrive, which has
+    no sharing check and no card. A team-only folder and the Drive root still
+    save. Why - a hijacked turn could otherwise carry mail to a
+    named outsider, reported only afterwards, or plant it as trusted knowledge.
     Python jobs (workflows/python_job.py, run_python_job): Pyodide 314 in Deno,
     one process per job (asyncio.Semaphore(1)), deno run --no-prompt --quiet
     --no-remote --allow-read=<PYTHON_SANDBOX_DIR>,<worker>, env stripped to

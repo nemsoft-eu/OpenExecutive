@@ -397,6 +397,8 @@ async def describe_save_files(actions: list[dict[str, Any]], session_id: str | N
         refused, outside = file_tools.folder_check(info, folder, account, file_tools._team_emails())
         if refused is not None:
             return f"save_files: {refused}."
+        if file_tools._NO_PERMISSIONS_LISTED in info:
+            return "save_files: Drive won't say who can open that folder, so it can't be shown on a card."
         if not outside:
             return "save_files: only the team can open that folder, so save_file saves into it now; no card needed."
         if len(outside) > OUTSIDE_MAX:
@@ -859,8 +861,9 @@ async def _do_drive_files(stored: dict[str, Any], *, tapped: bool) -> dict[str, 
 async def _do_save_files(stored: dict[str, Any], *, tapped: bool) -> dict[str, str]:
     """Save each file on a ``save_files`` action into its folder, one by one,
     from the copy kept when the card was made. Only on the person's tap:
-    the folder is still checked (``file_tools.folder_check``), but people
-    outside the team being able to open it is what they approved."""
+    the folder is still checked (``file_tools.folder_check``), and the people
+    outside the team the card showed being able to open it is what they
+    approved; anyone else stops the save (``file_tools._google``)."""
     from openexecutive.orchestrator import conversation_files, file_refs, file_tools
     from openexecutive.orchestrator import mail_file_save as save
     from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway

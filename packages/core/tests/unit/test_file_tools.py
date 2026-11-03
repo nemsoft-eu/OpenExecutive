@@ -383,7 +383,7 @@ def test_a_folder_open_to_anyone_with_the_link_gets_nothing(
     assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
 
 
-def test_a_card_left_before_saves_stopped_waiting_still_saves_on_the_tap(
+def test_a_tap_doesnt_save_for_someone_its_card_didnt_show(
     company: Session, shared_drive: list,
 ) -> None:
     from openexecutive.delegation import action_cards
@@ -391,6 +391,10 @@ def test_a_card_left_before_saves_stopped_waiting_still_saves_on_the_tap(
     conversation_files.keep(company.session_id, {"a.pdf": b"x"})
     files = [{"file": "file:a.pdf", "name": "a.pdf", "kept": "a.pdf", "sha256": hashlib.sha256(b"x").hexdigest()}]
     shown = {"folder": FOLDER, "session_id": company.session_id, "files": files, "outside": []}
+    out = asyncio.run(action_cards._do_save_files(shown, tapped=True))
+    assert out["status"] == "failed" and "dana@partner.example" in out["detail"]
+    assert not any(n.endswith("create_drive_file") for n, _ in shared_drive[1:])
+    shown["outside"] = ["dana@partner.example"]
     assert asyncio.run(action_cards._do_save_files(shown, tapped=True))["status"] == "done"
     assert sum(1 for n, _ in shared_drive[1:] if n.endswith("create_drive_file")) == 1
 
@@ -525,6 +529,151 @@ def test_a_job_read_after_outside_content_is_not_kept(sandbox: list, monkeypatch
     monkeypatch.setattr(python_job, "_read_outside_this_turn", lambda: True)
     out = _job({"code": "1", "save_as": "split_lois", "description": "Split LOIs"})
     assert "not saved" in out["save_error"]
+
+
+def _mail_read_turn(company: Session) -> None:
+    from openexecutive.delegation.settings import TurnDelegation
+
+    company.turn_delegation = TurnDelegation(offered=True, session_id=company.session_id)
+    pin_turn_delegation(company, "Save it").read_mail = True
+
+
+def test_after_a_mail_read_a_folder_open_outside_waits_for_a_card(company: Session, shared_drive: list) -> None:
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    out = _save({"file": "file:bill.pdf", "folder": FOLDER})
+    assert out["status"] == "failed" and "save_files" in out["detail"]
+    assert not any(n.endswith("create_drive_file") for n, _ in shared_drive[1:])
+
+
+def test_a_file_from_mail_holds_the_save_on_the_turn_that_uses_it(company: Session, shared_drive: list) -> None:
+    """No earlier read: using the file is what marks the turn, so the lock is
+    asked after its handle is resolved."""
+    from openexecutive.delegation.settings import TurnDelegation
+
+    company.turn_delegation = TurnDelegation(offered=True, session_id=company.session_id)
+    pin_turn_delegation(company, "Save it")
+    conversation_files.keep(company.session_id, {"half.pdf": b"x"}, from_mail=True)
+    out = _save({"file": "file:half.pdf", "folder": FOLDER})
+    assert out["status"] == "failed" and "save_files" in out["detail"]
+    assert not any(n.endswith("create_drive_file") for n, _ in shared_drive[1:])
+
+
+def test_after_a_mail_read_the_card_it_asks_for_can_be_made_and_saves_on_the_tap(
+    company: Session, shared_drive: list,
+) -> None:
+    from openexecutive.delegation import action_cards
+
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    assert _save({"file": "file:bill.pdf", "folder": FOLDER})["status"] == "failed"
+    actions = [{"kind": "save_files", "input": {
+        "folder": FOLDER, "files": [{"file": "file:bill.pdf", "name": "", "kept": "", "sha256": ""}],
+    }}]
+    assert asyncio.run(action_cards.describe_save_files(actions, company.session_id)) is None
+    assert asyncio.run(action_cards._do_save_files(actions[0]["input"], tapped=True))["status"] == "done"
+    assert [a["folder_id"] for n, a in shared_drive[1:] if n.endswith("create_drive_file")] == [FOLDER]
+
+
+def test_after_a_mail_read_a_team_only_folder_still_saves(company: Session, drive: list) -> None:
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    assert _save({"file": "file:bill.pdf", "folder": FOLDER})["status"] == "saved"
+
+
+def test_after_a_mail_read_the_drive_root_still_saves(company: Session, drive: list) -> None:
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    assert _save({"file": "file:bill.pdf", "folder": "root"})["status"] == "saved"
+    assert not any(n.endswith("get_drive_file_permissions") for n, _ in drive[1:])
+
+
+@pytest.mark.parametrize(("read", "status"), [(True, "failed"), (False, "saved")])
+def test_an_outside_read_holds_it(
+    company: Session, shared_drive: list, monkeypatch: pytest.MonkeyPatch, read: bool, status: str,
+) -> None:
+    """Mail in the Executive's own inbox comes through the gateway, so it never
+    sets the mail lock; the outside read is what holds the save. Under
+    "Don't ask" a read counts only once its check flagged it, as for any write."""
+    from openexecutive.orchestrator import outside_content
+
+    monkeypatch.setattr(outside_content, "read_outside", lambda: read)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    assert _save({"file": "file:bill.pdf", "folder": FOLDER})["status"] == status
+
+
+def test_a_failed_look_at_the_turn_holds_the_save(
+    company: Session, shared_drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.orchestrator import outside_content
+
+    def boom() -> bool:
+        raise RuntimeError("no state")
+
+    monkeypatch.setattr(outside_content, "read_outside", boom)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    assert _save({"file": "file:bill.pdf", "folder": FOLDER})["status"] == "failed"
+
+
+def test_after_a_mail_read_a_folder_hiding_who_can_open_it_is_refused(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _info("John (ceo@co.example)", perms=()) + "\n  No additional permissions (private file)"
+
+    async def call(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
+        drive.append((name, arguments))
+        return hidden if name.endswith("get_drive_file_permissions") else "unexpected"
+
+    monkeypatch.setattr(save, "_call", call)
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    out = _save({"file": "file:bill.pdf", "folder": FOLDER})
+    assert out["status"] == "failed" and "won't say" in out["detail"]
+    assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
+
+
+def test_a_tap_doesnt_save_when_drive_stops_saying_who_can_open_the_folder(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import action_cards
+
+    hidden = _info("John (ceo@co.example)", perms=()) + "\n  No additional permissions (private file)"
+
+    async def call(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
+        drive.append((name, arguments))
+        return hidden if name.endswith("get_drive_file_permissions") else "unexpected"
+
+    monkeypatch.setattr(save, "_call", call)
+    conversation_files.keep(company.session_id, {"a.pdf": b"x"})
+    files = [{"file": "file:a.pdf", "name": "a.pdf", "kept": "a.pdf", "sha256": hashlib.sha256(b"x").hexdigest()}]
+    stored = {"folder": FOLDER, "session_id": company.session_id, "files": files, "outside": ["dana@partner.example"]}
+    assert asyncio.run(action_cards._do_save_files(stored, tapped=True))["status"] == "failed"
+    assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
+
+
+def test_after_a_mail_read_documents_is_refused(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    async def ingest_file(**_: Any) -> int:
+        raise AssertionError("indexed on a held turn")
+
+    monkeypatch.setattr("openexecutive.knowledge.loader.ingest_file", ingest_file)
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    out = _save({"file": "file:bill.pdf", "folder": "documents"})
+    assert out["status"] == "failed" and "Documents" in out["detail"]
+    assert not (tmp_path / "docs" / "bill.pdf").exists()
+
+
+def test_after_a_mail_read_onedrive_is_refused(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(save, "storage_for", lambda _g: save.MICROSOFT)
+    _mail_read_turn(company)
+    conversation_files.keep(company.session_id, {"bill.pdf": b"x"})
+    out = _save({"file": "file:bill.pdf", "folder": "root"})
+    assert out["status"] == "failed" and "OneDrive" in out["detail"]
+    assert not [n for n, _ in drive[1:] if n.startswith("microsoft_365__")]
 
 
 def test_documents_takes_a_file_when_asked_and_without_drive(
