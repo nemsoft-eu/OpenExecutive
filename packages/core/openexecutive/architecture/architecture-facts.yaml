@@ -12683,7 +12683,8 @@ delegation:
     and, when it is in their Drafts, there too, only while that draft is still
     the version the card last saw (409 draft_changed / draft_not_plain /
     caller_signing_required, 422 empty / too_long); it sends nothing, and a
-    change by hand sets questions_settled. PUT
+    change by hand sets questions_settled, and a catch-up's new question with
+    choices clears it. PUT
     /delegation/replies/{id}/recipients {everyone} sends it to the sender
     only or to everyone the email went to (409 no_choice when nobody else
     was on it), with the same checks. POST

@@ -498,6 +498,20 @@ def test_answering_a_reply_no_longer_waiting_is_refused(
     assert rewriter == []
 
 
+def test_a_new_question_after_a_change_by_hand_holds_send_again() -> None:
+    settled = {"open_questions": ["Which day?"], "questions_settled": True}
+    assert answers.questions_left(settled) == 0
+    # A plain question offers nothing to tap, so it holds nothing.
+    plain = answers._new_questions(settled, [{"text": "Who else?", "choices": []}])
+    assert "questions_settled" not in plain and answers.questions_left({**settled, **plain}) == 0
+    # Not asked again, or asked only of what it already knew: nothing changes.
+    assert answers._new_questions(settled, [{"text": "Which day?", "choices": ["Mon"]}]) == {}
+    # One with choices is a decision the change by hand never saw.
+    new = answers._new_questions(settled, [{"text": "Which room?", "choices": ["A", "B"]}])
+    assert new["questions_settled"] is False and answers.questions_left({**settled, **new}) == 1
+    assert answers.questions_left({**settled, **new, "answered_questions": {"1": "A"}}) == 0
+
+
 def test_changing_the_words_by_hand_settles_the_questions(
     client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> None:

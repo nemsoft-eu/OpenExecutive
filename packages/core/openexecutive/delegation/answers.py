@@ -612,7 +612,10 @@ def _clean(text: str) -> bool:
 
 def _new_questions(payload: dict[str, Any], raw: Any) -> dict[str, Any]:
     """The questions a catch-up left the person, added after the card's own
-    (so the answers given keep their places)."""
+    (so the answers given keep their places). A change by hand settled only
+    the questions it saw: a new one with choices holds Send again, and until
+    it is answered or the words change by hand the older ones show again too."""
+    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
     from openexecutive.delegation.ghostwriter import one_line
 
     questions = [q for q in payload.get("open_questions") or [] if isinstance(q, str)]
@@ -621,6 +624,7 @@ def _new_questions(payload: dict[str, Any], raw: Any) -> dict[str, Any]:
     # A card made before choices: pad, so the new ones line up.
     shaped += [{"choices": [], "about": "", "source": ""}] * max(0, len(questions) - len(shaped))
     added = 0
+    holds = False
     for item in raw if isinstance(raw, list) else []:
         if added >= MAX_NEW_QUESTIONS or len(questions) >= MAX_QUESTIONS or not isinstance(item, dict):
             break
@@ -637,7 +641,10 @@ def _new_questions(payload: dict[str, Any], raw: Any) -> dict[str, Any]:
         questions.append(text)
         shaped.append({"choices": picked, "about": "", "source": ""})
         added += 1
-    return {"open_questions": questions, CHOICES_KEY: shaped} if added else {}
+        holds = holds or bool(picked)
+    if not added:
+        return {}
+    return {"open_questions": questions, CHOICES_KEY: shaped, **({QUESTIONS_SETTLED: False} if holds else {})}
 
 
 async def answer(
