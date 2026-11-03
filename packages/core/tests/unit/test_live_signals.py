@@ -716,6 +716,7 @@ def _mail(mid: str, sender: str, name: str, subject: str, at: datetime, thread: 
 def principal(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     me = SimpleNamespace(id=7, email="me@co.test", email_aliases=[], full_name="Pat Lee")
     monkeypatch.setattr(live_signals, "_principal", lambda: me)
+    monkeypatch.setattr("openexecutive.briefing.context.single_principal", lambda: True)
     return me
 
 
@@ -846,3 +847,56 @@ def test_own_inbox_is_the_principals_alone(principal: SimpleNamespace) -> None:
     assert len(own.inbox) == 1
     # Right now's alone: the briefs don't count it.
     assert own.is_empty()
+
+
+def test_own_inbox_and_chat_asks_stay_out_on_a_co_principal_roster(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every principal reads the header's principal scope, and these lines are
+    the lowest-id principal's own, so a second principal must not get them."""
+    from openexecutive.delegation import inbox
+    from openexecutive.people import store as people_store
+
+    owner = people_store.find_principal_person()
+    assert owner is not None and owner.id is not None
+    now = datetime.now(UTC)
+    since = now - timedelta(hours=6)
+    inbox._note_mail(owner.id, _mail("m1", "andy@svn.test", "Andy", "Hi", now - timedelta(minutes=30)), relation="contact")
+    ask = SimpleNamespace(
+        id=1, asked_at=(now - timedelta(hours=1)).isoformat(), text="sign off?", from_name="Kim",
+        channel="slack", link="https://x.slack.test/1",
+    )
+    from openexecutive.integrations import chat_asks
+
+    monkeypatch.setattr(chat_asks, "waiting", lambda *a: [ask])
+    monkeypatch.setattr(chat_asks, "where", lambda a: "#deals")
+
+    alone = live_signals.gather_live_signals(since, now=now, include_private=True)
+    assert len(alone.inbox) == 1 and len(alone.chat_asks) == 1
+    assert live_signals.own_inbox(since, UTC, now).total == 1
+
+    people_store.upsert_person(full_name="Ada Second", email="ada@x.com", is_principal=True)
+    shared = live_signals.gather_live_signals(since, now=now, include_private=True)
+    assert shared.inbox == () and shared.inbox_refs == () and shared.chat_asks == ()
+    assert shared.keys["chat_asks"] == []
+    # /today reads it directly too, for the "Also in" line and the new-mail count.
+    assert live_signals.own_inbox(since, UTC, now) == live_signals.OwnInbox()
+
+
+def test_own_inbox_stays_out_when_the_roster_cant_be_read(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import inbox
+    from openexecutive.people import store as people_store
+
+    owner = people_store.find_principal_person()
+    assert owner is not None and owner.id is not None
+    now = datetime.now(UTC)
+    inbox._note_mail(owner.id, _mail("m1", "andy@svn.test", "Andy", "Hi", now - timedelta(minutes=30)), relation="contact")
+
+    def broken() -> list[Any]:
+        raise RuntimeError("no roster")
+
+    monkeypatch.setattr(people_store, "active_principals", broken)
+    signals = live_signals.gather_live_signals(now - timedelta(hours=6), now=now, include_private=True)
+    assert signals.inbox == ()

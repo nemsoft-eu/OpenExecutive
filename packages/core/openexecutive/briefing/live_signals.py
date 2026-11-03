@@ -677,11 +677,23 @@ class OwnInbox:
     total: int = 0
 
 
+def _one_reader() -> bool:
+    """Whether ``_principal``'s own mail and asks may be shown: they are the
+    lowest-id principal's, and every principal reads the header's principal
+    scope and ``/today``, so a co-principal roster leaves them out, as does a
+    roster that can't be read."""
+    from openexecutive.briefing.context import single_principal
+
+    return single_principal()
+
+
 def _chat_asks(now: datetime, tz: tzinfo) -> tuple[list[str], list[dict[str, Any]], list[int]]:
     """``(lines, refs, ids)`` of the principal's unanswered chat asks
     (``integrations.chat_asks.waiting``). Private."""
     from openexecutive.integrations import chat_asks
 
+    if not _one_reader():
+        return [], [], []
     principal = _principal()
     if principal is None or principal.id is None:
         return [], [], []
@@ -714,6 +726,8 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
     from openexecutive.briefing import waiting_on
     from openexecutive.delegation import inbox as watcher
 
+    if not _one_reader():
+        return OwnInbox()
     principal = _principal()
     if principal is None or principal.id is None:
         return OwnInbox()
