@@ -48,15 +48,16 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # the Skills paragraph saves repeatable work as a workflow, not a playbook.
 # And again: Domain Expertise says when to consult a specialist. And again:
 # the wording was tightened (same rules, ~27% shorter) to cut the cached prefix.
+# And again: People is checked first when asked how to reach someone.
 #
-# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-10-26): this digest
+# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-11-03): this digest
 # necessarily differs from upstream's. The fork adds a "## Consulting Your
 # Leadership Team" section — the local model ignores `tool_choice`, so the
 # persona has to ask for the consult in prose — and it lives in the SHARED
 # _PERSONA_TAIL so BOTH the team and solo prompts carry it. Upstream's value is
-# f68aafaabbff8891a3bc253cde793c91df7208ea0c961b98021669d47f6b8b59.
+# e391cbc648ed2089e43d8fc0c0aecd0c50d74081cd99f4091c5fc4adbf971ba6.
 # The test keeps its purpose: any *unintended* byte change still fails here.
-TEAM_PERSONA_SHA256 = "985222079e0d7b5110996a4603588f517ee8aef64a6a649cfdfaa955d7561331"
+TEAM_PERSONA_SHA256 = "4465fbd5169355907f22900f8684002e3fc99444e0dba7f02face952e5b69e52"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",

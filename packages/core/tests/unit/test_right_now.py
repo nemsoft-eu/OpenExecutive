@@ -71,3 +71,122 @@ def test_seen_is_per_scope() -> None:
     at = right_now.mark_seen("principal")
     assert right_now.seen_at("principal") == at
     assert right_now.seen_at("company") is None
+
+
+def test_record_points_says_what_is_new_today() -> None:
+    now = datetime.now(UTC)
+    first = right_now.record_points("principal", HEADER, (now - timedelta(minutes=30)).isoformat())
+    assert len(first.new) == 2
+
+    later = right_now.record_points(
+        "principal", HEADER + "\n- **Board deck** — draft is in.", now.isoformat(),
+    )
+    assert later.new == ["**Board deck** — draft is in."]
+
+
+def test_point_sources_are_the_latest_headers_alone() -> None:
+    now = datetime.now(UTC)
+    day = narrative_cache.local_today(now)
+    mail = {"kind": "mail", "message_id": "m1", "thread_id": "t1"}
+    right_now.record_sources("principal", now.isoformat(), {"northwind contract": mail})
+    assert right_now.point_sources("principal", day) == {"northwind contract": mail}
+    # The next header replaces them: a point it no longer has opens nothing.
+    card = {"kind": "alert", "alert_id": 4}
+    right_now.record_sources("principal", now.isoformat(), {"lakeside renewal": card})
+    assert right_now.point_sources("principal", day) == {"lakeside renewal": card}
+    assert right_now.point_sources("person:7", day) == {}
+
+
+def test_a_dismissed_point_stays_gone_for_the_day_however_it_is_worded() -> None:
+    written = "2026-10-30T18:00:00+00:00"
+    right_now.record_sources("principal", written, {"signed contracts": {"kind": "mail", "message_id": "m1"}})
+
+    gone = right_now.dismiss("principal", "**Signed contracts**: Dana sent them.", at="2026-10-30T19:00:00+00:00")
+
+    assert gone is not None and gone.key == "signed contracts"
+    assert gone.source == {"kind": "mail", "message_id": "m1"}
+    day = right_now._day_of("2026-10-30T19:00:00+00:00")
+    assert day is not None
+    today = right_now.dismissed("principal", day)
+    assert [d.key for d in today] == ["signed contracts"]
+    # Same subject, or a new subject about the same email: both gone.
+    assert right_now.is_dismissed("**Signed contracts** — reworded.", None, today)
+    assert right_now.is_dismissed("**Signed papers**: in.", {"kind": "mail", "message_id": "m1"}, today)
+    assert not right_now.is_dismissed("**Lakeside renewal**: price.", {"kind": "mail", "message_id": "m2"}, today)
+    # Another scope, or the next day, starts clean.
+    assert right_now.dismissed("person:4", day) == []
+    assert right_now.dismissed("principal", "2026-10-31") == []
+    assert "Signed contracts: Dana sent them." in right_now.dismissed_block(today)
+    assert right_now.dismissed_block([]) == ""
+
+
+def test_dismissing_without_a_subject_or_source_still_works() -> None:
+    gone = right_now.dismiss("principal", "**Q3 board deck**: draft unsent.")
+    assert gone is not None and gone.source is None
+    assert right_now.dismiss("principal", "   ") is None
+
+
+def test_a_full_day_still_takes_a_point_dismissed_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(right_now, "_DISMISSED_MAX", 2)
+    at = "2026-10-30T19:00:00+00:00"
+    assert right_now.dismiss("principal", "**One**: a.", at=at) is not None
+    assert right_now.dismiss("principal", "**Two**: b.", at=at) is not None
+    assert right_now.dismiss("principal", "**Three**: c.", at=at) is None
+    # A double tap on one already kept is not refused.
+    assert right_now.dismiss("principal", "**Two**: b.", at=at) is not None
+
+
+def test_a_reworded_subject_keeps_its_time_and_is_not_new() -> None:
+    """The header rewords its subjects through the day ("Pricing and Alex",
+    "Pricing and the Alex demo"): the same item must not turn new again."""
+    now = datetime.now(UTC)
+    first = (now - timedelta(minutes=30)).isoformat()
+    right_now.record_points("principal", "**Opener.**\n- **Pricing and Alex** — due today.", first)
+
+    later = right_now.record_points(
+        "principal",
+        "**Opener.**\n- **Pricing and the Alex demo** — still open.\n- **Hiring plan** — new.",
+        now.isoformat(),
+    )
+
+    assert later.new == ["**Hiring plan** — new."]
+    times = right_now.point_times("principal", narrative_cache.local_today(now))
+    assert times["pricing and the alex demo"] == first
+    assert times["hiring plan"] == now.isoformat()
+
+
+def test_a_new_subject_about_the_same_email_keeps_its_time() -> None:
+    now = datetime.now(UTC)
+    first = (now - timedelta(minutes=30)).isoformat()
+    mail = {"kind": "mail", "message_id": "m1", "thread_id": "t1"}
+    right_now.record_points("principal", "**O.**\n- **Dog bite report** — forwarded.", first,
+                            {"dog bite report": mail})
+    right_now.record_sources("principal", first, {"dog bite report": mail})
+
+    later = right_now.record_points("principal", "**O.**\n- **Lawsuit** — Annamarie wrote.", now.isoformat(),
+                                    {"lawsuit": mail})
+
+    assert later.new == []
+    assert right_now.point_times("principal", narrative_cache.local_today(now))["lawsuit"] == first
+
+
+def test_same_point_matches_rewording_not_other_items() -> None:
+    same = right_now.same_point
+    assert same("dogwood view", "dogwood view dog bite")
+    assert same("signed eca lois", "signed eca lois 10 30")
+    assert not same("dogwood view dog bite", "dogwood lawsuit")
+    assert not same("stripe live mode", "launch blockers")
+    assert not same("the", "a")  # filler alone names nothing
+    # One shared word is not the same item.
+    assert not same("pricing", "pricing error in the northwind invoice")
+    assert not same("alex", "alex demo")
+
+
+def test_a_dismissal_never_hides_a_point_that_only_shares_words() -> None:
+    """Dismissal matches the key or the item, not ``same_point``: a new,
+    urgent point that grew from a dismissed subject must still show."""
+    gone = right_now.dismiss("principal", "**Q3 budget**: routine reminder.")
+    assert gone is not None
+    assert right_now.is_dismissed("**Q3 Budget:** reminder again.", None, [gone])
+    assert not right_now.is_dismissed("**Q3 budget overrun**: 20% over.", None, [gone])
+    assert not right_now.is_dismissed("**Pricing error in the Northwind invoice**: billed twice.", None, [gone])

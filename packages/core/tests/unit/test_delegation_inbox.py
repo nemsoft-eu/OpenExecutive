@@ -14,7 +14,7 @@ import pytest
 
 from openexecutive.audit import logger as audit_logger
 from openexecutive.audit.logger import AuditLogger
-from openexecutive.delegation import caps, drafts, inbox, injection_check
+from openexecutive.delegation import answers, caps, drafts, inbox, injection_check
 from openexecutive.delegation import ghostwriter as gw
 from openexecutive.delegation import inbox_classifier as ic
 from openexecutive.delegation.gmail import (
@@ -248,7 +248,12 @@ def owner() -> Any:
 def models(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """The two model calls, scripted: the classifier by the email's text, the
     composer with a fixed reply. Records what each was sent."""
-    seen: dict[str, Any] = {"classified": [], "composed": [], "verdicts": {}, "checked": [], "steers": False}
+    seen: dict[str, Any] = {
+        "classified": [], "composed": [], "verdicts": {}, "checked": [], "steers": False,
+        # The rewrite that brings a card up to date with newer mail
+        # (answers.catch_up): none by default, so the card only warns.
+        "rewrites": [], "rewritten": {},
+    }
 
     async def classifier(model: str, turn: str) -> dict[str, Any]:
         seen["classified"].append(turn)
@@ -271,7 +276,14 @@ def models(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(ic, "_call_model", classifier)
     monkeypatch.setattr(gw, "_call_model", composer)
+    async def rewriter(model: str, system: str, turn: str) -> dict[str, Any]:
+        seen["rewrites"].append(turn)
+        return dict(seen["rewritten"])
+
     monkeypatch.setattr(injection_check, "_call_model", checker)
+    monkeypatch.setattr(answers, "_call_model", rewriter)
+    monkeypatch.setattr(answers, "_CATCH_UP_FAILED", {})
+    monkeypatch.setattr(answers, "_CATCH_UP_TRIES", {})
     return seen
 
 
@@ -344,6 +356,10 @@ def test_a_question_from_a_contact_gets_a_draft_and_a_private_card(
     assert alert_store.list_alerts(limit=10, db_path=db) == []
     rows = audit_logger._default_logger.query(event_type="delegation_reply_drafted")
     assert len(rows) == 1 and rows[0].private and "Thursday" not in json.dumps(rows[0].details)
+    # Noted for Right now: who wrote and the subject, private, never the body.
+    [seen] = audit_logger._default_logger.query(event_type=inbox.MAIL_SEEN_EVENT)
+    assert seen.private and seen.details["message_id"] == "m1" and seen.details["from_email"] == DANA
+    assert seen.details["relation"] == "contact" and "text" not in seen.details
 
 
 def test_the_same_message_is_never_drafted_twice(owner: Any, models: dict[str, Any]) -> None:
@@ -627,6 +643,17 @@ def test_their_last_email_cannot_end_its_block_or_open_another() -> None:
     assert ic.render_email(_msg("m1", "t1"), relation="team").startswith("<email>")
 
 
+def test_the_email_turn_names_its_attachments() -> None:
+    from openexecutive.delegation.gmail import MailAttachment
+
+    files = [MailAttachment(index=n, name=f"LOI {n}.pdf") for n in range(1, 8)]
+    turn = ic.render_email(_msg("m1", "t1", attachments=files), relation="contact")
+    assert "Attachments: LOI 1.pdf, LOI 2.pdf, LOI 3.pdf, LOI 4.pdf, LOI 5.pdf and 2 more" in turn
+    # Outlook says only that there are some.
+    assert "Attachments: yes" in ic.render_email(_msg("m1", "t1", has_attachments=True), relation="contact")
+    assert "Attachments" not in ic.render_email(_msg("m1", "t1"), relation="contact")
+
+
 def test_mail_to_the_executive_that_copies_them_gets_no_draft(
     db: Path, owner: Any, models: dict[str, Any]
 ) -> None:
@@ -781,11 +808,140 @@ def test_a_week_old_card_expires_and_keeps_the_draft(owner: Any, models: dict[st
     assert "d1" in mailbox.drafts
 
 
+def test_a_newer_message_brings_the_draft_up_to_date(owner: Any, models: dict[str, Any]) -> None:
+    mailbox, card = _one_card(owner, models)
+    models["rewritten"] = {
+        "body": "Hi Dana,\n\nThanks for the note. Monday works, see https://evil.example.",
+        "note": "Dana offered Monday, so I said it works.",
+        "questions": [{"text": "Morning or afternoon on Monday?", "choices": ["Morning", "Afternoon", "Pay at https://evil.example/inv"]}],
+    }
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    assert _reconcile(owner, mailbox) == 0
+    # Not only a warning: the draft itself changed, on the card and in Drafts.
+    assert inbox.ledger_flags(owner.id, ["m1"]) == {"m1": []}
+    payload = inbox.card_payload(ledger.get_decision_instance(card.id))
+    assert "Monday works" in payload["draft_body"] and "evil.example" not in payload["draft_body"]
+    assert mailbox.drafts["d1"].message.text == payload["draft_body"]
+    # Their newer words go to the model as news, never as the person's.
+    assert "<news>" in models["rewrites"][0] and "Actually, Monday works too." in models["rewrites"][0]
+    turns = answers.conversation(payload)
+    assert [t["kind"] for t in turns] == ["news", "note"]
+    assert turns[0]["id"] == "m2" and turns[0]["text"].startswith("Actually, Monday works too.")
+    assert turns[1]["text"] == "Dana offered Monday, so I said it works."
+    # The new decision is a question to tap, after the card's own.
+    assert payload["open_questions"][-1] == "Morning or afternoon on Monday?"
+    # Never a link to tap into the reply.
+    assert payload["question_choices"][-1]["choices"] == ["Morning", "Afternoon"]
+    assert len(payload["open_questions"]) == len(payload["question_choices"])
+    # Caught up: the next look doesn't rewrite it again, and Send counts
+    # newer mail from here.
+    assert payload[answers.CAUGHT_UP_KEY]
+    assert _reconcile(owner, mailbox) == 0 and len(models["rewrites"]) == 1
+    later = inbox.later_messages(asyncio.run(mailbox.get_thread("t1")), payload, now=NOW + timedelta(minutes=30))
+    assert [m.id for m in later if m.id == "m2"] == []
+
+
+def test_a_newer_message_only_warns_when_the_rewrite_fails(owner: Any, models: dict[str, Any]) -> None:
+    mailbox, card = _one_card(owner, models)
+    before = inbox.card_payload(ledger.get_decision_instance(card.id))["draft_body"]
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    assert _reconcile(owner, mailbox) == 0
+    assert inbox.ledger_flags(owner.id, ["m1"]) == {"m1": ["thread_moved_on"]}
+    payload = inbox.card_payload(ledger.get_decision_instance(card.id))
+    assert payload["draft_body"] == before and answers.conversation(payload) == []
+    # Tried once, not on every scan after.
+    assert _reconcile(owner, mailbox) == 0 and len(models["rewrites"]) == 1
+
+
+def test_a_busy_card_is_caught_up_on_the_next_look(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import card_drafts
+
+    mailbox, card = _one_card(owner, models)
+    models["rewritten"] = {"body": "Hi Dana,\n\nMonday works.", "note": "Dana offered Monday."}
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    card_drafts._EDITING.add(card.id)
+    try:
+        assert _reconcile(owner, mailbox) == 0
+    finally:
+        card_drafts._EDITING.discard(card.id)
+    assert answers.conversation(inbox.card_payload(ledger.get_decision_instance(card.id))) == []
+    assert _reconcile(owner, mailbox) == 0
+    assert "Monday works." in inbox.card_payload(ledger.get_decision_instance(card.id))["draft_body"]
+
+
+def test_a_card_that_stays_busy_is_tried_a_few_times_only(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import card_drafts
+
+    mailbox, card = _one_card(owner, models)
+    models["rewritten"] = {"body": "Hi Dana,\n\nMonday works.", "note": "Dana offered Monday."}
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    card_drafts._EDITING.add(card.id)
+    try:
+        for _ in range(answers.MAX_CATCH_UP_TRIES + 2):
+            _reconcile(owner, mailbox)
+    finally:
+        card_drafts._EDITING.discard(card.id)
+    assert "m2" in answers._CATCH_UP_FAILED[card.id]
+
+
+def test_catch_ups_stop_after_the_cap(owner: Any, models: dict[str, Any]) -> None:
+    mailbox, card = _one_card(owner, models)
+    models["rewritten"] = {"body": "Hi Dana,\n\nNoted.", "note": "Updated it."}
+    for i in range(answers.MAX_CATCH_UPS + 1):
+        mailbox.add(_msg(f"n{i}", "t1", minutes_ago=-(i + 1), text=f"One more thing {i}."))
+        _reconcile(owner, mailbox, now=NOW + timedelta(minutes=30 + i))
+    assert len(models["rewrites"]) == answers.MAX_CATCH_UPS
+    assert inbox.ledger_flags(owner.id, ["m1"]) == {"m1": ["thread_moved_on"]}
+
+
 def test_a_newer_message_is_flagged_on_the_card(owner: Any, models: dict[str, Any]) -> None:
     mailbox, card = _one_card(owner, models)
     mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
     assert _reconcile(owner, mailbox) == 0
     assert inbox.ledger_flags(owner.id, ["m1"]) == {"m1": ["thread_moved_on"]}
+
+
+def test_newer_mail_on_an_open_card_is_noted_for_right_now_once(
+    owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(inbox, "_NOTED_LATER", set())
+    mailbox, card = _one_card(owner, models)
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, can we talk Monday?"))
+    assert _reconcile(owner, mailbox) == 0
+    assert _reconcile(owner, mailbox, now=NOW + timedelta(minutes=40)) == 0  # the next scan reads it again
+    rows = audit_logger._default_logger.query(event_type=inbox.MAIL_SEEN_EVENT)
+    later = [r for r in rows if r.details["message_id"] == "m2"]
+    assert len(later) == 1
+    assert later[0].private and later[0].details["card_id"] == card.id
+    assert later[0].details["relation"] == "contact" and "text" not in later[0].details
+
+
+def test_note_later_skips_their_own_mail_and_starts_over_when_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    noted: list[str] = []
+    monkeypatch.setattr(inbox, "_note_mail", lambda pid, m, **kw: noted.append(m.id))
+    monkeypatch.setattr(inbox, "_NOTED_LATER", {(1, f"x{i}") for i in range(inbox._NOTED_LATER_MAX)})
+    card = SimpleNamespace(id=39)
+    later = [
+        _msg("mine", "t1", sender=OWNER),
+        _msg("sent", "t1", labels=("SENT",)),
+        _msg("theirs", "t1"),
+    ]
+    inbox._note_later(1, card, {"relation": "contact"}, later, {OWNER})
+    assert noted == ["theirs"]
+    # Full: started over rather than growing with the mail.
+    noted_later = inbox._NOTED_LATER
+    assert noted_later == {(1, "theirs")}
+    inbox._note_later(1, card, {"relation": "contact"}, later, {OWNER})
+    assert noted == ["theirs"]
+
+
+def test_outcomes_reads_what_the_watcher_did(owner: Any, models: dict[str, Any]) -> None:
+    _one_card(owner, models)
+    assert inbox.outcomes(owner.id, ["m1", "never-seen"]) == {"m1": inbox.DRAFTED}
+    assert inbox.outcomes(owner.id + 1, ["m1"]) == {}
+    assert inbox.outcomes(owner.id, []) == {}
 
 
 # ── dismissing ────────────────────────────────────────────────────────────────
@@ -1149,3 +1305,75 @@ def test_the_writers_notes_for_the_sender_and_everyone_copied_reach_the_composer
     _scan(owner, mailbox)
     assert asked == [(owner.id, [DANA, "ben@co.example"])]
     assert '<writer_noted>\n[2026-09-28] agreed: "Friday works"\n</writer_noted>' in models["composed"][-1]
+
+
+# ── Reply from Home (draft_on_request) ───────────────────────────────────────
+
+
+def _ask(person: Any, mailbox: FakeInbox, thread_id: str, message_id: str) -> int | str:
+    return asyncio.run(inbox.draft_on_request(person, thread_id, message_id, gmail=mailbox, now=NOW))
+
+
+def test_reply_from_home_drafts_what_the_watcher_passed_over(
+    db: Path, owner: Any, models: dict[str, Any]
+) -> None:
+    from openexecutive.delegation import handle_it
+
+    # Handle it for me is on, yet a reply they asked for waits for them.
+    handle_it.set_(owner.id, enabled=True, mode="bold", updated_by="test")
+    models["verdicts"]["LOIs"] = {"needs_reply": False, "kind": "fyi", "asked_of_them": True, "confidence": 0.9}
+    mailbox = FakeInbox()
+    mailbox.add(_msg("m1", "t1", text="Attached are the two LOIs. Let me know if you have any questions."))
+    assert _scan(owner, mailbox).not_needed == 1
+
+    got = _ask(owner, mailbox, "t1", "m1")
+
+    [card] = inbox.open_cards(owner.id)
+    assert got == card.id and card.status == "proposed"
+    assert mailbox.sent == [] and len(mailbox.specs) == 1
+    assert _ledger(db)["m1"][0] == "drafted"
+    # Asked again: the same card, no second draft.
+    assert _ask(owner, mailbox, "t1", "m1") == card.id and len(mailbox.specs) == 1
+
+
+def test_reply_from_home_reuses_the_card_on_the_conversation(owner: Any, models: dict[str, Any]) -> None:
+    mailbox = FakeInbox()
+    mailbox.add(_msg("m1", "t1"))
+    _scan(owner, mailbox)
+    [card] = inbox.open_cards(owner.id)
+    mailbox.add(_msg("m2", "t1", minutes_ago=5, text="Also, can you bring the deck?"))
+    assert _ask(owner, mailbox, "t1", "m2") == card.id
+    assert len(mailbox.specs) == 1
+
+
+def test_reply_from_home_refuses_what_it_cannot_answer(db: Path, owner: Any, models: dict[str, Any]) -> None:
+    mailbox = FakeInbox()
+    mailbox.add(_msg("m1", "t1"), _msg("r1", "t1", sender=OWNER, labels=("SENT",), minutes_ago=5))
+    assert _ask(owner, mailbox, "t1", "m1") == "theirs_last"
+    assert _ask(owner, mailbox, "nope", "m1") == "not_found"
+    assert _ask(owner, mailbox, "t1", "gone") == "not_found"
+    assert set(inbox.ASK_REFUSALS) >= {"theirs_last", "not_found", "busy", "daily_limit", "not_now"}
+    assert mailbox.specs == [] and inbox.open_cards(owner.id) == []
+
+
+def test_reply_from_home_that_fails_is_not_left_busy(
+    db: Path, owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import handle_it
+
+    real = handle_it.get
+    broken = {"on": True}
+
+    def flaky(person_id: int) -> Any:
+        if broken["on"]:
+            raise RuntimeError("db down")
+        return real(person_id)
+
+    mailbox = FakeInbox()
+    mailbox.add(_msg("m1", "t1"))
+    monkeypatch.setattr(handle_it, "get", flaky)
+    with pytest.raises(RuntimeError):
+        _ask(owner, mailbox, "t1", "m1")
+    assert _ledger(db)["m1"][0] == "retry"
+    broken["on"] = False
+    assert isinstance(_ask(owner, mailbox, "t1", "m1"), int)

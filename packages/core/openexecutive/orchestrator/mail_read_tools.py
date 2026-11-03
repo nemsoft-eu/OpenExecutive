@@ -68,7 +68,7 @@ SAVES_PER_TURN = 10
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENT_CHARS = 15_000
 # What the document reader can turn into text (knowledge.loader, pdf_reader).
-READABLE_SUFFIXES = frozenset({".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".csv", ".md", ".txt", ".rst"})
+READABLE_SUFFIXES = frozenset({".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".csv", ".md", ".txt", ".rst", ".ics", ".eml"})
 MAX_RESULTS = 10
 INBOX_DAYS = 3
 AWAITING_DAYS = 14
@@ -751,37 +751,6 @@ async def handle_read_my_email_attachment(tool_input: dict[str, Any]) -> str:
     )
 
 
-# Words that ask for a file to be saved somewhere: "save the LOIs", "upload
-# them", "put it in my Drive". Without one in what they typed this turn,
-# nothing is copied: a mail's text can't ask for it. Kept narrow on purpose
-# ("keep", "link", "copy" and "folder" turn up in everyday asks).
-_SAVE_WORDS = frozenset({"onedrive", "save", "saved", "upload"})
-# "Drive" counts only as the place ("to my Drive", "in Drive", "Google
-# Drive"), not "our drive to hire".
-_DRIVE_AFTER = frozenset({"google", "in", "into", "my", "on", "to", "your"})
-_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
-_NOT_ASKED = (
-    "Save a file only when they ask you to, in their own words: they haven't "
-    "asked to save or upload a file in this message. Ask them "
-    "whether they want it saved to your Drive or OneDrive. Do not retry until "
-    "they say so."
-)
-
-
-def _asked_to_save(writer: Any) -> str | None:
-    """Why this turn may not copy a file out of their mail, or None: their
-    own words this turn (``own_words``: no quoted backstory, no attached
-    file's text) must ask for it. Plain code, fails closed."""
-    from openexecutive.delegation.settings import own_words
-
-    typed = own_words(getattr(writer.pinned, "speaker_text", "") or "")
-    words = [w.lower() for w in _WORD_RE.findall(typed)] if typed else []
-    asked = bool(set(words) & _SAVE_WORDS) or any(
-        word == "drive" and i > 0 and words[i - 1] in _DRIVE_AFTER for i, word in enumerate(words)
-    )
-    return None if asked else _error(_NOT_ASKED, status="not_asked")
-
-
 async def handle_save_my_email_attachment(tool_input: dict[str, Any]) -> str:
     from openexecutive.delegation.ghostwriter import one_line
     from openexecutive.orchestrator import mail_file_save as save
@@ -803,7 +772,7 @@ async def handle_save_my_email_attachment(tool_input: dict[str, Any]) -> str:
     too_large = f"over {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB"
 
     def check(writer: Any) -> str | None:
-        return _id_refusal(writer, message_id, "message") or _asked_to_save(writer)
+        return _id_refusal(writer, message_id, "message")
 
     async def read(writer: Any) -> str:
         if getattr(writer.mailbox, "saves_to_storage", True) is False:

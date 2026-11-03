@@ -197,6 +197,19 @@ def _maybe_send_monthly_value(now: datetime) -> bool:
         return False
 
 
+def _maybe_push_cards(now: datetime) -> bool:
+    """Send the cards that wait for someone outside any chat to their chat
+    app, with buttons (integrations/channel_cards.py). A hook like the
+    reminders. Never raises."""
+    try:
+        from openexecutive.integrations.channel_cards import maybe_push
+
+        return maybe_push(now)
+    except Exception:
+        logger.exception("scheduler: card push failed to start")
+        return False
+
+
 def _maybe_release_held(now: datetime) -> bool:
     """Send the messages held for quiet hours once they end, and the ones held
     for a brief that went to someone without one (people/held_messages.py).
@@ -374,6 +387,7 @@ async def run_scheduler(
             _maybe_remind_notes(now)
             _maybe_send_reminders(now)
             _maybe_release_held(now)
+            _maybe_push_cards(now)
             _maybe_send_monthly_value(now)
             due = claim_due_actions(now)
             if due:
@@ -2599,7 +2613,9 @@ async def _deliver_to_principal(text: str, *, label: str = "Update") -> Principa
         return await _send_on_plan(principal, plan, text, label=label)
 
 
-async def deliver_to_person(person: Person, text: str, *, label: str = "Update") -> PrincipalDelivery:
+async def deliver_to_person(
+    person: Person, text: str, *, label: str = "Update", chat_only: bool = False,
+) -> PrincipalDelivery:
     """Send ``text`` to ``person`` alone, the way the briefs reach the
     principal: their own Slack or Discord DM, their Telegram chat, or email
     to their own address (``delivery_order``, which skips a Telegram group).
@@ -2627,8 +2643,15 @@ async def deliver_to_person(person: Person, text: str, *, label: str = "Update")
     read. A caller whose TEXT is private to the principal owes one more
     thing: sending inside ``people_tools.restrict_to_principal()``, which is
     what narrows every leg's gate to ``is_principal``.
+
+    ``chat_only`` leaves email out: nothing goes when no chat app reaches them.
     """
-    plan = delivery_order(person, email_ready=await ensure_email_ready())
+    if chat_only:
+        plan = [c for c in delivery_order(person, email_ready=False) if c != "email"]
+        if not plan:
+            return PrincipalDelivery(False, "no chat app reaches them", "no_channel")
+    else:
+        plan = delivery_order(person, email_ready=await ensure_email_ready())
     return await _send_on_plan(person, plan, text, label=label)
 
 
@@ -2657,6 +2680,7 @@ async def _send_on_plan(
                     "user_id": principal.slack_user_id, "text": text,
                 })
                 if _delivered_ok(result):
+                    await _remember_in_chat(result, f"slack:dm:{principal.slack_user_id}", principal, text, label)
                     return _sent(channel, principal.slack_user_id, plan[0])
                 failures.append(f"{channel}: {_error_line(result)}")
             elif channel == "discord_dm" and principal.discord_user_id:
@@ -2665,6 +2689,7 @@ async def _send_on_plan(
                     "discord_user_id": principal.discord_user_id, "text": text,
                 })
                 if _delivered_ok(result):
+                    await _remember_in_chat(result, f"discord:dm:{principal.discord_user_id}", principal, text, label)
                     return _sent(channel, principal.discord_user_id, plan[0])
                 failures.append(f"{channel}: {_error_line(result)}")
             elif channel == "telegram" and principal.telegram_chat_id:
@@ -2675,6 +2700,7 @@ async def _send_on_plan(
                     "chat_id": int(principal.telegram_chat_id), "text": text,
                 })
                 if _delivered_ok(result):
+                    await _remember_in_chat(result, f"telegram:{principal.telegram_chat_id}", principal, text, label)
                     return _sent(channel, principal.telegram_chat_id, plan[0])
                 failures.append(f"{channel}: {_error_line(result)}")
             elif channel == "email":
@@ -2692,6 +2718,28 @@ async def _send_on_plan(
         False, "delivery failed on every channel: " + "; ".join(failures), "send_failed",
         first_tried=plan[0],
     )
+
+
+async def _remember_in_chat(
+    result_json: str, base_id: str, person: Person, text: str, label: str
+) -> None:
+    """Save a message just sent into a chat app into that chat's conversation
+    (``integrations.conversations.record_delivery``), so the person's reply
+    to it has it in view. Only once it was sent: a held one is saved when
+    ``people.held_messages`` releases it, which sends through
+    ``deliver_to_person`` and so through here. Never raises."""
+    import json as _json
+
+    try:
+        if _json.loads(result_json).get("status") != "sent":
+            return
+        from openexecutive.integrations.conversations import record_delivery
+
+        await asyncio.to_thread(
+            record_delivery, base_id, text, owner_person_id=person.id, title=label,
+        )
+    except Exception:
+        logger.exception("scheduler: couldn't save the delivery into %s", base_id)
 
 
 def _sent(channel: str, to: str | None, first_tried: str | None = None) -> PrincipalDelivery:

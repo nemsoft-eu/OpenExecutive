@@ -27,6 +27,15 @@ SOCIAL_HOSTS = frozenset({
 })
 LINKEDIN_HOSTS = frozenset({"linkedin.com"})
 
+# A phone label written before a number ("c: 256 555 0100", "Direct: (803)
+# 555-0101", "Tel. +44 20 7946 0000"): dropped, the number kept. Only these
+# words: "Fax:" or "Invoice-" is not a phone.
+_PHONE_LABEL = re.compile(
+    r"^(?:(?:office|mobile|cell|direct|work|main|desk)\s+)?"
+    r"(?:c|m|o|t|p|d|w|tel|telephone|phone|ph|mobile|mob|cell|direct|dir|office|work|main|desk|line)"
+    r"\s*[:.\-]\s*(?=[+(\d])",
+    re.IGNORECASE,
+)
 _PHONE_OK = re.compile(r"^\+?[\d\s().\-/]+(?:\s*(?:x|ext\.?)\s*\d{1,6})?$", re.IGNORECASE)
 _HOST = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _PATH = re.compile(r"/[\w\-./~%@]*")
@@ -37,8 +46,9 @@ _BANNED = re.compile(r"https?:|www\.|@|<|>|\b(ignore|instruction|prompt|system|a
 def clean_phone(raw: str | None) -> str:
     """A phone number written plainly ("+1 (555) 010-0100", "555 0100 ext 2"),
     or "" when it is not one: 7 to 15 digits, nothing but digits, spaces,
-    + ( ) . - / and an extension."""
+    + ( ) . - / and an extension, after any label like "Mobile:"."""
     text = " ".join((raw or "").split()).strip(" ,;:")
+    text = _PHONE_LABEL.sub("", text, count=1)
     if not text or len(text) > PHONE_MAX or not _PHONE_OK.match(text):
         return ""
     main = re.split(r"(?i)\s*(?:x|ext\.?)\s*\d", text)[0]

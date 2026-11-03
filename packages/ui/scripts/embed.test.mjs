@@ -9,6 +9,7 @@ import {
   acceptsEvent,
   badgeMessage,
   embedRequested,
+  hintWarning,
   isAppPath,
   isNativePath,
   openMessage,
@@ -128,4 +129,37 @@ test("nothing hides without a valid init from the parent", () => {
   assert.match(shell, /const \{ embedded \} = useEmbed\(\);/);
   assert.equal(shell.match(/<EmbeddedShell/g)?.length, 1);
   assert.match(shell, /if \(embedded\) \{[\s\S]*?<EmbeddedShell/);
+});
+
+test("the embedded page warns when the host's user isn't who is signed in here", () => {
+  // Someone else: warn, naming both.
+  assert.deepEqual(hintWarning("b@x.com", "a@x.com"), { hint: "b@x.com", signedIn: "a@x.com" });
+  // The same person, whatever the case or spacing on either side.
+  assert.equal(hintWarning("a@x.com", "A@x.com"), null);
+  assert.equal(hintWarning("A@X.com", "a@x.com"), null);
+  assert.equal(hintWarning(" a@x.com ", "a@x.com"), null);
+  // Shown lowercased.
+  assert.deepEqual(hintWarning("B@x.com", "A@x.com"), { hint: "b@x.com", signedIn: "a@x.com" });
+  // Nothing without a hint, or without a session.
+  for (const hint of [null, undefined, "", "  "]) assert.equal(hintWarning(hint, "a@x.com"), null, String(hint));
+  for (const email of [null, undefined, "", "  "]) assert.equal(hintWarning("a@x.com", email), null, String(email));
+  // A hint as init delivers it is compared the same way.
+  const init = parseHostMessage({
+    protocol: EMBED_PROTOCOL,
+    type: "init",
+    contract: 1,
+    theme: { mode: "light", tokens: {} },
+    productName: "Host",
+    userHint: "A@X.com",
+  });
+  assert.equal(hintWarning(init.init.userHint, "a@x.com"), null);
+  assert.ok(hintWarning(init.init.userHint, "b@x.com"));
+});
+
+test("the warning is shown above the page and signs out back to it", () => {
+  const shell = readFileSync(new URL("../src/components/embed/EmbeddedShell.tsx", import.meta.url), "utf8");
+  assert.match(shell, /<UserHintWarning \/>\s*<PausedBanner \/>/);
+  assert.match(shell, /hintWarning\(init\?\.userHint, data\?\.user\?\.email\)/);
+  // Sign out comes back to the same page, still embedded.
+  assert.match(shell, /signOut\(\{[\s\S]*?\/signin\?embed=1&callbackUrl=/);
 });

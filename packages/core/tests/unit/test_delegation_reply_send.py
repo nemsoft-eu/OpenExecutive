@@ -212,6 +212,30 @@ def test_a_newer_message_needs_a_second_yes(owner: Any, models: dict[str, Any]) 
     assert mailbox.sent == ["d1"]
 
 
+def test_a_draft_brought_up_to_date_asks_again_unless_that_version_was_shown(
+    owner: Any, models: dict[str, Any],
+) -> None:
+    from openexecutive.delegation import card_drafts
+    from openexecutive.delegation.answers import CAUGHT_UP_KEY
+
+    mailbox, card = _card(owner)
+    models["rewritten"] = {"body": "Hi Dana,\n\nMonday works.", "note": "Dana offered Monday."}
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    asyncio.run(inbox.reconcile(owner, mailbox, now=NOW + timedelta(minutes=30), own={OWNER, *mailbox.aliases}))
+    card = ledger.get_decision_instance(card.id)
+    caught_up = inbox.card_payload(card)[CAUGHT_UP_KEY]
+    # Rewritten on its own after the card was shown: a second yes.
+    first = _refused(card, mailbox, owner, confirm={"seen_caught_up_at": "an older version"})
+    assert first.code == "confirm" and first.extra["reasons"] == ["thread_moved_on"]
+    # The card that was tapped showed this version: it goes.
+    _send(card, mailbox, owner, confirm={"seen_caught_up_at": caught_up})
+    assert mailbox.sent == ["d1"]
+    # The Executive's own rewrite isn't the person's change.
+    assert card_drafts.EDITED_ON_CARD not in inbox.card_payload(card)
+    assert "edited_in_gmail" not in inbox.ledger_flags(owner.id, ["m1"])["m1"]
+    assert _status(card) == "approved_unchanged"
+
+
 def test_a_draft_gone_or_answered_closes_the_card(owner: Any, models: dict[str, Any]) -> None:
     mailbox, card = _card(owner)
     del mailbox.drafts["d1"]
@@ -440,9 +464,11 @@ def test_only_dismiss_deletes_a_draft() -> None:
     has just made, when that draft's card couldn't be made (a follow-up's
     too), or an unedited follow-up nobody needs once the thread is answered,
     and a reply kept on its card takes back the draft it made for a send that
-    was refused before anything went."""
+    was refused before anything went. A chat draft that a redraft or the
+    Executive's own send replaced goes too, when unedited (redrafts)."""
     assert _uses("delete_draft") == {
         "delegation/replies.py", "delegation/inbox.py", "delegation/follow_ups.py", "delegation/card_drafts.py",
+        "delegation/redrafts.py",
     }
     assert _importers("openexecutive.delegation.replies") == {"api/routes/decisions.py", "api/routes/delegation.py"}
 

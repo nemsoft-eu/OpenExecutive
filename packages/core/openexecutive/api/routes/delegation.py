@@ -68,6 +68,11 @@ Routes:
                                     route (same checks); returns the card
                                     with changed_sentences. 429 past the
                                     hourly limit (delegation.answers)
+  POST   /delegation/replies/{id}/change — {text}: what to change, in the
+                                    caller's words; rewritten and saved like
+                                    an answer (same checks and limit); the
+                                    request and the Executive's line on what
+                                    it changed join the card's conversation
   PUT    /delegation/handle-it    — {enabled?, mode?}: Handle it for me,
                                     the inbox watcher sending some replies on
                                     its own, mode careful | balanced | bold
@@ -135,6 +140,7 @@ Every change writes a private audit row.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from dataclasses import asdict
 from typing import Any, Literal
@@ -399,6 +405,18 @@ class ReplyQuestionOut(BaseModel):
     answer: str = ""
 
 
+class ReplyTurnOut(BaseModel):
+    """One turn of a reply card's conversation since its draft was written."""
+
+    # "news": newer email in the conversation; "asked": what the caller asked
+    # to change; "note": the Executive's line on what it changed.
+    kind: str
+    text: str
+    from_name: str = ""
+    from_email: str = ""
+    at: str = ""
+
+
 class ReplyCardOut(BaseModel):
     decision_id: int
     status: str
@@ -442,6 +460,12 @@ class ReplyCardOut(BaseModel):
     # What the email asks and what the draft says, in a line or two, for the
     # card's closed view ("" on a card drafted before it).
     gist: str = ""
+    # Newer email in the conversation, what the caller asked to change and
+    # what the Executive changed, in order.
+    conversation: list[ReplyTurnOut] = Field(default_factory=list)
+    # When it was last brought up to date with newer mail; Send passes it
+    # back as edits.seen_caught_up_at.
+    caught_up_at: str = ""
 
 
 class RepliesOut(BaseModel):
@@ -477,6 +501,12 @@ class ReplyAnswerIn(BaseModel):
 
     question_index: int = Field(ge=0, le=20)
     answer_text: str = Field(min_length=1, max_length=500)
+
+
+class ReplyChangeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=500)
 
 
 class ReplyAnswersIn(BaseModel):
@@ -673,7 +703,11 @@ async def _calendar_out(person: Person, status: str) -> CalendarOut:
             granted = await gmail_for(email).calendar_granted()
         except Exception:
             logger.warning("delegation: couldn't tell whether the sign-in includes the calendar", exc_info=True)
-    return CalendarOut(enabled=calendar.enabled(person.id), granted=granted, connect_command=f"{command} --calendar")
+    # On only while the mailbox is connected: the calendar opens through it,
+    # so with none the switch would read On while nothing can be read. The
+    # stored choice stays, and shows again once the mailbox is back.
+    enabled = calendar.enabled(person.id) and status == "connected"
+    return CalendarOut(enabled=enabled, granted=granted, connect_command=f"{command} --calendar")
 
 
 def _inbox_out(person_id: int) -> InboxOut:
@@ -722,6 +756,21 @@ def _team_out(person: Person) -> TeamOut | None:
             enabled=True, inbox=watching, drafts_30d=drafted, sent_30d=sent,
         ))
     return TeamOut(enabled=team_members_switch(), members=members)
+
+
+def _one_status_check(route: Any) -> Any:
+    """Run ``route`` asking the mail service for each mailbox's status once
+    (``gmail.status_memo``): moving the dial up a few steps used to ask
+    again at every step and for every page state in between, each a live
+    call, which held the switch for many seconds."""
+    from openexecutive.delegation.gmail import status_memo
+
+    @functools.wraps(route)
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with status_memo():
+            return await route(*args, **kwargs)
+
+    return wrapped
 
 
 async def _state(person: Person) -> DelegationOut:
@@ -846,6 +895,7 @@ async def get_delegation(request: Request) -> DelegationOut:
 
 
 @router.put("/delegation", response_model=DelegationOut)
+@_one_status_check
 async def update_delegation(request: Request, body: DelegationUpdate) -> DelegationOut:
     person = _caller(request)
     person_id = _person_id(person)
@@ -927,6 +977,7 @@ _CHECKS: set[asyncio.Task[Any]] = set()
 
 
 @router.put("/delegation/inbox", response_model=DelegationOut)
+@_one_status_check
 async def update_delegation_inbox(request: Request, body: InboxUpdate) -> DelegationOut:
     person = _caller(request)
     person_id = _person_id(person)
@@ -1000,6 +1051,134 @@ def get_delegation_replies(request: Request) -> RepliesOut:
         ReplyCardOut(**{k: v for k, v in asdict(card).items() if k in ReplyCardOut.model_fields})
         for card in found
     ])
+
+
+class MailAttachmentOut(BaseModel):
+    name: str
+    mime_type: str = ""
+    size: int = 0
+
+
+class MailViewOut(BaseModel):
+    """One email in the caller's own mailbox, as Home opens it from a Right
+    now point: who wrote, to whom, what they wrote (without the quoted
+    conversation below), its files, what the caller last wrote in the
+    conversation, a link to it in their mailbox, and the reply card open on
+    the conversation, if any."""
+
+    thread_id: str
+    message_id: str
+    subject: str = ""
+    from_name: str = ""
+    from_email: str = ""
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    received_at: str = ""
+    text: str = ""
+    attachments: list[MailAttachmentOut] = Field(default_factory=list)
+    has_attachments: bool = False
+    their_last_words: str = ""
+    link: str = ""
+    reply_card_id: int | None = None
+
+
+class MailReplyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str = Field(min_length=1, max_length=512)
+    message_id: str = Field(min_length=1, max_length=512)
+
+
+class MailReplyOut(BaseModel):
+    decision_id: int
+
+
+# The most of an email's own words Home shows.
+_MAIL_VIEW_MAX_CHARS = 8000
+_MAIL_EARLIER_MAX_CHARS = 400
+
+
+async def _connected_mailbox(person: Person) -> Any:
+    status = await gmail_status(person.email)
+    if status != "connected":
+        raise _refuse(409, _BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+    return gmail_for(person.email or "")
+
+
+@router.get("/delegation/mail", response_model=MailViewOut)
+async def get_delegation_mail(request: Request, thread_id: str, message_id: str) -> MailViewOut:
+    """One email in the caller's own mailbox (Home's View email). Their own
+    mailbox only: the client is theirs, so another person's ids find
+    nothing. Reads; changes nothing."""
+    from openexecutive.delegation.gmail import GmailNotFound, mailbox_link
+    from openexecutive.delegation.inbox import card_payload, open_cards
+    from openexecutive.delegation.inbox_classifier import their_last_words
+    from openexecutive.integrations.email_poller import sender_new_text
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    if not (0 < len(thread_id) <= 512 and 0 < len(message_id) <= 512):
+        raise _refuse(422, "bad_id", "That isn't an email.")
+    client = await _connected_mailbox(person)
+    try:
+        thread = await client.get_thread(thread_id)
+        own = {(person.email or "").strip().lower(), *(a.strip().lower() for a in await client.send_as_addresses())}
+    except GmailNotFound as exc:
+        raise _refuse(404, "not_found", "That email isn't in your mailbox any more.") from exc
+    except GmailAuthError as exc:
+        raise _refuse(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+    except GmailError as exc:
+        logger.warning("delegation: reading an email failed", exc_info=True)
+        raise _refuse(502, "gmail_error", STATUS_MESSAGES["error"]) from exc
+    message = next((m for m in thread.messages if m.id == message_id), None)
+    if message is None:
+        raise _refuse(404, "not_found", "That email isn't in your mailbox any more.")
+    card = next(
+        (c for c in open_cards(person_id) if card_payload(c).get("thread_id") == thread.id), None
+    )
+    return MailViewOut(
+        thread_id=thread.id,
+        message_id=message.id,
+        subject=message.subject,
+        from_name=message.from_name,
+        from_email=message.from_addr,
+        to=list(message.to),
+        cc=list(message.cc),
+        received_at=message.received_at,
+        text=sender_new_text(message.text or "")[:_MAIL_VIEW_MAX_CHARS].strip(),
+        attachments=[
+            MailAttachmentOut(name=a.name, mime_type=a.mime_type, size=a.size) for a in message.attachments
+        ],
+        has_attachments=bool(message.attachments) or message.has_attachments,
+        their_last_words=their_last_words(thread, message, own)[:_MAIL_EARLIER_MAX_CHARS],
+        link=mailbox_link(person.email or "", thread_id=thread.id, message_id=message.id),
+        reply_card_id=int(card.id) if card is not None else None,
+    )
+
+
+@router.post("/delegation/mail/reply", response_model=MailReplyOut)
+async def reply_to_delegation_mail(request: Request, body: MailReplyIn) -> MailReplyOut:
+    """Write a reply to one email in the caller's own inbox, because they
+    asked (Home's Reply), and put it on a reply card for them
+    (``delegation.inbox.draft_on_request``). The open card already on that
+    conversation when there is one. Sends nothing: the card's Send does."""
+    from openexecutive.delegation.inbox import ASK_REFUSALS, draft_on_request
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    if not is_enabled(person_id):
+        raise _refuse(409, "act_as_me_off", "Turn Act as me on first.")
+    client = await _connected_mailbox(person)
+    try:
+        got = await draft_on_request(person, body.thread_id, body.message_id, gmail=client)
+    except GmailAuthError as exc:
+        raise _refuse(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+    except GmailError as exc:
+        logger.warning("delegation: writing a reply on request failed", exc_info=True)
+        raise _refuse(502, "gmail_error", STATUS_MESSAGES["error"]) from exc
+    if isinstance(got, str):
+        raise _refuse(409, got, ASK_REFUSALS.get(got, ASK_REFUSALS["not_now"]))
+    return MailReplyOut(decision_id=got)
 
 
 @router.put("/delegation/replies/{decision_id}/text", response_model=ReplyCardOut)
@@ -1110,6 +1289,39 @@ async def answer_delegation_reply(request: Request, decision_id: int, body: Repl
             caller=api_caller.caller(request),
             resolver=person_id,
             answers=[answers.Answer(question_index=a.question_index, text=a.answer_text) for a in body.answers],
+        )
+    except SendRefused as refused:
+        raise HTTPException(
+            status_code=refused.status, detail={"code": refused.code, "message": refused.message, **refused.extra},
+        ) from None
+    card = next((c for c in cards(person) if c.decision_id == decision_id), None)
+    if card is None:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    out = ReplyCardOut(**{k: v for k, v in asdict(card).items() if k in ReplyCardOut.model_fields})
+    return out.model_copy(update={"changed_sentences": changed})
+
+
+@router.post("/delegation/replies/{decision_id}/change", response_model=ReplyCardOut)
+async def change_delegation_reply(request: Request, decision_id: int, body: ReplyChangeIn) -> ReplyCardOut:
+    """Change one of the caller's reply cards the way they said, in their
+    own words: the draft is rewritten in their voice and saved like an
+    answer (``delegation.answers.change`` through ``card_drafts.edit``: the
+    same checks, the same update in their Drafts, the same hourly limit).
+    Their own cards only; sends nothing."""
+    from openexecutive.delegation import answers
+    from openexecutive.delegation.inbox import DECISION_CLASS
+    from openexecutive.delegation.replies import cards
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    person = _caller(request)
+    person_id = _person_id(person)
+    instance = get_decision_instance(decision_id)
+    if instance is None or instance.decision_class != DECISION_CLASS or instance.approver_person_id != person_id:
+        raise _refuse(404, "not_found", "That reply isn't waiting for you any more.")
+    try:
+        _, changed = await answers.change(
+            instance, caller=api_caller.caller(request), resolver=person_id, text=body.text,
         )
     except SendRefused as refused:
         raise HTTPException(
@@ -1421,6 +1633,7 @@ def reach_of(person_id: int) -> str:
 
 
 @router.put("/delegation/reach", response_model=DelegationOut)
+@_one_status_check
 async def update_delegation_reach(request: Request, body: ReachUpdate) -> DelegationOut:
     """Move the dial. Going down turns the higher switches off first, top
     down, and needs no signed sign-in. Going up turns each one on in order

@@ -9,6 +9,64 @@ From 0.3.0 on, entries are written by release-please from the titles of the
 merged pull requests (`feat` → Added, `fix` → Fixed). The open release PR holds
 the next entry; edit it there before merging if a line needs rewording.
 
+## [0.6.8](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.6.7...v0.6.8) (2026-10-30)
+
+
+### Added
+
+* **briefing:** dismiss a Right now point and drop mail whose sender you wrote to ([#665](https://github.com/SenteLabsAI/OpenExecutive/issues/665)) ([24e577b](https://github.com/SenteLabsAI/OpenExecutive/commit/24e577be7498011e735fe4b16f2a3c8c3ee462ff))
+* **chat:** attach, split and save any file by one handle ([#663](https://github.com/SenteLabsAI/OpenExecutive/issues/663)) ([6cd7d4c](https://github.com/SenteLabsAI/OpenExecutive/commit/6cd7d4cb29f0dbbba7c0d4c2a8a2d5ab0dc2195f))
+* **chat:** search the speaker's own earlier chats before looking things up again ([#660](https://github.com/SenteLabsAI/OpenExecutive/issues/660)) ([1ff8263](https://github.com/SenteLabsAI/OpenExecutive/commit/1ff8263dfd8254263126d2d88655a216d286403c))
+* **delegation:** take replaced chat drafts out of the person's Drafts ([#655](https://github.com/SenteLabsAI/OpenExecutive/issues/655)) ([622211c](https://github.com/SenteLabsAI/OpenExecutive/commit/622211c5b9618658ff1b71c7741c2439dae136b5))
+* **integrations:** decide every waiting card from a chat app ([#658](https://github.com/SenteLabsAI/OpenExecutive/issues/658)) ([49c27bb](https://github.com/SenteLabsAI/OpenExecutive/commit/49c27bbe2d851405e028b19314c3f3258dcd366b))
+
+
+### Fixed
+
+* **chat:** book on the company clock and stop false holds and flags ([#659](https://github.com/SenteLabsAI/OpenExecutive/issues/659)) ([ac38ef1](https://github.com/SenteLabsAI/OpenExecutive/commit/ac38ef1ead89d7ce764ab51505e32b74d0a47a8f))
+* **chat:** stop flagging the Executive's own tool notes as email instructions ([#662](https://github.com/SenteLabsAI/OpenExecutive/issues/662)) ([8261476](https://github.com/SenteLabsAI/OpenExecutive/commit/82614765a0a73b15945fe39cfcc48de397b89e8b))
+* **people:** fill contact details from signatures and add the right contacts ([#657](https://github.com/SenteLabsAI/OpenExecutive/issues/657)) ([d89c1b7](https://github.com/SenteLabsAI/OpenExecutive/commit/d89c1b7f4242603974af6d2edffcbcb92bcf1556))
+* **workflows:** send Gemini's reasoning back in action steps and the designer ([#664](https://github.com/SenteLabsAI/OpenExecutive/issues/664)) ([d77a9c0](https://github.com/SenteLabsAI/OpenExecutive/commit/d77a9c09901f74e009f1f0ca11c16ea0689b90f5))
+
+## [0.6.7](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.6.6...v0.6.7) (2026-10-27)
+
+
+### Added
+
+* **briefing:** open and reply to Right now's email points from Home ([#651](https://github.com/SenteLabsAI/OpenExecutive/issues/651)) ([ddc4429](https://github.com/SenteLabsAI/OpenExecutive/commit/ddc4429112ac75f1285d6d4d35ea3e140b461344))
+* **briefing:** show your own inbox in Right now and message you when it changes ([#640](https://github.com/SenteLabsAI/OpenExecutive/issues/640)) ([428456a](https://github.com/SenteLabsAI/OpenExecutive/commit/428456a73924f886a2c95c6f2539e1f2f70d00b9))
+* **delegation:** open reply cards as a conversation and redraft on newer mail ([#639](https://github.com/SenteLabsAI/OpenExecutive/issues/639)) ([bd293a7](https://github.com/SenteLabsAI/OpenExecutive/commit/bd293a79bceef557a8ee9d84b4a568242bea6e7d))
+* **orchestrator:** answer on a pushback model after the person pushes back ([#653](https://github.com/SenteLabsAI/OpenExecutive/issues/653)) ([3eb8242](https://github.com/SenteLabsAI/OpenExecutive/commit/3eb82426323667c3350d99d7ad4eee2b298a86a9))
+* **ui:** warn when the host's user isn't who is signed in, and let hosts read who that is ([#638](https://github.com/SenteLabsAI/OpenExecutive/issues/638)) ([4c5e154](https://github.com/SenteLabsAI/OpenExecutive/commit/4c5e1542f72df1fda9263ac9e8e70d2047876a91))
+
+
+### Fixed
+
+* **attunement:** raise the open-loop caps ([#642](https://github.com/SenteLabsAI/OpenExecutive/issues/642)) ([fc0ea3c](https://github.com/SenteLabsAI/OpenExecutive/commit/fc0ea3c6214d712a8f8cc088dadb7e2aa7b78501))
+* **briefing:** drop answered mail from Right now and show its steps while it updates ([#652](https://github.com/SenteLabsAI/OpenExecutive/issues/652)) ([297cbe0](https://github.com/SenteLabsAI/OpenExecutive/commit/297cbe0966cb21cabdf09ac05705dcfc948ebfea))
+* **evals:** give MCP scenarios a gateway so they can reach their tools ([#563](https://github.com/SenteLabsAI/OpenExecutive/issues/563)) ([d9c629e](https://github.com/SenteLabsAI/OpenExecutive/commit/d9c629e6ba24fd7269f4ad0849f1f44b11ab0690))
+* **people:** read a contact's signature from their newest signed mail, again on new mail ([#649](https://github.com/SenteLabsAI/OpenExecutive/issues/649)) ([d27ff6e](https://github.com/SenteLabsAI/OpenExecutive/commit/d27ff6ebc9132b3c986ee4b8aecb284f909f79e9))
+* **people:** time the contact keeper's next run from its last run, not a restart ([#650](https://github.com/SenteLabsAI/OpenExecutive/issues/650)) ([787d070](https://github.com/SenteLabsAI/OpenExecutive/commit/787d070a6e507f41b117fc9ffef07d5a7c32e3ec))
+
+## [0.6.6](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.6.5...v0.6.6) (2026-10-26)
+
+
+### Added
+
+* **ui:** a nonce Content-Security-Policy on every page ([#623](https://github.com/SenteLabsAI/OpenExecutive/issues/623)) ([85b5945](https://github.com/SenteLabsAI/OpenExecutive/commit/85b5945c3c9130433f517931919c1b71a3d6337f))
+* **ui:** confirm changes inside a frame once the browser reports the question seen ([#635](https://github.com/SenteLabsAI/OpenExecutive/issues/635)) ([9d9ca16](https://github.com/SenteLabsAI/OpenExecutive/commit/9d9ca16d0a958cfe7e7193643e999465218be901))
+* **ui:** let host origins frame the UI and call a short host list ([#628](https://github.com/SenteLabsAI/OpenExecutive/issues/628)) ([42b626d](https://github.com/SenteLabsAI/OpenExecutive/commit/42b626d12199d80d116a9d20241b0874c8e004ef))
+* **ui:** sum up Home under At a glance with more tiles ([#633](https://github.com/SenteLabsAI/OpenExecutive/issues/633)) ([6d20d9c](https://github.com/SenteLabsAI/OpenExecutive/commit/6d20d9c73383c0d534401496da70d62e39f793c8))
+
+
+### Fixed
+
+* **briefing:** stop first-week nudges for steps already done ([#632](https://github.com/SenteLabsAI/OpenExecutive/issues/632)) ([c04bd42](https://github.com/SenteLabsAI/OpenExecutive/commit/c04bd4235b1d91cc15ae56ae293e974226676fdd))
+* **chat:** stop the host chat list growing once the mark is stored ([#634](https://github.com/SenteLabsAI/OpenExecutive/issues/634)) ([efe9dd4](https://github.com/SenteLabsAI/OpenExecutive/commit/efe9dd43bda6649e11af426a5afe189770f94556))
+* **integrations:** save briefs and digests into the chat-app conversation ([#636](https://github.com/SenteLabsAI/OpenExecutive/issues/636)) ([e500883](https://github.com/SenteLabsAI/OpenExecutive/commit/e500883008cae4e4bad209c849a648fb46fae6ee))
+* **ui:** count done optional rows and make adding the team optional ([#631](https://github.com/SenteLabsAI/OpenExecutive/issues/631)) ([f211b96](https://github.com/SenteLabsAI/OpenExecutive/commit/f211b96961986d6ddef3e1be201ffe54bda3613a))
+* **workflows:** let chat fix a saved workflow on a card and say whose calendar a step reads ([#629](https://github.com/SenteLabsAI/OpenExecutive/issues/629)) ([582449d](https://github.com/SenteLabsAI/OpenExecutive/commit/582449d787abb11ff73773762935aff3ad80e5c9))
+
 ## [0.6.5](https://github.com/SenteLabsAI/OpenExecutive/compare/v0.6.4...v0.6.5) (2026-10-24)
 
 

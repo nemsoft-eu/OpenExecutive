@@ -163,6 +163,12 @@ export interface MessageAdded {
   ids: string[];
 }
 
+// The person pressed I'll finish it (POST /chat/hand-over) and the turn took
+// it: no more tools, the reply is a write-up of what it has so far.
+export interface HandingOver {
+  type: "handing_over";
+}
+
 // The turn held steps after reading something from outside: they wait on the
 // person's go, offered as Approve / Not now under the reply.
 export interface HeldStepsEvent {
@@ -171,12 +177,21 @@ export interface HeldStepsEvent {
   steps: string[];
 }
 
-// What the content check flagged this turn, in plain words: shown under the
-// reply (orchestrator/outside_content.py `pending_flags`).
+// What the content check flagged this turn, in plain words: sent only with
+// held steps, as their reason (orchestrator/outside_content.py `pending_flags`).
 export interface FlagsEvent {
   type: "flags";
   session_id?: string;
   flags: string[];
+}
+
+// A long turn's plan, every step up front, and the step it is on now
+// (orchestrator/turn_plan.py). Sent again each time it moves on or the plan
+// changes; a turn that sends none shows its steps as they happen.
+export interface PlanEvent {
+  type: "plan";
+  steps: string[];
+  current: number;
 }
 
 export type StreamItem =
@@ -187,8 +202,10 @@ export type StreamItem =
   | Activity
   | SourcesEvent
   | MessageAdded
+  | HandingOver
   | HeldStepsEvent
-  | FlagsEvent;
+  | FlagsEvent
+  | PlanEvent;
 
 export interface StreamChatOptions {
   committeeReview?: boolean;
@@ -351,6 +368,22 @@ export async function transcribeRecording(recording: Blob, filename: string): Pr
 export async function stopChat(clientTurnId: string): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/chat/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_turn_id: clientTurnId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// I'll finish it: stop the running turn's work and have it write up what it
+// has for the person to finish. False when the turn won't take it (finished
+// or stopped); the reply that arrives is then the turn's own.
+export async function handOverChat(clientTurnId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/chat/hand-over`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ client_turn_id: clientTurnId }),
@@ -2103,6 +2136,14 @@ export interface HandledReply {
 // alone. Send approves it (POST /decisions/{id}/approve); Dismiss rejects it
 // (POST /decisions/{id}/reject). `status` is "executing" while a send Gmail
 // didn't confirm is being checked.
+export interface ReplyTurn {
+  kind: "news" | "asked" | "note" | string;
+  text: string;
+  from_name?: string;
+  from_email?: string;
+  at?: string;
+}
+
 export interface ReplyCard {
   decision_id: number;
   status: string;
@@ -2152,6 +2193,13 @@ export interface ReplyCard {
   // What the email asks and what the draft says, in a line or two, for the
   // card's closed view; empty or absent on a card drafted before it.
   gist?: string;
+  // Since the draft was written: newer email in the conversation ("news"),
+  // what you asked to change ("asked") and what the Executive changed
+  // ("note"), in order. Absent on an older backend.
+  conversation?: ReplyTurn[];
+  // When the reply was last brought up to date with newer mail; Send passes
+  // it back, so a version you never saw asks again.
+  caught_up_at?: string;
 }
 
 // One thing a reply leaves you to decide (GET /delegation/replies).
@@ -2502,6 +2550,18 @@ export async function answerReplyQuestions(
   return (await res.json()) as ReplyCard;
 }
 
+// Change the reply the way you say, in your own words: the Executive
+// rewrites it and says what it changed (POST .../change). Sends nothing.
+export async function changeReply(id: number, text: string): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/change`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't change your reply.");
+  return (await res.json()) as ReplyCard;
+}
+
 // Forget one thing it learned in training: it asks again from now on.
 export async function removeTrainingLearned(id: number): Promise<DelegationSettings> {
   const res = await fetch(`${API_BASE}/delegation/learned/${id}`, { method: "DELETE" });
@@ -2586,6 +2646,43 @@ export async function getReplyCards(signal?: AbortSignal): Promise<ReplyCard[] |
   return body.cards;
 }
 
+// One email in your own mailbox, as Right now opens it (GET /delegation/mail).
+export interface MailView {
+  thread_id: string;
+  message_id: string;
+  subject: string;
+  from_name: string;
+  from_email: string;
+  to: string[];
+  cc: string[];
+  received_at: string;
+  text: string;
+  attachments: { name: string; mime_type: string; size: number }[];
+  has_attachments: boolean;
+  their_last_words: string;
+  link: string;
+  reply_card_id: number | null;
+}
+
+export async function getMail(threadId: string, messageId: string, signal?: AbortSignal): Promise<MailView> {
+  const q = new URLSearchParams({ thread_id: threadId, message_id: messageId });
+  const res = await fetch(`${API_BASE}/delegation/mail?${q}`, { signal });
+  if (!res.ok) throw await delegationError(res, "Couldn't open that email.");
+  return (await res.json()) as MailView;
+}
+
+// A reply to one email, on a card for you (the conversation's open card
+// when there is one). Sends nothing.
+export async function replyToMail(threadId: string, messageId: string): Promise<number> {
+  const res = await fetch(`${API_BASE}/delegation/mail/reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thread_id: threadId, message_id: messageId }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't write that reply.");
+  return ((await res.json()) as { decision_id: number }).decision_id;
+}
+
 // Why a Send didn't go: the backend's code (draft_gone, you_replied,
 // already_handled, send_unconfirmed, caller_signing_required, …) and what to
 // tell you.
@@ -2615,7 +2712,14 @@ function strings(value: unknown): string[] {
 // version when you changed the draft (Drafts in training).
 export async function sendReplyCard(
   id: number,
-  confirm?: { recipients: string[]; thread_moved_on?: boolean; allow?: boolean; example?: boolean },
+  confirm?: {
+    recipients: string[];
+    thread_moved_on?: boolean;
+    allow?: boolean;
+    example?: boolean;
+    // The card's caught_up_at as shown: brought up to date since asks again.
+    seen_caught_up_at?: string;
+  },
 ): Promise<SendReplyResult> {
   const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
     method: "POST",
@@ -2659,7 +2763,7 @@ export async function sendChatDraft(row: number, threadMovedOn = false): Promise
 // Dismiss (POST /decisions/{id}/reject) drops it.
 export interface ActionCardAction {
   index: number;
-  // invite, message, add_contact or drive_files.
+  // invite, message, add_contact, drive_files or save_files.
   kind: string;
   summary: string;
   // A message's text as it will be sent, or a meeting's description.
@@ -3775,6 +3879,10 @@ export interface AgentDetail {
   research_focus: string | null;
   research_focus_default: string | null;
   instructions: string | null;
+  // The Executive only: the model for one answer after pushback ("off" or ""
+  // = same as normal answers), and PUSHBACK_MODEL's.
+  pushback_model?: string | null;
+  pushback_model_default?: string | null;
 }
 
 export interface AgentHistoryEntry {
@@ -3787,6 +3895,7 @@ export interface AgentHistoryEntry {
   voice_persona_slug: string | null;
   research_focus: string | null;
   instructions: string | null;
+  pushback_model?: string | null;
   created_at: string;
 }
 
@@ -3798,6 +3907,7 @@ export interface AgentPatch {
   voice_persona_slug?: string | null;
   research_focus?: string | null;
   instructions?: string | null;
+  pushback_model?: string | null;
 }
 
 // ---- Voice Personas --------------------------------------------------------
@@ -4755,7 +4865,7 @@ export interface ContactChange {
   full_name: string;
   old_value: string;
   new_value: string;
-  reason: "emailed" | "met" | "asked" | "from_line" | "signature";
+  reason: "emailed" | "met" | "wrote" | "asked" | "from_line" | "signature";
   evidence: number;
   status: "applied" | "suggested" | "undone" | "dismissed";
   seen: boolean;
@@ -4798,6 +4908,13 @@ export interface ContactNote {
   met_count: number;
   note_written_at: string | null;
   updated_at: string;
+}
+
+// When the principal last emailed, heard from or met each person, for the
+// People list (principal only; people with nothing known are left out).
+export async function getLastContacts(): Promise<{ person_id: number; at: string; how: string }[]> {
+  const body = await contactsCall<{ people: { person_id: number; at: string; how: string }[] }>("/last-contact");
+  return body.people;
 }
 
 export async function getContactNote(personId: number): Promise<ContactNote | null> {
@@ -5303,6 +5420,26 @@ export interface NarrativePoint {
   text: string;
   // When the point first appeared today (ISO UTC).
   since?: string | null;
+  // What the point is about, when Home can open it: an email in your own
+  // inbox, or a card in Needs you.
+  source?: PointSource | null;
+}
+
+// What a Right now being rewritten is doing (shown in its place): reading
+// what moved, writing, checking each point. `new_mail`: emails from people
+// the owner deals with since the served header (`since`) was written.
+export interface NarrativeProgress {
+  step: "reading" | "writing" | "checking";
+  new_mail?: number;
+  since?: string | null;
+}
+
+export interface PointSource {
+  kind: "mail" | "alert";
+  message_id?: string | null;
+  thread_id?: string | null;
+  decision_id?: number | null;
+  alert_id?: number | null;
 }
 
 export interface MorningBriefItem {
@@ -5329,6 +5466,8 @@ export interface Today {
   // Optional for older API builds + test mocks.
   narrative_generated_at?: string | null;
   narrative_stale?: boolean;
+  // While narrative_stale: what the rewrite is doing.
+  narrative_progress?: NarrativeProgress | null;
   // The same narrative split for Home's Right now card: the bold opener, the
   // points with when each first appeared today, the Move today line, and when
   // this reader last looked. Optional for older API builds + test mocks.
@@ -5336,6 +5475,12 @@ export interface Today {
   narrative_points?: NarrativePoint[];
   narrative_move?: string | null;
   narrative_seen_at?: string | null;
+  // When the served header was last found current (null while a fresher one
+  // is being written), and the owner's "Also in" line: today's mail to their
+  // own inbox from people they don't deal with. Optional for older API builds.
+  narrative_checked_at?: string | null;
+  inbox_also?: string[];
+  inbox_also_total?: number;
   // The owner's own: today's delivered morning brief and the meetings still
   // ahead today.
   morning_brief?: MorningBriefItem | null;
@@ -5377,6 +5522,19 @@ export async function markTodaySeen(): Promise<string | null> {
   if (!res.ok) return null;
   const body = (await res.json()) as { seen_at?: string };
   return body.seen_at ?? null;
+}
+
+// The reader cleared a Right now point: gone for the rest of the day, and
+// the Executive doesn't raise it again. True when it was kept.
+export async function dismissTodayPoint(text: string): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/today/dismiss`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { dismissed?: boolean };
+  return body.dismissed === true;
 }
 
 // The latest morning brief or end-of-day digest that didn't reach the owner,

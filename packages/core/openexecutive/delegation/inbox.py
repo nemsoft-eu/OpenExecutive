@@ -943,6 +943,84 @@ def _audit(event_type: str, summary: str, details: dict[str, Any]) -> None:
     )
 
 
+# Mail the watcher looked at, for Right now (``briefing.live_signals``): who
+# wrote, about what, and how well the person knows them. Skips that aren't
+# mail to them from someone else (their own, the Executive's, before the
+# switch, too old, already answered) are left out.
+MAIL_SEEN_EVENT = "delegation_inbox_mail"
+# Not recorded: nothing new to the reader, or bulk, list and Gmail-tab mail
+# (never a point, and a busy day of it would crowd the real mail out of the
+# rows Right now reads).
+_NOT_NEWS = frozenset({
+    "before_watch", "stale", "no_sender", "from_you", "from_executive", "ours", "you_replied", "draft_exists",
+    "automatic", "mailing_list", "category",
+})
+# Newer mail on a card's thread already noted, in this process: reconcile
+# reads the thread on every scan. Right now also drops repeats by message id.
+_NOTED_LATER: set[tuple[int, str]] = set()
+# Started over past this many, so it never grows with the mail.
+_NOTED_LATER_MAX = 5000
+
+
+def _note_mail(
+    person_id: int, message: Any, *, relation: str, reason: str | None = None, card_id: int | None = None,
+) -> None:
+    """Record that ``message`` reached the person's inbox (private, theirs).
+    Never raises."""
+    if reason in _NOT_NEWS:
+        return
+    try:
+        _audit(MAIL_SEEN_EVENT, f"Email to person {person_id}", {
+            "person_id": person_id,
+            "message_id": message.id,
+            "thread_id": message.thread_id,
+            "from_name": message.from_name or "",
+            "from_email": message.from_addr or "",
+            "subject": message.subject or "",
+            "received_at": message.received_at or "",
+            "relation": relation or "",
+            "reason": reason or "",
+            "card_id": card_id,
+        })
+    except Exception:
+        logger.warning("delegation.inbox: noting a message failed", exc_info=True)
+
+
+def outcomes(person_id: int, message_ids: list[str], db_path: Path | None = None) -> dict[str, str]:
+    """``message_id`` → what the watcher did with it (``DRAFTED``,
+    ``NOT_NEEDED``, …), for the ids it recorded. Never raises."""
+    if not message_ids:
+        return {}
+    try:
+        conn = _connect(db_path)
+        try:
+            marks = ",".join("?" * len(message_ids))
+            rows = conn.execute(
+                f"SELECT message_id, outcome FROM {INBOX_MESSAGES_TABLE} "  # noqa: S608 — constant table name
+                f"WHERE person_id = ? AND message_id IN ({marks})",
+                (person_id, *message_ids),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("delegation.inbox: reading outcomes failed", exc_info=True)
+        return {}
+    return {r["message_id"]: r["outcome"] for r in rows}
+
+
+def _note_later(person_id: int, card: Any, payload: dict[str, Any], later: list[Any], own: set[str]) -> None:
+    """Note newer mail from someone else on an open card's thread (a scan
+    passes those threads over while the card is open)."""
+    relation = str(payload.get("relation") or "")
+    for m in later:
+        if m.from_addr in own or "SENT" in m.labels or (person_id, m.id) in _NOTED_LATER:
+            continue
+        if len(_NOTED_LATER) >= _NOTED_LATER_MAX:
+            _NOTED_LATER.clear()
+        _NOTED_LATER.add((person_id, m.id))
+        _note_mail(person_id, m, relation=relation, card_id=card.id)
+
+
 async def scan_person(person: Any, *, gmail: Any = None, now: datetime | None = None) -> ScanResult:
     """One scan of ``person``'s inbox. Never raises; the switch's status
     records how it went. With the switch off it only follows through a send
@@ -1181,18 +1259,7 @@ async def _consider(
     """Handle one message. True when the rest of the scan should stop.
     Once claimed, a message is finished or left for a later scan
     (``_retry_later``); a Gmail failure is raised for the scan to back off."""
-    from openexecutive.config import get_settings
-    from openexecutive.delegation import (
-        caps,
-        card_drafts,
-        drafts,
-        handle_it,
-        injection_check,
-        invites,
-    )
-    from openexecutive.delegation import disclosure as ai_disclosure
-    from openexecutive.delegation.ghostwriter import ComposeError
-    from openexecutive.delegation.gmail import DraftSpec, GmailError
+    from openexecutive.delegation import invites
     from openexecutive.delegation.inbox_classifier import (
         addressing,
         classify,
@@ -1200,7 +1267,6 @@ async def _consider(
         wants_draft,
     )
 
-    email = (person.email or "").strip().lower()
     thread = await client.get_thread(thread_id)
     message = next((m for m in thread.messages if m.id == message_id), None)
     if message is None:
@@ -1221,6 +1287,7 @@ async def _consider(
     if reason is not None:
         if _claim(person.id, message, relation="", outcome=SKIPPED, reason=reason, now=now):
             result.skipped += 1
+            _note_mail(person.id, message, relation="", reason=reason)
         return False
     known_as = await relation_of(message.from_addr, client, contacts=bool(person.is_principal))
     relation = handling_relation(known_as, message)
@@ -1233,6 +1300,7 @@ async def _consider(
         return False
     if not _claim(person.id, message, relation=relation, outcome=PROCESSING, now=now):
         return False
+    _note_mail(person.id, message, relation=relation)
     asked = addressing(message, name=person.full_name or "", own=own, exec_address=exec_address)
     verdict = await classify(
         message, relation=relation, addressed=asked, earlier=their_last_words(thread, message, own)
@@ -1247,6 +1315,27 @@ async def _consider(
         _set_outcome(person.id, message.id, NOT_NEEDED, reason=reason)
         result.not_needed += 1
         return False
+    return await _draft_card(
+        person, client, message, thread, relation=relation, known_as=known_as, verdict=verdict,
+        own=own, exec_address=exec_address, now=now, result=result,
+    )
+
+
+async def _draft_card(
+    person: Any, client: Any, message: Any, thread: Any, *, relation: str, known_as: str, verdict: Any,
+    own: set[str], exec_address: str, now: datetime, result: ScanResult, asked: bool = False,
+) -> bool:
+    """Write the reply to ``message`` (already claimed, ``PROCESSING``) and
+    put it on a card, within the day's draft limit; under Handle it for me
+    it may go on its own, unless the person ``asked`` for it (from Home).
+    True when the rest of the scan should stop (the limit)."""
+    from openexecutive.config import get_settings
+    from openexecutive.delegation import caps, card_drafts, drafts, handle_it, injection_check
+    from openexecutive.delegation import disclosure as ai_disclosure
+    from openexecutive.delegation.ghostwriter import ComposeError
+    from openexecutive.delegation.gmail import DraftSpec, GmailError
+
+    email = (person.email or "").strip().lower()
     settings = get_settings()
     if caps.reserve(person.id, settings.delegation_max_drafts_per_day) is not None:
         # Chat took the day's last draft while this one was being read: it
@@ -1273,11 +1362,12 @@ async def _consider(
         # Handle it for me: plain code decides whether this reply may go on
         # its own. The two model calls above have no tools, so the email's
         # text can only change their answers, never this.
-        handling = handle_it.get(person.id)
+        # Asked for from Home, it is always a card for them to look at.
+        on_its_own_allowed = handle_it.get(person.id).enabled and not asked
         held = handle_it.refusal(
             person.id, message, thread, reply, verdict, relation=relation, own=own,
             exec_address=exec_address, now=now,
-        ) if handling.enabled else "level"
+        ) if on_its_own_allowed else "level"
         if held is None and await injection_check.held_back(message, relation=relation):
             # One more look, only ever holding back: an email that tries to
             # steer an assistant waits for the person.
@@ -1322,7 +1412,7 @@ async def _consider(
     try:
         decision_id = _create_card(
             person, message, thread, reply, draft, relation=known_as, handled_as=relation, verdict=verdict,
-            on_its_own=held is None, handle_it_reason=held if handling.enabled else None,
+            on_its_own=held is None, handle_it_reason=held if on_its_own_allowed else None,
             kept=None if draft.draft_id else card_drafts.card_fields(spec, key),
         )
     except Exception as exc:
@@ -1350,12 +1440,103 @@ async def _consider(
         "relation": relation,
         "kind": verdict.kind,
         "flags": reply.flags,
-        **({"handle_it": held or "send"} if handling.enabled else {}),
+        **({"handle_it": held or "send"} if on_its_own_allowed else {}),
     })
     if held is None and decision_id is not None:
         await _send_on_its_own(person, client, decision_id, result, now=now)
     return False
 
+
+# Why Home's Reply couldn't make a card, by code.
+ASK_REFUSALS: dict[str, str] = {
+    "not_found": "That email isn't in your mailbox any more.",
+    "theirs_last": "You wrote last in that conversation.",
+    "backlog_full": "Too many replies are waiting for you. Send or dismiss some first.",
+    "daily_limit": "That's today's limit of replies. Try again tomorrow.",
+    "busy": "I'm already working on that one. Try again in a minute.",
+    "not_now": "I couldn't write that reply just now. Try again in a minute.",
+}
+
+
+def _row_for(person_id: int, message_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            f"SELECT outcome, decision_id FROM {INBOX_MESSAGES_TABLE} "  # noqa: S608 — constant table name
+            "WHERE person_id = ? AND message_id = ?",
+            (person_id, message_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+async def draft_on_request(
+    person: Any, thread_id: str, message_id: str, *, gmail: Any = None, now: datetime | None = None
+) -> int | str:
+    """A reply card for one email in ``person``'s own inbox, because they
+    asked for one (Home's Reply), whatever the watcher judged of it. The
+    open card already on its conversation when there is one (the watcher
+    brings its draft up to date with newer mail), else a new card, always
+    left for them: never sent on its own. Returns the card's decision id, or
+    a code from ``ASK_REFUSALS``. A Gmail failure is raised."""
+    from openexecutive.config import get_settings
+    from openexecutive.delegation.gmail import GmailNotFound, gmail_for
+    from openexecutive.delegation.inbox_classifier import Verdict
+
+    now = now or datetime.now(UTC)
+    person_id = int(person.id)
+    email = (person.email or "").strip().lower()
+    cards = open_cards(person_id)
+    on_thread = next((c for c in cards if card_payload(c).get("thread_id") == thread_id), None)
+    if on_thread is not None:
+        return int(on_thread.id)
+    if len(cards) >= OPEN_CARDS_MAX:
+        return "backlog_full"
+    client = gmail if gmail is not None else gmail_for(email)
+    try:
+        thread = await client.get_thread(thread_id)
+    except GmailNotFound:
+        return "not_found"
+    own = {email, *(a.strip().lower() for a in await client.send_as_addresses())}
+    shown = [m for m in thread.messages if "DRAFT" not in m.labels]
+    message = next((m for m in shown if m.id == message_id), None)
+    if message is None:
+        return "not_found"
+    if shown[-1].from_addr.strip().lower() in own:
+        return "theirs_last"
+    exec_address = (get_settings().exec_email_address or "").strip().lower()
+    known_as = await relation_of(message.from_addr, client, contacts=bool(person.is_principal))
+    relation = handling_relation(known_as, message)
+    row = _row_for(person_id, message_id)
+    if row is not None and row["outcome"] == PROCESSING:
+        return "busy"
+    if row is None:
+        if not _claim(person_id, message, relation=relation, outcome=PROCESSING, now=now):
+            return "busy"
+        _note_mail(person_id, message, relation=relation)
+    else:
+        _set_outcome(person_id, message_id, PROCESSING, reason="asked")
+    # They asked: the reply is theirs to write, so no verdict is needed.
+    verdict = Verdict(needs_reply=True, kind="request", confidence=1.0, asked_of_them=True)
+    result = ScanResult("ok")
+    try:
+        await _draft_card(
+            person, client, message, thread, relation=relation, known_as=known_as, verdict=verdict,
+            own=own, exec_address=exec_address, now=now, result=result, asked=True,
+        )
+    except Exception:
+        # Never left PROCESSING (every later Reply would say "busy"): it
+        # goes back to the watcher for a later scan, as a scan's failure does.
+        left = _row_for(person_id, message_id)
+        if left is not None and left["outcome"] == PROCESSING:
+            _retry_later(person_id, message_id, "error")
+        raise
+    if result.drafted:
+        done = _row_for(person_id, message_id)
+        if done is not None and isinstance(done["decision_id"], int):
+            return int(done["decision_id"])
+    return "daily_limit" if result.status == "daily_limit" else "not_now"
 
 async def _send_on_its_own(person: Any, client: Any, decision_id: int, result: ScanResult, *, now: datetime) -> None:
     """Send the reply on card ``decision_id`` under Handle it for me. A
@@ -1454,8 +1635,13 @@ async def settle_sends(person: Any, client: Any, *, now: datetime, own: set[str]
 
 
 def later_messages(thread: Any, payload: dict[str, Any], *, now: datetime) -> list[Any]:
-    """The thread's messages after the one a card answers (drafts left out)."""
-    inbound_at = _parse(str(payload.get("received_at") or ""))
+    """The thread's messages after the one a card answers (drafts left out),
+    or after the newest its draft was brought up to date with
+    (``answers.catch_up``)."""
+    from openexecutive.delegation.answers import CAUGHT_UP_KEY
+
+    marks = [_parse(str(payload.get(key) or "")) for key in ("received_at", CAUGHT_UP_KEY)]
+    inbound_at = max((m for m in marks if m is not None), default=None)
     return [
         m for m in thread.messages
         if "DRAFT" not in m.labels and (inbound_at is None or ((_parse(m.received_at) or now) > inbound_at))
@@ -1527,6 +1713,7 @@ async def _reconcile_card(person: Any, client: Any, card: Any, *, now: datetime,
     if sent_by_them:
         return int(_close_card(person.id, card.id, message_id, "you_replied", CLOSED))
     if any(m.from_addr not in own and "SENT" not in m.labels for m in later):
+        _note_later(person.id, card, payload, later, own)
         if payload.get("source") == FOLLOW_UP_SOURCE:
             # They answered: the follow-up isn't needed any more.
             closed = _close_card(person.id, card.id, message_id, "answered", CLOSED)
@@ -1537,7 +1724,13 @@ async def _reconcile_card(person: Any, client: Any, card: Any, *, now: datetime,
                 except Exception:
                     logger.warning("delegation.inbox: couldn't delete an unneeded follow-up draft", exc_info=True)
             return int(closed)
-        _add_flag(person.id, message_id, "thread_moved_on")
+        # Newer mail from them: the draft is brought up to date on its card,
+        # and only warns at Send when it couldn't be.
+        from openexecutive.delegation.answers import catch_up
+
+        newer = [m for m in later if m.from_addr not in own and "SENT" not in m.labels]
+        if not await catch_up(person, card, payload, newer, gmail=client, now=now):
+            _add_flag(person.id, message_id, "thread_moved_on")
     return 0
 
 

@@ -50,7 +50,9 @@ from openexecutive.orchestrator import (
     outside_content,
     take_the_lead,
     tool_groups,
+    turn_plan,
 )
+from openexecutive.orchestrator import pushback as pushback_mod
 from openexecutive.orchestrator.action_card_tools import (
     ACTION_CARD_TOOL_HANDLERS,
     ACTION_CARD_TOOLS,
@@ -80,6 +82,13 @@ from openexecutive.orchestrator.broadcast_tools import (
 from openexecutive.orchestrator.calendar_tools import (
     CALENDAR_TOOL_HANDLERS,
     CALENDAR_TOOLS,
+    typed_booking_only,
+)
+from openexecutive.orchestrator.chat_search_tools import (
+    CHAT_SEARCH_TOOL_HANDLERS,
+    CHAT_SEARCH_TOOL_NAMES,
+    CHAT_SEARCH_TOOLS,
+    search_person,
 )
 from openexecutive.orchestrator.content_trust import (
     principal_only_withheld,
@@ -113,6 +122,7 @@ from openexecutive.orchestrator.fact_tools import (
     FACT_TOOL_HANDLERS,
     FACT_TOOLS,
 )
+from openexecutive.orchestrator.file_tools import FILE_TOOL_HANDLERS, FILE_TOOLS
 from openexecutive.orchestrator.form_tools import (
     FORM_TOOL_HANDLERS,
     FORM_TOOLS,
@@ -187,6 +197,8 @@ from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
 from openexecutive.orchestrator.teammate_mail import guard_call_tool
 from openexecutive.orchestrator.turn_inbox import (
+    HAND_OVER_EMPTY_REPLY,
+    HAND_OVER_NOTE,
     TurnInbox,
     render_added_messages,
     with_added,
@@ -217,12 +229,16 @@ from openexecutive.providers.translator import (
     OPENROUTER_CITATIONS_BLOCK,
     reasoning_replay_block,
 )
-from openexecutive.workflows import python_job, step_script
+from openexecutive.workflows import python_job, step_script, turn_files
 from openexecutive.workflows.action_step import looks_like_error
 from openexecutive.workflows.python_job import PYTHON_JOB_TOOL_HANDLERS, PYTHON_JOB_TOOLS
 from openexecutive.workflows.tool_catalog import filter_search_results
 
 logger = logging.getLogger(__name__)
+
+# The tools that read the speaker's own notes or earlier chats: private rows,
+# withheld from the process log, and checked like a mail read.
+_OWN_RECALL_TOOL_NAMES: frozenset[str] = HISTORY_TOOL_NAMES | CHAT_SEARCH_TOOL_NAMES
 
 
 def _private_to_principal(session: Any) -> bool:
@@ -268,7 +284,10 @@ def _log_value(tool_name: str, value: Any) -> str:
     audit row keeps it)."""
     from openexecutive.delegation.settings import turn_touched_delegate_mail
 
-    if tool_name in DELEGATION_TOOL_NAMES or tool_name in HISTORY_TOOL_NAMES or turn_touched_delegate_mail():
+    if (
+        tool_name in DELEGATION_TOOL_NAMES or tool_name in _OWN_RECALL_TOOL_NAMES
+        or turn_touched_delegate_mail()
+    ):
         return "<private>"
     return _trunc(value)
 
@@ -817,6 +836,7 @@ _ALL_SKILL_TOOLS = [
     *FORM_TOOLS,
     *GUIDE_TOOLS,
     *PYTHON_JOB_TOOLS,
+    *FILE_TOOLS,
     *APP_TOOLS,
 ]
 
@@ -849,6 +869,7 @@ _ALL_SKILL_HANDLERS = {
     **FORM_TOOL_HANDLERS,
     **GUIDE_TOOL_HANDLERS,
     **PYTHON_JOB_TOOL_HANDLERS,
+    **FILE_TOOL_HANDLERS,
     **APP_TOOL_HANDLERS,
 }
 
@@ -867,6 +888,7 @@ def builtin_tool_names() -> frozenset[str]:
         step_script.LIST_SAVED_TOOLS_TOOL,
         tool_groups.OPEN_TOOLS,
         tool_groups.USE_TOOL,
+        turn_plan.PLAN_STEPS,
         WEB_SEARCH_TOOL_NAME,
         WEB_FETCH_TOOL_NAME,
     })
@@ -880,7 +902,7 @@ def _private_tool_row(tool_name: str) -> bool:
     return (
         tool_name in DELEGATION_TOOL_NAMES
         or tool_name in FACT_TOOL_HANDLERS
-        or tool_name in HISTORY_TOOL_NAMES
+        or tool_name in _OWN_RECALL_TOOL_NAMES
         # An installed extension's tool that quotes the speaker's own data
         # (orchestrator/extensions.py, private_row).
         or extensions.private_row(tool_name)
@@ -895,6 +917,44 @@ def _artifact_row_owner(tool_name: str) -> int | None:
     from openexecutive.orchestrator.artifact_records import current_viewer
 
     return current_viewer().person_id
+
+
+def _pushback_for_turn(
+    settings: Any, session: Session, text: str, normal_model: str
+) -> pushback_mod.Pushback | None:
+    """The pushback model for this turn, when the person pushed back on the
+    last answer (``orchestrator.pushback``). The Executive's Council pick
+    wins over ``PUSHBACK_MODEL``. None runs the turn on ``normal_model``."""
+    try:
+        from openexecutive.agents.overrides import EXECUTIVE_AGENT_ID, get_override
+
+        ov = get_override(EXECUTIVE_AGENT_ID)
+        return pushback_mod.for_turn(
+            session_id=session.session_id,
+            text=text,
+            history=session.conversation_history,
+            normal_model=normal_model,
+            override_pick=ov.pushback_model if ov is not None else None,
+            default=getattr(settings, "pushback_model", "") or "",
+        )
+    except Exception:
+        logger.warning("pushback: couldn't pick the turn's model", exc_info=True)
+        return None
+
+
+def _log_pushback(
+    pushback: pushback_mod.Pushback | None, session: Session, turn_id: str
+) -> None:
+    if pushback is None:
+        return
+    audit_log(
+        "pushback_model",
+        f"Pushback on the last answer ({pushback.reason}); this answer on {pushback.model}",
+        session_id=session.session_id,
+        turn_id=turn_id,
+        actor="executive",
+        details={"reason": pushback.reason, "model": pushback.model},
+    )
 
 
 def _speaker_text(memory_text: str | None, user_message: str) -> str:
@@ -1144,6 +1204,17 @@ def _emit_cache_event(
         session_id=session_id,
         turn_id=turn_id,
     )
+
+
+# Added after the tool results of the round before the last. The last round
+# is offered no tool (tool_choice none), so this is the turn's chance to
+# answer from what it has rather than run out of steps mid-task.
+LAST_ROUND_NOTE = (
+    "This is your last step for this message: no more tools can run. Write "
+    "your answer now from what you have gathered so far. If part of the "
+    "request is still undone, say briefly what is left, and that you can "
+    "carry on if they ask."
+)
 
 
 def _round_separator(tail: str, text: str) -> str:
@@ -1479,6 +1550,12 @@ class Executive:
             )
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
+        # Pushback on the last answer: this one answer on the pushback model.
+        pushback = _pushback_for_turn(
+            self._settings, session, _speaker_text(memory_text, user_message), effective_model
+        )
+        if pushback is not None:
+            effective_model = pushback.model
         # Resolved once and handed to both the prompt and the tool loop, so
         # the persona can never promise a search tool the request lacks.
         search = select_web_search_tool(effective_model)
@@ -1527,6 +1604,7 @@ class Executive:
         t0 = time.monotonic()
         full_response = ""
         with set_turn(session_id=session.session_id, turn_id=turn_id):
+            _log_pushback(pushback, session, turn_id)
             # Per-person prefetch from Honcho. Runs once per turn (NOT inside
             # the tool-call loop) so a long multi-tool turn doesn't accrue
             # multiple round trips. The wrapper enforces a hard timeout and
@@ -1860,6 +1938,12 @@ class Executive:
             )
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
+        # Pushback on the last answer: this one answer on the pushback model.
+        pushback = _pushback_for_turn(
+            self._settings, session, _speaker_text(memory_text, user_message), effective_model
+        )
+        if pushback is not None:
+            effective_model = pushback.model
 
         # Gated on the DRAFT pass, which is the one that carries tools. The
         # revision pass below reuses these exact blocks on purpose — a second
@@ -1912,6 +1996,7 @@ class Executive:
         # refactor adds a raising step in this window, wrap that step in
         # try/finally with clear_turn() or migrate to `with set_turn`.
         bind_turn(session_id=session.session_id, turn_id=turn_id)
+        _log_pushback(pushback, session, turn_id)
 
         # Per-person prefetch from Honcho (see stream_chat for rationale).
         # Skip when caller pre-resolved (e.g. parallel context fetch in route).
@@ -2774,6 +2859,11 @@ class Executive:
         if history_offered:
             delegation_tools = [*delegation_tools, *HISTORY_TOOLS]
             turn_handlers = {**turn_handlers, **HISTORY_TOOL_HANDLERS}
+        # Earlier chats: search_past_chats joins the same way, on a turn whose
+        # speaker is verified in a chat nobody else reads (chat_search_tools).
+        if not mcp_client and not replaying and search_person(current_session.get()) is not None:
+            delegation_tools = [*delegation_tools, *CHAT_SEARCH_TOOLS]
+            turn_handlers = {**turn_handlers, **CHAT_SEARCH_TOOL_HANDLERS}
         # Tools an installed extension adds (orchestrator/extensions.py): only
         # on a turn someone is in, never an unattended run or a turn private
         # to the principal, and only where each tool says it is offered.
@@ -2841,7 +2931,16 @@ class Executive:
         # Every tool the turn ran with its result: for the claim check, and
         # (``calls_out``) for the conversation review's record of the turn.
         turn_calls: list[tuple[str, str]] = calls_out if calls_out is not None else []
+        # What the after-reply check reads (claim_check): each call with what
+        # it was asked to do, since a result's first line rarely says it all.
+        claim_calls: list[tuple[str, str]] = []
         claim_checked = False
+        # Set once the person asks to finish the work themselves: the next
+        # round writes up what the turn has, and runs no tool.
+        handing_over = False
+        # The plan the turn last showed (plan_steps), so a call that only
+        # moves on keeps the steps.
+        shown_plan: list[str] | None = None
 
         stream_model = model or self._settings.default_model
         if self._settings.routing_prepass_enabled:
@@ -2923,12 +3022,17 @@ class Executive:
                     [
                         *SPECIALIST_TOOLS, *_offered_skill_tools(), *self._mcp_tools,
                         *self._script_tools, *delegation_tools, *extra_client_tools,
+                        turn_plan.PLAN_STEPS_TOOL,
                     ],
                     workspace_mode,
                 )
                 if t["name"] not in not_offered
             )
             client_tools = sorted(direct_tools, key=lambda t: t["name"])
+            booking_offered = any(
+                isinstance(t, dict) and t.get("name") == "create_calendar_event"
+                for t in [*direct_tools, *deferred_tools]
+            )
             tools_with_cache: list[dict[str, Any]] = [
                 *client_tools[:-1],
                 {**client_tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}},
@@ -2941,6 +3045,12 @@ class Executive:
                 system=system_blocks,  # type: ignore[arg-type]
                 tools=tools_with_cache,  # type: ignore[arg-type,list-item]
                 messages=current_messages,  # type: ignore[arg-type]
+                # The last round runs no tool, so a turn that used up its
+                # steps still answers from what it gathered instead of
+                # ending on "unable to complete". The tools and system
+                # blocks stay cached; the messages are read uncached this
+                # once, as tool_choice changes. Only a turn at its cap pays it.
+                **({"tool_choice": {"type": "none"}} if iteration == max_iterations else {}),
             ) as stream:
                 async for event in stream:
                     if (
@@ -3053,14 +3163,14 @@ class Executive:
                 await outside_content.settle()
                 # Do what it says: a reply that claims a change no call this
                 # turn made gets one more round to make it or say it can't.
-                if claim_checked or iteration >= max_iterations:
+                if claim_checked or handing_over or iteration >= max_iterations:
                     return
                 claim_checked = True
                 reply_text = "\n".join(
                     str(b.get("text", "")) for b in response_content if b.get("type") == "text"
                 )
                 claim = await claim_check.unbacked_claim(
-                    claim_check.last_person_message(messages), reply_text, turn_calls,
+                    claim_check.last_person_message(messages), reply_text, claim_calls,
                 )
                 if claim is None:
                     return
@@ -3075,19 +3185,43 @@ class Executive:
                     private=private_turn,
                 )
                 current_messages.append({"role": "assistant", "content": response_content})
-                current_messages.append(
-                    {"role": "user", "content": [{"type": "text", "text": claim_check.nudge(claim)}]}
-                )
+                nudge: list[dict[str, Any]] = [{"type": "text", "text": claim_check.nudge(claim)}]
+                # The retry is the last round, which runs no tool: say so,
+                # so it says it can't rather than try a call it won't get.
+                if iteration == max_iterations - 1:
+                    nudge.append({"type": "text", "text": LAST_ROUND_NOTE})
+                current_messages.append({"role": "user", "content": nudge})
                 # The retry's text gets its paragraph break from
                 # _round_separator, like any other round's.
                 continue
 
+            # Handed over: the write-up asked for a tool anyway. Run nothing;
+            # what it wrote (if anything) is the reply.
+            if handing_over:
+                if not any(
+                    b.get("type") == "text" and str(b.get("text", "")).strip()
+                    for b in response_content
+                ):
+                    yield HAND_OVER_EMPTY_REPLY
+                return
+
             # open_tools is answered here; a use_tool call becomes the call it
             # stands for (same id), so every guard, handler, chip and audit
             # row below sees the tool's own name, as for a direct call.
+            # plan_steps is answered here too: nothing runs, and the chat
+            # gets the plan before this round's activity label.
             group_results: dict[str, str] = {}
             for i, tu in enumerate(tool_uses):
-                if tu["name"] == tool_groups.OPEN_TOOLS:
+                if tu["name"] == turn_plan.PLAN_STEPS:
+                    result, plan_event, shown_plan = turn_plan.apply(
+                        tu["input"],
+                        shown_plan,
+                        alone=all(other["name"] == turn_plan.PLAN_STEPS for other in tool_uses),
+                    )
+                    group_results[tu["id"]] = result
+                    if plan_event is not None:
+                        yield plan_event
+                elif tu["name"] == tool_groups.OPEN_TOOLS:
                     group_results[tu["id"]] = tool_groups.open_result(tu["input"], deferred_tools)
                 elif tu["name"] == tool_groups.USE_TOOL:
                     call, error = tool_groups.unwrap(tu)
@@ -3200,7 +3334,7 @@ class Executive:
             # (delegation.lockdown.mail_turn_withholds).
             mail_touched_uses: list[dict[str, Any]] = []
             reads_mail_now = any(
-                tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in dispatch_uses
+                tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in _OWN_RECALL_TOOL_NAMES for tu in dispatch_uses
             )
             if pinned_delegation is not None and (pinned_delegation.read_mail or reads_mail_now):
                 mail_touched_uses = [
@@ -3326,7 +3460,11 @@ class Executive:
             # indicator on. Never fatal: a labelling bug must not take the
             # turn down with it.
             try:
-                activity = summarize_activity(tool_uses, iteration=iteration)
+                # The plan call is not what the round is doing.
+                activity = summarize_activity(
+                    [tu for tu in tool_uses if tu["name"] != turn_plan.PLAN_STEPS],
+                    iteration=iteration,
+                )
             except Exception:
                 logger.warning(
                     "activity_label_failed iteration=%d", iteration, exc_info=True
@@ -3759,7 +3897,7 @@ class Executive:
             if mcp_tool_uses and self._mcp_gateway is not None:
                 # A teammate's mail with the Executive stays theirs: every
                 # mailbox read the model makes is filtered (teammate_mail).
-                guarded_call_tool = guard_call_tool(
+                guarded_call_tool = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
                     else department_gate.gated_call_tool(
@@ -3767,7 +3905,7 @@ class Executive:
                     )
                     if seat is not None
                     else self._mcp_gateway.call_tool
-                )
+                ))
                 _mcp_dispatch = {
                     "search_tools": self._mcp_gateway.search_tools,
                     # A replay (memory.replay) makes the reads and records the rest.
@@ -3890,7 +4028,7 @@ class Executive:
                 # matters: the gateway's own gates (discovery, deny-list,
                 # recipients), Take the lead's gate on an unattended run, and
                 # the same chip and audit row, as each call happens.
-                script_call = guard_call_tool(
+                script_call = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
                     else department_gate.gated_call_tool(
@@ -3898,7 +4036,7 @@ class Executive:
                     )
                     if seat is not None
                     else self._mcp_gateway.call_tool
-                )
+                ))
                 # The Executive's own tools a script may call this turn: the
                 # fixed list, less any this turn is not offered. Each runs
                 # through the turn's handler (Take the lead's gate included).
@@ -4229,7 +4367,7 @@ class Executive:
             # next round on (delegation.lockdown.mail_lock_holds).
             if pinned_delegation is not None and reads_mail_now:
                 for tu in dispatch_uses:
-                    if tu["name"] not in MAILBOX_TOOL_NAMES and tu["name"] not in HISTORY_TOOL_NAMES:
+                    if tu["name"] not in MAILBOX_TOOL_NAMES and tu["name"] not in _OWN_RECALL_TOOL_NAMES:
                         continue
                     if tu["id"] not in results_by_id:
                         continue  # never ran (not offered): no mail was read
@@ -4262,6 +4400,9 @@ class Executive:
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
                 turn_calls.append((tu["name"], str(results_by_id.get(tu["id"], ""))))
+                claim_calls.append(
+                    (claim_check.call_label(tu["name"], tu["input"]), str(results_by_id.get(tu["id"], "")))
+                )
             for tu in tool_uses:
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
@@ -4302,6 +4443,14 @@ class Executive:
                 # Audited by the inbox's owner (the web chat route), under
                 # the same privacy as the turn's own message.
                 yield {"type": "message_added", "ids": [m.id for m in added]}
+            # The last round has no step after it to write anything up in;
+            # its own reply stands, and the request is never taken.
+            if iteration < max_iterations and inbox is not None and inbox.take_hand_over():
+                tool_results.append({"type": "text", "text": HAND_OVER_NOTE})
+                handing_over = True
+                yield {"type": "handing_over"}
+            if iteration == max_iterations - 1 and not handing_over:
+                tool_results.append({"type": "text", "text": LAST_ROUND_NOTE})
             current_messages.append({"role": "user", "content": tool_results})
             # Bounded to the messages this loop appended: current_messages
             # is a shallow copy, so anything at a lower index is still owned
@@ -4398,17 +4547,25 @@ class Executive:
             from openexecutive.people.reach import note_talked
 
             await asyncio.to_thread(note_talked, session)
+        # The files a chat app read for this message (turn_files.offer): bound
+        # for the turn and kept for the conversation, as a web upload is.
+        offered = turn_files.take_offered()
+        if offered:
+            from openexecutive.orchestrator import conversation_files
+
+            await asyncio.to_thread(conversation_files.keep, session.session_id, offered)
         stream = (
             self.stream_chat_with_committee(**common_kwargs)
             if committee_review
             else self.stream_chat(**common_kwargs)
         )
         result = ""
-        async for chunk in stream:
-            if isinstance(chunk, str) and chunk != self._THINKING:
-                result += chunk
-            elif cards is not None and isinstance(chunk, dict) and chunk.get("type") == "action_taken":
-                decision_id = chunk.get("decision_id")
-                if isinstance(decision_id, int) and not isinstance(decision_id, bool) and decision_id not in cards:
-                    cards.append(decision_id)
+        with turn_files.bind(offered or None) if offered else contextlib.nullcontext():
+            async for chunk in stream:
+                if isinstance(chunk, str) and chunk != self._THINKING:
+                    result += chunk
+                elif cards is not None and isinstance(chunk, dict) and chunk.get("type") == "action_taken":
+                    decision_id = chunk.get("decision_id")
+                    if isinstance(decision_id, int) and not isinstance(decision_id, bool) and decision_id not in cards:
+                        cards.append(decision_id)
         return result

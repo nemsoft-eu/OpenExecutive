@@ -30,6 +30,12 @@ already hold them:
   • WAITING — the principal's own sent mail nobody has answered yet
     (``briefing.waiting_on``, read in the background from their own mailbox
     under Act as me): who it went to, its subject, when. Private.
+  • INBOX — mail to the principal's own inbox that the Act as me watcher
+    looked at (``delegation_inbox_mail`` audit rows, ``delegation.inbox``),
+    including newer mail on a thread whose reply card is still open. From
+    people they deal with, one line each with what the watcher did; from
+    anyone else (strangers, bulk mail), only short labels for Home's "Also
+    in" line, never a point. Private.
 
 Private rows (the principal's own contacts, their drafts, their chat titles,
 their calendar) are included only with ``include_private=True``: the morning brief (a
@@ -52,6 +58,7 @@ from datetime import UTC, datetime, tzinfo
 from typing import Any
 
 from openexecutive.alerts.lifecycle import parse_aware
+from openexecutive.utils.clock import clock
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,8 @@ _OWN_MAX = 6
 _CALENDAR_MAX = 6
 _MET_TODAY_MAX = 3
 _WAITING_MAX = 5
+_INBOX_MAX = 6
+_INBOX_OTHERS_MAX = 3
 # How many audit rows each query reads. A busy day's inbound is well under
 # this; the cap keeps a flood from turning one page load into a scan.
 _POOL = 200
@@ -93,16 +102,16 @@ def _one_line(value: Any, limit: int = _TEXT_MAX) -> str:
 
 
 def _local_hhmm(iso: str | None, tz: tzinfo, now: datetime | None = None) -> str:
-    """"14:05", or "Wed 14 Oct 14:05" when ``now`` is given and the moment
-    falls on another local day: the brief's window reaches into yesterday,
-    and a bare time read as today put yesterday's mail on today."""
+    """"2:05 PM", or "Wed 14 Oct 2:05 PM" when ``now`` is given and the
+    moment falls on another local day: the brief's window reaches into
+    yesterday, and a bare time read as today put yesterday's mail on today."""
     dt = parse_aware(iso)
     if dt is None:
         return "--:--"
     local = dt.astimezone(tz)
     if now is not None and local.date() != now.astimezone(tz).date():
-        return f"{local:%a} {local.day} {local:%b %H:%M}"
-    return f"{local:%H:%M}"
+        return f"{local:%a} {local.day} {local:%b} {clock(local)}"
+    return clock(local)
 
 
 def _principal() -> Any:
@@ -221,6 +230,20 @@ class LiveSignals:
     met_today: tuple[str, ...] = ()
     # The reader's own emails with no answer yet, newest first.
     waiting: tuple[str, ...] = ()
+    # Mail to the reader's own inbox from people they deal with, newest
+    # first; and short labels for the rest (``inbox_others_total`` of them).
+    # Right now's alone, like ``waiting``.
+    inbox: tuple[str, ...] = ()
+    inbox_others: tuple[str, ...] = ()
+    inbox_others_total: int = 0
+    # Which email each ``inbox`` line is, in the same order, so Home can open
+    # it from the point that cites it. Never rendered or keyed.
+    inbox_refs: tuple[dict[str, Any], ...] = ()
+    # Messages in a team chat that ask something of the principal, unanswered
+    # for half an hour (``integrations.chat_asks``), oldest first, and the
+    # link to each in the same order. Right now's alone, like ``inbox``.
+    chat_asks: tuple[str, ...] = ()
+    chat_ask_refs: tuple[dict[str, Any], ...] = ()
     # Stable identities for the brief's "unchanged" fingerprint — no times.
     # The reader's own messages are left out: chatting with the Executive
     # is not a reason to send a brief.
@@ -452,13 +475,28 @@ def _drafts(
     count = drafts.count_waiting(principal.id, since)
     if not count:
         return 0, []
+    waiting = drafts.waiting_drafts(principal.id, since)
+    # A draft addressed only to the reader (one the Executive saved for them
+    # to keep, like signed papers mailed to themselves) is not mail anyone is
+    # waiting on: Right now called one "still sitting in drafts, unsent".
+    own = {a.casefold() for a in [principal.email, *principal.email_aliases] if a}
+    count = max(0, count - sum(1 for d in waiting if _only_to(d.to, own)))
     # Only the ones a settle pass has read: a bare time names nothing (the
     # count still covers them).
     return count, [
         draft_line(d, tz, now)
-        for d in drafts.waiting_drafts(principal.id, since)
-        if d.to or d.subject
+        for d in waiting
+        if (d.to or d.subject) and not _only_to(d.to, own)
     ]
+
+
+def _only_to(recipients: Any, own: set[str]) -> bool:
+    """Whether every recipient of a draft is one of the reader's own
+    addresses (and there is at least one)."""
+    from email.utils import parseaddr
+
+    addresses = [parseaddr(str(r))[1].casefold() for r in recipients or ()]
+    return bool(own) and bool(addresses) and all(a in own for a in addresses)
 
 
 def draft_line(draft: Any, tz: tzinfo, now: datetime | None = None) -> str:
@@ -595,9 +633,9 @@ def _calendar_lines(events: list[Any], now: datetime, tz: tzinfo) -> list[str]:
             continue
         if e.end == e.start and e.start < now:
             continue
-        when = f"{e.start.astimezone(tz):%H:%M}"
+        when = clock(e.start.astimezone(tz))
         if e.end > e.start:
-            when += f"–{e.end.astimezone(tz):%H:%M}"
+            when += f"–{clock(e.end.astimezone(tz))}"
         state = "IN PROGRESS " if e.start <= now < e.end else ""
         lines.append(f"{state}{when} {_one_line(e.title, 80)}")
     return (all_day + lines)[:_CALENDAR_MAX]
@@ -616,9 +654,174 @@ def _met_today_lines(events: list[Any], now: datetime, tz: tzinfo) -> list[str]:
         reverse=True,
     )
     return [
-        f"{e.start.astimezone(tz):%H:%M}–{e.end.astimezone(tz):%H:%M} {_one_line(e.title, 80)}"
+        f"{clock(e.start.astimezone(tz))}–{clock(e.end.astimezone(tz))} {_one_line(e.title, 80)}"
         for e in over[:_MET_TODAY_MAX]
     ]
+
+
+# Why the watcher passed mail over without reading it as someone's: bulk,
+# a list, a Gmail tab, not addressed to them. Such mail is "Also in", never a
+# point, however well they know the sender.
+_INBOX_NOISE = frozenset({"automatic", "mailing_list", "category", "not_addressed", "too_many_recipients"})
+_INBOX_KNOWN = frozenset({"team", "contact", "correspondent"})
+
+
+@dataclass(frozen=True)
+class OwnInbox:
+    lines: tuple[str, ...] = ()
+    others: tuple[str, ...] = ()
+    others_total: int = 0
+    # Per line: the email's ids and its open reply card, if any.
+    refs: tuple[dict[str, Any], ...] = ()
+    # Mail from people they deal with, before ``lines`` is cut to its cap.
+    total: int = 0
+
+
+def _chat_asks(now: datetime, tz: tzinfo) -> tuple[list[str], list[dict[str, Any]], list[int]]:
+    """``(lines, refs, ids)`` of the principal's unanswered chat asks
+    (``integrations.chat_asks.waiting``). Private."""
+    from openexecutive.integrations import chat_asks
+
+    principal = _principal()
+    if principal is None or principal.id is None:
+        return [], [], []
+    lines: list[str] = []
+    refs: list[dict[str, Any]] = []
+    ids: list[int] = []
+    for ask in chat_asks.waiting(principal.id, now):
+        try:
+            at = clock(datetime.fromisoformat(ask.asked_at).astimezone(tz))
+        except ValueError:
+            at = ""
+        lines.append(
+            f"{chat_asks.where(ask)}, {_one_line(ask.from_name, 60)}"
+            + (f" at {at}" if at else "") + f": {_one_line(ask.text, 300)}"
+        )
+        refs.append({"kind": "link", "url": ask.link, "app": chat_asks.APP_NAMES.get(ask.channel, ask.channel)}
+                    if ask.link else {})
+        ids.append(ask.id)
+    return lines, refs, ids
+
+
+def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnInbox:
+    """Mail to the principal's own inbox since ``since`` (by when it arrived),
+    as the Act as me watcher recorded it, leaving out any they have dealt
+    with since it came: answered in its thread (``waiting_on.replied``), or
+    wrote to its sender from another thread after it came (``waiting_on.
+    wrote_to``) on the same subject, or on any subject when the email needed
+    nothing back. A request answered only by an unrelated note to the same
+    person stays. Private; never raises."""
+    from openexecutive.briefing import waiting_on
+    from openexecutive.delegation import inbox as watcher
+
+    principal = _principal()
+    if principal is None or principal.id is None:
+        return OwnInbox()
+    try:
+        from openexecutive.audit import logger as audit_logger
+
+        if audit_logger._default_logger is None and not audit_logger.DB_PATH.exists():
+            return OwnInbox()  # a read must not create the database (see _audit_rows)
+        # The principal's rows carry no owner; owned_by keeps a row a
+        # failed principal check left marked as theirs too.
+        rows = audit_logger.get_audit_logger().query(
+            event_type=watcher.MAIL_SEEN_EVENT, since=since.isoformat(), limit=_POOL,
+            include_private=True, owned_by=principal.id,
+        )
+    except Exception:
+        logger.exception("live_signals: own inbox read failed")
+        return OwnInbox()
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    answered = waiting_on.replied()
+    wrote = waiting_on.wrote_to()
+    for ev in rows:  # newest first
+        d = ev.details if isinstance(ev.details, dict) else {}
+        message_id = str(d.get("message_id") or "")
+        if d.get("person_id") != principal.id or not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        # Noted on a later pass (a restart, a card read again): what counts
+        # is when it arrived.
+        arrived = parse_aware(str(d.get("received_at") or "")) or parse_aware(ev.ts)
+        if arrived is None or arrived < since:
+            continue
+        # They wrote in the thread after it came: handled, whatever the
+        # watcher made of it.
+        replied = answered.get(str(d.get("thread_id") or ""))
+        if replied is not None and replied > arrived:
+            continue
+        picked.append(d | {"_at": arrived})
+    picked.sort(key=lambda d: d["_at"], reverse=True)
+    done = watcher.outcomes(principal.id, [str(d["message_id"]) for d in picked])
+    lines: list[str] = []
+    refs: list[dict[str, Any]] = []
+    others: list[str] = []
+    others_total = 0
+    total = 0
+    for d in picked:
+        address = str(d.get("from_email") or "")
+        name = _one_line(d.get("from_name"), 60)
+        subject = _one_line(d.get("subject"), 100) or "(no subject)"
+        outcome = done.get(str(d["message_id"]), "")
+        if _wrote_back(d, outcome == watcher.NOT_NEEDED, wrote.get(address.strip().lower(), [])):
+            continue
+        relation = str(d.get("relation") or "")
+        reason = str(d.get("reason") or "")
+        on_card = d.get("card_id") is not None
+        needs_them = on_card or outcome in (watcher.DRAFTED, watcher.SENT)
+        if not needs_them and (relation not in _INBOX_KNOWN or reason in _INBOX_NOISE):
+            others_total += 1
+            if len(others) < _INBOX_OTHERS_MAX:
+                who = name or _one_line(address, 60)
+                others.append(_one_line(f"{who}: {subject}", 90))
+            continue
+        total += 1
+        if len(lines) >= _INBOX_MAX:
+            continue
+        who = f"{name} ({address})" if name and address else _named(address, True)
+        at = _local_hhmm(d["_at"].isoformat(), tz, now)
+        if on_card:
+            what = (
+                "wrote again in a thread whose reply card is still open, so the card's "
+                "draft was written before this"
+            )
+        elif outcome == watcher.DRAFTED:
+            what = "I drafted a reply; it is on a card waiting for the reader"
+        elif outcome == watcher.SENT:
+            what = "I answered it on the reader's behalf"
+        elif outcome == watcher.NOT_NEEDED:
+            what = "no reply needed"
+        else:
+            what = ""
+        line = f"[{at}] from {who}: \"{subject}\""
+        lines.append(f"{line} — {what}" if what else line)
+        refs.append(_mail_ref(d))
+    return OwnInbox(tuple(lines), tuple(others), others_total, tuple(refs), total)
+
+
+def _wrote_back(d: dict[str, Any], fyi: bool, sends: list[tuple[datetime, str]]) -> bool:
+    """Whether a send of theirs to this email's sender, after it came,
+    deals with it: one on the same subject (a reply started fresh), or any
+    one when the email needed nothing back (signed papers they then sent on
+    with the sender on copy)."""
+    from openexecutive.delegation.drafts import _same_subject
+
+    subject = _same_subject(str(d.get("subject") or ""))
+    return any(
+        at > d["_at"] and (fyi or (bool(subject) and _same_subject(sent) == subject))
+        for at, sent in sends
+    )
+
+
+def _mail_ref(d: dict[str, Any]) -> dict[str, Any]:
+    """What Home needs to open one email from a Right now point."""
+    ref: dict[str, Any] = {"kind": "mail", "message_id": str(d.get("message_id") or "")}
+    if d.get("thread_id"):
+        ref["thread_id"] = str(d["thread_id"])
+    if isinstance(d.get("card_id"), int):
+        ref["decision_id"] = d["card_id"]
+    return ref
 
 
 def _waiting_lines(items: list[Any], now: datetime, tz: tzinfo) -> list[str]:
@@ -632,7 +835,7 @@ def _waiting_lines(items: list[Any], now: datetime, tz: tzinfo) -> list[str]:
         local = w.sent_at.astimezone(tz)
         days = (today - local.date()).days
         when = (
-            f"today at {local:%H:%M}" if days == 0
+            f"today at {clock(local)}" if days == 0
             else "yesterday" if days == 1
             else f"{days} days ago ({local:%a} {local.day} {local:%b})"
         )
@@ -736,6 +939,22 @@ def gather_live_signals(
         except Exception:
             logger.exception("live_signals: waiting render failed")
 
+    mail = OwnInbox()
+    if include_private:
+        try:
+            mail = own_inbox(since, tz, now)
+        except Exception:
+            logger.exception("live_signals: own inbox render failed")
+
+    asks: list[str] = []
+    ask_refs: list[dict[str, Any]] = []
+    ask_keys: list[int] = []
+    if include_private:
+        try:
+            asks, ask_refs, ask_keys = _chat_asks(now, tz)
+        except Exception:
+            logger.exception("live_signals: chat asks read failed")
+
     stuck = stuck[:_STUCK_MAX]
     return LiveSignals(
         inbound=tuple(inbound),
@@ -749,7 +968,14 @@ def gather_live_signals(
         calendar=calendar_lines,
         met_today=met_today,
         waiting=waiting,
+        inbox=mail.lines,
+        inbox_others=mail.others,
+        inbox_others_total=mail.others_total,
+        inbox_refs=mail.refs,
+        chat_asks=tuple(asks),
+        chat_ask_refs=tuple(ask_refs),
         keys={
+            "chat_asks": ask_keys,
             "inbound": sorted(inbound_keys),
             "stuck": sorted(s.split("] ", 1)[-1] for s in stuck),
             "drafts": drafts,
