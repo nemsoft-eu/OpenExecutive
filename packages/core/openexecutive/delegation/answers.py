@@ -331,6 +331,17 @@ def questions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def questions_left(payload: dict[str, Any]) -> int:
+    """How many offered choices still wait for the person, which is what holds
+    the web card's Send (``questionsLeft`` in the UI's ``replyCards.ts``). None
+    once they changed the words by hand (``card_drafts.QUESTIONS_SETTLED``)."""
+    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
+
+    if payload.get(QUESTIONS_SETTLED) is True:
+        return 0
+    return sum(1 for q in questions_for(payload) if q["choices"] and not q["answer"].strip())
+
+
 # --------------------------------------------------------------------------- #
 # Rewriting the draft with the answers
 # --------------------------------------------------------------------------- #

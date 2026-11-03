@@ -129,6 +129,28 @@ def test_send_in_a_chat_app_sends_the_draft_as_its_person(owner: int, monkeypatc
     assert calls == [{"caller": ChatTap(OWNER), "resolver": owner, "confirm": {}}]
 
 
+def test_a_reply_with_a_question_left_isnt_sent_from_a_chat(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Any] = []
+
+    async def send(instance: Any, **kw: Any) -> str:
+        calls.append(kw)
+        return "m1"
+
+    monkeypatch.setattr(reply_send, "send_approved_reply", send)
+    asked = {
+        "private": True, "person_id": owner, "draft_to": ["dana@northpeak.example"], "draft_body": "Tuesday works.",
+        "open_questions": ["Which day?"], "question_choices": [{"choices": ["Tuesday", "Friday"], "source": ""}],
+    }
+    tap = lambda card: asyncio.run(channel_cards.resolve(card, get_person(owner), approve=True))  # noqa: E731
+    assert "Open it in the app" in tap(_card("delegation_reply", asked, owner))
+    assert calls == []
+    # Answered, changed by hand, or a plain question with no choices to pick: as the web card.
+    assert tap(_card("delegation_reply", {**asked, "answered_questions": {"0": "Friday"}}, owner)) == "Sent."
+    assert tap(_card("delegation_reply", {**asked, "questions_settled": True}, owner)) == "Sent."
+    assert tap(_card("delegation_reply", {**asked, "question_choices": []}, owner)) == "Sent."
+    assert len(calls) == 3
+
+
 def test_a_send_that_needs_a_second_yes_says_where_to_give_it(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
     async def send(instance: Any, **kw: Any) -> str:
         raise reply_send.SendRefused(409, "confirm", "The draft's recipients changed since it was written.")

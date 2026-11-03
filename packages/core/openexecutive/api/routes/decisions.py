@@ -1062,10 +1062,18 @@ async def resolve_in_chat(instance_id: int, person: Any, *, approve: bool) -> De
 
 async def _send_reply_from_chat(instance: DecisionInstance, tap: Any, resolver: int) -> DecisionInstance:
     """Send a reply card's draft on a tap in a chat app, as written. What
-    would ask a second yes on the web card (recipients changed, newer mail)
-    is turned down here with what to do instead."""
+    would ask a second yes on the web card (recipients changed, newer mail),
+    or that card's questions still waiting for an answer, is turned down here
+    with what to do instead."""
+    from openexecutive.delegation.answers import questions_left
+    from openexecutive.delegation.inbox import card_payload
     from openexecutive.delegation.reply_send import SendRefused, send_approved_reply
 
+    # The chat card doesn't show the questions, and the draft isn't finished.
+    if questions_left(card_payload(instance)):
+        raise HTTPException(
+            status_code=409, detail="This reply still has a question for you. Open it in the app to answer it and send.",
+        )
     try:
         await send_approved_reply(instance, caller=tap, resolver=resolver, confirm={})
     except SendRefused as refused:
