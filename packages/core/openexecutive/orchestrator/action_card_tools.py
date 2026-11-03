@@ -145,7 +145,7 @@ def _ai_app_speaker(session: Any) -> tuple[Any, Any] | str:
 async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
     from openexecutive.audit import rows_via
     from openexecutive.delegation import action_cards
-    from openexecutive.integrations.channel_cards import card_here
+    from openexecutive.integrations.channel_cards import card_here, card_text, shows_cards
     from openexecutive.orchestrator import outside_content
     from openexecutive.orchestrator.delegation_tools import _writer
     from openexecutive.orchestrator.schedule_tools import current_session, mcp_client_acting
@@ -227,6 +227,9 @@ async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
         "decision_id": decision_id,
         "actions": [a["summary"] for a in checked],
         "note": (
+            # A chat app shows a card whole or not at all (card_text).
+            "Nothing has happened yet. It is on Today in the web app for them to approve; it's too long to show in this chat."
+            if shows_cards(session) and card_text(decision_id) is None else
             "Nothing has happened yet. It is in this chat and on Today in the web app for them to approve."
             if card_here(session) or not getattr(session, "origin_channel", "") else
             "Nothing has happened yet. It is on Today in the web app for them to approve; this chat can't show it."

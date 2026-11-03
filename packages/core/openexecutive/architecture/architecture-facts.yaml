@@ -9413,7 +9413,9 @@ integrations:
     send is tried again on later passes, three tries in all; audit ``chat_card_sent``. A reply, action, Take the lead or
     department card is shown whole (the whole draft, each action's text,
     every field of the held call) or not at all: over CARD_MAX (1800) it is neither pushed nor
-    approvable from a chat.
+    approvable from a chat, and propose_actions tells the model so it points
+    to Today. Action text is quoted line by line so it can't pass for another
+    action; Discord shows a card in a code block, since it renders markdown.
 
     Chat messages asking the principal. ``slack_bot.note_chat_ask`` runs on
     every Slack channel message the bot receives: a mention of the

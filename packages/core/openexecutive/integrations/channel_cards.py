@@ -224,10 +224,11 @@ def card_text(decision_id: int) -> str | None:
             if isinstance(action, dict) and action.get("summary"):
                 lines.append(f"- {str(action['summary'])}")
                 # As the web card shows it: a message's words, the files and
-                # who else can open their folder.
+                # who else can open their folder. Quoted line by line, so
+                # words the model wrote can't pass for another action.
                 detail = str(action.get("text") or "").strip()
                 if detail:
-                    lines.append(detail)
+                    lines.extend(f"> {line}" for line in detail.splitlines())
     text = "\n".join(lines)
     if instance.decision_class in _WHOLE_CLASSES and len(text) > CARD_MAX:
         # Too long to show whole: it waits in the app instead.

@@ -693,6 +693,13 @@ def _card_view(decision_id: int, labels: tuple[str, str] = ("Approve", "Skip")) 
     return view
 
 
+def _card_content(text: str) -> str:
+    """A card as Discord should show it: literally, in a code block, since
+    its tap does what is stored and markdown in the words could hide a line
+    (a spoiler) or disguise a link. Same length bar the fence, so it still fits."""
+    return "```\n" + text.replace("```", "'''") + "\n```"
+
+
 async def _send_cards(send_card: Callable[[int, str], Awaitable[None]], cards: list[int]) -> None:
     from openexecutive.integrations import channel_cards
 
@@ -700,7 +707,7 @@ async def _send_cards(send_card: Callable[[int, str], Awaitable[None]], cards: l
         try:
             text = await asyncio.to_thread(channel_cards.card_text, decision_id)
             if text:
-                await send_card(decision_id, text[:_MAX_CARD_TEXT])
+                await send_card(decision_id, _card_content(text)[:_MAX_CARD_TEXT])
         except Exception:
             logger.exception("Discord: couldn't send card %d", decision_id)
 
@@ -1829,7 +1836,7 @@ async def send_dm_card(discord_user_id: str, decision_id: int, text: str, labels
             f"https://discord.com/api/v10/channels/{channel_id}/messages",
             headers=headers,
             json={
-                "content": text[:_MAX_CARD_TEXT],
+                "content": _card_content(text)[:_MAX_CARD_TEXT],
                 "flags": _SUPPRESS_EMBEDS,
                 "components": [{"type": 1, "components": [
                     {"type": 2, "style": 3, "label": labels[0],

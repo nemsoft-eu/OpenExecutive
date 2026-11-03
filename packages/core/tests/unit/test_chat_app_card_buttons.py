@@ -113,6 +113,18 @@ def test_slack_cards_go_out_as_plain_text_with_buttons(monkeypatch: pytest.Monke
     assert [e["value"] for e in blocks[1]["elements"]] == ["card:3:a", "card:3:s"]
 
 
+def test_discord_cards_go_out_literally(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[str] = []
+
+    async def send_card(_decision_id: int, text: str) -> None:
+        sent.append(text)
+
+    text = "x" * (channel_cards.CARD_MAX - 40) + "||``` [bank.com](https://evil.example)"
+    monkeypatch.setattr(channel_cards, "card_text", lambda _id: text)
+    asyncio.run(discord_bot._send_cards(send_card, [3]))
+    assert sent[0].startswith("```\n") and sent[0].endswith("\n```") and sent[0].count("```") == 2
+
+
 class FakeResponse:
     def __init__(self) -> None:
         self.sent: list[str] = []

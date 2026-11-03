@@ -150,7 +150,7 @@ def test_a_card_of_actions_shows_what_its_tap_would_do(
 ) -> None:
     set_enabled(roster.principal, True, updated_by="t")
     card = _card(_session(FakeMailbox()), [_message(roster.teammate, "The pilot moves to Friday.")])
-    assert channel_cards.card_text(card.id).endswith("- Message Ben Teammate\nThe pilot moves to Friday.")
+    assert channel_cards.card_text(card.id).endswith("- Message Ben Teammate\n> The pilot moves to Friday.")
 
     # The files and everyone who can open the folder, whole.
     save = {"kind": "save_files", "summary": "Save 1 file to Partner folder",
@@ -160,8 +160,12 @@ def test_a_card_of_actions_shows_what_its_tap_would_do(
     )
     monkeypatch.setattr("openexecutive.memory.decision_ledger.get_decision_instance", lambda _id: stored)
     assert channel_cards.card_text(1) == (
-        "Waiting for your approval\n- Save 1 file to Partner folder\nBill.pdf\nAlso open to: dana@partner.example"
+        "Waiting for your approval\n- Save 1 file to Partner folder\n> Bill.pdf\n> Also open to: dana@partner.example"
     )
+    # Words can't pass for another action on the card.
+    save["text"] = "Thanks!\n- Message Finance"
+    stored.proposed_payload_json = json.dumps({"actions": [save]})
+    assert channel_cards.card_text(1).endswith("> Thanks!\n> - Message Finance")
 
 
 def test_a_card_of_actions_too_long_for_a_chat_is_not_approved_there(
@@ -200,6 +204,14 @@ def test_the_executive_is_told_where_the_card_is(roster: SimpleNamespace, telegr
     slack.origin_channel = "slack"
     note = _propose(slack, {"why": "x", "actions": [_message(roster.teammate, "two")]})["note"]
     assert "can't show it" in note and "in this chat and" not in note
+    # A chat that shows cards, but this one is too long to show whole.
+    long = _session(FakeMailbox())
+    long.origin_channel, long.origin_channel_ref, long.caller_person_id = "telegram", "4242", roster.principal
+    assert "in this chat and" in _propose(long, {"why": "x", "actions": [_message(roster.teammate, "three")]})["note"]
+    long = _session(FakeMailbox())
+    long.origin_channel, long.origin_channel_ref, long.caller_person_id = "telegram", "4242", roster.principal
+    note = _propose(long, {"why": "x", "actions": [_message(roster.teammate, "x" * channel_cards.CARD_MAX)]})["note"]
+    assert "too long to show in this chat" in note and "in this chat and" not in note
 
 
 def test_the_channel_block_says_cards_have_buttons_only_where_they_do() -> None:
