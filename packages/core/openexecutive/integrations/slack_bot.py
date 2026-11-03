@@ -484,7 +484,9 @@ _CARD_ACTION_RE = re.compile(rf"^({_CARD_ACTION_APPROVE}|{_CARD_ACTION_SKIP})$")
 _MAX_CARD_TEXT = 2900
 
 
-def _card_blocks(text: str, decision_id: int | None = None) -> list[dict[str, Any]]:
+def _card_blocks(
+    text: str, decision_id: int | None = None, labels: tuple[str, str] = ("Approve", "Skip"),
+) -> list[dict[str, Any]]:
     """A card as Slack blocks: its text as plain text (it may quote what
     someone else wrote, so never mrkdwn), with the two buttons while it waits."""
     from openexecutive.integrations import channel_cards
@@ -495,10 +497,10 @@ def _card_blocks(text: str, decision_id: int | None = None) -> list[dict[str, An
     if decision_id is not None:
         blocks.append({"type": "actions", "elements": [
             {"type": "button", "action_id": _CARD_ACTION_APPROVE, "style": "primary",
-             "text": {"type": "plain_text", "text": "Approve"},
+             "text": {"type": "plain_text", "text": labels[0]},
              "value": channel_cards.callback_data(decision_id, channel_cards.APPROVE)},
             {"type": "button", "action_id": _CARD_ACTION_SKIP,
-             "text": {"type": "plain_text", "text": "Skip"},
+             "text": {"type": "plain_text", "text": labels[1]},
              "value": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
         ]})
     return blocks
@@ -514,12 +516,97 @@ async def _send_cards(client: Any, channel: str, cards: list[int]) -> None:
         try:
             text = await asyncio.to_thread(channel_cards.card_text, decision_id)
             if text:
+                labels = await asyncio.to_thread(channel_cards.card_buttons, decision_id)
                 await client.chat_postMessage(
-                    channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id),
+                    channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id, labels),
                     unfurl_links=False, unfurl_media=False,
                 )
         except Exception:
             logger.exception("Slack: couldn't send card %d", decision_id)
+
+
+async def send_dm_card(slack_user_id: str, decision_id: int, text: str, labels: tuple[str, str]) -> None:
+    """Post a card waiting outside any chat to ``slack_user_id``'s DM with the
+    bot (``channel_cards.push_waiting``). Raises when it couldn't."""
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    from openexecutive.config import get_settings
+
+    token = get_settings().slack_bot_token
+    if not token or not slack_user_id:
+        raise RuntimeError("slack is not configured")
+    client = AsyncWebClient(token=token)
+    opened: Any = await client.conversations_open(users=slack_user_id)
+    channel = str(((opened or {}).get("channel") or {}).get("id") or "")
+    if not channel:
+        raise RuntimeError("slack did not open a DM")
+    await client.chat_postMessage(
+        channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id, labels),
+        unfurl_links=False, unfurl_media=False,
+    )
+
+
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+async def note_chat_ask(event: dict[str, Any], client: Any) -> None:
+    """A message in a channel the bot is in: keep it when it mentions the
+    principal, and mark the asks it answers when the principal wrote it
+    (``integrations.chat_asks``). Never raises."""
+    from openexecutive.integrations import chat_asks
+    from openexecutive.people.store import find_person_by_slack_id, find_principal_person
+
+    try:
+        user = str(event.get("user") or "")
+        channel = str(event.get("channel") or "")
+        ts = str(event.get("ts") or "")
+        if not user or not channel or not ts:
+            return
+        thread = str(event.get("thread_ts") or ts)
+        principal = await asyncio.to_thread(find_principal_person)
+        own_id = str(getattr(principal, "slack_user_id", "") or "") if principal is not None else ""
+        if principal is None or principal.id is None or not own_id:
+            return
+        if user == own_id:
+            await asyncio.to_thread(
+                chat_asks.note_spoke, "slack", place=channel, thread=thread, top_level=thread == ts,
+                person_id=principal.id,
+            )
+            return
+        text = str(event.get("text") or "")
+        if own_id not in _MENTION_RE.findall(text):
+            return
+        author = await asyncio.to_thread(find_person_by_slack_id, user)
+        from_name = str(getattr(author, "full_name", "") or "")
+        if not from_name:
+            try:
+                info = await client.users_info(user=user)
+                profile = ((info or {}).get("user") or {})
+                from_name = str(profile.get("real_name") or profile.get("name") or "")
+            except Exception:
+                from_name = ""
+        place_name = ""
+        link = ""
+        try:
+            info = await client.conversations_info(channel=channel)
+            name = str(((info or {}).get("channel") or {}).get("name") or "")
+            place_name = f"#{name}" if name else ""
+        except Exception:
+            logger.info("Slack: couldn't name channel %s for an ask", channel, exc_info=True)
+        try:
+            found = await client.chat_getPermalink(channel=channel, message_ts=ts)
+            link = str((found or {}).get("permalink") or "")
+        except Exception:
+            logger.info("Slack: couldn't link an ask in %s", channel, exc_info=True)
+        first = (principal.full_name or "").split(" ")[0] or "you"
+        shown = _MENTION_RE.sub(lambda m: f"@{first}" if m.group(1) == own_id else "@someone", text)
+        await asyncio.to_thread(
+            chat_asks.note_ask, "slack", place=channel, thread=thread, message_ref=f"{channel}:{ts}",
+            person_id=principal.id, from_name=from_name or "Someone", text=shown, link=link,
+            place_name=place_name,
+        )
+    except Exception:
+        logger.warning("Slack: couldn't note a chat ask", exc_info=True)
 
 
 async def _is_own_dm(client: Any, user_id: str, channel_id: str) -> bool:
@@ -1298,6 +1385,7 @@ async def create_slack_app():
             async with inflight:
                 await _handle_message(event, say, client=client, mode="dm")
             return
+        await note_chat_ask(event, client)
 
         # A failed auth_test at startup left the id unset; try again
         # (rate-limited) so thread auto-continuation comes back on its own.

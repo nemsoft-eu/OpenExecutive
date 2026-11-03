@@ -52,6 +52,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
         return "connected"
 
     monkeypatch.setattr(gmail_mod, "gmail_status", connected)
+    monkeypatch.setattr(keeper, "_PAUSE", 0)
     people_registry.invalidate()
     yield path
     people_registry.invalidate()
@@ -78,7 +79,11 @@ class FakeMailbox:
         self.sent: list[MailMessage] = []
         self.events: list[CalendarEvent] = []
         self.latest: dict[str, MailMessage] = {}
+        # Older mail from each address, after its newest (``latest``).
+        self.older: dict[str, list[MailMessage]] = {}
         self.calendar_error: Exception | None = None
+        # Mail in the principal's inbox, newest first.
+        self.inbox: list[MailMessage] = []
 
     async def profile_email(self) -> str:
         return OWNER
@@ -96,6 +101,16 @@ class FakeMailbox:
 
     async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
         return self.latest.get(address)
+
+    async def recent_from(self, address: str, *, days: int = 90, limit: int = 5) -> list[MailMessage]:
+        newest = self.latest.get(address)
+        return ([newest] if newest is not None else []) + self.older.get(address, [])[:limit]
+
+    async def inbox_message_ids(self, *, after: datetime, max_results: int = 25) -> list[tuple[str, str]]:
+        return [(m.id, m.thread_id) for m in self.inbox[:max_results]]
+
+    async def get_message(self, message_id: str) -> MailMessage:
+        return next(m for m in self.inbox if m.id == message_id)
 
 
 def _run(mailbox: FakeMailbox) -> keeper.RunResult:
@@ -117,6 +132,64 @@ def test_names_come_only_from_how_a_name_was_written() -> None:
     assert keeper.name_from_address("priya.shah@x.example") == "Priya Shah"
     assert keeper.name_from_address("info@x.example") == ""
     assert keeper.name_from_address("ps2@x.example") == ""
+
+
+def test_a_role_keeps_the_part_the_mail_holds() -> None:
+    text = "Kyle Harrelson\nVice President, Finance & Accounting\nDirect: (803) 555-0101"
+    assert keeper._copied_role("Vice President, Finance & Accounting, Cahec Mgmt", text) == (
+        "Vice President, Finance & Accounting"
+    )
+    assert keeper._copied_role("<UNKNOWN>", text) == ""
+
+
+def test_the_signature_above_a_disclaimer_is_the_one_read() -> None:
+    text = (
+        "Thanks.\n\nChris Corbin\nAttorney at Law\n(555) 010-0144\n\n"
+        "CONFIDENTIALITY NOTICE: This email and any attachments are privileged.\n" + "Legal words. " * 200
+    )
+    assert keeper._before_footer(text).endswith("(555) 010-0144")
+    assert keeper._before_footer("Please keep this confidential.\nThanks\nLeo") == (
+        "Please keep this confidential.\nThanks\nLeo"
+    )
+    # A body line that reads like a notice never cuts off the signature below it.
+    body = "Hi Sam,\nThis email is just to confirm Thursday.\n\nThanks,\nJane Ro\nVP Finance, Acme\n+1 555 010 0100"
+    assert keeper._before_footer(body, frozenset({"jane", "ro"})) == body
+    # A notice under a signature with only a name in it is cut at the name.
+    named = "Thanks.\nJane Ro\nVP Finance\nThis message is intended only for the addressee."
+    assert keeper._before_footer(named, frozenset({"jane", "ro"})) == "Thanks.\nJane Ro\nVP Finance"
+
+
+def test_a_signature_is_read_with_room_for_all_its_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cut-off tool call is lost whole, so the reader has room for a role
+    and every detail; labelled phones are kept as numbers."""
+    asked: dict[str, Any] = {}
+
+    class Block:
+        type = "tool_use"
+        input = {
+            "role": "Managing Director, Avat Realty",
+            "details": [{"kind": "mobile", "value": "c: 256-555-0165"}, {"kind": "phone", "value": "o: 256-555-0196"}],
+        }
+
+    class Response:
+        content = [Block()]
+        usage = None
+        stop_reason = "tool_use"
+
+    class Provider:
+        async def messages_create(self, **kw: Any) -> Response:
+            asked.update(kw)
+            return Response()
+
+    monkeypatch.setattr("openexecutive.providers.get_provider", lambda model: Provider())
+    message = MailMessage(
+        id="m", thread_id="t", from_addr="andy@avat.example",
+        text="See attached.\n\nAndy Ames\nManaging Director\nAvat Realty\nc: 256-555-0165\no: 256-555-0196",
+    )
+    found = asyncio.run(keeper.read_signature(message, model="m"))
+    assert asked["max_tokens"] >= 400
+    assert found.role == "Managing Director, Avat Realty"
+    assert found.details == [("mobile", "256-555-0165"), ("phone", "256-555-0196")]
 
 
 def test_a_role_must_be_copied_from_the_mail() -> None:
@@ -177,14 +250,70 @@ def test_who_is_never_added(owner: int) -> None:
         "gone@x.example",  # removed before
         "blocked.person@x.example",  # undone before
         "x9@x.example",  # no name to give them
+        "private.wealth@x.example",  # a shared mailbox's name
     ):
         box.sent += [_sent([address], days_ago=1), _sent([address], days_ago=2)]
     old = _sent([PRIYA], days_ago=90)
     box.sent += [old, old]
-    big = _sent([f"p{i}.q@x.example" for i in range(12)], days_ago=1)
+    big = _sent([f"p{i}.q@x.example" for i in range(30)], days_ago=1)
     box.sent += [big, big]
     assert _run(box).added == 0
     assert changes.list_changes() == []
+
+
+def _inbound(address: str, name: str, n: int, **flags: Any) -> list[MailMessage]:
+    return [
+        MailMessage(
+            id=f"in-{address}-{i}", thread_id="t", from_addr=address, from_name=name, to=[OWNER],
+            received_at=(NOW - timedelta(days=i + 1)).isoformat(), **{"sender_authenticated": True, **flags},
+        )
+        for i in range(n)
+    ]
+
+
+def test_emailed_once_counts_when_they_wrote_back(owner: int) -> None:
+    box = FakeMailbox()
+    box.sent = [
+        _sent([PRIYA], names={PRIYA: "Priya Shah"}, days_ago=2),
+        _sent([MARCO], names={MARCO: "Marco Diaz"}, days_ago=2),
+    ]
+    box.inbox = _inbound(PRIYA, "Priya Shah", 1) + _inbound(MARCO, "Marco Diaz", 1, bulk=True)
+    assert _run(box).added == 1
+    assert _contact(PRIYA) is not None
+    assert _contact(MARCO) is None  # a bulk mail is not writing back
+    [change] = changes.list_changes()
+    assert (change.reason, change.evidence) == ("emailed", 1)
+
+
+def test_someone_who_keeps_writing_is_only_suggested(owner: int) -> None:
+    box = FakeMailbox()
+    box.inbox = (
+        _inbound(PRIYA, "Priya Shah", 2)
+        + _inbound("once.only@x.example", "Once Only", 1)
+        + _inbound("forged.sender@x.example", "Forged Sender", 3, sender_authenticated=False)
+        + _inbound("reporting@x.example", "Financial Reporting", 3)
+    )
+    result = _run(box)
+    assert (result.added, result.suggested) == (0, 1)
+    [change] = changes.list_changes()
+    assert (change.email, change.reason, change.evidence, change.status) == (PRIYA, "wrote", 2, "suggested")
+    assert _contact(PRIYA) is None
+
+
+def test_a_from_name_never_ties_an_address_to_someone_they_have(owner: int) -> None:
+    people_store.upsert_person(full_name="Jane Smith", email="jane@acme.example", kind="contact")
+    lookalike = "x@other.example"
+    box = FakeMailbox()
+    box.sent = [_sent([lookalike], days_ago=1), _sent([lookalike], days_ago=2)]
+    box.inbox = _inbound(lookalike, "Jane Smith", 1)
+    _run(box)
+    assert not [c for c in changes.list_changes() if c.field == "email_alias"]
+
+
+def test_a_shared_mailbox_name_is_never_a_contact() -> None:
+    assert keeper.mailbox_name("Private Wealth")
+    assert keeper.mailbox_name("Financial Reporting")
+    assert not keeper.mailbox_name("Hunter Walker")
 
 
 def test_off_and_act_as_me_off_do_nothing(owner: int) -> None:
@@ -418,6 +547,158 @@ def test_a_contact_added_in_chat_is_listed_with_an_undo(owner: int, monkeypatch:
     assert changes.counts_by_day() == []
 
 
+def _from_leo(message_id: str, text: str, **flags: Any) -> MailMessage:
+    return MailMessage(
+        id=message_id, thread_id="t", from_addr="leo@contoso.example", text=text, sender_authenticated=True, **flags,
+    )
+
+
+def _reading(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The ids of the mails a signature is read from."""
+    read: list[str] = []
+
+    async def record(message: Any, *, model: str | None = None) -> keeper.Signature:
+        read.append(message.id)
+        return keeper.Signature(details=[("mobile", "555.010.0199")])
+
+    monkeypatch.setattr(keeper, "read_signature", record)
+    return read
+
+
+def test_a_calendar_invite_on_top_reads_the_newest_signed_mail(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid = people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    box = FakeMailbox()
+    box.latest = {"leo@contoso.example": _from_leo("invite", "Invitation from Google Calendar", calendar_invite=True)}
+    box.older = {"leo@contoso.example": [
+        _from_leo("short", "Sounds good."),
+        _from_leo("signed", SIGNATURE),
+    ]}
+    _run(box)
+    assert read == ["signed"]
+    assert [(d.kind, d.value) for d in people_store.get_person(pid).details] == [("mobile", "555.010.0199")]
+
+
+def test_a_date_or_reference_number_is_not_a_sign_off(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    box = FakeMailbox()
+    box.latest = {"leo@contoso.example": _from_leo("invite", "x", calendar_invite=True)}
+    box.older = {"leo@contoso.example": [
+        _from_leo("dated", "Sent 2026-05-12\nRef 123 456 789"),
+        _from_leo("signed", SIGNATURE),
+    ]}
+    _run(box)
+    assert read == ["signed"]
+
+
+def test_an_invite_on_top_of_a_read_mail_does_not_read_it_again(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    box = _leo_box()
+    _run(box)
+    signed = box.latest["leo@contoso.example"]
+    box.latest["leo@contoso.example"] = _from_leo("invite", "x", calendar_invite=True)
+    box.older["leo@contoso.example"] = [signed]
+    asyncio.run(keeper.run_once(client=box, now=NOW + 2 * keeper.READ_AGAIN))
+    assert read == ["in1"]
+    assert changes.reads_since((NOW + 2 * keeper.READ_AGAIN).replace(hour=0)) == 0
+
+
+def test_a_signature_is_read_again_only_when_new_mail_comes(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    box = _leo_box()
+    _run(box)
+    # A day on, the same mail: not read again.
+    asyncio.run(keeper.run_once(client=box, now=NOW + keeper.READ_AGAIN + timedelta(hours=1)))
+    assert read == ["in1"]
+    box.latest["leo@contoso.example"] = _from_leo("in2", SIGNATURE)
+    asyncio.run(keeper.run_once(client=box, now=NOW + 2 * keeper.READ_AGAIN + timedelta(hours=2)))
+    assert read == ["in1", "in2"]
+
+
+def test_new_mail_within_a_day_waits_for_the_next_day(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    box = _leo_box()
+    _run(box)
+    box.latest["leo@contoso.example"] = _from_leo("in2", SIGNATURE)
+    asyncio.run(keeper.run_once(client=box, now=NOW + timedelta(hours=1)))
+    assert read == ["in1"]
+    asyncio.run(keeper.run_once(client=box, now=NOW + keeper.READ_AGAIN + timedelta(hours=1)))
+    assert read == ["in1", "in2"]
+
+
+def test_mail_with_nothing_to_read_does_not_use_up_the_days_reads(
+    owner: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read = _reading(monkeypatch)
+    box = FakeMailbox()
+    for i in range(keeper.SIGNATURE_READS_PER_DAY):
+        address = f"invites{i}@northwind.example"
+        people_store.upsert_person(full_name=f"Invite Sender{i}", email=address, kind="contact")
+        box.latest[address] = MailMessage(
+            id=f"inv{i}", thread_id="t", from_addr=address, text="x", sender_authenticated=True, calendar_invite=True,
+        )
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    box.latest["leo@contoso.example"] = _from_leo("in1", SIGNATURE)
+    people_registry.invalidate()
+    for hours in range(0, 24, 6):  # the day's runs
+        asyncio.run(keeper.run_once(client=box, now=NOW + timedelta(hours=hours)))
+    assert read == ["in1"]
+    assert changes.reads_since(NOW.replace(hour=0)) == 1
+
+
+def test_a_contact_whose_mail_fails_goes_to_the_back(owner: int) -> None:
+    class Failing(FakeMailbox):
+        async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
+            raise RuntimeError("bad message")
+
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    box = Failing()
+    _run(box)
+    assert changes.checked_times()["leo@contoso.example"] == NOW
+
+
+def test_a_contact_with_no_mail_is_checked_once_a_day(owner: int) -> None:
+    asked: list[int] = []
+
+    class Counting(FakeMailbox):
+        async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
+            asked.append(days)
+            return None
+
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    box = Counting()
+    _run(box)
+    asyncio.run(keeper.run_once(client=box, now=NOW + keeper.RUN_EVERY))
+    # The signature's look (90 days) once; the second run asks only for the
+    # last-heard date (LOOKBACK).
+    assert asked == [90, keeper.LOOKBACK.days]
+
+
+def test_a_read_from_before_details_is_read_again(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    read = _reading(monkeypatch)
+    # Read last week, by the reader before this version, from the same mail.
+    changes.note_read("leo@contoso.example", NOW - timedelta(days=7), message_id="in1", version=1)
+    _run(_leo_box())
+    assert read == ["in1"]
+    assert changes.last_read("leo@contoso.example").version == keeper.READ_VERSION
+
+
+def test_an_old_reads_table_gets_its_new_columns(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE contact_keeper_reads (email TEXT PRIMARY KEY, read_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO contact_keeper_reads VALUES ('leo@contoso.example', ?)", (NOW.isoformat(),))
+    found = changes.last_read("leo@contoso.example", db_path=path)
+    assert found is not None and (found.message_id, found.version) == ("", 0)
+
+
 def test_details_typed_in_chat_are_checked(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
     from openexecutive.orchestrator import people_tools
 
@@ -570,9 +851,10 @@ def test_a_mailbox_slowdown_stops_the_reads_not_the_notes(owner: int, written: l
         box.sent.append(_wrote(address, f"About order {i}.", days_ago=1))
     people_registry.invalidate()
     result = _run(box)
-    # One signature read, one last-heard read: each stops at the first refusal,
-    # the notes are written, and the run still reports the mailbox failing.
-    assert len(asked) == 2
+    # One signature read (asked again once after a pause), one last-heard
+    # read: each stops at the refusal, the notes are written, and the run
+    # still reports the mailbox failing.
+    assert len(asked) == 3
     assert len(written) == 2 and result.status == "error"
 
 
@@ -709,6 +991,31 @@ def test_the_note_route_and_removing_a_contact(client: TestClient, owner: int, w
     assert client.get(f"/contacts/{person.id}/note", headers={"x-caller-email": OWNER}).status_code == 404
 
 
+def test_the_last_contact_route(client: TestClient, owner: int) -> None:
+    from openexecutive.people import contact_notes
+
+    pid = people_store.upsert_person(full_name="Priya Shah", email=PRIYA, kind="contact")
+    contact_notes.put_activity(
+        pid, last_emailed_at="2026-10-18T10:00:00+00:00", last_met_at="2026-10-20T15:00:00+00:00",
+        next_meeting_at=None, next_meeting_title="", emailed_count=1, met_count=1,
+        last_heard_at="2026-10-19T09:00:00+00:00",
+    )
+    people_store.upsert_person(full_name="Ben Teammate", email="ben@co.example")
+    people_registry.invalidate()
+    assert client.get("/contacts/last-contact", headers={"x-caller-email": "ben@co.example"}).status_code == 404
+    body = client.get("/contacts/last-contact", headers={"x-caller-email": OWNER}).json()
+    assert body["people"] == [{"person_id": pid, "at": "2026-10-20T15:00:00+00:00", "how": "met"}]
+    # Provider offsets and Z are compared as instants, and come back in UTC.
+    contact_notes.put_activity(
+        pid, last_emailed_at="2026-10-21T09:00:00-07:00", last_met_at=None, next_meeting_at=None,
+        next_meeting_title="", emailed_count=1, met_count=1, last_heard_at="2026-10-21T15:00:00Z",
+    )
+    body = client.get("/contacts/last-contact", headers={"x-caller-email": OWNER}).json()
+    assert body["people"] == [{"person_id": pid, "at": "2026-10-21T16:00:00+00:00", "how": "emailed"}]
+    people_store.archive_person(pid)
+    assert client.get("/contacts/last-contact", headers={"x-caller-email": OWNER}).json() == {"people": []}
+
+
 # --- contact details from a signature --------------------------------------
 
 
@@ -750,6 +1057,31 @@ def test_details_are_added_for_contacts_and_team_and_undone(owner: int, monkeypa
     held = {(d.kind, d.value) for d in people_store.get_person(pid).details}
     assert ("phone", "+1 (555) 010-0100") not in held and ("mobile", "555 010 0123") in held
     assert changes.is_blocked("leo@contoso.example", "phone", "+1 (555) 010-0100")
+
+
+def test_signatures_are_read_before_the_sent_mail_uses_up_the_quota(
+    owner: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = people_store.upsert_person(full_name="Leo Park", email="leo@contoso.example", kind="contact")
+    _signed(monkeypatch, [("phone", "+1 (555) 010-0100")])
+
+    class BusyBox(FakeMailbox):
+        sent_read = False
+
+        async def list_sent(self, limit: int = 40) -> list[MailMessage]:
+            self.sent_read = True
+            return []
+
+        async def latest_from(self, address: str, *, days: int = 90) -> MailMessage | None:
+            # After the sent-mail pass the mailbox says "slow down".
+            if self.sent_read:
+                raise gmail_mod.GmailRateLimited("slow down")
+            return await super().latest_from(address, days=days)
+
+    box = BusyBox()
+    box.latest = _leo_box().latest
+    _run(box)
+    assert [(d.kind, d.value) for d in people_store.get_person(pid).details] == [("phone", "+1 (555) 010-0100")]
 
 
 def test_a_newer_signature_replaces_only_its_own_detail(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -806,3 +1138,28 @@ def test_undo_never_changes_a_team_members_name(owner: int) -> None:
     )
     changes.undo(change_id)
     assert people_store.get_person(pid).full_name == "Ben Teammate"
+
+
+def test_a_restart_does_not_push_the_next_run_back(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[datetime] = []
+
+    async def run(*, now: datetime | None = None, **_kw: Any) -> keeper.RunResult:
+        started.append(now or NOW)
+        return keeper.RunResult("ok")
+
+    async def tick(moment: datetime) -> bool:
+        ran = keeper.maybe_run(moment)
+        if keeper._task is not None:
+            await keeper._task
+        return ran
+
+    monkeypatch.setattr(keeper, "run_once", run)
+    monkeypatch.setattr(keeper, "_task", None)
+    # A fresh process, two hours after the last run.
+    monkeypatch.setattr(keeper, "_last_start", None)
+    changes.note_run("ok", NOW)
+    restart = NOW + timedelta(hours=2)
+    assert asyncio.run(tick(restart)) is False
+    # Due six hours after the last run, not six after the restart.
+    assert asyncio.run(tick(NOW + keeper.RUN_EVERY + timedelta(minutes=1))) is True
+    assert started == [NOW + keeper.RUN_EVERY + timedelta(minutes=1)]

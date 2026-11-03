@@ -34,7 +34,6 @@ from openexecutive.orchestrator.answer_sources import TurnSources
 from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.orchestrator.turn_inbox import TurnInbox
 from openexecutive.workflows import turn_files
-from openexecutive.workflows.python_job import available as python_job_available
 from openexecutive.workflows.turn_files import bind as bind_turn_files
 
 # Per-file size cap. Mirrors `_DEFAULT_MAX_BYTES` in
@@ -471,6 +470,18 @@ def _add_to_turn(client_turn_id: str, owner: str, message_id: str, text: str) ->
     if entry is None or entry.owner != owner or entry.inbox is None:
         return None
     if entry.event.is_set() or not entry.inbox.add(message_id, text):
+        return None
+    return entry.turn_id
+
+
+def _hand_over_turn(client_turn_id: str, owner: str) -> str | None:
+    """Ask a running turn to stop and hand over what it has. Returns its
+    server `turn_id`, or None (no such live turn, not yours, already stopped
+    or finished: indistinguishable, as for `_request_stop`)."""
+    entry = _active_stops.get(client_turn_id)
+    if entry is None or entry.owner != owner or entry.inbox is None:
+        return None
+    if entry.event.is_set() or not entry.inbox.request_hand_over():
         return None
     return entry.turn_id
 
@@ -1063,10 +1074,6 @@ async def _run_chat_turn(
     principal_turn = is_principal_on_verified_surface(
         SimpleNamespace(from_web_chat=True, caller_person_id=caller_person_id)
     )
-    # Only a principal's turn can run a Python job, so only there are the
-    # uploads kept for the turn; anyone else's are dropped here.
-    if turn_files and not (principal_turn and python_job_available()):
-        turn_files = None
     # A client-supplied id must be the caller's own chat; any other id the
     # turn can't use is swapped for a fresh chat before the stop switch arms.
     requested_id = _clean_session_id(session_id)
@@ -1169,6 +1176,13 @@ async def _run_chat_turn(
                 status_code=409,
                 detail="This conversation was started in Open Executive. Continue it there.",
             )
+        if turn_files:
+            # Kept for the conversation, so a later message can still attach,
+            # split or save them (orchestrator/file_refs.py, file:<name>).
+            # Inside the guard: a cancelled write must release the turn too.
+            from openexecutive.orchestrator import conversation_files
+
+            await asyncio.to_thread(conversation_files.keep, session.session_id, turn_files)
     except BaseException:
         _release_stop(client_turn_id, turn_id)
         if lock_key is not None:
@@ -1873,8 +1887,10 @@ async def _run_chat_turn(
                 held_evt = {"type": "held_steps", "session_id": session.session_id, "steps": list(held_steps)}
                 yield f"data: {json.dumps(held_evt)}\n\n"
             # What the content check flagged this turn, in plain words
-            # (orchestrator.content_scan): shown under the reply.
-            flags = outside_content.pending_flags(session) if not (stopped or timed_out) else ()
+            # (orchestrator.content_scan): sent only with held steps, as the
+            # reason on their card. A flag that held nothing changed nothing
+            # the person sees, so it stays in the audit log alone.
+            flags = outside_content.pending_flags(session) if held_steps else ()
             if flags:
                 flags_evt = {"type": "flags", "session_id": session.session_id, "flags": list(flags)}
                 yield f"data: {json.dumps(flags_evt)}\n\n"
@@ -2125,6 +2141,31 @@ async def chat_stop(body: StopChatRequest, request: Request) -> dict[str, str]:
     return {"status": "stopping", "turn_id": stopped_turn_id}
 
 
+@router.post("/chat/hand-over")
+async def chat_hand_over(body: StopChatRequest, request: Request) -> dict[str, str]:
+    """Stop an in-flight /chat turn's work and have it hand over what it has.
+
+    The person will finish the task themselves (I'll finish it). The turn
+    takes the request at its next step, says so with a `handing_over` event,
+    runs no more tools and writes up what it found and did as its reply. A
+    request that lands while the final answer is already being written
+    changes nothing: that answer is the hand-over. 404 as for /chat/stop.
+    """
+    client_turn_id = _clean_client_turn_id(body.client_turn_id)
+    turn_id = (
+        _hand_over_turn(
+            client_turn_id,
+            _stop_owner_key(request, _resolve_caller_person_id(request)),
+        )
+        if client_turn_id
+        else None
+    )
+    if turn_id is None:
+        raise HTTPException(status_code=404, detail="No in-flight turn with that id")
+    logger.info("chat.hand_over_requested turn_id=%s", turn_id)
+    return {"status": "handing_over", "turn_id": turn_id}
+
+
 @router.post("/chat/add")
 async def chat_add(body: AddChatMessageRequest, request: Request) -> dict[str, str]:
     """Add a message to an in-flight /chat turn, addressed by its
@@ -2208,6 +2249,9 @@ async def chat_upload(
             extra_text, blocks = await build_attachment_output(
                 filename, data, upload.content_type or "", inbound=False,
             )
+            # The upload is bound and kept by this route itself; don't leave
+            # it offered for a chat app's turn (turn_files.offer).
+            turn_files.take_offered()
         except Exception:
             logger.exception("chat_upload: processing failed for %s", filename)
             text_parts.append(f"(Could not process {filename})")

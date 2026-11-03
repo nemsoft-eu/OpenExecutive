@@ -50,8 +50,8 @@ At send time it checks again, in this order:
    API runs for local login, answering this computer only. Anything else is a
    409 ``caller_signing_required``: with only a shared secret, whoever holds
    it could send as the owner.
-2. Act as me and Draft replies to my inbox are both on, and no client slot is
-   active.
+2. Act as me is on (and on its own, Draft replies to my inbox too), and no
+   client slot is active.
 3. Their Gmail is connected (``gmail_status``).
 4. The draft still exists, in the same thread, and they haven't replied
    there themselves since (either way the card closes).
@@ -207,6 +207,7 @@ async def _send_checked(
 ) -> str:
     from openexecutive.config import get_settings
     from openexecutive.delegation import card_drafts, drafts, handle_it, training
+    from openexecutive.delegation.answers import CAUGHT_UP_KEY
     from openexecutive.delegation.gmail import (
         BLOCKING_CODES,
         STATUS_MESSAGES,
@@ -304,10 +305,15 @@ async def _send_checked(
                 raise SendRefused(
                     409, "learned_full", "It has learned as much as it can hold. Remove something first.",
                 )
-    if not is_enabled(person.id) or not get_watch(person.id).enabled:
+    # The watcher's switch governs what goes without a tap. A tap is the
+    # person's own act, on a card that may be one they asked for from Home
+    # (inbox.draft_on_request), which that switch never had a say in. With it
+    # off no scan closes an old card, so an old one can be tapped; what follows
+    # still checks the mail that came since.
+    if not is_enabled(person.id) or (on_its_own and not get_watch(person.id).enabled):
         raise SendRefused(
             409, "inbox_off",
-            "Turn on Act as me and Draft replies to my inbox to send from here, or send it from your mailbox.",
+            "Turn on Act as me to send from here, or send it from your mailbox.",
         )
     if _client_slot_active():
         raise SendRefused(409, "client_slot", "Sending from here is paused while a client is active. Send it from your mailbox.")
@@ -366,6 +372,15 @@ async def _send_checked(
         reasons.append("recipients_changed")
     moved_on = any(m.from_addr not in own and "SENT" not in m.labels for m in later)
     if moved_on and confirm.get("thread_moved_on") is not True:
+        reasons.append("thread_moved_on")
+    # Brought up to date with newer mail on its own (answers.catch_up): Send
+    # goes without asking again only when the card that was tapped showed
+    # that version (edits.seen_caught_up_at).
+    caught_up = str(payload.get(CAUGHT_UP_KEY) or "")
+    if (
+        caught_up and confirm.get("seen_caught_up_at") != caught_up
+        and confirm.get("thread_moved_on") is not True and "thread_moved_on" not in reasons
+    ):
         reasons.append("thread_moved_on")
     if reasons:
         raise SendRefused(

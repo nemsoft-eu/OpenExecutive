@@ -1,7 +1,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { clockLabel, isNewSince, newSinceLabel, seenBaseline } from "../src/lib/rightNow.ts";
+import {
+  alsoInLine,
+  buildMoveSeed,
+  cardLink,
+  checkedLabel,
+  clockLabel,
+  isNewSince,
+  isPutOff,
+  laterMark,
+  moveMail,
+  newSinceLabel,
+  pointTarget,
+  progressNote,
+  progressSteps,
+  seenBaseline,
+} from "../src/lib/rightNow.ts";
 
 const at = (h, m) => {
   const d = new Date();
@@ -36,4 +51,99 @@ test("points after the baseline are new", () => {
   assert.equal(newSinceLabel(points, baseline), "2 new since 11:05 AM");
   assert.equal(newSinceLabel(points, null), null);
   assert.equal(newSinceLabel(points.slice(2), baseline), null);
+});
+
+test("checkedLabel says when the header was last found current", () => {
+  const at = new Date(2026, 9, 26, 14, 20).toISOString();
+  assert.equal(checkedLabel(at), "Checked 2:20 PM");
+  assert.equal(checkedLabel(null), null);
+  assert.equal(checkedLabel("nope"), null);
+});
+
+test("alsoInLine names a few and counts the rest", () => {
+  assert.equal(alsoInLine([], 0), null);
+  assert.equal(alsoInLine(undefined, undefined), null);
+  assert.equal(alsoInLine(["Yardi: Webinar"], 1), "Also in: 1 other — Yardi: Webinar.");
+  assert.equal(
+    alsoInLine(["Ana: Rates", "Yardi: Webinar"], 2),
+    "Also in: 2 others — Ana: Rates and Yardi: Webinar.",
+  );
+  assert.equal(
+    alsoInLine(["Ana: Rates", "Yardi: Webinar", "Bo: Hi"], 5),
+    "Also in: 5 others — Ana: Rates, Yardi: Webinar, Bo: Hi and 2 more.",
+  );
+  assert.equal(alsoInLine([], 3), "Also in: 3 others.");
+});
+
+test("a point opens the email or card it is about", () => {
+  assert.deepEqual(
+    pointTarget({ text: "a", source: { kind: "mail", message_id: "m1", thread_id: "t1", decision_id: 4 } }),
+    { kind: "mail", threadId: "t1", messageId: "m1", cardId: 4 },
+  );
+  assert.deepEqual(pointTarget({ text: "a", source: { kind: "alert", alert_id: 9 } }), { kind: "alert", alertId: 9 });
+  // An email without its conversation, or no source, opens nothing.
+  assert.equal(pointTarget({ text: "a", source: { kind: "mail", message_id: "m1" } }), null);
+  assert.equal(pointTarget({ text: "a" }), null);
+  assert.deepEqual(
+    pointTarget({ text: "a", source: { kind: "link", url: "https://acme.slack.com/archives/C1/p1", app: "Slack" } }),
+    { kind: "link", url: "https://acme.slack.com/archives/C1/p1", app: "Slack" },
+  );
+  // Only an https link opens.
+  assert.equal(pointTarget({ text: "a", source: { kind: "link", url: "javascript:alert(1)", app: "Slack" } }), null);
+});
+
+test("progress steps follow the step the server reports", () => {
+  assert.deepEqual(
+    progressSteps("writing").map((s) => s.state),
+    ["done", "now", "todo"],
+  );
+  assert.equal(progressSteps("writing")[0].label, "Checked your inbox, calendar and Needs you");
+  assert.equal(progressSteps("checking")[1].label, "Wrote what matters now");
+  // Not started yet, or a step this page doesn't know: the first is running.
+  assert.deepEqual(progressSteps(null).map((s) => s.state), ["now", "todo", "todo"]);
+  assert.deepEqual(progressSteps("later").map((s) => s.state), ["now", "todo", "todo"]);
+});
+
+test("the progress note counts new email since the last header", () => {
+  const since = at(15, 12).toISOString();
+  assert.equal(progressNote(2, since), "2 new emails since 3:12 PM");
+  assert.equal(progressNote(1, since), "1 new email since 3:12 PM");
+  assert.equal(progressNote(0, since), null);
+  assert.equal(progressNote(3, null), null);
+});
+
+test("a quiet card links only to what it doesn't already show", () => {
+  const brief = { at: "2026-11-02T12:00:00Z", text: "x" };
+  const meet = { title: "Call", start: "2026-11-02T20:00:00Z" };
+  assert.equal(cardLink({ narrative_points: [{}] }, 0), "whole");
+  assert.equal(cardLink({ narrative_points: [], morning_brief: brief, calendar_next: [meet] }, 1), "morning");
+  assert.equal(cardLink({ narrative_points: [], morning_brief: brief, calendar_next: [meet, meet] }, 1), "whole");
+  assert.equal(cardLink({ narrative_points: [], narrative_move: "Call Ana" }, 0), "whole");
+  assert.equal(cardLink({ narrative_points: [], narrative_move: " ", calendar_next: [meet] }, 1), null);
+});
+
+test("Do next: the seed quotes the move", () => {
+  const seed = buildMoveSeed("  Read Annamarie's email. ");
+  assert.match(seed, /"Read Annamarie's email\."/);
+  assert.match(seed, /before it goes/);
+});
+
+test("Do next opens the top point's email only when the move names it", () => {
+  const mail = { text: "**Dogwood View**: lawsuit", source: { kind: "mail", message_id: "m1", thread_id: "t1", decision_id: 4 } };
+  const alert = { text: "**Board deck**", source: { kind: "alert", alert_id: 3 } };
+  const move = "Read Annamarie's Dogwood email before you log off.";
+  assert.deepEqual(moveMail([mail, alert], move), { kind: "mail", threadId: "t1", messageId: "m1", cardId: 4 });
+  assert.equal(moveMail([mail], "Move the 3 PM call to Friday."), null);
+  assert.equal(moveMail([alert, mail], move), null);
+  assert.equal(moveMail([], move), null);
+});
+
+test("Later puts away this move for today only", () => {
+  const now = at(15, 0);
+  const mark = laterMark("Call Dana.", now);
+  assert.equal(isPutOff(mark, "Call Dana. ", now), true);
+  assert.equal(isPutOff(mark, "Email Kim.", now), false);
+  assert.equal(isPutOff(mark, "Call Dana.", new Date(now.getTime() + 86_400_000)), false);
+  assert.equal(isPutOff("not json", "Call Dana.", now), false);
+  assert.equal(isPutOff(null, "Call Dana.", now), false);
 });

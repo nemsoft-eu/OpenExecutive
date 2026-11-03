@@ -52,7 +52,11 @@ PROPOSE_ACTIONS_TOOL: dict[str, Any] = {
         "optional role; the owner's cards only), `drive_files` (rename and/or move "
         "Google Drive files: `files` with each file_id and its new name, and "
         "`move_to`, a folder id, to move them; up to 25 files; the owner's cards "
-        "only), for a rename or move they asked for that the Drive tools refused. "
+        "only), for a rename or move they asked for that the Drive tools refused, "
+        "`save_files` (save files into a Drive folder people outside the team can "
+        "open, when save_file says it needs a card: `folder`, the folder id, and "
+        "`files`, each with the file's handle as `file` and the `name` to save "
+        "under; one action a folder; the owner's cards only). "
         "Tell them the card is waiting; never say it is done."
     ),
     "input_schema": {
@@ -68,7 +72,7 @@ PROPOSE_ACTIONS_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["invite", "message", "add_contact", "drive_files"]},
+                        "kind": {"type": "string", "enum": ["invite", "message", "add_contact", "drive_files", "save_files"]},
                         "title": {"type": "string"},
                         "start": {"type": "string", "description": "Local date and time, e.g. 2026-10-10T14:00."},
                         "end": {"type": "string", "description": "Local date and time, e.g. 2026-10-10T14:30."},
@@ -85,13 +89,17 @@ PROPOSE_ACTIONS_TOOL: dict[str, Any] = {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "file_id": {"type": "string"},
-                                    "name": {"type": "string", "description": "The new name; leave out to only move it."},
+                                    "file_id": {"type": "string", "description": "drive_files: the Drive file's id."},
+                                    "file": {"type": "string", "description": "save_files: the file's handle."},
+                                    "name": {
+                                        "type": "string",
+                                        "description": "drive_files: the new name; leave out to only move it. save_files: the name to save under.",
+                                    },
                                 },
-                                "required": ["file_id"],
                             },
                         },
                         "move_to": {"type": "string", "description": "Drive folder id to move the files into."},
+                        "folder": {"type": "string", "description": "save_files: the Drive folder id to save into."},
                     },
                     "required": ["kind"],
                 },
@@ -137,7 +145,7 @@ def _ai_app_speaker(session: Any) -> tuple[Any, Any] | str:
 async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
     from openexecutive.audit import rows_via
     from openexecutive.delegation import action_cards
-    from openexecutive.integrations.channel_cards import card_here
+    from openexecutive.integrations.channel_cards import card_here, card_text, shows_cards
     from openexecutive.orchestrator import outside_content
     from openexecutive.orchestrator.delegation_tools import _writer
     from openexecutive.orchestrator.schedule_tools import current_session, mcp_client_acting
@@ -161,6 +169,8 @@ async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
     if isinstance(checked, str):
         return _error(checked)
     unshown = await action_cards.describe_drive_files(checked)
+    if unshown is None:
+        unshown = await action_cards.describe_save_files(checked, getattr(session, "session_id", None))
     if unshown is not None:
         return _error(unshown)
     via = (rows_via() or "an AI app") if ai_app else None
@@ -217,6 +227,9 @@ async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
         "decision_id": decision_id,
         "actions": [a["summary"] for a in checked],
         "note": (
+            # A chat app shows a card whole or not at all (card_text).
+            "Nothing has happened yet. It is on Today in the web app for them to approve; it's too long to show in this chat."
+            if shows_cards(session) and card_text(decision_id) is None else
             "Nothing has happened yet. It is in this chat and on Today in the web app for them to approve."
             if card_here(session) or not getattr(session, "origin_channel", "") else
             "Nothing has happened yet. It is on Today in the web app for them to approve; this chat can't show it."

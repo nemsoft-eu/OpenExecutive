@@ -106,12 +106,51 @@ def extract_text_from_pdf(path: Path) -> str:
     return "\n\n".join(pages)
 
 
+class LegacyWordDocument(ValueError):
+    """A ``.doc`` in the old binary Word format, which python-docx cannot read.
+
+    Raised by name so the upload can ask for a ``.docx`` instead of calling
+    the file damaged. A ``.doc`` that is really a ``.docx`` (a zip) is read."""
+
+
 def extract_text_from_docx(path: Path) -> str:
+    """A Word document's paragraphs and tables, in the order they appear.
+
+    Each table row becomes one line, its cells joined with `` | ``. A merged
+    cell, which python-docx repeats for each column it spans, is kept once."""
+    import zipfile
+
     from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    if path.suffix.lower() == ".doc" and not zipfile.is_zipfile(path):
+        raise LegacyWordDocument(f"{path.name} is an old-format Word document")
 
     doc = Document(str(path))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(paragraphs)
+    parts: list[str] = []
+    for block in doc.iter_inner_content():
+        if isinstance(block, Paragraph):
+            if block.text.strip():
+                parts.append(block.text)
+        elif isinstance(block, Table):
+            rows: list[str] = []
+            for row in block.rows:
+                cells: list[str] = []
+                last_tc = None
+                for cell in row.cells:
+                    # A merged cell comes back once per grid column it spans,
+                    # as the same underlying <w:tc>: keep it once. Equal text
+                    # in separate cells, and empty cells, keep their place.
+                    if cell._tc is last_tc:
+                        continue
+                    last_tc = cell._tc
+                    cells.append(" ".join(cell.text.split()))
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append("\n".join(rows))
+    return "\n\n".join(parts)
 
 
 def extract_text_from_xlsx(path: Path, max_chars: int = 200_000) -> str:
@@ -186,11 +225,37 @@ def _parse_file(path: Path) -> str:
         return extract_text_from_docx(path)
     elif suffix in (".xlsx", ".xlsm"):
         return extract_text_from_xlsx(path)
-    elif suffix in (".md", ".txt", ".rst", ".csv"):
+    elif suffix in (".md", ".txt", ".rst", ".csv", ".ics"):
         # Lenient: a CSV saved by Excel is often cp1252, and a strict decode
-        # error would surface as a 500 rather than a readable document.
+        # error would surface as a 500 rather than a readable document. A
+        # calendar invite (.ics) is text too.
         return path.read_text(encoding="utf-8", errors="replace")
+    elif suffix == ".eml":
+        return extract_text_from_eml(path)
     return ""
+
+
+def extract_text_from_eml(path: Path) -> str:
+    """A saved email (.eml): its headers and plain text, with the names of
+    its own attachments."""
+    from email import policy
+    from email.parser import BytesParser
+
+    message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+    lines = [f"{h}: {message[h]}" for h in ("From", "To", "Cc", "Date", "Subject") if message[h]]
+    body = message.get_body(preferencelist=("plain", "html"))
+    text = ""
+    if body is not None:
+        try:
+            text = body.get_content()
+        except (LookupError, ValueError):
+            text = ""
+        if body.get_content_type() == "text/html":
+            text = re.sub(r"<[^>]+>", " ", text)
+    names = [p.get_filename() for p in message.iter_attachments() if p.get_filename()]
+    if names:
+        lines.append(f"Attachments: {', '.join(str(n) for n in names)}")
+    return "\n".join(lines) + "\n\n" + text.strip()
 
 
 async def read_document_text(path: Path, *, inbound: bool = False) -> PdfReadResult:
@@ -229,6 +294,19 @@ async def extract_text_from_file_async(path: Path, *, busy_raises: bool = False)
 
         raise ParserBusy(f"{path.name}: {result.note}")
     return result.text
+
+
+def _drop_stale_chunks(store: ChromaDBStore, collection: str, name: str, kept: int) -> None:
+    """Remove a document's chunks past the ``kept`` it was just re-indexed into.
+
+    Chunk ids are ``name`` plus a position, so re-indexing a document upserts
+    positions ``0..kept-1`` over the old ones. When the new version is shorter,
+    the old version's later chunks would otherwise stay searchable. Runs after
+    the write, so a failed write never leaves the document with no chunks."""
+    store.delete_documents(
+        collection=collection,
+        where={"$and": [{"filename": name}, {"chunk_index": {"$gte": kept}}]},
+    )
 
 
 def _make_chunk_id(source: str, chunk_index: int) -> str:
@@ -317,6 +395,7 @@ async def ingest_file(
     ids = [_make_chunk_id(name, i) for i in range(len(chunks))]
 
     store.add_documents(texts=texts, metadatas=metadatas, ids=ids, collection=collection)
+    _drop_stale_chunks(store, collection, name, len(chunks))
     return len(chunks)
 
 
@@ -357,6 +436,7 @@ def ingest_text_sync(
     ids = [_make_chunk_id(source_name, i) for i in range(len(chunks))]
 
     store.add_documents(texts=chunks, metadatas=metadatas, ids=ids, collection=collection)
+    _drop_stale_chunks(store, collection, source_name, len(chunks))
     return len(chunks)
 
 

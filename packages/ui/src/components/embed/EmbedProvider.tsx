@@ -2,7 +2,8 @@
 
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 
-import { CardActionRefusedInFrame, frameActionFor } from "@/lib/cardActions";
+import FrameConfirm from "@/components/embed/FrameConfirm";
+import { frameGate, type FrameAsk, type FrameGate } from "@/lib/cardActions";
 import HOST_LIST from "@/lib/host-list.json";
 import {
   acceptsEvent,
@@ -21,13 +22,12 @@ import {
 //
 // Apart from that, in ANY frame (embedded or not, since a page on a host
 // origin can frame these pages without saying so), a card action, a chat
-// message, and any other change off the host list that follows a click, is
-// refused (lib/cardActions.ts): a page over the frame could have lured it.
+// message, and any other change off the host list that follows a click,
+// waits for a Yes asked inside the frame that counts only once the browser
+// reports it seen (lib/cardActions.ts, lib/seen.ts, FrameConfirm): a page
+// over the frame could have lured it.
 
 const HOST_CALLS = HOST_LIST.calls.map(([method, pattern]) => [method, pattern] as const);
-// A change made this soon after a click or a key in the frame may have been
-// lured, so it is refused; later than that, the page made it on its own.
-const AFTER_INPUT_MS = 10_000;
 // What counts as input: a click, a key, a drop or a paste (a page over the
 // frame can lure any of them, and put its own file in a drag).
 const INPUT_EVENTS = ["pointerdown", "keydown", "drop", "paste"] as const;
@@ -67,7 +67,8 @@ export default function EmbedProvider({
   children: React.ReactNode;
 }) {
   const [state, setState] = useState<EmbedState>(NOT_EMBEDDED);
-  const lastInput = useRef(0);
+  const [pending, setPending] = useState<FrameAsk | null>(null);
+  const gate = useRef<FrameGate | null>(null);
 
   // The handshake: `ready` to the parent, addressed to each listed host
   // origin (the browser delivers it only to the one the parent is), then
@@ -98,31 +99,31 @@ export default function EmbedProvider({
   }, [hostOrigins, version]);
 
   // In any frame: every card action and chat message, and any change off
-  // the host list that follows a click, is refused.
+  // the host list that follows a click, waits for a Yes in FrameConfirm
+  // (lib/cardActions.ts, frameGate).
   useEffect(() => {
     if (window.top === window.self) return;
+    const original = window.fetch;
+    const current = frameGate(original, HOST_CALLS, setPending);
+    gate.current = current;
     const onInput = (event: Event) => {
-      if (event.isTrusted) lastInput.current = Date.now();
+      if (event.isTrusted) current.input();
     };
     for (const type of INPUT_EVENTS) window.addEventListener(type, onInput, true);
-    const original = window.fetch;
-    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      const action = frameActionFor(method, url, init?.body, HOST_CALLS);
-      const refused = action !== null && (action.card || Date.now() - lastInput.current < AFTER_INPUT_MS);
-      if (refused) throw new CardActionRefusedInFrame(action);
-      return original(input, init);
-    };
+    window.fetch = current.fetch;
     return () => {
       window.fetch = original;
       for (const type of INPUT_EVENTS) window.removeEventListener(type, onInput, true);
+      gate.current = null;
     };
   }, []);
+
+  const answer = (ok: boolean) => gate.current?.answer(ok);
 
   return (
     <EmbedContext.Provider value={state}>
       {children}
+      {pending && <FrameConfirm action={pending.action} onAnswer={answer} />}
     </EmbedContext.Provider>
   );
 }

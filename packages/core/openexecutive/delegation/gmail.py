@@ -48,6 +48,9 @@ import json
 import logging
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.message import EmailMessage, Message
@@ -58,6 +61,7 @@ from urllib.parse import quote
 
 import httpx
 
+from openexecutive.delegation.email_html import body_html, is_ours
 from openexecutive.utils.html_tags import strip_tags, unescape
 
 logger = logging.getLogger(__name__)
@@ -142,6 +146,10 @@ _TOKEN_URI_RE = re.compile(r"^https://oauth2\.googleapis\.com/")
 _MAX_HEADER = 900
 _TOKEN_SLACK_SECONDS = 60
 _FETCH_CONCURRENCY = 5
+# Most sent messages ``list_sent`` reads (pages of 100).
+SENT_MAX = 300
+# Pause before asking again after Gmail said "slow down".
+_SLOW_DOWN_SECONDS = 2.0
 
 # Access tokens by (address, refresh token) — never written anywhere.
 _TOKENS: dict[str, tuple[str, float]] = {}
@@ -812,6 +820,22 @@ def references_header(prior: str, parent: str) -> str | None:
     return joined if len(joined) <= _MAX_HEADER else None
 
 
+def _plain_or_ours(msg: EmailMessage) -> bool:
+    """Whether ``msg`` is only words: plain text, or plain text with the HTML
+    part ``build_raw`` adds for a table — nothing that rewriting its text
+    would lose (files, inline pictures)."""
+    if not msg.is_multipart():
+        return msg.get_content_type() == "text/plain"
+    if msg.get_content_type() != "multipart/alternative":
+        return False
+    parts = list(msg.iter_parts())
+    if [p.get_content_type() for p in parts] != ["text/plain", "text/html"]:
+        return False
+    # Gmail's own composer saves the same shape: only our table HTML counts.
+    html_part = parts[1]
+    return isinstance(html_part, EmailMessage) and is_ours(str(html_part.get_content()))
+
+
 def build_raw(sender: str, spec: DraftSpec) -> str:
     """The draft as a base64url RFC 2822 message (Gmail's ``raw``)."""
     msg = EmailMessage()
@@ -828,9 +852,15 @@ def build_raw(sender: str, spec: DraftSpec) -> str:
         msg["References"] = clean_header(spec.references)
     msg[GHOSTWRITTEN_HEADER] = "1"
     body = spec.body
+    quoted = ""
     if spec.forward is not None:
-        body = f"{spec.body}\n\n{spec.forward.header}\n\n{spec.forward.text}"
+        quoted = f"{spec.forward.header}\n\n{spec.forward.text}"
+        body = f"{spec.body}\n\n{quoted}"
     msg.set_content(body)
+    # A table goes as a real one: an HTML part next to the plain text.
+    markup = body_html(spec.body, quoted=quoted)
+    if markup is not None:
+        msg.add_alternative(markup, subtype="html")
     for name, mime, data in spec.attachments:
         maintype, _, subtype = (mime or "application/octet-stream").partition("/")
         msg.add_attachment(
@@ -1081,14 +1111,27 @@ class DelegateGmail:
         return MailThread(id=thread_id, messages=messages)
 
     async def list_sent(self, limit: int = 40) -> list[MailMessage]:
-        """The person's recent sent mail, newest first (at most ``limit``)."""
+        """The person's recent sent mail, newest first (at most ``limit``,
+        capped at ``SENT_MAX``)."""
+        want = max(1, min(limit, SENT_MAX))
         async with self._client() as client:
-            data = await self._get(
-                client,
-                "/messages",
-                {"q": "in:sent -in:chats newer_than:1y", "maxResults": max(1, min(limit, 100))},
-            )
-            ids = [str(m.get("id")) for m in data.get("messages") or [] if valid_id(m.get("id"))]
+            ids: list[str] = []
+            page = ""
+            while len(ids) < want:
+                params: dict[str, Any] = {"q": "in:sent -in:chats newer_than:1y", "maxResults": min(want - len(ids), 100)}
+                if page:
+                    params["pageToken"] = page
+                try:
+                    data = await self._get(client, "/messages", params)
+                except GmailRateLimited:
+                    if ids:
+                        break  # read what was listed rather than nothing
+                    await asyncio.sleep(_SLOW_DOWN_SECONDS)
+                    data = await self._get(client, "/messages", params)
+                ids += [str(m.get("id")) for m in data.get("messages") or [] if valid_id(m.get("id"))]
+                page = str(data.get("nextPageToken") or "")
+                if not page:
+                    break
             gate = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
             async def fetch(message_id: str) -> MailMessage | GmailAuthError | None:
@@ -1099,6 +1142,17 @@ class DelegateGmail:
                         raw = await self._get(client, f"/messages/{message_id}", {"format": "full"})
                     except GmailAuthError as exc:
                         return exc
+                    except GmailRateLimited:
+                        # Asked to slow down: once more after a pause, so a
+                        # busy mailbox doesn't silently drop sent mail.
+                        await asyncio.sleep(_SLOW_DOWN_SECONDS)
+                        try:
+                            raw = await self._get(client, f"/messages/{message_id}", {"format": "full"})
+                        except GmailAuthError as exc:
+                            return exc
+                        except GmailError:
+                            logger.warning("delegation.gmail: skipped a sent message (rate limited)")
+                            return None
                     except GmailError:
                         logger.warning("delegation.gmail: skipped an unreadable sent message")
                         return None
@@ -1158,6 +1212,23 @@ class DelegateGmail:
             return None
         found = await self.list_message_ids(f"from:{target} -in:chats newer_than:{int(days)}d", max_results=1)
         return await self.get_message(found[0][0]) if found else None
+
+    async def recent_from(self, address: str, *, days: int = 90, limit: int = 5) -> list[MailMessage]:
+        """The newest ``limit`` mails ``address`` sent the person in the last
+        ``days``, newest first."""
+        target = normalize_email(address)
+        if not _EMAIL_RE.fullmatch(target):
+            return []
+        found = await self.list_message_ids(
+            f"from:{target} -in:chats newer_than:{int(days)}d", max_results=max(1, min(int(limit), 25)),
+        )
+        messages: list[MailMessage] = []
+        for message_id, _thread in found:
+            try:
+                messages.append(await self.get_message(message_id))
+            except GmailNotFound:
+                continue  # deleted since it was listed
+        return messages
 
     async def get_message(self, message_id: str) -> MailMessage:
         if not valid_id(message_id):
@@ -1273,9 +1344,13 @@ class DelegateGmail:
                 msg = message_from_bytes(_b64decode(raw), policy=policy.default)
             except (ValueError, TypeError) as exc:
                 raise GmailError("gmail returned an unreadable draft") from exc
-            if not isinstance(msg, EmailMessage) or msg.is_multipart() or msg.get_content_type() != "text/plain":
+            if not isinstance(msg, EmailMessage) or not _plain_or_ours(msg):
                 raise DraftChanged("not_plain")
+            msg.clear_content()
             msg.set_content(text)
+            markup = body_html(text)
+            if markup is not None:
+                msg.add_alternative(markup, subtype="html")
             if to is not None:
                 del msg["To"]
                 del msg["Cc"]
@@ -1484,12 +1559,43 @@ def gmail_for(email: str) -> Any:
     return DelegateGmail(email)
 
 
+# One settings change asks for the mailbox's status several times over (the
+# dial's every step, then the page's new state), each a live call to the mail
+# service; inside ``status_memo`` the first answer is reused.
+_STATUS_MEMO: ContextVar[dict[str, GmailStatus] | None] = ContextVar("gmail_status_memo", default=None)
+
+
+@contextmanager
+def status_memo() -> Iterator[None]:
+    """Reuse each mailbox's status for the rest of this block (one request).
+    Nested blocks share the outer one's."""
+    if _STATUS_MEMO.get() is not None:
+        yield
+        return
+    token = _STATUS_MEMO.set({})
+    try:
+        yield
+    finally:
+        _STATUS_MEMO.reset(token)
+
+
 async def gmail_status(person_email: str | None, *, gmail: Any = None) -> GmailStatus:
     """Whether ``person_email``'s own mailbox can be used right now. Asks
-    the mail service which mailbox the credential opens. Never raises."""
+    the mail service which mailbox the credential opens (once per
+    ``status_memo`` block). Never raises."""
+    address = normalize_email(person_email)
+    memo = _STATUS_MEMO.get() if gmail is None else None
+    if memo is not None and address in memo:
+        return memo[address]
+    status = await _gmail_status(address, gmail=gmail)
+    if memo is not None:
+        memo[address] = status
+    return status
+
+
+async def _gmail_status(address: str, *, gmail: Any = None) -> GmailStatus:
     from openexecutive.config import get_settings
 
-    address = normalize_email(person_email)
     if not address:
         return "no_email"
     try:

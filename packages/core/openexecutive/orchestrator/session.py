@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.memory.company_profile import CompanyProfile
+from openexecutive.memory.conversation_ids import is_rolling
 
 if TYPE_CHECKING:
     from openexecutive.memory.workspace_settings import PrincipalRole
@@ -138,6 +139,10 @@ def history_window_start(total: int, max_turns: int = 20, step_turns: int = 10) 
         return 0
     step = max(1, step_turns) * 2
     return ((total - keep) // step) * step
+
+
+# The user turn put before history that opens with the Executive's message.
+CONTINUED_PLACEHOLDER = "(Continuing our chat.)"
 
 
 @dataclass
@@ -498,8 +503,15 @@ class Session:
         """
         start = history_window_start(len(self.conversation_history), max_turns, step_turns)
         history = self.conversation_history[start:]
-        # Anthropic requires messages to start with a user turn.
-        # Drop a leading assistant message if history length is odd (can happen on error recovery).
+        # Anthropic requires messages to start with a user turn. A chat-app
+        # conversation can open with the Executive's own message (a brief or
+        # digest it sent, ``integrations.conversations.record_delivery``).
+        # Dropping that would hide what the person is answering, so there a
+        # placeholder turn goes first; anywhere else a leading assistant
+        # message (left by error recovery) is dropped.
         if history and history[0]["role"] != "user":
-            history = history[1:]
+            if is_rolling(self.session_id):
+                history = [{"role": "user", "content": CONTINUED_PLACEHOLDER}, *history]
+            else:
+                history = history[1:]
         return history

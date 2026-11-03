@@ -107,6 +107,7 @@ _LABELS: dict[str, str] = {
     "run_executive_research": "Researching…",
     "create_alert": "Flagging something for review…",
     "run_python_job": "Working on the files…",
+    "save_file": "Saving the file…",
     "draft_artifact": "Writing that up…",
     "list_artifacts": "Looking through earlier work…",
     "get_artifact": "Rereading that document…",
@@ -141,6 +142,8 @@ _LABELS: dict[str, str] = {
 
     # Always in the loop: the speaker's own notes
     "recall_history": "Checking your notes…",
+    # Earlier chats: the speaker's own
+    "search_past_chats": "Checking our earlier chats…",
 
     # MCP gateway. `call_tool` is dynamic and handled in `_label_for`.
     "search_tools": "Looking for the right tool…",

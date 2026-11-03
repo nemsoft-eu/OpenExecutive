@@ -1,19 +1,47 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import type { Today } from "@/lib/api";
+import { ReplyCardItem, type useReplyCards } from "@/components/RepliesWaiting";
+import Button, { buttonClass } from "@/components/ui/Button";
+import { getMail, replyToMail, type MailView, type Today } from "@/lib/api";
 import { MEMORY_ACTIONS, briefingMemoryLine } from "@/lib/briefing-memory";
-import { clockLabel, isNewSince, newSinceLabel, type TimedPoint } from "@/lib/rightNow";
+import {
+  alsoInLine,
+  buildMoveSeed,
+  cardLink,
+  clockLabel,
+  isNewSince,
+  isPutOff,
+  laterMark,
+  moveMail,
+  newSinceLabel,
+  pointTarget,
+  progressNote,
+  progressSteps,
+  type PointTarget,
+  type TimedPoint,
+} from "@/lib/rightNow";
+import { mailboxName, safeGmailLink } from "@/lib/replyCards";
 
 import { buildNarrativeSeed, type ContinueHandler } from "./shared";
 
 // Right now: the Executive's live read of the day (the /today header, which
 // is rewritten as things change), shown as a card at the top of Home with
 // the whole picture in a side panel. Points that appeared since the reader
-// last looked today get a green dot.
+// last looked today get a green dot. A point about an email in your own
+// inbox has View email and Reply under it: View opens the email right there
+// (GET /delegation/mail), with the reply card already on its conversation;
+// Reply writes one (POST /delegation/mail/reply) and shows it to send,
+// change or edit. A point about a card in Needs you has Show me. Every
+// point has a ✕ that dismisses it for the rest of the day (POST
+// /today/dismiss). While it is being rewritten, its steps show in place of
+// the old read, which is no longer current. The card leads with Do next
+// (the header's Move today line) and buttons that start it: Do it opens a
+// chat where the Executive gets going, View email and Reply open the top
+// point's email, and Later puts it away until the move changes.
 
 // How many points the Home card shows; the panel has them all.
 const CARD_POINTS = 3;
@@ -33,16 +61,53 @@ function plainText(text: string): string {
   return text.replace(/\*\*|__|`/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim();
 }
 
+type Replies = ReturnType<typeof useReplyCards>;
+
+// What a point's buttons need from Home.
+export interface PointActions {
+  replies?: Replies;
+  onShowAlert?: (alertId: number) => void;
+  onContinue?: ContinueHandler;
+  // A point with nothing to open is a button that talks it through (the
+  // panel), or plain text (the Home card).
+  plainRows?: boolean;
+  // Clears a point for the rest of the day.
+  onDismiss?: (point: TimedPoint) => void;
+}
+
+function DismissButton({ text, onClick }: { text: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Dismiss: ${text}`}
+      title="Dismiss"
+      className="-mr-1 -mt-1 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-fg-muted transition hover:bg-accent/10 hover:text-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+    >
+      <span aria-hidden className="text-base leading-none">✕</span>
+    </button>
+  );
+}
+
 function PointRow({
   point,
   isNew,
-  onContinue,
+  actions,
 }: {
   point: TimedPoint;
   isNew: boolean;
-  onContinue?: ContinueHandler;
+  actions?: PointActions;
 }) {
+  const [open, setOpen] = useState<"view" | "reply" | null>(null);
+  const target = pointTarget(point);
+  const onContinue = actions?.onContinue;
+  const text = plainText(point.text);
+  const talk = onContinue
+    ? () => onContinue(buildNarrativeSeed(text), briefingMemoryLine(MEMORY_ACTIONS.narrative, text))
+    : undefined;
   const when = clockLabel(point.since);
+  const onDismiss = actions?.onDismiss;
+  const dismiss = onDismiss ? <DismissButton text={text} onClick={() => onDismiss(point)} /> : null;
   const body = (
     <>
       <span
@@ -56,21 +121,300 @@ function PointRow({
       {when && <span className="flex-shrink-0 pt-0.5 text-xs tabular-nums text-fg-muted">{when}</span>}
     </>
   );
-  if (!onContinue) {
-    return <li className="flex items-start gap-2.5 border-t border-line py-2 first:border-t-0">{body}</li>;
+  // No email or card behind it: the whole row talks it through, as before.
+  if (!target || (target.kind === "alert" && !actions?.onShowAlert) || (target.kind === "mail" && !actions?.replies)) {
+    if (!talk || actions?.plainRows) {
+      return (
+        <li className="flex items-start gap-2.5 border-t border-line py-2 first:border-t-0">
+          {body}
+          {dismiss}
+        </li>
+      );
+    }
+    return (
+      <li className="flex items-start gap-1 border-t border-line first:border-t-0">
+        <button
+          type="button"
+          onClick={talk}
+          aria-label={`Discuss: ${text}`}
+          className="-ml-2 flex min-w-0 flex-1 items-start gap-2.5 rounded-xl px-2 py-2 text-left transition hover:bg-accent/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+        >
+          {body}
+        </button>
+        {dismiss && <div className="pt-2">{dismiss}</div>}
+      </li>
+    );
   }
-  const text = plainText(point.text);
   return (
-    <li className="border-t border-line first:border-t-0">
-      <button
-        type="button"
-        onClick={() => onContinue(buildNarrativeSeed(text), briefingMemoryLine(MEMORY_ACTIONS.narrative, text))}
-        aria-label={`Discuss: ${text}`}
-        className="-mx-2 flex w-[calc(100%+1rem)] items-start gap-2.5 rounded-xl px-2 py-2 text-left transition hover:bg-accent/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
-      >
+    <li className="border-t border-line py-2 first:border-t-0">
+      <div className="flex items-start gap-2.5">
         {body}
-      </button>
+        {dismiss}
+      </div>
+      {target.kind === "mail" && open ? (
+        <MailPanel
+          target={target}
+          replies={actions!.replies!}
+          startWithReply={open === "reply"}
+          onTalk={talk}
+          onClose={() => setOpen(null)}
+        />
+      ) : (
+        <div className="ml-[18px] mt-2 flex flex-wrap gap-2">
+          {target.kind === "mail" ? (
+            <>
+              <Button size="sm" onClick={() => setOpen("view")}>View email</Button>
+              <Button size="sm" onClick={() => setOpen("reply")}>Reply</Button>
+            </>
+          ) : target.kind === "link" ? (
+            <Button size="sm" onClick={() => window.open(target.url, "_blank", "noopener,noreferrer")}>
+              Open in {target.app}
+            </Button>
+          ) : (
+            <Button size="sm" onClick={() => actions!.onShowAlert!(target.alertId)}>Show me</Button>
+          )}
+          {talk && <Button size="sm" onClick={talk}>Talk it through</Button>}
+        </div>
+      )}
     </li>
+  );
+}
+
+type MailTarget = Extract<NonNullable<PointTarget>, { kind: "mail" }>;
+
+// One email opened from its point: what they wrote, their files, what you
+// last wrote to them, and the reply card for it (the one already open on
+// the conversation, or one written when you tap Reply).
+function MailPanel({
+  target,
+  replies,
+  startWithReply,
+  onTalk,
+  onClose,
+}: {
+  target: MailTarget;
+  replies: Replies;
+  startWithReply: boolean;
+  onTalk?: () => void;
+  onClose: () => void;
+}) {
+  const [mail, setMail] = useState<MailView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [cardId, setCardId] = useState<number | null>(target.cardId);
+  const [writing, setWriting] = useState(false);
+  const { refresh } = replies;
+  const { threadId, messageId } = target;
+
+  const reply = async () => {
+    setWriting(true);
+    setError(null);
+    try {
+      const id = await replyToMail(threadId, messageId);
+      await refresh();
+      setCardId(id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't write that reply.");
+    } finally {
+      setWriting(false);
+    }
+  };
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getMail(threadId, messageId, controller.signal)
+      .then((m) => {
+        setMail(m);
+        if (m.reply_card_id !== null) setCardId(m.reply_card_id);
+        // Reply tapped on the point: write it once the email is open, unless
+        // a card is already there.
+        else if (startWithReply && target.cardId === null) void reply();
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        setError(err instanceof Error ? err.message : "Couldn't open that email.");
+      });
+    return () => controller.abort();
+    // Opened once per email; `reply` and the flags are read as they were then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId, messageId]);
+
+  const card = cardId !== null ? replies.cards.find((c) => c.decision_id === cardId) : undefined;
+  const link = mail ? safeGmailLink(mail.link) : "";
+  const files = mail?.attachments ?? [];
+  const who = mail ? mail.from_name.trim() || mail.from_email : "";
+  const others = mail ? mail.cc.map((a) => a.split("@")[0]).join(", ") : "";
+  return (
+    <div className="ml-[18px] mt-2 rounded-xl border border-line bg-surface p-3">
+      {!mail && !error && <p className="animate-pulse text-sm text-fg-muted">Opening the email…</p>}
+      {mail && (
+        <>
+          <p className="text-sm">
+            <span className="font-semibold text-fg">{who}</span>
+            <span className="text-fg-muted">
+              {" "}· to you{others ? `, cc ${others}` : ""}
+              {clockLabel(mail.received_at) ? ` · ${clockLabel(mail.received_at)}` : ""}
+            </span>
+          </p>
+          {mail.subject && <p className="mt-0.5 text-sm text-fg-muted">{mail.subject}</p>}
+          <p className="mt-2 whitespace-pre-line break-words text-[15px] text-fg">{mail.text || "(No words, just the files.)"}</p>
+          {(files.length > 0 || mail.has_attachments) && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {files.length > 0 ? (
+                files.map((f, i) => (
+                  <span key={`${i}-${f.name}`} className="rounded-lg border border-line px-2.5 py-1 text-sm text-fg">
+                    📎 {f.name}
+                  </span>
+                ))
+              ) : (
+                <span className="text-sm text-fg-muted">📎 Has attachments</span>
+              )}
+            </div>
+          )}
+          {mail.their_last_words && (
+            <p className="mt-2 text-sm text-fg-muted">
+              Replying to you: &ldquo;{mail.their_last_words.replace(/\s+/g, " ").slice(0, 160)}
+              {mail.their_last_words.length > 160 ? "…" : ""}&rdquo;
+            </p>
+          )}
+        </>
+      )}
+      {card ? (
+        <div className="mt-3">
+          <ReplyCardItem
+            card={card}
+            onGone={(id, note) => {
+              replies.gone(id, note);
+              setCardId(null);
+            }}
+            onRefresh={replies.refresh}
+            onChanged={replies.replace}
+            defaultOpen
+          />
+        </div>
+      ) : writing ? (
+        <p className="mt-3 animate-pulse text-sm text-fg-muted">Writing a reply…</p>
+      ) : null}
+      {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-300">{error}</p>}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {!card && mail && !writing && (
+          <Button size="sm" variant="primary" onClick={() => void reply()}>Reply</Button>
+        )}
+        {link && (
+          <a href={link} target="_blank" rel="noopener noreferrer" className={buttonClass("secondary", "sm")}>
+            Open in {mailboxName(link)}
+          </a>
+        )}
+        {onTalk && <Button size="sm" onClick={onTalk}>Talk it through</Button>}
+        <Button size="sm" variant="ghost" onClick={onClose}>Close</Button>
+      </div>
+    </div>
+  );
+}
+
+/** Right now being rewritten: a spinner and its steps, and how many emails
+ * came since the last read. Shown instead of that read. */
+function Progress({ today }: { today: Today }) {
+  const progress = today.narrative_progress;
+  const steps = progressSteps(progress?.step);
+  const note = progressNote(progress?.new_mail, progress?.since);
+  return (
+    <div aria-live="polite" aria-busy="true">
+      <ol className="flex flex-col gap-3">
+        {steps.map((s, i) => (
+          <li key={s.label}>
+            <div className={`flex items-center gap-3 text-[15px] ${s.state === "todo" ? "text-fg-muted" : "text-fg"} ${s.state === "now" ? "font-semibold" : ""}`}>
+              {s.state === "done" ? (
+                <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-xs font-bold text-emerald-700 dark:text-emerald-300" aria-hidden>
+                  ✓
+                </span>
+              ) : s.state === "now" ? (
+                <span className="h-5 w-5 flex-shrink-0 animate-spin rounded-full border-2 border-accent/25 border-t-accent" aria-hidden />
+              ) : (
+                <span className="h-5 w-5 flex-shrink-0 rounded-full border-2 border-line" aria-hidden />
+              )}
+              {s.label}
+            </div>
+            {i === 0 && note && <p className="ml-8 mt-0.5 text-sm text-fg-muted">{note}</p>}
+          </li>
+        ))}
+      </ol>
+      <p className="mt-3 border-t border-line pt-2 text-sm text-fg-muted">Usually under a minute.</p>
+    </div>
+  );
+}
+
+const LATER_KEY = "oe.rightNow.later";
+
+const LATER_EVENT = "oe-right-now-later";
+// A private window has no storage: Later still holds until reload.
+let laterFallback: string | null = null;
+
+function readLater(): string | null {
+  try {
+    return window.localStorage.getItem(LATER_KEY) ?? laterFallback;
+  } catch {
+    return laterFallback;
+  }
+}
+
+function writeLater(value: string): void {
+  laterFallback = value;
+  try {
+    window.localStorage.setItem(LATER_KEY, value);
+  } catch {
+    // Kept in memory above.
+  }
+  window.dispatchEvent(new Event(LATER_EVENT));
+}
+
+function subscribeLater(onChange: () => void): () => void {
+  window.addEventListener(LATER_EVENT, onChange);
+  window.addEventListener("storage", onChange);
+  return () => {
+    window.removeEventListener(LATER_EVENT, onChange);
+    window.removeEventListener("storage", onChange);
+  };
+}
+
+// Do next on the Home card: the move, and buttons that start it.
+function MoveBox({ move, points, actions }: { move: string; points: TimedPoint[]; actions?: PointActions }) {
+  const [open, setOpen] = useState<"view" | "reply" | null>(null);
+  // The server render has no storage, so it shows the box.
+  const stored = useSyncExternalStore(subscribeLater, readLater, () => null);
+  if (isPutOff(stored, move, new Date())) return null;
+  const mail = actions?.replies ? moveMail(points, move) : null;
+  const onContinue = actions?.onContinue;
+  const doIt = onContinue
+    ? () => onContinue(buildMoveSeed(move), briefingMemoryLine(MEMORY_ACTIONS.narrative, move))
+    : undefined;
+  const later = () => writeLater(laterMark(move, new Date()));
+  return (
+    <div className="mt-3 rounded-xl bg-accent/10 px-4 py-3">
+      <h3 className="text-xs font-bold uppercase tracking-wide text-accent">Do next</h3>
+      <p className="mt-1 text-[16px] font-semibold leading-snug text-fg">{move}</p>
+      {mail && open ? (
+        <MailPanel
+          target={mail}
+          replies={actions!.replies!}
+          startWithReply={open === "reply"}
+          onTalk={doIt}
+          onClose={() => setOpen(null)}
+        />
+      ) : (
+        <div className="mt-2.5 flex flex-wrap gap-2">
+          {doIt && (
+            <Button variant="primary" size="sm" onClick={doIt}>Do it</Button>
+          )}
+          {mail && (
+            <>
+              <Button size="sm" onClick={() => setOpen("view")}>View email</Button>
+              <Button size="sm" onClick={() => setOpen("reply")}>Reply</Button>
+            </>
+          )}
+          <Button size="sm" onClick={later}>Later</Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -88,20 +432,26 @@ function Lead({ today }: { today: Today }) {
 }
 
 /** The Home card: when it was updated, what's new, the opener and the top
- * points. Renders nothing until there is a header or one is being written. */
+ * points, or its steps while it is being rewritten. */
 export function RightNowCard({
   today,
   baseline,
   updatedLabel,
   onOpen,
+  actions,
 }: {
   today: Today;
   baseline: Date | null;
   updatedLabel: string | null;
   onOpen: () => void;
+  actions?: PointActions;
 }) {
   const points = today.narrative_points ?? [];
   const badge = newSinceLabel(points, baseline);
+  const alsoIn = alsoInLine(today.inbox_also, today.inbox_also_total);
+  // A quiet card (no points) lists the next meetings itself.
+  const calendar = points.length === 0 ? (today.calendar_next ?? []).slice(0, CARD_POINTS) : [];
+  const link = cardLink(today, calendar.length);
   return (
     <section aria-labelledby="sec-right-now" className="mb-8 rounded-2xl border border-line bg-surface-elevated p-4 sm:p-5">
       <div className="mb-2 flex flex-wrap items-center gap-x-2.5 gap-y-1">
@@ -119,30 +469,58 @@ export function RightNowCard({
           </span>
         )}
       </div>
-      {today.narrative ? (
+      {today.narrative_stale ? (
+        <Progress today={today} />
+      ) : today.narrative ? (
         <>
           <Lead today={today} />
+          {today.narrative_move?.trim() && (
+            <MoveBox move={today.narrative_move.trim()} points={points} actions={actions} />
+          )}
           {points.length > 0 && (
             <ul className="mt-2">
               {points.slice(0, CARD_POINTS).map((p, i) => (
-                <PointRow key={`${i}-${p.text}`} point={p} isNew={isNewSince(p, baseline)} />
+                <PointRow
+                  key={`${i}-${p.text}`}
+                  point={p}
+                  isNew={isNewSince(p, baseline)}
+                  actions={actions ? { ...actions, plainRows: true } : undefined}
+                />
               ))}
             </ul>
           )}
-          <button
-            type="button"
-            onClick={onOpen}
-            aria-haspopup="dialog"
-            className="mt-3 min-h-[40px] rounded-xl px-1 text-[15px] font-semibold text-accent hover:underline"
-          >
-            See the whole picture →
-          </button>
+          {calendar.length > 0 && (
+            <ul className="mt-3 border-t border-line pt-2">
+              {calendar.map((e, i) => (
+                <li key={`${i}-${e.title}`} className="flex items-start gap-2.5 py-1">
+                  <span className="w-16 flex-shrink-0 text-[15px] font-semibold tabular-nums text-fg">
+                    {calendarWhen(e.start, e.all_day)}
+                  </span>
+                  <span className="min-w-0 flex-1 text-[15px] text-fg">{e.title}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {alsoIn && <AlsoIn text={alsoIn} />}
+          {link && (
+            <button
+              type="button"
+              onClick={onOpen}
+              aria-haspopup="dialog"
+              className="mt-3 min-h-[40px] rounded-xl px-1 text-[15px] font-semibold text-accent hover:underline"
+            >
+              {link === "morning" ? "Morning brief →" : "See the whole picture →"}
+            </button>
+          )}
         </>
-      ) : (
-        <p className="animate-pulse text-[15px] text-fg-muted">Catching up on today…</p>
-      )}
+      ) : null}
     </section>
   );
+}
+
+// Mail from people the reader doesn't deal with: one quiet line, never a point.
+function AlsoIn({ text }: { text: string }) {
+  return <p className="mt-2 border-t border-dashed border-line pt-2 text-sm text-fg-muted">{text}</p>;
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -160,28 +538,34 @@ export function RightNowBody({
   today,
   baseline,
   onContinue,
+  actions,
 }: {
   today: Today;
   baseline: Date | null;
   onContinue?: ContinueHandler;
+  actions?: PointActions;
 }) {
-  const [showMorning, setShowMorning] = useState(false);
+  // Unset until tapped: open on a quiet day, when it is what the card links to.
+  const [morningToggled, setShowMorning] = useState<boolean | null>(null);
+  if (today.narrative_stale) return <Progress today={today} />;
   if (!today.narrative) {
     return (
-      <div aria-live="polite" className="animate-pulse rounded-xl bg-accent/5 px-4 py-3 text-[15px] text-fg-muted">
-        {today.narrative_stale ? "Catching up on today…" : "Nothing yet today."}
+      <div aria-live="polite" className="rounded-xl bg-accent/5 px-4 py-3 text-[15px] text-fg-muted">
+        Nothing yet today.
       </div>
     );
   }
   const points = today.narrative_points ?? [];
+  const showMorning = morningToggled ?? cardLink(today, CARD_POINTS) === "morning";
   const fresh = points.filter((p) => isNewSince(p, baseline));
   const open = points.filter((p) => !isNewSince(p, baseline));
   const calendar = today.calendar_next ?? [];
   const morning = today.morning_brief;
+  const alsoIn = alsoInLine(today.inbox_also, today.inbox_also_total);
   const list = (items: TimedPoint[], isNew: boolean) => (
     <ul>
       {items.map((p, i) => (
-        <PointRow key={`${i}-${p.text}`} point={p} isNew={isNew} onContinue={onContinue} />
+        <PointRow key={`${i}-${p.text}`} point={p} isNew={isNew} actions={{ ...actions, onContinue }} />
       ))}
     </ul>
   );
@@ -202,6 +586,7 @@ export function RightNowBody({
       ) : (
         open.length > 0 && <div className="mt-3">{list(open, false)}</div>
       )}
+      {alsoIn && <AlsoIn text={alsoIn} />}
       {today.narrative_move && (
         <p className="mt-4 rounded-xl bg-accent/5 px-3 py-2.5 text-[15px] text-fg">
           <span className="font-semibold">Move today:</span> {today.narrative_move}
@@ -229,7 +614,7 @@ export function RightNowBody({
         <div className="mt-5 border-t border-line pt-3">
           <button
             type="button"
-            onClick={() => setShowMorning((v) => !v)}
+            onClick={() => setShowMorning(!showMorning)}
             aria-expanded={showMorning}
             className="min-h-[40px] text-sm font-medium text-fg-muted hover:text-fg"
           >

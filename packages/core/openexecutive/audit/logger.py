@@ -62,6 +62,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "scheduled_action",
     "alert",
     "integration_inbound",
+    "chat_card_sent",  # a card waiting outside any chat was sent to its person's chat app (integrations.channel_cards)
     "auth_login",
     "auth_logout",
     # Instrumentation events — surface what the agent saw on each turn so
@@ -89,6 +90,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "delegation_voice_changed",     # "How I write" learned, edited, locked, reset or its signature re-read
     "delegation_voice_described",   # a person had their style written from their own words (nothing saved yet)
     "delegation_drafted",           # ghostwrite_email saved a draft in a person's own Gmail
+    "delegation_draft_replaced",    # earlier chat drafts deleted: a redraft or the Executive's own send replaced them
     "delegation_inbox_changed",     # a person turned "Draft replies to my inbox" on or off (PUT /delegation/inbox)
     "delegation_inbox_scanned",     # the inbox watcher checked a person's inbox (counts only)
     "delegation_reply_drafted",     # it drafted a reply in their Gmail and left a card for them

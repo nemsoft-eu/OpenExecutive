@@ -114,8 +114,16 @@ _ALLOWED: frozenset[str] = frozenset({
     "briefing/top_three.py::_read_executive_calendar",
     # Private, and sent to the owner alone (`runner._deliver_to_principal`).
     "briefing/value_summary.py::summarize",
-    # Private: replies the owner is waiting on, behind `include_private`.
-    "briefing/waiting_on.py::cached",
+    # Added by the 2026-11-03 upstream sync, each decided:
+    # Private, and sent to that same person alone: the row is only the
+    # recipient of the Right now ping, and whose notification setting applies.
+    # The text is the header's own points, already gated on what they carry.
+    "briefing/right_now_ping.py::_maybe_ping",
+    # Private: whether the owner's last read may be used, in place of the check
+    # `cached` made. `cached` is behind `include_private`; `replied` and
+    # `wrote_to` reach only `live_signals.own_inbox`, which needs a one-principal
+    # roster (`live_signals._one_reader`).
+    "briefing/waiting_on.py::_usable",
     # Private: the owner's chats and live blocks, read only under
     # `PRINCIPAL_DELIVERY`.
     "workflows/end_of_day_digest.py::_the_day",

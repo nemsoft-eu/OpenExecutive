@@ -1,6 +1,7 @@
 """GET / PUT /delegation and /delegation/voice (api/routes/delegation.py)."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -471,6 +472,13 @@ def test_read_my_calendar_turns_on_only_once_the_calendar_opens(
     assert body["calendar"]["enabled"] is True and calendar.enabled(ids["principal"]) is True
     assert body["calendar"]["granted"] is True
     assert calendar.enabled(ids["teammate"]) is False
+    # The mailbox gone (disconnected, or its sign-in revoked): the switch reads
+    # Off, since nothing can be read, and On again once it's back.
+    gmail["status"] = "not_configured"
+    assert client.get("/delegation", headers=OWNER).json()["calendar"]["enabled"] is False
+    assert calendar.enabled(ids["principal"]) is True
+    gmail["status"] = "connected"
+    assert client.get("/delegation", headers=OWNER).json()["calendar"]["enabled"] is True
     # Act as me off takes it with it, and it is audited privately each way.
     client.put("/delegation", json={"enabled": False}, headers=OWNER)
     assert calendar.enabled(ids["principal"]) is False
@@ -581,3 +589,27 @@ def test_training_set_before_sending_holds_once_it_sends(
     assert handle_it.get(pid).enabled
     t = training.get(pid)
     assert t.replies and t.follow_ups
+
+
+def test_one_settings_change_asks_for_the_mailbox_status_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.delegation import gmail as gmail_mod
+
+    asked: list[str] = []
+
+    async def live(address: str, *, gmail: Any = None) -> str:
+        asked.append(address)
+        return "connected"
+
+    monkeypatch.setattr(gmail_mod, "_gmail_status", live)
+
+    async def go() -> list[str]:
+        with gmail_mod.status_memo():
+            with gmail_mod.status_memo():
+                first = await gmail_mod.gmail_status("Owner@Example.com")
+            second = await gmail_mod.gmail_status("owner@example.com")
+        third = await gmail_mod.gmail_status("owner@example.com")
+        return [first, second, third]
+
+    assert asyncio.run(go()) == ["connected"] * 3
+    # Once inside the block, and again outside it.
+    assert asked == ["owner@example.com", "owner@example.com"]
