@@ -166,6 +166,31 @@ async def test_a_stop_before_the_watch_starts_runs_nothing(quiet: bool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_failed_row_read_leaves_nothing_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlite3
+
+    def locked(run_id: str, db_path: Path | None = None) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(wf_persistence, "get_run", locked)
+    closed: list[bool] = []
+
+    async def events() -> AsyncIterator[int]:
+        try:
+            yield 1
+        finally:
+            closed.append(True)
+
+    gen = events()
+    await anext(gen)  # started, so aclose runs its finally
+    with pytest.raises(sqlite3.OperationalError):
+        async for _ in run_control.watch("p3", gen):
+            pass
+    assert not run_control.is_running_here("p3")
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
 async def test_a_running_row_is_watched_as_before() -> None:
     wf_persistence.create_run("p2", "weekly_wf", "Weekly", {})
 

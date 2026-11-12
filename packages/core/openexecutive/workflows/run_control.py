@@ -65,11 +65,12 @@ async def watch(
     # A Stop that landed between the run's row being written and this watch
     # registering (the SSE route hands the client its run_id first) found no
     # run here to stop: read the row once, after registering, so a Stop on
-    # either side of that moment is seen.
-    row = get_run(run_id)
-    if row is not None and row.get("status") == "stopped":
-        run.stopping = True
+    # either side of that moment is seen. Inside the try, so a failed read
+    # still unregisters the run and closes ``events``.
     try:
+        row = get_run(run_id)
+        if row is not None and row.get("status") == "stopped":
+            run.stopping = True
         while True:
             if run.stopping:
                 if quiet:
