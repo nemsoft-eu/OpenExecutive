@@ -19,7 +19,9 @@ from openexecutive.workflows import persistence as wf_persistence
 from openexecutive.workflows import run_control
 
 
-@pytest.fixture()
+# Autouse: ``watch`` reads the run's row, so no test here may reach the
+# default ./episodic_memory.db.
+@pytest.fixture(autouse=True)
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "test.db"
     for mod in (episodic, wf_persistence):
@@ -135,6 +137,43 @@ async def test_no_sign_off_goes_out_for_a_stopped_run(db: Path, monkeypatch: pyt
     with pytest.raises(run_control.RunStopped):
         await gate.checkpoint_gate(run_id="g1", event=object(), db_path=db)  # type: ignore[arg-type]
     assert sent == []
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+@pytest.mark.asyncio
+async def test_a_stop_before_the_watch_starts_runs_nothing(quiet: bool) -> None:
+    # The SSE route sends run_created before it starts watching, so a Stop
+    # can mark the row stopped while no watch is registered to hear it.
+    started: list[bool] = []
+
+    async def events() -> AsyncIterator[int]:
+        started.append(True)
+        yield 1
+
+    wf_persistence.create_run("p1", "weekly_wf", "Weekly", {})
+    assert wf_persistence.stop_run("p1") is True
+    assert run_control.stop("p1") is False  # nothing here to stop yet
+    seen: list[int] = []
+    if quiet:
+        async for item in run_control.watch("p1", events(), quiet=True):
+            seen.append(item)
+    else:
+        with pytest.raises(run_control.RunStopped):
+            async for item in run_control.watch("p1", events()):
+                seen.append(item)
+    assert seen == [] and started == []
+    assert not run_control.is_running_here("p1")
+
+
+@pytest.mark.asyncio
+async def test_a_running_row_is_watched_as_before() -> None:
+    wf_persistence.create_run("p2", "weekly_wf", "Weekly", {})
+
+    async def events() -> AsyncIterator[int]:
+        yield 1
+        yield 2
+
+    assert [i async for i in run_control.watch("p2", events())] == [1, 2]
 
 
 def test_stopping_a_run_this_process_is_not_driving_is_a_no_op() -> None:

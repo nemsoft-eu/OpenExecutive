@@ -7544,6 +7544,14 @@ workflows:
     discoverable without remembering which run produced them.
   registry: openexecutive.workflows.WORKFLOW_REGISTRY
   streaming: SSE — every step emits a WorkflowEvent (start/progress/complete) consumed by /workflows/{name}/runs.
+  stop_run: |
+    POST /workflows/runs/{run_id}/stop marks an unfinished run `stopped`
+    (persistence.stop_run) and calls run_control.stop, which ends the run
+    if this process is driving it through run_control.watch. watch also
+    reads the run's row once when it starts, after registering: the SSE
+    route sends run_created (with the run_id) before it starts watching,
+    so a Stop in that gap found no driver to stop and the run used to go
+    ahead (found in review of nemsoft-eu/OpenExecutive#70).
   human_in_the_loop: |
     `wait_for_human` (openexecutive/workflows/wait_for_human.py) is a
     first-class step primitive that pauses a run: `save_checkpoint` moves

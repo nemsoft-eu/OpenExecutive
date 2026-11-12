@@ -11,7 +11,10 @@ the database (``persistence.stop_run``) and calls ``stop(run_id)``:
   driver itself is never cancelled — the scheduler loop that drives a
   scheduled run keeps going;
 * otherwise (the driver is handling an event between steps), ``watch``
-  raises ``RunStopped`` the next time it is asked for an event.
+  raises ``RunStopped`` the next time it is asked for an event;
+* a Stop that came before ``watch`` started (the run's row exists, and its
+  id may already be on the client) is read from the row when ``watch``
+  starts, so the run ends before its first event.
 
 A sign-off that was already on its way when Stop landed is not sent:
 ``gate.checkpoint_gate`` raises ``RunStopped`` for a run marked ``stopped``.
@@ -55,8 +58,17 @@ async def watch(
     """``events``, until the run is stopped: then ``RunStopped``, or with
     ``quiet`` the events just end (for a driver whose own ending already
     copes with a run that produced nothing)."""
+    from openexecutive.workflows.persistence import get_run
+
     run = _Run(task=None)
     _runs[run_id] = run
+    # A Stop that landed between the run's row being written and this watch
+    # registering (the SSE route hands the client its run_id first) found no
+    # run here to stop: read the row once, after registering, so a Stop on
+    # either side of that moment is seen.
+    row = get_run(run_id)
+    if row is not None and row.get("status") == "stopped":
+        run.stopping = True
     try:
         while True:
             if run.stopping:
