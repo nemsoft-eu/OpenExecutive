@@ -129,6 +129,10 @@ _BLANK_WIPE_TABLES = (
     "watchlist",
     "page_watch_state",
     "outbound_context",
+    # What the Executive mailed back (integrations.email_replies), found by
+    # the recipient's address: an advisor who writes for two clients would
+    # otherwise be shown the previous client's replies.
+    "email_thread_replies",
     # An in-progress setup interview: the previous client's unedited
     # description and answers (financials included).
     "onboarding_interviews",

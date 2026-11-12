@@ -72,22 +72,39 @@ def _reader(request: Request) -> tuple[Any | None, bool]:
     """The caller's person (or None) and whether they are the owner. A
     request that names no one counts only under local login, as on As you."""
     from openexecutive.api import caller as api_caller
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
     from openexecutive.api.routes.people import caller_is_principal
     from openexecutive.delegation.settings import local_login
-    from openexecutive.people.store import find_principal_person, get_person
+    from openexecutive.people.store import get_person
 
     who = api_caller.caller(request)
     if not who.email and not (who.defaults_to_principal and local_login()):
         return None, False
     try:
-        if caller_is_principal(request):
-            return find_principal_person(), True
-        from openexecutive.api.routes.chat import _resolve_caller_person_id
-
+        # The caller's own entry, for an owner too: with co-principals the
+        # oldest principal's entry is someone else's, and As you shows that
+        # person's replies and correspondents.
         person_id = _resolve_caller_person_id(request)
-        return (get_person(person_id) if person_id is not None else None), False
+        person = get_person(person_id) if person_id is not None else None
+        return person, person is not None and caller_is_principal(request)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Couldn't read the People list.") from exc
+
+
+def _own_entry(request: Request, principal: Any) -> Any:
+    """The caller's own People entry, given that they are an owner
+    (``principal`` is the oldest one). 403 if it can't be read."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.people.store import get_person
+
+    try:
+        person_id = _resolve_caller_person_id(request)
+        own = principal if person_id == principal.id else get_person(person_id) if person_id is not None else None
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Couldn't read the People list.") from exc
+    if own is None:
+        raise HTTPException(status_code=403, detail="Only the account owner can change this.")
+    return own
 
 
 def _can_delegate(person: Any) -> bool:
@@ -146,6 +163,9 @@ def _offer_person(request: Request, key: str, *, narrowing: bool) -> tuple[Any, 
     side = go_on_its_own.side_of(key)
     if side == go_on_its_own.AS_ME:
         principal = take_the_lead._principal(request)
+        # The calling owner, not the oldest one (``_principal``): the summary
+        # sent back carries their own As you rows.
+        principal = _own_entry(request, principal)
         if not narrowing and not take_the_lead._provably_theirs(request, principal):
             raise HTTPException(
                 status_code=409,

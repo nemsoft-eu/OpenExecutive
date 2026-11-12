@@ -234,3 +234,27 @@ def test_a_request_that_names_no_one_reads_nothing_off_local_login(
     monkeypatch.delenv("OE_LOCAL_LOGIN", raising=False)
     body = client.get("/approvals/summary").json()
     assert body["week"]["waited"] == 0 and body["offers"] == []
+
+
+def test_a_co_owner_reads_their_own_approvals_not_the_first_owners(client: TestClient, owner: Any) -> None:
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    pat = "pat@co.example"
+    people_store.upsert_person(full_name="Pat Partner", is_principal=True, email=pat)
+    people_registry.invalidate()
+    training.set_(owner.id, {training.TRAINING: True}, updated_by="t")
+    _sent_unchanged(owner)
+    _reply(owner.id, DANA, reason="stranger")
+    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, training=True, updated_by="t")
+    as_me_key = _as_me_unchanged(ttl.SUGGEST_AFTER)
+    headers = {"x-caller-email": pat}
+    body = client.get("/approvals/summary", headers=headers).json()
+    # Pat is an owner too, so sees the Executive's own, but none of Olivia's replies.
+    assert [o["side"] for o in body["offers"]] == ["as_me"]
+    assert all(i["side"] != "as_you" for i in body["week"]["items"])
+    assert KENJI not in str(body) and DANA not in str(body)
+    after = client.post("/approvals/offers/keep-asking", json={"key": as_me_key}, headers=headers).json()
+    assert after["offers"] == [] and KENJI not in str(after)
+    # Olivia still sees her own.
+    assert any(o["address"] == KENJI for o in client.get("/approvals/summary").json()["offers"])

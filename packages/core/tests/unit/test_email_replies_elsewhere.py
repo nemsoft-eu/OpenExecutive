@@ -101,3 +101,22 @@ def test_the_sender_check_retries_only_an_empty_read(monkeypatch: Any) -> None:
         assert aio.run(poller._prove_sender(None, "m1", "a@x.example")) is False
         assert len(checks) == tries
     assert len(waits) == 2
+
+
+def test_a_blank_client_and_a_factory_reset_drop_the_replies(tmp_path: Any, monkeypatch: Any) -> None:
+    # Found by recipient address, so a reply kept for the previous client
+    # would reach an advisor who also writes for the next one.
+    import inspect
+
+    from openexecutive.cli.fixture_loader import reset_all_state
+    from openexecutive.clients import slots
+    from openexecutive.integrations import email_replies
+    from openexecutive.memory import episodic
+
+    db = tmp_path / "episodic.db"
+    monkeypatch.setattr(episodic, "DB_PATH", db)
+    email_replies.record("email:t1", "advisor@firm.example", "Old client figures.", db_path=db)
+    assert email_replies.recent_elsewhere("email:t2", ["advisor@firm.example"], db_path=db)
+    slots._wipe_per_client_tables()
+    assert email_replies.recent_elsewhere("email:t2", ["advisor@firm.example"], db_path=db) == []
+    assert f'"{email_replies.TABLE}"' in inspect.getsource(reset_all_state)

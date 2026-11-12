@@ -11636,7 +11636,11 @@ clients:
     fixtures: per-company research never crosses companies). Activating a
     blank slot (no state.db yet) factory-wipes the per-client tables and
     re-seeds defaults (departments, principal briefs, cadences) so the new
-    client's Today works without a process restart.
+    client's Today works without a process restart. That wipe and
+    reset_all_state also clear email_thread_replies
+    (integrations.email_replies): recent_elsewhere finds rows by the
+    recipient's address, so an advisor writing for two clients would be
+    shown the previous client's replies.
     Wipe lists must cover the DERIVED CACHES, not just authored state.
     briefing_narrative and person_insights were wiped by NO path, and because
     /today serves the cached narrative unconditionally (regenerating only in a
@@ -13072,7 +13076,10 @@ delegation:
     (LeadRulesEditor on POST/DELETE /take-the-lead/rules: the list with a
     Waits / Goes badge and the order they're read in, Add a rule opening
     Always wait for me / Goes on its own, the kind and the value) and a link to
-    Settings → Your Executive. Say it was written with AI (both switches)
+    Settings → Your Executive. Its GET /approvals/summary (api/routes/approvals.py)
+    reads the caller's own People entry, an owner's too, never the oldest
+    principal's: with co-principals that row was another owner's, and As you
+    showed their reply subjects and correspondents. Say it was written with AI (both switches)
     is a card on the As you tab. Setup
     status light your_gmail (amber while the inbox watcher is erroring,
     rate-limited or has 25 cards waiting); the API protection light says

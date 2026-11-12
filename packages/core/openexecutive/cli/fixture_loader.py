@@ -875,7 +875,10 @@ async def reset_all_state(
                                # Take the lead: switches, rules, its log.
                                *TAKE_THE_LEAD_TABLES,
                                # Each department's own notes.
-                               "department_notes"):
+                               "department_notes",
+                               # What the Executive mailed back
+                               # (integrations.email_replies).
+                               "email_thread_replies"):
                     if _conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
                     ).fetchone():
