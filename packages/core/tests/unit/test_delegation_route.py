@@ -511,16 +511,22 @@ def test_the_dial_climbs_one_switch_at_a_time(
     pid = ids["principal"]
     gmail["status"] = "connected"
     assert route.reach_of(pid) == "off"
+    assert _reach(client, "when_asked").status_code == 200
+    assert is_enabled(pid) and not inbox.get_watch(pid).enabled and not handle_it.get(pid).enabled
     assert _reach(client, "inbox").status_code == 200
-    assert is_enabled(pid) and inbox.get_watch(pid).enabled and not handle_it.get(pid).enabled
+    assert inbox.get_watch(pid).enabled and handle_it.get(pid).enabled
     assert route.reach_of(pid) == "inbox"
-    _reach(client, "bold")
-    assert handle_it.get(pid).enabled and handle_it.get(pid).mode == "bold"
-    _reach(client, "everything")
-    assert route.reach_of(pid) == "everything"
-    # Across the sending steps: Everything goes, the level stays the one picked.
-    _reach(client, "careful")
-    assert route.reach_of(pid) == "careful" and not handle_it.leading(pid)
+    for gone in ("bold", "everything", "careful"):
+        assert _reach(client, gone).status_code == 422
+
+
+def test_an_older_app_s_handle_it_step_means_inbox(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
+) -> None:
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    assert _reach(client, "handle_it").status_code == 200
+    assert route.reach_of(pid) == "inbox"
 
 
 def test_moving_down_turns_everything_above_off(
@@ -530,10 +536,10 @@ def test_moving_down_turns_everything_above_off(
 
     pid = ids["principal"]
     gmail["status"] = "connected"
-    _reach(client, "everything")
+    _reach(client, "inbox")
     assert _reach(client, "when_asked").status_code == 200
     assert is_enabled(pid) and not inbox.get_watch(pid).enabled
-    assert not handle_it.get(pid).enabled and not handle_it.leading(pid)
+    assert not handle_it.get(pid).enabled
     _reach(client, "off")
     assert route.reach_of(pid) == "off" and not is_enabled(pid)
 
@@ -544,51 +550,15 @@ def test_without_a_mailbox_the_dial_stays_off(client: TestClient, ids: dict[str,
     assert route.reach_of(ids["principal"]) == "off"
 
 
-def test_sending_needs_a_signed_sign_in_but_holding_back_doesnt(
+def test_holding_back_needs_no_signed_sign_in(
     client: TestClient, ids: dict[str, int], gmail: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openexecutive.delegation import handle_it
-
     pid = ids["principal"]
     gmail["status"] = "connected"
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    _reach(client, "bold")
-    monkeypatch.delenv("OE_LOCAL_LOGIN")
-    # Without signed sign-ins it can't go higher...
-    assert _reach(client, "everything").status_code == 409
-    assert route.reach_of(pid) == "bold"
-    # ...but a lower level, or no sending at all, is always possible.
-    assert _reach(client, "careful").status_code == 200 and handle_it.get(pid).mode == "careful"
-    assert _reach(client, "inbox").status_code == 200 and route.reach_of(pid) == "inbox"
-
-
-def test_everything_is_the_owners_and_not_in_training(
-    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from openexecutive.delegation import training
-
-    gmail["status"] = "connected"
-    _reach(client, "balanced")
-    training.set_(ids["principal"], {training.REPLIES: True}, updated_by="t")
-    resp = _reach(client, "everything")
-    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "in_training"
-    assert route.reach_of(ids["principal"]) == "balanced"
-
-
-def test_training_set_before_sending_holds_once_it_sends(
-    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
-) -> None:
-    from openexecutive.delegation import handle_it, training
-
-    pid = ids["principal"]
-    gmail["status"] = "connected"
     _reach(client, "inbox")
-    resp = client.put("/delegation/training", json={"replies": True, "follow_ups": True}, headers=OWNER)
-    assert resp.status_code == 200
-    _reach(client, "careful")
-    assert handle_it.get(pid).enabled
-    t = training.get(pid)
-    assert t.replies and t.follow_ups
+    monkeypatch.delenv("OE_LOCAL_LOGIN")
+    assert _reach(client, "when_asked").status_code == 200 and route.reach_of(pid) == "when_asked"
 
 
 def test_one_settings_change_asks_for_the_mailbox_status_once(monkeypatch: pytest.MonkeyPatch) -> None:

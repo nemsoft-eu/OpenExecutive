@@ -292,6 +292,9 @@ def _lessons_for_call(query: str) -> str:
 
     session = current_session.get()
     person_id = getattr(session, "caller_person_id", None) if session is not None else None
+    if person_id is None and session is not None:
+        # A shared call: the lessons of the person it belongs to.
+        person_id = getattr(session, "lessons_person_id", None)
     return lessons_for_query(person_id, query)
 
 
@@ -325,8 +328,9 @@ async def route_to_specialist(
     only).
 
     ``standing_facts`` is the STANDING FACTS block (``memory.facts``) the
-    same way: "" sends none, ``None`` reads the store — so a workflow step's
-    analysis uses the principal's corrections just as a chat consult does.
+    same way: "" sends none, ``None`` reads the store, the facts that bear
+    on ``query`` first — so a workflow step's analysis uses the principal's
+    corrections just as a chat consult does.
     """
     resolved = resolve_specialist_name(specialist_name)
     # `specialist_name` may be any JSON value off a local backend, so render it
@@ -354,7 +358,7 @@ async def route_to_specialist(
     if standing_facts is None:
         from openexecutive.memory.facts import render_facts_for_prompt
 
-        standing_facts = await asyncio.to_thread(render_facts_for_prompt)
+        standing_facts = await asyncio.to_thread(render_facts_for_prompt, query=query)
     with trace_span("specialist {specialist}", specialist=specialist_name, actor=actor):
         return await agent.analyze(
             query=query,
@@ -502,19 +506,26 @@ async def _prefetch_department_for_call(
     registry and queries the dept peer's Honcho representation. Returns
     "" when the specialist has no owning department (e.g. ``triage``)
     or when Honcho is disabled / fails — the wrapper's own degrade-on-
-    failure semantics already audit the outcome.
+    failure semantics already audit the outcome. When Honcho has nothing
+    (off, or empty), the department's own notes answer instead
+    (``memory.department_notes``).
     """
     from openexecutive.departments.registry import slug_for_specialist
+    from openexecutive.memory import department_notes
     from openexecutive.memory.honcho_client import prefetch_department
 
     slug = slug_for_specialist(call["specialist"])
     if slug is None:
         return ""
-    return await prefetch_department(
+    answer = await prefetch_department(
         query=call["query"],
         department_slug=slug,
         session_id=session_id,
     )
+    if answer:
+        return answer
+    # A sqlite read: off the event loop, like every parallel specialist call.
+    return await asyncio.to_thread(department_notes.for_prompt, slug, call["query"])
 
 
 async def route_parallel(

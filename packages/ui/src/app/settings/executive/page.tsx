@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useExecutiveStatus } from "@/components/executive/ExecutiveStatusContext";
 import ExecutiveRunSwitch from "@/components/executive/ExecutiveRunSwitch";
 import VoicePicker from "@/components/executive/VoicePicker";
-import OutsideContentCard from "@/components/settings/OutsideContentCard";
+import ApprovalsLinkCard from "@/components/settings/ApprovalsLinkCard";
 import SettingsCard from "@/components/settings/SettingsCard";
 import SettingsSubpage from "@/components/settings/SettingsSubpage";
 
@@ -16,7 +16,7 @@ const ALWAYS_DOES: { title: string; text: string }[] = [
   { title: "Looks over your day", text: "Spots what's stuck or coming up and tells you." },
   {
     title: "Looks back at its chats",
-    text: "After a chat goes quiet, it fixes what it left undone and grades its own answers. What it learned is under Pulse, in Learning.",
+    text: "After a chat goes quiet, it fixes what it left undone and grades its own answers. What it learned is on the Memory page, in Learning.",
   },
   { title: "Research and monitoring", text: "Follows the topics and sources you asked it to watch." },
 ];
@@ -30,18 +30,18 @@ export default function ExecutiveSettingsPage() {
   return (
     <SettingsSubpage
       title="Your Executive"
-      description="Pause it, when it checks with you, what it always does without asking, and the voice it answers in."
+      description="Pause it, what it always does without asking, and the voice it answers in."
     >
       <SettingsCard
         title="Pause everything"
-        description="Stops everything it does on its own, Take the lead included, plus briefs, nudges and research. It still answers when someone messages it, and anything you tap Send or Approve on still goes."
+        description="Stops everything it does on its own, As me included, plus briefs, nudges and research. It still answers when someone messages it, and anything you tap Send or Approve on still goes."
       >
         <ExecutiveRunSwitch />
       </SettingsCard>
 
       <PausedNote />
 
-      <OutsideContentCard />
+      <ApprovalsLinkCard />
 
       <SettingsCard title="Always does on its own" description="No switch for these. Pause stops them too.">
         <ul className="flex flex-col gap-3">
@@ -55,8 +55,8 @@ export default function ExecutiveSettingsPage() {
       </SettingsCard>
 
       <p className="text-[15px] text-fg-muted">
-        Take the lead, booking meetings and what it sends as you are under{" "}
-        <Link href="/delegate/take-the-lead" className="font-medium text-accent underline-offset-2 hover:underline">
+        Approvals, what it does as you and as itself, In training and your rules are under{" "}
+        <Link href="/delegate" className="font-medium text-accent underline-offset-2 hover:underline">
           Delegate
         </Link>
         .

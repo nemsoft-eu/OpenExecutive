@@ -11,10 +11,11 @@ import {
   type MayDoSection,
   type WhatItMayDo,
 } from "@/lib/api";
-import { SENDS_HREF, WRITES_HREF } from "@/lib/reach";
+import { APPROVALS_HREF, AS_ME_HREF, AS_YOU_HREF } from "@/lib/reach";
 import { GROUP_OF, GROUP_ORDER, changedRows, groupTitle, rowId, snapshot, type Group } from "@/lib/whatItDoes";
+import { PageSpinner } from "@/components/ui/Spinner";
 
-// What it does for you: read-only, beside the Delegate tabs
+// What it does for you: read-only, beside the Delegate page
 // (WhatItDoesPanel). With the viewer's settings right now, what goes out on
 // its own, what asks first and what it only writes, each with the setting
 // that decides it. It reloads when a setting is saved (DELEGATION_CHANGED)
@@ -38,10 +39,10 @@ const GROUP_DOT: Record<Group, string> = {
 const CHANGED_MS = 10_000;
 
 function settingHref(setting: string): { href: string; label: string } | null {
-  if (setting === "act_as_me") return { href: WRITES_HREF, label: "Act as me" };
-  if (setting === "handle_it") return { href: SENDS_HREF, label: "Handle it for me" };
-  if (setting === "take_the_lead") return { href: "/delegate/take-the-lead", label: "Take the lead" };
-  if (setting === "pause") return { href: "/settings/executive", label: "Your Executive" };
+  if (setting === "act_as_me") return { href: AS_YOU_HREF, label: "As you" };
+  if (setting === "take_the_lead") return { href: AS_ME_HREF, label: "As me" };
+  if (setting === "pause") return { href: AS_ME_HREF, label: "Pause everything" };
+  if (setting === "approvals") return { href: APPROVALS_HREF, label: "Approvals" };
   if (setting.startsWith("department:")) {
     const slug = setting.slice("department:".length);
     return { href: `/departments/${encodeURIComponent(slug)}`, label: "Department settings" };
@@ -170,7 +171,7 @@ export default function WhatItDoes() {
     };
   }, [load]);
 
-  if (state === "loading") return <p className="text-sm text-fg-muted">Loading…</p>;
+  if (state === "loading") return <PageSpinner />;
   if (state === "error") return <p className="text-sm text-fg-muted">Couldn&apos;t load this. Reload the page to try again.</p>;
   if (state === "hidden" || !data) return <p className="text-sm text-fg-muted">Only people on the team can see this.</p>;
 

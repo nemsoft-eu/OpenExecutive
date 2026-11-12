@@ -205,12 +205,42 @@ def test_a_job_result_is_saved_into_the_folder_under_the_name_asked_for(
     assert base64.b64decode(created[0]["base64_content"]) == b"half 2"
 
 
-def test_an_outsiders_folder_gets_nothing(company: Session, drive: list) -> None:
+def _cards(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    from openexecutive.orchestrator import levels
+
+    held: list[tuple[str, str]] = []
+
+    def card_or(blocked: str, tool: str, arguments: dict[str, Any], *, reason: str, mcp: bool = True) -> str:
+        held.append((tool, reason))
+        return json.dumps({"status": "waiting_for_approval", "blocked": json.loads(blocked)})
+
+    monkeypatch.setattr(levels, "card_or", card_or)
+    return held
+
+
+def test_an_outsiders_folder_is_an_approve_card_below_hands_off(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = _cards(monkeypatch)
     drive[0][1]["value"] = "Mallory (mallory@outside.example)"
     conversation_files.keep(company.session_id, {"a.pdf": b"x"})
     out = _save({"file": "file:a.pdf", "folder": FOLDER})
-    assert out["status"] == "failed" and "outside the team" in out["detail"]
+    assert out["status"] == "waiting_for_approval" and "outside the team" in out["blocked"]["detail"]
+    assert held == [("save_file", "file_place")]
     assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
+
+
+def test_hands_off_saves_into_an_outsiders_folder(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.orchestrator import levels
+
+    monkeypatch.setattr(levels, "relaxed", lambda: True)
+    drive[0][1]["value"] = "Mallory (mallory@outside.example)"
+    conversation_files.keep(company.session_id, {"a.pdf": b"x"})
+    out = _save({"file": "file:a.pdf", "folder": FOLDER})
+    assert out["status"] == "saved"
+    assert any(n.endswith("create_drive_file") for n, _ in drive[1:])
 
 
 def test_after_an_outside_read_it_saves_without_their_exact_words(
@@ -362,8 +392,8 @@ def test_a_save_files_card_refuses_what_it_shouldnt_hold(
     twice = action_cards.check([{"kind": "save_files", "folder": FOLDER, "files": one + one}], owner, now=now)
     assert isinstance(twice, list) and len(twice[0]["input"]["files"]) == 1
     # Never carried out on its own, whatever the settings.
-    assert action_cards._on_its_own_refusal(owner, twice, now) in ("tap_only", "training_off", "act_as_me_off", "signing_off")
-    monkeypatch.setattr("openexecutive.delegation.training.get", lambda _pid: SimpleNamespace(actions=True, actions_without_asking=True))
+    monkeypatch.setattr("openexecutive.delegation.handle_it.get", lambda _pid: SimpleNamespace(enabled=True))
+    monkeypatch.setattr("openexecutive.delegation.handle_it.approvals_hold", lambda: False)
     monkeypatch.setattr("openexecutive.delegation.settings.can_delegate", lambda _p: True)
     monkeypatch.setattr("openexecutive.delegation.settings.is_enabled", lambda _pid: True)
     monkeypatch.setattr("openexecutive.delegation.handle_it.signing_ok", lambda: True)
@@ -405,9 +435,11 @@ def test_a_team_only_folder_needs_no_card_and_a_lost_copy_isnt_saved(
     assert got["status"] == "failed" and "no longer kept" in got["detail"]
 
 
-def test_a_folder_open_to_anyone_with_the_link_gets_nothing(
+def test_a_folder_open_to_anyone_with_the_link_is_an_approve_card(
     company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _cards(monkeypatch)
+
     async def call(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
         drive.append((name, arguments))
         return _info("John (ceo@co.example)", perms=OUTSIDE_PERMS)
@@ -415,7 +447,7 @@ def test_a_folder_open_to_anyone_with_the_link_gets_nothing(
     monkeypatch.setattr(save, "_call", call)
     conversation_files.keep(company.session_id, {"a.pdf": b"x"})
     out = _save({"file": "file:a.pdf", "folder": FOLDER})
-    assert out["status"] == "failed" and "Everyone at partner.example" in out["detail"]
+    assert out["status"] == "waiting_for_approval" and "Everyone at partner.example" in out["blocked"]["detail"]
     assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
 
 
@@ -753,3 +785,32 @@ def test_a_file_made_from_mail_saves_when_asked_in_any_words(company: Session, d
     company.turn_delegation = TurnDelegation(offered=True, session_id=company.session_id)
     pin_turn_delegation(company, "Svane them")
     assert _save({"file": "file:half.pdf", "folder": FOLDER})["status"] == "saved"
+
+
+def test_drive_saves_run_a_few_at_once(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filing a whole email's attachments: Google saves overlap, up to
+    GOOGLE_PARALLEL_SAVES at a time, instead of one after another."""
+    names = [f"Report {i}.xlsx" for i in range(10)]
+    conversation_files.keep(company.session_id, {n: b"x" for n in names})
+    inner = save._call
+    running = {"now": 0, "most": 0}
+
+    async def slow(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
+        running["now"] += 1
+        running["most"] = max(running["most"], running["now"])
+        await asyncio.sleep(0.01)
+        running["now"] -= 1
+        return await inner(gateway, name, arguments)
+
+    monkeypatch.setattr(save, "_call", slow)
+
+    async def all_of_them() -> list[str]:
+        return await asyncio.gather(*(
+            file_tools.handle_save_file({"file": f"file:{n}", "folder": FOLDER}) for n in names
+        ))
+
+    results = [json.loads(r) for r in asyncio.run(all_of_them())]
+    assert all(r["status"] == "saved" for r in results)
+    assert running["most"] == save.GOOGLE_PARALLEL_SAVES

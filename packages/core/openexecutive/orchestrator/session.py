@@ -178,6 +178,16 @@ class Session:
     # as the web app's. Inbound vocabulary — see `normalize_channel`.
     origin_channel: str = ""
     origin_channel_ref: str = ""
+    # Where this session's turns count a lesson as used (`memory.lessons`
+    # `SURFACES`): set by a caller whose turns are not a plain chat, such as
+    # a one-to-one call ("one_on_one") or a team meeting ("meeting"). Empty
+    # means a chat, or an email when `origin_channel` says so.
+    memory_surface: str = ""
+    # Whose lessons a turn with no single speaker reads: the person a shared
+    # call belongs to. Only lessons follow this id. Figures the Executive
+    # worked out and what it knows about a person stay with a turn that
+    # person speaks alone (`person_id`).
+    lessons_person_id: int | None = None
     # True only for a session minted by the web chat route. `origin_channel`
     # cannot stand in for this: alert review, the CLI, the MCP server, the
     # scheduler and the unattended workflows all leave it empty while being
@@ -207,7 +217,7 @@ class Session:
     # person checks), counts as a verified surface for `caller_person_id`,
     # and offers anything that reaches another person only as an approval
     # card (`propose_actions`), which goes on its own only by the speaker's
-    # Handle it for me (`action_cards.on_its_own_refusal`). It is still
+    # Handle it for me and Approvals (`action_cards.on_its_own_refusal`). It is still
     # never offered `schedule_tools.MCP_CLIENT_ACTING_WITHHELD_TOOLS`, Act as
     # me's mailbox tools, recall_history or extension tools.
     mcp_client_may_act: bool = False
@@ -236,13 +246,6 @@ class Session:
     # resolved `caller_person_id` from a sender identity the platform
     # authenticated, never from anything the message says, and per turn.
     speaker_verified: bool = False
-    # The sender's People entry on a channel that names its sender but isn't
-    # one `people_tools` verifies (Google Chat, by the Google account email on
-    # its signed event). Read only by the department gate
-    # (`department_gate.speaker`), so the principal there isn't held and a
-    # teammate gets their own department's authority. Never a grant for
-    # anything else, and never set alongside `caller_person_id`.
-    gate_sender_person_id: int | None = None
     # Set by a channel adapter when nobody but the speaker (and the
     # Executive) can read the conversation, e.g. a direct message
     # (`delegation.settings.private_conversation`, which also needs
@@ -369,9 +372,14 @@ class Session:
     # pinned to that turn's viewer, so what it drafts is theirs. An
     # ``artifact_records.Viewer``; None derives it from this session.
     documents_viewer: Any = None
-    # Evals and tests only (``delegation.settings.DelegationOverride``): run
-    # as if the speaker had Act as me, against a fake mailbox.
+    # Run as if the speaker had Act as me, against the mailbox it carries
+    # (``delegation.settings.DelegationOverride``): an eval's or test's fake
+    # one, or the person's own for the inbox's work turn
+    # (``delegation.card_work``).
     delegation_override: Any = None
+    # The inbox's work turn (``delegation.card_work``): the reply card whose
+    # email it is doing, which ``update_reply_card`` writes back to.
+    reply_card_work: int | None = None
     # A replay of a graded turn (``memory.replay``): the chat loop runs as it
     # would for the recorded surface and speaker, reads for real, and every
     # tool that sends, posts, books, schedules, runs or changes stored state

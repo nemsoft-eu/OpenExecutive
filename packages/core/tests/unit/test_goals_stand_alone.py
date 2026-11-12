@@ -220,6 +220,54 @@ def test_goal_review_grades_uncovered_goals_and_skips_fresh_ones(monkeypatch: py
     assert len(calls) == 1
 
 
+def test_a_done_goal_is_left_out_of_the_reviews(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.workflows.department_check_in import _render_goals, persist_goal_verdicts
+
+    done = _goal(None, "Launch", status="done")
+    open_goal = _goal(None, "Hire a lead")
+    calls: list[dict[str, Any]] = []
+
+    async def fake_route(**kw: Any) -> str:
+        calls.append(kw)
+        # A grader that names the done goal anyway changes nothing on it.
+        return json.dumps({
+            "verdicts": [
+                {"goal_id": done, "status": "off_track", "rationale": "x"},
+                {"goal_id": open_goal, "status": "at_risk", "rationale": "No candidates."},
+            ],
+            "narrative": "",
+        })
+
+    monkeypatch.setattr("openexecutive.orchestrator.router.route_to_specialist", fake_route)
+    now = datetime.now(UTC)
+    assert asyncio.run(goal_review.run_review(now)) == 1
+    assert f"[id={done}]" not in calls[0]["query"] and f"[id={open_goal}]" in calls[0]["query"]
+    assert store.get_goal(done).status == "done"  # type: ignore[union-attr]
+
+    # The shared helpers hold on their own: nothing rendered, nothing written.
+    group = goal_review.review_group([store.get_goal(done)])  # type: ignore[list-item]
+    assert f"[id={done}]" not in _render_goals(group)
+    written = persist_goal_verdicts(
+        group, [{"goal_id": done, "status": "at_risk", "rationale": "x"}],
+        now=now, period="2026-01-05", actor="test",
+    )
+    assert written == [] and store.get_goal(done).status == "done"  # type: ignore[union-attr]
+
+    # Marked done while the review ran: the old snapshot writes and logs nothing.
+    stale = goal_review.review_group([store.get_goal(open_goal)])  # type: ignore[list-item]
+    store.update_goal(open_goal, status="done")
+    written = persist_goal_verdicts(
+        stale, [{"goal_id": open_goal, "status": "off_track", "rationale": "x"}],
+        now=now, period="2026-01-05", actor="test",
+    )
+    assert written == [] and store.get_goal(open_goal).status == "done"  # type: ignore[union-attr]
+
+    # With only done goals left, the review makes no call.
+    calls.clear()
+    assert asyncio.run(goal_review.run_review(now + timedelta(days=8))) == 0
+    assert calls == []
+
+
 def test_goal_review_with_nothing_to_grade_makes_no_call(monkeypatch: pytest.MonkeyPatch) -> None:
     async def boom(**_kw: Any) -> str:
         raise AssertionError("no model call expected")
@@ -332,6 +380,52 @@ def test_patch_and_delete_reach_any_goal(client: TestClient) -> None:
     assert client.delete(f"/goals/{gid}").status_code == 404
 
 
+def test_a_person_changing_the_status_counts_as_a_check(client: TestClient) -> None:
+    gid = client.post("/goals", json={"key_result": "Launch"}).json()["id"]
+    assert store.get_goal(gid).last_reviewed_at == ""  # type: ignore[union-attr]
+    # An edit that leaves the status alone is not a check.
+    client.patch(f"/goals/{gid}", json={"status": "on_track", "current": "Half done"})
+    assert store.get_goal(gid).last_reviewed_at == ""  # type: ignore[union-attr]
+    client.patch(f"/goals/{gid}", json={"status": "at_risk"})
+    assert store.get_goal(gid).last_reviewed_at != ""  # type: ignore[union-attr]
+
+
+def test_a_goal_can_be_marked_done_and_reopened(client: TestClient, as_principal: None) -> None:
+    from openexecutive.orchestrator.department_tools import handle_update_department_goal
+
+    gid = client.post("/goals", json={"key_result": "Launch"}).json()["id"]
+    assert client.patch(f"/goals/{gid}", json={"status": "done"}).json()["status"] == "done"
+    assert client.patch(f"/goals/{gid}", json={"status": "on_track"}).json()["status"] == "on_track"
+    # The Executive marks one done when told it is finished.
+    result = _tool(handle_update_department_goal,
+                   {"goal_id": gid, "status": "done", "rationale": "They said it shipped."})
+    assert result["status"] == "ok"
+    assert store.get_goal(gid).status == "done"  # type: ignore[union-attr]
+
+
+def test_a_status_change_still_leaves_the_goal_for_the_next_review(client: TestClient) -> None:
+    # The stamp is written before updated_at, so the edit reads as newer
+    # than the check: the department check-in and the weekly goal review
+    # still grade the goal rather than skipping it as fresh.
+    from datetime import UTC, datetime
+
+    from openexecutive.departments import registry
+    from openexecutive.departments.goal_review import _needs_review
+    from openexecutive.workflows.department_check_in import needs_check_in
+
+    dept = store.create_department("Finance", specialist_key="finance")
+    gid = _goal(dept.config.slug)
+    client.patch(f"/goals/{gid}", json={"status": "off_track"})
+    goal = store.get_goal(gid)
+    assert goal is not None and goal.last_reviewed_at
+    now = datetime.now(UTC)
+    assert _needs_review(goal, now)
+    registry.invalidate()
+    state = registry.get_state(dept.config.slug)
+    assert state is not None
+    assert needs_check_in(state, now) is None
+
+
 def test_department_routes_still_reach_only_their_own_goals(client: TestClient) -> None:
     store.create_department("Sales")
     loose = _goal(None)
@@ -370,6 +464,49 @@ def test_update_tool_reaches_a_goal_with_no_department() -> None:
                   {"department_slug": "sales", "goal_id": gid, "status": "on_track",
                    "rationale": "x"})
     assert "no department" in wrong["error"]
+
+
+def test_only_the_principal_marks_a_goal_done_from_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import department_tools
+    from openexecutive.orchestrator.department_tools import (
+        handle_create_goal,
+        handle_update_department_goal,
+    )
+
+    gid = _goal(None)
+    payload = {"goal_id": gid, "status": "done", "rationale": "Shipped."}
+    monkeypatch.setattr(department_tools, "_principal_asked", lambda: False)
+    refused = _tool(handle_update_department_goal, payload)
+    assert "only the principal can mark a goal done" in refused["error"]
+    assert store.get_goal(gid).status == "on_track"  # type: ignore[union-attr]
+
+    monkeypatch.setattr(department_tools, "_principal_asked", lambda: True)
+    monkeypatch.setattr(department_tools, "_goals_created_by_turn", {})
+    assert _tool(handle_update_department_goal, payload)["status"] == "ok"
+    assert store.get_goal(gid).status == "done"  # type: ignore[union-attr]
+    # Nor does anyone else reopen it.
+    monkeypatch.setattr(department_tools, "_principal_asked", lambda: False)
+    reopen = _tool(handle_update_department_goal,
+                   {"goal_id": gid, "status": "on_track", "rationale": "Reopen it."})
+    assert "only the principal can reopen it" in reopen["error"]
+    assert store.get_goal(gid).status == "done"  # type: ignore[union-attr]
+    monkeypatch.setattr(department_tools, "_principal_asked", lambda: True)
+    # A finished goal doesn't block the same goal for a new period.
+    again = _tool(handle_create_goal, {"key_result": store.get_goal(gid).key_result,  # type: ignore[union-attr]
+                                       "target": "20", "rationale": "Same goal next quarter."})
+    assert again.get("status") == "ok", again
+    # A new goal can't start as done.
+    born_done = _tool(handle_create_goal, {"key_result": "Open a second office", "target": "1 office", "status": "done",
+                                           "rationale": "They said so."})
+    assert "can't start as done" in born_done["error"]
+
+
+def test_a_review_does_not_reopen_a_goal_marked_done() -> None:
+    gid = _goal(None, "Launch", status="done")
+    assert store.record_goal_review(gid, status="at_risk", last_reviewed_at="2026-01-05T09:00:00+00:00") is False
+    # A stamp-only update finds the goal and leaves it as it is.
+    assert store.update_goal(gid, last_reviewed_at="2026-01-05T09:00:00+00:00") is True
+    assert store.get_goal(gid).status == "done"  # type: ignore[union-attr]
 
 
 def test_create_tool_without_an_area_makes_no_department(as_principal: None) -> None:

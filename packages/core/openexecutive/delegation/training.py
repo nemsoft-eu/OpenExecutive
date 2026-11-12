@@ -1,51 +1,37 @@
-"""Act as me, in training: each setting can be put in training on its own.
+"""As you, in training: one switch and what it learns.
 
-A person turns training on per setting (``SETTINGS``, one row each in
-``delegation_training``, absent means not in training), from the Training
-card on the Act as me page:
+**In training** (``training``, one row in ``delegation_training``, absent
+means off) sits above Approvals for everything sent as the person. While it
+is on, nothing goes out as them on its own, on any level: every reply,
+follow-up, invite answer and suggested action waits on its card, which says
+what it would have done. Send (Accept, Approve) does it once. Ticked "Send to
+them on its own next time", it also allows that person (``allow_person``,
+one allowance per address): from then on replies to them, follow-ups to
+them, their invites and messages or meetings with them go on their own,
+where Approvals lets them (Careful still holds everything; the checks
+``handle_it.refusal`` always makes still apply). Everything not allowed yet
+keeps coming as a card. Off, Approvals alone decides.
 
-- **Replies** (``replies``): every reply the inbox watcher drafts waits on its
-  card, whatever Handle it for me's dial says. The card adds **Send + allow**:
-  it sends that reply on the person's tap, as Send does, and from then on
-  replies to that same sender may go on their own while Handle it for me is
-  on, under the dial's limits and every check Handle it always makes
-  (``handle_it.refusal``), strangers included. A meeting invite card
-  (``delegation.invites``) adds the same tick, "Accept from them on its own
-  next time": from then on invites from that sender with no clash are
-  accepted on their own while Handle it for me is on.
-- **Follow-ups** (``follow_ups``): every follow-up waits; Send + allow on a
-  follow-up card lets follow-ups to exactly those people go on their own.
-- **Suggested actions** (``actions``): an action card from someone's mail
-  (``delegation.action_cards``) adds **Approve + allow**: from then on a card
-  whose every action is one they allowed (a message to that person, a meeting
-  with exactly those people) is carried out at once, under the checks in
-  ``action_cards.on_its_own_refusal``. A new contact always waits.
-- **Suggested actions, On** (``actions_on``, a switch of its own and not a
-  setting in training): an action card is carried out at once, no tap and no
-  allow needed, under the same checks plus two more
-  (``action_cards.on_its_own_refusal``): a new contact, or anyone whose
-  roster entry is under a week old, always waits. In training wins when both
-  are set.
-- **Drafts** (``drafts``): nothing is sent. When they change a reply's draft
-  in their mailbox before tapping Send and tick "Do it like this next time",
-  what they sent is kept as an example the ghostwriter follows when it next
-  writes to that person (``ghostwriter``'s ``<writer_example>``), from the
-  inbox and from chat.
+**Drafts** (``drafts``): nothing is sent. When they change a reply's draft
+in their mailbox before tapping Send and tick "Do it like this next time",
+what they sent is kept as an example the ghostwriter follows when it next
+writes to that person (``ghostwriter``'s ``<writer_example>``), from the
+inbox and from chat.
 
-What it learns lives in Take the lead's one "What it's learned" list
+What it keeps lives in Take the lead's one "What it's learned" list
 (``take_the_lead.allow``), as feature ``act_as_me`` with the person's id:
-theirs alone to see and remove, and never in anyone else's prompts. Each
-item's setting is read from its key (``setting_of``). Allowing happens only
-after a tap the API knows is the person's (``reply_send``, the rule Send
-uses; ``action_cards.approve``).
+theirs alone to see and remove, and never in anyone else's prompts. Keeping
+happens only after a tap the API knows is the person's (``reply_send``, the
+rule Send uses).
 """
 from __future__ import annotations
 
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,21 +40,12 @@ from openexecutive.orchestrator.take_the_lead import FEATURE_ACT_AS_ME, Allowed
 
 logger = logging.getLogger(__name__)
 
-REPLIES = "replies"
-FOLLOW_UPS = "follow_ups"
-ACTIONS = "actions"
+TRAINING = "training"
 DRAFTS = "drafts"
-SETTINGS: tuple[str, ...] = (REPLIES, FOLLOW_UPS, ACTIONS, DRAFTS)
-# Suggested actions On: carried out with no allow. Stored with the settings,
-# but nothing is learned under it.
-ACTIONS_ON = "actions_on"
-SWITCHES: tuple[str, ...] = (*SETTINGS, ACTIONS_ON)
+SETTINGS: tuple[str, ...] = (TRAINING, DRAFTS)
 
 # What each kind of key teaches, by the action in it.
-_SETTING_OF_ACTION = {
-    "reply": REPLIES, "follow_up": FOLLOW_UPS, "message": ACTIONS, "invite": ACTIONS, "style": DRAFTS,
-    "invite_from": REPLIES,
-}
+_SETTING_OF_ACTION = {"style": DRAFTS, "person": TRAINING}
 
 # The longest example kept, after the quoted thread is dropped.
 EXAMPLE_CHARS = 1000
@@ -77,19 +54,12 @@ EXAMPLE_CHARS = 1000
 @dataclass(frozen=True)
 class Training:
     person_id: int
-    replies: bool = False
-    follow_ups: bool = False
-    actions: bool = False
+    # In training: nothing goes out as them on its own but to people they allowed.
+    training: bool = False
     drafts: bool = False
-    actions_on: bool = False
 
     def on(self, setting: str) -> bool:
-        return bool(getattr(self, setting, False)) if setting in SWITCHES else False
-
-    @property
-    def actions_without_asking(self) -> bool:
-        """Suggested actions set to On: out of training, carried out with no allow."""
-        return self.actions_on and not self.actions
+        return bool(getattr(self, setting, False)) if setting in SETTINGS else False
 
 
 # --------------------------------------------------------------------------- #
@@ -111,11 +81,10 @@ def _connect(db_path: Path | None) -> sqlite3.Connection:
     return conn
 
 
-def get(person_id: int, *, db_path: Path | None = None) -> Training:
+def get(person_id: int, *, db_path: Path | None = None, strict: bool = False) -> Training:
     """Which of ``person_id``'s settings are in training. Never raises:
-    unreadable is in training for Replies and Follow-ups (they wait) and not
-    for Suggested actions (they wait too) or Drafts (nothing kept), and
-    Suggested actions is not On."""
+    unreadable is not (nothing kept), unless ``strict``, for a caller that
+    must hold rather than guess."""
     try:
         conn = _connect(db_path)
         try:
@@ -126,22 +95,24 @@ def get(person_id: int, *, db_path: Path | None = None) -> Training:
         finally:
             conn.close()
     except Exception:
+        if strict:
+            raise
         logger.warning("delegation.training: couldn't read the switches", exc_info=True)
-        return Training(person_id=person_id, replies=True, follow_ups=True)
-    on = {setting for setting, enabled in rows if enabled and setting in SWITCHES}
-    return Training(person_id=person_id, **{s: s in on for s in SWITCHES})
+        return Training(person_id=person_id)
+    on = {setting for setting, enabled in rows if enabled and setting in SETTINGS}
+    return Training(person_id=person_id, **{s: s in on for s in SETTINGS})
 
 
 def set_(
     person_id: int, changes: dict[str, bool], *, updated_by: str, db_path: Path | None = None,
 ) -> Training:
-    """Turn settings in or out of training, or Suggested actions On or off
-    (callers authorize first). An unknown setting is ignored."""
+    """Turn settings in or out of training (callers authorize first). An
+    unknown setting is ignored."""
     now = datetime.now(UTC).isoformat()
     conn = _connect(db_path)
     try:
         for setting, enabled in changes.items():
-            if setting not in SWITCHES:
+            if setting not in SETTINGS:
                 continue
             conn.execute(
                 f"INSERT INTO {TRAINING_TABLE} (person_id, setting, enabled, updated_at, updated_by) "  # noqa: S608
@@ -156,7 +127,7 @@ def set_(
 
 
 # --------------------------------------------------------------------------- #
-# What one allow covers
+# What one example covers
 # --------------------------------------------------------------------------- #
 
 
@@ -170,21 +141,14 @@ def _prefix(person_id: int) -> str:
     return f"{FEATURE_ACT_AS_ME}|person:{person_id}"
 
 
-def reply_key(person_id: int, sender: str) -> str:
-    return f"{_prefix(person_id)}|reply|{_email(sender)}"
-
-
-def inviter_key(person_id: int, sender: str) -> str:
-    return f"{_prefix(person_id)}|invite_from|{_email(sender)}"
-
-
-def follow_up_key(person_id: int, recipients: list[str]) -> str:
-    going = sorted({_email(a) for a in recipients if _email(a)})
-    return f"{_prefix(person_id)}|follow_up|{','.join(going)}"
-
-
 def style_key(person_id: int, recipient: str) -> str:
     return f"{_prefix(person_id)}|style|{_email(recipient)}"
+
+
+def person_key(person_id: int, address: str) -> str:
+    """What one "on its own next time" covers: everything sent as
+    ``person_id`` to ``address``."""
+    return f"{_prefix(person_id)}|person|{_email(address)}"
 
 
 def setting_of(key: str) -> str:
@@ -199,49 +163,6 @@ def _who(name: str, address: str) -> str:
     shown = one_line(name or "", 80)
     email = _email(address)
     return f"{shown} ({email})" if shown else email
-
-
-def reply_label(name: str, sender: str) -> str:
-    return f"Reply to {_who(name, sender)}"
-
-
-def _person_name(person_id: int) -> str | None:
-    from openexecutive.people.store import get_person
-
-    person = get_person(person_id)
-    if person is None or person.archived:
-        return None
-    return str(person.full_name or person.email or "") or None
-
-
-def action_key(person_id: int, action: dict[str, Any]) -> tuple[str, str] | None:
-    """What allowing one stored action card action covers, ``(key, label)``:
-    a message to that person, or a meeting with exactly those people (the
-    person themselves left out). None for anything else: a new contact
-    always waits."""
-    kind = action.get("kind")
-    given = action.get("input")
-    stored: dict[str, Any] = given if isinstance(given, dict) else {}
-    try:
-        if kind == "message":
-            target = int(stored["person_id"])
-            name = _person_name(target)
-            if name is None:
-                return None
-            return f"{_prefix(person_id)}|message|person:{target}", f"Message {name}"[:200]
-        if kind == "invite":
-            raw = stored.get("attendee_person_ids")
-            if not isinstance(raw, list):
-                return None
-            ids = sorted({int(i) for i in raw if not isinstance(i, bool)} - {person_id})
-            names = [_person_name(i) for i in ids]
-            if not ids or any(n is None for n in names):
-                return None
-            who = ", ".join(n for n in names if n)
-            return f"{_prefix(person_id)}|invite|people:{','.join(str(i) for i in ids)}", f"Meetings with {who}"[:200]
-    except (KeyError, TypeError, ValueError):
-        return None
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -262,33 +183,6 @@ def _find(person_id: int, key: str, *, db_path: Path | None) -> Allowed | None:
     return found if found is not None and found.person_id == person_id else None
 
 
-def allowed_sender(person_id: int, sender: str, *, db_path: Path | None = None) -> Allowed | None:
-    """The allowance for ``person_id``'s replies to ``sender``, if they gave one."""
-    if not _email(sender):
-        return None
-    return _find(person_id, reply_key(person_id, sender), db_path=db_path)
-
-
-def allowed_inviter(person_id: int, sender: str, *, db_path: Path | None = None) -> Allowed | None:
-    """The allowance for accepting ``sender``'s meeting invites on their own."""
-    if not _email(sender):
-        return None
-    return _find(person_id, inviter_key(person_id, sender), db_path=db_path)
-
-
-def allowed_follow_up(person_id: int, recipients: list[str], *, db_path: Path | None = None) -> Allowed | None:
-    """The allowance for ``person_id``'s follow-ups to exactly ``recipients``."""
-    if not any(_email(a) for a in recipients):
-        return None
-    return _find(person_id, follow_up_key(person_id, recipients), db_path=db_path)
-
-
-def allowed_action(person_id: int, action: dict[str, Any], *, db_path: Path | None = None) -> Allowed | None:
-    """The allowance covering one stored action card action, if any."""
-    found = action_key(person_id, action)
-    return _find(person_id, found[0], db_path=db_path) if found is not None else None
-
-
 def _text_of(found: Allowed | None) -> str | None:
     if found is None or not found.example:
         return None
@@ -301,19 +195,66 @@ def _text_of(found: Allowed | None) -> str | None:
 
 def example_for(person_id: int, recipient: str, *, db_path: Path | None = None) -> str | None:
     """What ``person_id`` sent ``recipient`` after changing a draft, kept with
-    "Do it like this next time"; None when there isn't one. An example kept
-    on a reply allowance before Drafts had its own switch still counts."""
+    "Do it like this next time"; None when there isn't one."""
     if not _email(recipient):
         return None
-    return _text_of(_find(person_id, style_key(person_id, recipient), db_path=db_path)) or _text_of(
-        allowed_sender(person_id, recipient, db_path=db_path)
-    )
+    return _text_of(_find(person_id, style_key(person_id, recipient), db_path=db_path))
+
+
+def allowed_person(person_id: int, address: str, *, db_path: Path | None = None) -> Allowed | None:
+    """``person_id``'s allowance for ``address``, if they gave one."""
+    if not _email(address):
+        return None
+    return _find(person_id, person_key(person_id, address), db_path=db_path)
+
+
+def all_allowed(person_id: int, addresses: list[str], *, db_path: Path | None = None) -> list[Allowed] | None:
+    """The allowances covering every one of ``addresses``; None when any is
+    missing (or there is nobody to cover)."""
+    found = [allowed_person(person_id, a, db_path=db_path) for a in addresses]
+    if not found or any(f is None for f in found):
+        return None
+    return [f for f in found if f is not None]
+
+
+def reply_goes_to(payload: dict[str, Any]) -> list[str]:
+    """Who a reply card's send reaches: everyone the draft goes to
+    (``draft_to``), else the sender it answers."""
+    to = payload.get("draft_to")
+    going = [str(v) for v in to if isinstance(v, str) and v] if isinstance(to, list) else []
+    if going:
+        return going
+    sender = str(payload.get("from_email") or "")
+    return [sender] if sender else []
+
+
+def can_allow_reply(person_id: int, payload: dict[str, Any], trained: Training, *, db_path: Path | None = None) -> bool:
+    """Whether a reply card offers "on its own next time": In training is
+    on and someone it goes to isn't allowed yet."""
+    if not trained.training:
+        return False
+    going = reply_goes_to(payload)
+    return bool(going) and all_allowed(person_id, going, db_path=db_path) is None
+
+
+def in_training(person_id: int, *, db_path: Path | None = None, strict: bool = False) -> bool:
+    """Whether ``person_id``'s As you is in training. Never raises unless ``strict``."""
+    return get(person_id, db_path=db_path, strict=strict).training
 
 
 def room_for(person_id: int, key: str, *, db_path: Path | None = None) -> bool:
     from openexecutive.orchestrator import take_the_lead
 
     return take_the_lead.room_for(key, person_id=person_id, db_path=db_path)
+
+
+def room_for_all(person_id: int, addresses: Iterable[str], *, db_path: Path | None = None) -> bool:
+    """Whether ``person_id`` can allow every one of ``addresses`` at once:
+    the ones not yet allowed must fit together under the list's cap."""
+    from openexecutive.orchestrator import take_the_lead
+
+    keys = {person_key(person_id, a) for a in addresses if _email(a)}
+    return take_the_lead.room_for_all(keys, person_id=person_id, db_path=db_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,45 +274,19 @@ def _allow(
     )
 
 
-def allow_sender(
-    person_id: int, sender: str, name: str, *, decision_id: int | None, db_path: Path | None = None,
-) -> Allowed:
-    """Let replies to ``sender`` go on their own for ``person_id``. Raises
-    ``take_the_lead.RuleError`` when their list is full."""
-    return _allow(person_id, reply_key(person_id, sender), reply_label(name, sender),
-                  decision_id=decision_id, db_path=db_path)
-
-
-def allow_inviter(
-    person_id: int, sender: str, name: str, *, decision_id: int | None, db_path: Path | None = None,
-) -> Allowed:
-    """Let ``sender``'s meeting invites be accepted on their own for
-    ``person_id`` (when nothing clashes). Raises ``take_the_lead.RuleError``
-    when their list is full."""
-    return _allow(person_id, inviter_key(person_id, sender), f"Accept invites from {_who(name, sender)}",
-                  decision_id=decision_id, db_path=db_path)
-
-
-def allow_follow_up(
-    person_id: int, recipients: list[str], *, decision_id: int | None, db_path: Path | None = None,
-) -> Allowed:
-    """Let follow-ups to exactly ``recipients`` go on their own."""
-    from openexecutive.delegation.ghostwriter import one_line
-
-    going = sorted({_email(a) for a in recipients if _email(a)})
-    label = one_line(f"Follow up with {', '.join(going)}", 200)
-    return _allow(person_id, follow_up_key(person_id, going), label, decision_id=decision_id, db_path=db_path)
-
-
-def allow_action(
-    person_id: int, action: dict[str, Any], *, decision_id: int | None, db_path: Path | None = None,
+def allow_person(
+    person_id: int, address: str, name: str, *, decision_id: int | None, db_path: Path | None = None,
 ) -> Allowed | None:
-    """Let actions like this one happen on their own; None when it can't be
-    allowed (a new contact, someone no longer on the roster)."""
-    found = action_key(person_id, action)
-    if found is None:
+    """"Send to them on its own next time": let everything sent as
+    ``person_id`` to ``address`` go on its own, where Approvals lets it.
+    None when there is no address. Raises ``take_the_lead.RuleError`` when
+    their list is full."""
+    if not _email(address):
         return None
-    return _allow(person_id, found[0], found[1], decision_id=decision_id, db_path=db_path)
+    return _allow(
+        person_id, person_key(person_id, address), f"Send to {_who(name, address)} on its own",
+        decision_id=decision_id, db_path=db_path,
+    )
 
 
 def keep_style(
@@ -391,10 +306,14 @@ def keep_style(
 
 
 def learned(person_id: int, *, db_path: Path | None = None) -> list[Allowed]:
-    """``person_id``'s own Act as me items, newest first."""
+    """``person_id``'s own As you items (who it may send to on its own, and
+    how they write), newest first."""
     from openexecutive.orchestrator import take_the_lead
 
-    return take_the_lead.list_allowed(feature=FEATURE_ACT_AS_ME, person_id=person_id, db_path=db_path)
+    return [
+        a for a in take_the_lead.list_allowed(feature=FEATURE_ACT_AS_ME, person_id=person_id, db_path=db_path)
+        if setting_of(a.key) in SETTINGS
+    ]
 
 
 def forget(person_id: int, allowed_id: int, *, db_path: Path | None = None) -> bool:
@@ -408,3 +327,105 @@ def used(allowance: Allowed, *, db_path: Path | None = None) -> None:
     from openexecutive.orchestrator import take_the_lead
 
     take_the_lead._used(allowance.id, db_path=db_path)
+
+
+# --------------------------------------------------------------------------- #
+# Could go on its own: people whose replies they sent unchanged
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Offer:
+    """Replies to one person ``person_id`` sent unchanged ``approvals`` times
+    in training, with nobody allowed for that address yet."""
+
+    key: str
+    address: str
+    name: str
+    approvals: int
+    last_at: str
+
+    @property
+    def label(self) -> str:
+        return f"Replies to {self.name or self.address}"
+
+
+def offers(person_id: int, *, db_path: Path | None = None) -> list[Offer]:
+    """Who ``person_id`` could let replies go to on its own: someone they
+    sent ``take_the_lead.SUGGEST_AFTER`` reply cards to unchanged in the last
+    ``SUGGEST_DAYS`` days, not allowed yet. Only while As you is in training:
+    outside it Approvals alone decides, and allowing someone changes
+    nothing. After Keep asking, or a removal, only sends since count. Never
+    raises: unreadable is none."""
+    from openexecutive.delegation.inbox import DECISION_CLASS
+    from openexecutive.memory.decision_ledger import STATUS_APPROVED_UNCHANGED, list_instances
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        if not in_training(person_id, db_path=db_path):
+            return []
+        since = (datetime.now(UTC) - timedelta(days=take_the_lead.SUGGEST_DAYS)).isoformat()
+        after = take_the_lead.counted_since(db_path=db_path)
+        sent = list_instances(
+            DECISION_CLASS, status=STATUS_APPROVED_UNCHANGED, approver_person_id=person_id,
+            resolved_since=since, limit=500, db_path=db_path,
+        )
+    except Exception:
+        logger.warning("delegation.training: couldn't read what could go on its own", exc_info=True)
+        return []
+    counts: dict[str, int] = {}
+    names: dict[str, str] = {}
+    last: dict[str, str] = {}
+    # Each key's address as it was counted, never parsed back out of the key.
+    addresses: dict[str, str] = {}
+    for card in sent:
+        try:
+            payload = json.loads(card.proposed_payload_json or "{}")
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or payload.get("person_id") != person_id:
+            continue
+        at = card.resolved_at or ""
+        sender = _email(str(payload.get("from_email") or ""))
+        for address in {_email(a) for a in reply_goes_to(payload)} - {""}:
+            key = person_key(person_id, address)
+            if key in after and at <= after[key]:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            last[key] = max(last.get(key, ""), at)
+            addresses[key] = address
+            if address == sender and payload.get("from_name") and key not in names:
+                from openexecutive.delegation.ghostwriter import one_line
+
+                names[key] = one_line(str(payload["from_name"]), 80)
+    out: list[Offer] = []
+    for key, n in counts.items():
+        if n < take_the_lead.SUGGEST_AFTER:
+            continue
+        address = addresses[key]
+        if allowed_person(person_id, address, db_path=db_path) is not None:
+            continue
+        out.append(Offer(key=key, address=address, name=names.get(key, ""), approvals=n, last_at=last[key]))
+    return sorted(out, key=lambda o: (-o.approvals, o.label))
+
+
+def let_go(person_id: int, key: str, *, db_path: Path | None = None) -> Allowed | None:
+    """"Let it go" on one of ``person_id``'s current offers: allow that
+    person, as ticking "on its own next time" would. None when ``key``
+    isn't a current offer. Raises ``take_the_lead.RuleError`` when their
+    list is full."""
+    match = next((o for o in offers(person_id, db_path=db_path) if o.key == key), None)
+    if match is None:
+        return None
+    return allow_person(person_id, match.address, match.name, decision_id=None, db_path=db_path)
+
+
+def keep_asking(person_id: int, key: str, *, db_path: Path | None = None) -> bool:
+    """"Keep asking" on one of ``person_id``'s current offers. False when
+    ``key`` isn't one."""
+    from openexecutive.orchestrator import take_the_lead
+
+    if not any(o.key == key for o in offers(person_id, db_path=db_path)):
+        return False
+    take_the_lead.dismiss(key, person_id=person_id, db_path=db_path)
+    return True

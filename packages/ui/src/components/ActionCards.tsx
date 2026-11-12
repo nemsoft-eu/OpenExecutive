@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import Button from "@/components/ui/Button";
 import NextTimeTick from "@/components/NextTimeTick";
 import ChatAppActionCard from "@/components/ChatAppActionCard";
+import ChatHeldActionCard from "@/components/ChatHeldActionCard";
 import ChatMeetingCard from "@/components/ChatMeetingCard";
 import FeatureName from "@/components/FeatureName";
 import {
@@ -91,8 +92,8 @@ export function ActionCardItem({
       return next;
     });
 
-  // `nextTime`: the "on its own next time" tick, with Suggested actions in
-  // training: Approve then also allows the same kind with the same people.
+  // `nextTime`: the "on its own next time" tick, In training: Approve then
+  // also allows everyone the ticked actions reach.
   const [nextTime, setNextTime] = useState(false);
   const [allowed, setAllowed] = useState(false);
   const approve = async (allow = false) => {
@@ -180,7 +181,7 @@ export function ActionCardItem({
 
       {results && allowed && (
         <p className="mt-3 text-sm text-fg-muted">
-          From now on, the same kind with the same people happens on its own, without asking.
+          From now on, what it sends as you to these people goes on its own, where Approvals lets it.
         </p>
       )}
       {results ? (
@@ -197,8 +198,8 @@ export function ActionCardItem({
             checked={nextTime}
             disabled={busy !== null}
             onChange={setNextTime}
-            label={ticked.size > 1 ? "Do these on their own next time" : "Do this on its own next time"}
-            help="Same kind, same people. You can undo this in Act as me."
+            label="Send to these people on its own next time"
+            help="Everything sent as you to them goes on its own from then on, where Approvals lets it. Undo it on Delegate."
           />
         )}
         <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -240,6 +241,7 @@ export function ChatActionCards({ ids }: { ids: number[] }) {
         <div key={id}>
           <ChatMeetingCard id={id} />
           <ChatAppActionCard id={id} />
+          <ChatHeldActionCard id={id} />
         </div>
       ))}
     </div>

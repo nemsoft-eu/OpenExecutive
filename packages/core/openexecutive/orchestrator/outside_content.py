@@ -49,7 +49,10 @@ When that next message is a go ("go", "yes, do it", "Go. Pull the scans",
 refused once (``defers_read``), so the steps the person just approved run
 before a new read holds them again. It runs only what the model calls in that
 turn, under every usual check, so it trusts the person's go no more than
-before; it only stops a re-read from undoing it. A shared chat, or mail from
+before; it only stops a re-read from undoing it. For the same reason, on that
+turn (``go_turn``) only a read the check flags holds it again, at Careful and
+Balanced alike: one that is merely unchecked or too big to check (a scanned
+PDF) does not. A shared chat, or mail from
 someone not in People, remembers nothing.
 
 How much a read holds is the owner's safety level (``orchestrator.outside_mode``),
@@ -119,6 +122,9 @@ APP = "app"
 SENDER = "sender"
 # A read of one of the company's own Drive items (``vet_reads``).
 COMPANY = "company"
+# What the owner's own authenticated mail quotes or forwards: other people's
+# words, whoever passed them on (``integrations.email_poller._principal_email_text``).
+QUOTED = "quoted"
 # A read of the owner's own mailbox or notes (Act as me): checked like any
 # read (``check_mail_read``), but it decides the Act as me lockdown
 # (``delegation.lockdown.mail_lock_holds``), never ``TurnOutside.sources``.
@@ -193,6 +199,11 @@ _FETCH_TOOLS: dict[str, str] = {
 # ``_ATTACHMENT_MARK``): an inlined document's label or a note naming a file.
 _ATTACHMENT_MARK = re.compile(r"\[Attached: |\((?:Attached|Skipped|Could not)\b")
 
+# What the owner's own mail quotes or forwards, as the email poller labels it.
+_QUOTED_BLOCK = re.compile(
+    r'<untrusted_content source="email_quoted"[^>]*>(.*?)</untrusted_content>', re.DOTALL
+)
+
 # A Google or Microsoft 365 tool whose own name (after the server prefix)
 # starts with one of these writes rather than reads, so its result is no
 # outside text: sending three emails or writing a doc it just created stays
@@ -251,6 +262,17 @@ class TurnOutside:
     go_seen: frozenset[str] = frozenset()
     # The owner's setting as it applies to this turn (``outside_mode.for_turn``).
     mode: str = "ask"
+    # The person's own message this turn, as they sent it: what
+    # ``card_answers`` reads for their yes.
+    user_message: str = ""
+    # Only the words they said, when the caller wrapped them in more (a 1:1
+    # call's apps list and notes, ``Executive.chat``'s ``memory_text``).
+    # None means ``user_message`` is theirs as it stands; "" means they
+    # wrote nothing (an app's own ask), so nothing of it answers a card.
+    own_words: str | None = None
+    # Whether this turn approved or answered a Needs you card
+    # (``card_answers``): one per message.
+    card_answered: bool = False
     # Google Drive ids checked this turn (``vet_reads``): the company's own,
     # and the rest, so each is looked up once.
     inside_items: set[str] = field(default_factory=set)
@@ -280,12 +302,14 @@ def begin_turn(
     user_message: str = "",
     attachment_blocks: list[dict[str, Any]] | None = None,
     retrieved_context: str = "",
+    own_words: str | None = None,
 ) -> TurnOutside:
     """Start a fresh record for a NEW turn: never the previous turn's.
 
     The message counts as outside content when it carries an attachment (an
-    image or PDF block, or a document's text inlined into it), and so does
-    the retrieved context when it quotes a synced folder. So does the whole
+    image or PDF block, or a document's text inlined into it) or the owner's
+    own mail quotes or forwards someone else's, and so does the retrieved
+    context when it quotes a synced folder. So does the whole
     turn when it answers mail from someone not in People
     (``Session.sender_off_team``)."""
     state = TurnOutside(
@@ -294,6 +318,8 @@ def begin_turn(
         shared=getattr(session, "shared_chat", False) is True,
         web=getattr(session, "from_web_chat", False) is True,
         previous=_TURN.get(),
+        user_message=user_message or "",
+        own_words=own_words,
     )
     from openexecutive.orchestrator import outside_mode
 
@@ -312,6 +338,11 @@ def begin_turn(
     synced = synced_sections(retrieved_context)
     if synced:
         _queue(state, SYNCED, synced)
+    # The owner's own mail counts as them, but what it quotes or forwards
+    # doesn't: it is checked like an attached file.
+    quoted = _QUOTED_BLOCK.findall(user_message or "")
+    if quoted:
+        _queue(state, QUOTED, "\n".join(quoted))
     key = _held_key(session, state)
     if key:
         stored = _HELD.pop(key, None)
@@ -440,33 +471,6 @@ def step_words(label: str) -> str:
     return "A step"
 
 
-# Added to a web chat refusal: the reply gets the buttons, so the person taps
-# rather than types.
-WEB_APPROVE_HINT = (
-    " On this screen your reply gets Approve and Not now buttons for it: tell "
-    "them to tap Approve when they're ready, not to say go."
-)
-
-
-def approve_hint() -> str:
-    """``WEB_APPROVE_HINT`` on a web chat turn whose holds the person can
-    approve; else empty."""
-    state = current()
-    if state is None or not state.web or state.shared or SENDER in state.sources:
-        return ""
-    return WEB_APPROVE_HINT
-
-
-def note_held(label: str) -> None:
-    """Remember that the turn in progress refused ``label`` for what it read,
-    for the conversation's next turn. Not on a turn answering mail from
-    someone not in People: no next message of theirs approves anything."""
-    state = current()
-    if state is None or SENDER in state.sources or not label:
-        return
-    state.held.append(str(label)[:200])
-
-
 def _reads(tool_name: str, tool_input: Any) -> bool:
     """Whether a call reads: outside content (``source_of``) or the speaker's
     own mail."""
@@ -508,6 +512,24 @@ def go_first_error(label: str) -> str:
         "of what your last reply proposed before reading; a read first would hold it "
         "again. You can read in the next round."
     )})
+
+
+def go_turn(state: TurnOutside | None) -> bool:
+    """Whether ``state``'s turn answers a go to what the last turn held
+    (``go_first``). On such a turn, at Careful and Balanced alike, only a read
+    the check flags holds the turn again: a read that is merely unchecked or
+    too big to check no longer undoes the person's go."""
+    return state is not None and bool(state.go_first)
+
+
+def _read_holds(state: TurnOutside, verdict: Any) -> bool:
+    """Whether a checked read holds the turn at Careful or Balanced
+    (``verdict`` is a ``content_scan.Verdict``)."""
+    from openexecutive.orchestrator import outside_mode
+
+    if go_turn(state):
+        return bool(verdict.flagged)
+    return state.mode == outside_mode.ASK or (state.mode == outside_mode.OUTSIDERS and bool(verdict.holds))
 
 
 def current() -> TurnOutside | None:
@@ -681,8 +703,7 @@ def _apply(state: TurnOutside, source: str, verdict: Any, *, warned: bool) -> No
     if verdict.flagged:
         _flag(state, source, tuple(verdict.categories), evidence=getattr(verdict, "evidence", ""))
     if (
-        state.mode == outside_mode.ASK
-        or (state.mode == outside_mode.OUTSIDERS and verdict.holds)
+        (state.mode != outside_mode.TRUST and _read_holds(state, verdict))
         or (state.mode == outside_mode.TRUST and verdict.holds and not warned)
     ):
         state.sources.add(source)
@@ -718,7 +739,7 @@ def mark(source: str) -> None:
     state = current()
     if state is None:
         return
-    if state.mode != outside_mode.ASK and source != SENDER:
+    if source != SENDER and (state.mode != outside_mode.ASK or go_turn(state)):
         return
     state.sources.add(source)
 
@@ -1109,7 +1130,7 @@ async def check_mail_read(pinned: Any, result: Any) -> tuple[Any, str]:
             state, MAIL, tuple(verdict.categories), _mail_label(_parsed(result)),
             getattr(verdict, "evidence", ""),
         )
-    if state.mode == outside_mode.ASK or (state.mode == outside_mode.OUTSIDERS and verdict.holds):
+    if state.mode != outside_mode.TRUST and _read_holds(state, verdict):
         pinned.mail_held = True
     if verdict.flagged:
         return result, FLAG_NOTICE.format(what=content_scan.describe(verdict.categories))
@@ -1212,18 +1233,27 @@ def note_added_person(person_id: int, person: Any = None) -> None:
 
 def added_ref(ref: Any) -> bool:
     """Whether ``ref`` (an address or chat id) belongs to someone added this
-    turn. Never raises."""
+    turn. Never raises. Under Hands-off nobody counts (``added_this_turn``)."""
     state = current()
     if state is None or not state.added_refs or not isinstance(ref, (str, int)):
+        return False
+    from openexecutive.orchestrator import levels
+
+    if levels.relaxed():
         return False
     return str(ref).strip().lower() in state.added_refs
 
 
 def added_this_turn(person_id: Any) -> bool:
     """Whether ``person_id`` was added (or given a new address or chat
-    account) in the turn in progress. Never raises."""
+    account) in the turn in progress. Never raises. Under Hands-off
+    (``levels.relaxed``) nobody counts: the owner chose to let it act."""
     state = current()
     if state is None or not state.added_people:
+        return False
+    from openexecutive.orchestrator import levels
+
+    if levels.relaxed():
         return False
     try:
         return int(person_id) in state.added_people
@@ -1343,18 +1373,70 @@ def _reads_company_item(tool_input: Any) -> bool:
     return item is not None and item in state.inside_items
 
 
+# Searches and listings of the company's own Drive or OneDrive: what the
+# company's own account can see. Like a read of one of its own items, they
+# are never outside content (Rufus, 2026-11-03: "your company's own Drive and
+# files never count as outside content"), on Google and Microsoft alike.
+_COMPANY_LISTINGS: frozenset[str] = frozenset({
+    "google_workspace__search_drive_files",
+    "google_workspace__list_drive_items",
+    "google_workspace__get_drive_file_permissions",
+    "microsoft_365__search-onedrive-files",
+    "microsoft_365__list-folder-files",
+    "microsoft_365__list-drives",
+    "microsoft_365__get-drive-item",
+    "microsoft_365__get-drive-root-item",
+})
+
+
+def _company_listing(tool_input: Any) -> bool:
+    """Whether a ``call_tool`` input searches or lists the company's own
+    files (``_COMPANY_LISTINGS``) and nothing pointed elsewhere."""
+    if not isinstance(tool_input, dict) or tool_input.get("name") not in _COMPANY_LISTINGS:
+        return False
+    arguments = tool_input.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, RecursionError):
+            return False
+    if arguments is None:
+        return True
+    if not isinstance(arguments, dict):
+        return False
+    return not any(
+        isinstance(k, str) and _norm(k) in {"url", "fileurl", "sharedlink"} and v not in (None, "")
+        for k, v in arguments.items()
+    )
+
+
 def source_of(tool_name: str, tool_input: Any) -> str | None:
-    """The outside source a tool use reads, or None when it reads none."""
+    """The outside source a tool use reads, or None when it reads none. The
+    company's own Drive and OneDrive (one of its own items, or a search or
+    listing of them) is not outside content: None."""
     if tool_name == "call_tool":
         named = tool_input.get("name") if isinstance(tool_input, dict) else None
         if not gateway_call_reads(named):
             return None
-        return COMPANY if _reads_company_item(tool_input) else GATEWAY
+        if _reads_company_item(tool_input) or _company_listing(tool_input) or is_own_onedrive_read(tool_input):
+            return None
+        return GATEWAY
     if tool_name in _FETCH_TOOLS:
         return _FETCH_TOOLS[tool_name]
     from openexecutive.orchestrator.extensions import reads_outside
 
     return APP if reads_outside(tool_name) else None
+
+
+def is_own_onedrive_read(call_input: Any) -> bool:
+    """A OneDrive file's content (``schedule_tools.is_onedrive_file_read``):
+    the company's own, like a Drive item it owns."""
+    try:
+        from openexecutive.orchestrator.schedule_tools import is_onedrive_file_read
+
+        return is_onedrive_file_read(call_input)
+    except Exception:
+        return False
 
 
 def outside_allows_mcp_call(call_input: Any) -> bool:
@@ -1507,9 +1589,6 @@ def outside_withheld_error(label: str) -> str:
         why = CONTACT_REFUSAL
     else:
         why = REFUSAL
-    note_held(label)
-    if why is REFUSAL:
-        why += approve_hint()
     return json.dumps({"error": f"{label} was not run. {why}"})
 
 

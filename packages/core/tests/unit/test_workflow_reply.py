@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from openexecutive.delegation import handle_it, inbox, workflow_email, workflow_reply
+from openexecutive.delegation import inbox, workflow_email, workflow_reply
 from openexecutive.memory import decision_ledger as ledger
 from openexecutive.orchestrator.artifact_records import pinned_viewer, viewer_for_person
 from openexecutive.workflows import chat_tools, dynamic_store, tool_catalog
@@ -30,8 +30,23 @@ def local_login(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CALLER_ASSERTION_PUBLIC_KEYS", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def settled(models: dict[str, Any]) -> None:
+    """The composed reply leaves nothing to answer: one that does always
+    waits for the person (handle_it.leaves_questions)."""
+    models["questions"] = []
+
+
 def _answer(owner: Any, mailbox: FakeInbox, thread_id: str = "t1") -> str:
     return asyncio.run(inbox.answer_thread(owner, mailbox, thread_id, now=NOW))
+
+
+@pytest.fixture(autouse=True)
+def balanced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Approvals on Balanced: Careful holds what it would send as them."""
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.OUTSIDERS)
 
 
 def _mailbox(*messages: Any) -> FakeInbox:
@@ -41,7 +56,7 @@ def _mailbox(*messages: Any) -> FakeInbox:
 
 
 def test_it_sends_on_its_own_when_handle_it_allows(db, owner: Any, models: dict[str, Any]) -> None:
-    handle_it.set_(owner.id, enabled=True, mode=None, updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     mailbox = _mailbox()
 
     assert _answer(owner, mailbox) == "sent"
@@ -50,7 +65,10 @@ def test_it_sends_on_its_own_when_handle_it_allows(db, owner: Any, models: dict[
     assert _answer(owner, mailbox) == "theirs_last" and mailbox.sent == ["d1"]
 
 
-def test_otherwise_it_waits_on_a_card(owner: Any, models: dict[str, Any]) -> None:
+def test_otherwise_it_waits_on_a_card(owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.ASK)  # Careful holds it
     mailbox = _mailbox()
 
     assert _answer(owner, mailbox) == "card"
@@ -62,7 +80,7 @@ def test_otherwise_it_waits_on_a_card(owner: Any, models: dict[str, Any]) -> Non
 
 
 def test_an_email_that_steers_an_assistant_waits(owner: Any, models: dict[str, Any]) -> None:
-    handle_it.set_(owner.id, enabled=True, mode=None, updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     models["steers"] = True
     mailbox = _mailbox()
 
@@ -105,7 +123,7 @@ def at_now(monkeypatch: pytest.MonkeyPatch, owner: Any) -> None:
 
 
 def test_the_step_answers_as_its_creator(owner: Any, models: dict[str, Any], at_now: None) -> None:
-    handle_it.set_(owner.id, enabled=True, mode=None, updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     mailbox = _mailbox()
 
     out = _run(owner.id, {"thread_id": "t1"}, mailbox, runner=owner.id)
@@ -142,7 +160,7 @@ def test_naming_a_thread_is_no_write_target() -> None:
 
 
 def test_one_answer_at_a_time_per_person(owner: Any, models: dict[str, Any]) -> None:
-    handle_it.set_(owner.id, enabled=True, mode=None, updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     mailbox = _mailbox(_msg("m1", "t1"), _msg("m2", "t2", minutes_ago=40))
 
     async def both() -> list[str]:
@@ -158,7 +176,7 @@ def test_one_answer_at_a_time_per_person(owner: Any, models: dict[str, Any]) -> 
 def test_every_row_it_writes_is_theirs_alone(db, owner: Any, models: dict[str, Any]) -> None:
     import sqlite3
 
-    handle_it.set_(owner.id, enabled=True, mode=None, updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     with sqlite3.connect(db) as conn:
         before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM audit_log").fetchone()[0]
 

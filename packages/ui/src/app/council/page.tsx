@@ -44,6 +44,7 @@ import {
   panelOpensAdvanced,
   shortModelName,
 } from "@/lib/councilCards";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 interface DraftState {
   role: string;
@@ -752,7 +753,7 @@ export default function CouncilPage() {
           </div>
         )}
         {!detail || !draft || detail.name !== selected ? (
-          <p className="text-[15px] text-fg-muted">Loading…</p>
+          <PageSpinner />
         ) : !advanced ? (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-line bg-surface-elevated px-4 py-3">
@@ -1021,16 +1022,16 @@ export default function CouncilPage() {
                           Active persona
                         </label>
                         <select
-                          value={draft.voice_persona_slug ?? "default"}
+                          value={
+                            // A stored voice that no longer exists speaks as Direct.
+                            personas.some((p) => p.slug === draft.voice_persona_slug)
+                              ? (draft.voice_persona_slug as string)
+                              : "default"
+                          }
                           onChange={(e) => setDraft({ ...draft, voice_persona_slug: e.target.value === "default" ? null : e.target.value })}
                           className={`w-full ${FIELD} h-11 text-[15px]`}
                         >
-                          {personas.filter((p) => !p.is_legacy).map(personaOption)}
-                          {personas.some((p) => p.is_legacy) && (
-                            <optgroup label="Legacy voices">
-                              {personas.filter((p) => p.is_legacy).map(personaOption)}
-                            </optgroup>
-                          )}
+                          {personas.map(personaOption)}
                         </select>
                         <p className="text-[13px] text-fg-subtle mt-1">
                           Selection saves with Save at the bottom of this panel.

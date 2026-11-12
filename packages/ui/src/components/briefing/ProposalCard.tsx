@@ -11,9 +11,12 @@ import OverflowMenu, { type OverflowItem } from "@/components/ui/OverflowMenu";
 import type { PersonBriefItem, ProposalItem } from "@/lib/api";
 import { MEMORY_ACTIONS, briefingMemoryLine, nudgeAction } from "@/lib/briefing-memory";
 import { ageLabel, daysUntil, proposalStatusChip } from "@/lib/briefingSummary";
+import { cardButtons, isSignalCard } from "@/lib/needsYou";
 import { type SnoozeChoice, snoozeChoices } from "@/lib/snooze";
 import { hostOf } from "@/lib/url";
 
+import CardAsk from "./CardAsk";
+import CardTopRow from "./CardTopRow";
 import HeldActionCard, { isHeldAction } from "./HeldActionCard";
 import LeadTrainingCard, { isLeadTraining } from "./LeadTrainingCard";
 import { Chip, TONE_TEXT, buildMonitoringSeed, type ContinueHandler } from "./shared";
@@ -174,6 +177,15 @@ interface CardAction {
   danger?: boolean;
 }
 
+// What the card needs from its reader (ProposalItem.needs), as the chip at
+// its top says it.
+const NEEDS_CHIP: Record<string, { label: string; tone: "sky" | "amber" | "emerald" | "neutral" }> = {
+  answer: { label: "Needs your answer", tone: "sky" },
+  choice: { label: "Pick one", tone: "amber" },
+  ok: { label: "Needs your OK", tone: "emerald" },
+  fyi: { label: "For you to know", tone: "neutral" },
+};
+
 // A card in "Needs you" (and in the Across-the-team panel). Closed, it shows
 // the proposal, one status chip and who it is routed to, with one primary
 // button (the recommended move, or Approve) beside Discuss; the rest sit in
@@ -188,6 +200,7 @@ export default function ProposalCard({
   onSnooze,
   onRerun,
   onApproveWithEdits,
+  onAnswer,
   busy = false,
   defaultBodyExpanded = false,
   emphasized = false,
@@ -202,6 +215,9 @@ export default function ProposalCard({
   // Queue a failed scheduled run again (cards with `failed_run_id`).
   onRerun?: (p: ProposalItem) => void;
   onApproveWithEdits?: (p: ProposalItem, editedBody: string) => void;
+  // Answer a card that asks something (needs "answer" or
+  // "choice"); rejects with the reason when it couldn't be sent.
+  onAnswer?: (p: ProposalItem, answer: string) => Promise<void>;
   busy?: boolean;
   // Show the whole body while closed (no clamp) — the first card in the
   // queue, so its full text reads without a click.
@@ -225,6 +241,7 @@ export default function ProposalCard({
     return (
       <RosterRequestCard
         request={proposal.roster_request}
+        at={proposal.created_at}
         emphasized={emphasized}
         onResolved={() => onDismiss?.(proposal)}
       />
@@ -265,6 +282,10 @@ export default function ProposalCard({
   // Monitoring items are passive external/watchlist signals — nothing to
   // approve, so the body reads as "why it's on your radar".
   const isMonitoring = proposal.category === "monitoring";
+  // A signal from outside (a watched stock's move, an app's new entries) is
+  // for you to know even when its severity lifted it into the action lane:
+  // nothing to approve, Got it clears it.
+  const isSignal = isSignalCard(proposal);
   // Decision-backed proposals (gated calendar bookings) execute server-side
   // via the /decisions endpoints. The verbatim-DM "Edit & approve" flow
   // doesn't map to a calendar booking, so it's not offered for these.
@@ -275,7 +296,9 @@ export default function ProposalCard({
   // Monitoring signals show their body as "why it's on your radar" when
   // opened, and artifacts show the document.
   const description = (() => {
-    if (isMonitoring || isArtifact) return "";
+    // A document's card says why it was made, without opening Details.
+    if (isArtifact) return (proposal.suggested_action || "").trim();
+    if (isMonitoring) return "";
     const body = proposal.body.trim();
     const headline = proposal.headline.trim();
     if (!body || body === headline) return "";
@@ -299,12 +322,12 @@ export default function ProposalCard({
     proposal.headline,
   );
   // What approving commits the Executive to ("if I approve, the exec will
-  // do THIS"); for an artifact, why it's worth reading. Never for monitoring.
+  // do THIS"). Never for monitoring; a document shows its why under the title.
   const suggestedActionBlock =
-    !isMonitoring && proposal.suggested_action ? (
+    !isMonitoring && !isArtifact && proposal.suggested_action ? (
       <div className="rounded-xl border border-accent/30 bg-accent/5 px-3.5 py-2.5">
         <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-accent">
-          {isArtifact ? "Why this is worth your time" : "If you approve"}
+          If you approve
         </div>
         <p className="text-sm leading-snug text-fg whitespace-pre-wrap break-words">
           {proposal.suggested_action}
@@ -380,18 +403,23 @@ export default function ProposalCard({
   const openRun: CardAction | null = failedRun
     ? { label: "Open the run", href: `/jobs/runs/${encodeURIComponent(failedRun)}` }
     : null;
+  // A card that asks something is answered on the card, and one that's for
+  // them to know has nothing to approve.
+  const needs = proposal.needs ?? "";
+  const asks = (needs === "answer" || needs === "choice") && Boolean(onAnswer);
+  const { noApprove, gotIt } = cardButtons(needs, isSignal);
   const approve: CardAction | null =
-    !isMonitoring && !isArtifact && !failedRun && onApprove
+    !noApprove && !isMonitoring && !isArtifact && !failedRun && onApprove
       ? { label: "Approve", onSelect: () => onApprove(proposal) }
       : null;
   const editApprove: CardAction | null =
-    !isMonitoring && !isArtifact && !isDecision && !failedRun && onApproveWithEdits
+    !noApprove && !isMonitoring && !isArtifact && !isDecision && !failedRun && onApproveWithEdits
       ? { label: "Edit & approve", onSelect: startEditing }
       : null;
+  // Dismiss sits apart at the right of every card; a card that is only for
+  // you to know leads with it as Got it instead.
   const dismiss: CardAction | null = onDismiss
-    ? isArtifact
-      ? { label: "Mark reviewed", onSelect: () => onDismiss(proposal) }
-      : { label: isMonitoring ? "Dismiss signal" : "Dismiss", onSelect: () => onDismiss(proposal) }
+    ? { label: gotIt ? "Got it" : "Dismiss", onSelect: () => onDismiss(proposal) }
     : null;
   const openDoc: CardAction | null = isArtifact
     ? { label: "Open document", href: `/artifacts/${encodeURIComponent(`alert:${proposal.alert_id}`)}` }
@@ -409,6 +437,8 @@ export default function ProposalCard({
   // card is stale; Open for a document; otherwise Approve.
   let primary: CardAction | null;
   if (isArtifact) primary = openDoc;
+  else if (asks) primary = null; // answered on the card
+  else if (gotIt) primary = dismiss; // Got it
   else if (isMonitoring) primary = null; // Discuss leads
   else if (isLikelyStale && dismiss) primary = dismiss;
   else primary = rerun ?? nudge ?? workflow ?? approve;
@@ -418,9 +448,10 @@ export default function ProposalCard({
     onSnooze && !isArtifact
       ? snoozeChoices().map((c) => ({ label: c.label, onSelect: () => onSnooze(proposal, c) }))
       : [];
-  const menu = [rerun, openRun, nudge, workflow, approve, editApprove, ...snoozes, dismiss, openInApp, personPage].filter(
+  const menu = [rerun, openRun, nudge, workflow, approve, editApprove, ...snoozes, openInApp, personPage].filter(
     (a): a is CardAction => a != null && a !== primary,
   );
+  const sideDismiss = dismiss && dismiss !== primary ? dismiss : null;
   const showActions = Boolean(onApprove || onDismiss || onApproveWithEdits);
 
   const status = isMonitoring ? null : proposalStatusChip(proposal);
@@ -428,8 +459,8 @@ export default function ProposalCard({
   const visibleTags = proposal.topic_tags.filter(
     (t) => t !== "artifact" && !t.startsWith("failed_run:") && !t.startsWith("private:"),
   );
-  const ageShown = status != null && status.label.endsWith(" old");
-  const { reviewLine, lifecycleRow, reviewedFooter } = buildProposalLifecycle(proposal, ageShown);
+  // The top row always shows its age.
+  const { reviewLine, lifecycleRow, reviewedFooter } = buildProposalLifecycle(proposal, true);
   const surfacedNote = proposal.surfaced_reason ? (
     <p className="text-sm text-fg-muted leading-snug">{proposal.surfaced_reason}</p>
   ) : null;
@@ -447,13 +478,23 @@ export default function ProposalCard({
       isLongBody,
   );
 
+  // The top row: what it needs from you, then As me or where it came from,
+  // then its age; a due date or a likely-stale review joins it.
+  const need = isArtifact
+    ? artifactBadge(proposal.artifact_format)
+    : NEEDS_CHIP[needs]?.label ??
+      (failedRun ? "Didn't finish" : gotIt ? "For you to know" : approve ? "Needs your OK" : undefined);
+  const source = failedRun ? "Workflow" : isSignal ? "Watch list" : undefined;
+  const flag = status && !status.label.endsWith(" old") ? status : null;
   const header = (
     <>
-      {isArtifact && (
-        <div className="mb-1.5">
-          <Chip tone="amber">{artifactBadge(proposal.artifact_format)}</Chip>
-        </div>
-      )}
+      <CardTopRow
+        need={need}
+        mode={source ? undefined : "take_the_lead"}
+        source={source}
+        at={proposal.created_at}
+        waitingOn={proposal.waiting_on}
+      />
       <div
         className={`text-base sm:text-[17px] font-semibold leading-snug text-fg whitespace-pre-wrap break-words${
           expanded ? "" : " line-clamp-3"
@@ -471,10 +512,9 @@ export default function ProposalCard({
           {description}
         </p>
       )}
-      {(status || assignee || hasDetails) && (
+      {(flag || hasDetails) && (
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-fg-muted">
-          {status && <Chip tone={status.tone}>{status.label}</Chip>}
-          {assignee && <span>→ {assignee.full_name}</span>}
+          {flag && <Chip tone={flag.tone}>{flag.label}</Chip>}
           {hasDetails && (
             <span className="inline-flex items-center gap-1 text-fg-subtle">
               {expanded ? "Less" : "Details"}
@@ -506,6 +546,12 @@ export default function ProposalCard({
         </button>
       ) : (
         <div>{header}</div>
+      )}
+
+      {approve && proposal.waiting_because && (
+        <p className="mt-2 text-sm leading-snug text-fg-muted break-words">
+          <span className="font-semibold text-fg">Waiting because:</span> {proposal.waiting_because}
+        </p>
       )}
 
       {expanded && (
@@ -544,6 +590,15 @@ export default function ProposalCard({
         </div>
       )}
 
+      {asks && onAnswer && (
+        <CardAsk
+          alertId={proposal.alert_id}
+          question={proposal.question ?? ""}
+          choices={needs === "choice" ? (proposal.choices ?? []) : []}
+          onAnswer={(answer) => onAnswer(proposal, answer)}
+        />
+      )}
+
       {showActions && (
         <div className="mt-4 flex flex-wrap items-center gap-2">
           {primary &&
@@ -565,19 +620,28 @@ export default function ProposalCard({
               Discuss
             </Button>
           )}
-          <OverflowMenu
-            label="More actions for this item"
-            items={menu.map(
-              (a): OverflowItem => ({
-                label: a.label,
-                onSelect: a.onSelect,
-                href: a.href,
-                external: a.external,
-                danger: a.danger,
-                disabled: busy && !a.href,
-              }),
-            )}
-          />
+          {menu.length > 0 && (
+            <OverflowMenu
+              label="More actions for this item"
+              items={menu.map(
+                (a): OverflowItem => ({
+                  label: a.label,
+                  onSelect: a.onSelect,
+                  href: a.href,
+                  external: a.external,
+                  danger: a.danger,
+                  disabled: busy && !a.href,
+                }),
+              )}
+            />
+          )}
+          {sideDismiss && (
+            // Dismiss is its own button, apart on the right, in the same
+            // place on every card.
+            <Button variant="ghost" className="ml-auto" onClick={sideDismiss.onSelect} disabled={busy}>
+              {sideDismiss.label}
+            </Button>
+          )}
         </div>
       )}
     </div>

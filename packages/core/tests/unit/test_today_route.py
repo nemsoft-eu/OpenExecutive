@@ -22,6 +22,8 @@ from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.workflows import persistence as wf_persistence
 
+pytestmark = pytest.mark.usefixtures("stored_department_levels")
+
 
 def _setup_isolated_db(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Monkeypatch all store DB_PATHs to `db` and initialise schemas."""
@@ -212,12 +214,33 @@ def test_goal_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     dept_store.insert_goal("finance", period_value="Q2 2026", key_result="Test", target="T", current="C", status="on_track", db_path=db)
     dept_store.insert_goal("finance", period_value="Q2 2026", key_result="Burn", target="<$550K", current="$612K", status="at_risk", db_path=db)
+    # A finished goal is not counted.
+    dept_store.insert_goal("finance", period_value="Q2 2026", key_result="Close the books", target="T", current="", status="done", db_path=db)
 
     resp = _make_client().get("/today")
     assert resp.status_code == 200
     fin = next(d for d in resp.json()["departments"] if d["slug"] == "finance")
     assert fin["goal_count"] == 2
     assert fin["at_risk_count"] == 1
+
+
+def test_unchecked_count_only_goals_no_review_has_looked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A goal still on its on_track default with no review counts as not
+    checked yet; a reviewed one, or one someone set at risk, does not."""
+    db = tmp_path / "unchecked.db"
+    _setup_isolated_db(db, monkeypatch)
+
+    dept_store.insert_goal("finance", period_value="Q2 2026", key_result="New", target="T", current="", status="on_track", db_path=db)
+    checked = dept_store.insert_goal("finance", period_value="Q2 2026", key_result="Checked", target="T", current="", status="on_track", db_path=db)
+    dept_store.insert_goal("finance", period_value="Q2 2026", key_result="Burn", target="T", current="", status="at_risk", db_path=db)
+    dept_store.record_goal_review(checked, status="on_track", last_reviewed_at="2026-11-02T09:00:00+00:00", db_path=db)
+
+    resp = _make_client().get("/today")
+    fin = next(d for d in resp.json()["departments"] if d["slug"] == "finance")
+    assert fin["goal_count"] == 3
+    assert fin["unchecked_count"] == 1
 
 
 def test_attention_goals_surface_problem_goals_inline(
@@ -504,6 +527,55 @@ def test_today_non_decision_alert_has_null_decision_instance_id(
     proposals = _make_client().get("/today").json()["proposals"]
     assert len(proposals) == 1
     assert proposals[0]["decision_instance_id"] is None
+
+
+def test_approvals_one_request_held_share_a_group_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Approvals held from the same chat turn for the same kind of step share
+    one group key, so Needs you shows them as one card. A card from another
+    chat, another kind of step, or one already answered stands alone."""
+    db = tmp_path / "groups.db"
+    _setup_isolated_db(db, monkeypatch)
+
+    def held(session: str | None, tool: str, n: int, to: int = 5) -> int:
+        decision_id = decision_ledger.create_decision_instance(
+            decision_class="department_action", department="ops",
+            originating_session_id=session,
+            proposed_payload={"tool": tool, "input": {"name": f"file-{n}"}},
+            idempotency_key=None, gate_mode="propose",
+            approver_person_id=None, confidence=None, db_path=db,
+        )
+        alert_store.insert_alert(
+            source="decision",
+            external_id=f"decision:{decision_id}",
+            severity="medium",
+            headline=f"Waiting for your OK: save file-{n}",
+            body="...",
+            topic_tags=[f"decision_instance:{decision_id}", "decision_class:department_action"],
+            routed_to_person_id=to,
+            db_path=db,
+        )
+        return decision_id
+
+    for n in range(3):
+        held("chat-1", "drive_save", n)
+    held("chat-1", "send_email", 3)
+    held("chat-1", "drive_save", 8, to=6)  # same request, waiting on someone else
+    held("chat-2", "drive_save", 4)
+    held(None, "drive_save", 5)
+    answered = held("chat-3", "drive_save", 6)
+    held("chat-3", "drive_save", 7)
+    decision_ledger.mark_resolved(answered, decision_ledger.STATUS_REJECTED, db_path=db)
+
+    proposals = _make_client().get("/today").json()["proposals"]
+    by_name = {p["headline"].rsplit("-", 1)[1]: p["group_key"] for p in proposals}
+    group = {by_name["0"], by_name["1"], by_name["2"]}
+    assert len(group) == 1 and None not in group
+    assert by_name["3"] is None and by_name["4"] is None and by_name["5"] is None
+    assert by_name["7"] is None and by_name["8"] is None
+    # The key says nothing about the conversation it came from.
+    assert "chat-1" not in next(iter(group))
 
 
 # --------------------------------------------------------------------------- #
@@ -2711,6 +2783,47 @@ def test_a_dismissed_point_leaves_right_now(
     assert refreshed
 
 
+def test_right_now_lists_rows_for_the_owner_and_a_dismissal_sticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.briefing import right_now_list
+    from openexecutive.integrations import chat_asks
+
+    db = tmp_path / "rn-list.db"
+    _setup_isolated_db(db, monkeypatch)
+    people_store.upsert_person(
+        full_name="Pat Principal", is_principal=True, email="p@co.com", db_path=db,
+    )
+    people_store.upsert_person(full_name="Dana Lee", email="dana@co.com", db_path=db)
+    people_registry.invalidate()
+    monkeypatch.setattr(today_route, "_regen_briefing_narrative", _noop_regen)
+    monkeypatch.setattr(right_now_list, "_mail_rows", lambda *a: [])
+    monkeypatch.setattr(right_now_list, "_draft_rows", lambda *a: [])
+    asked = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(chat_asks, "waiting", lambda pid, now=None: [
+        chat_asks.ChatAsk(
+            id=4, channel="slack", place_name="ops", from_name="Kim Ono", text="Sign off on the budget?",
+            link="https://chat.example.com/m/4", asked_at=asked,
+        ),
+    ])
+    c = _make_client()
+    owner = {"x-caller-email": "p@co.com"}
+
+    rows = c.get("/today", headers=owner).json()["right_now"]
+
+    assert [(r["key"], r["kind"], r["who"]) for r in rows] == [("chat:4", "chat", "Kim Ono")]
+    assert rows[0]["source"]["kind"] == "link"
+    # A teammate has no list, and can't clear the owner's.
+    teammate = {"x-caller-email": "dana@co.com"}
+    assert c.get("/today", headers=teammate).json()["right_now"] == []
+    assert c.post("/today/right-now/dismiss", json={"key": "chat:4"}, headers=teammate).json() == {"dismissed": False}
+    # Only a row it lists.
+    assert c.post("/today/right-now/dismiss", json={"key": "chat:99"}, headers=owner).json() == {"dismissed": False}
+
+    assert c.post("/today/right-now/dismiss", json={"key": "chat:4"}, headers=owner).json() == {"dismissed": True}
+    assert c.get("/today", headers=owner).json()["right_now"] == []
+
+
 def test_an_unrostered_look_is_not_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2874,3 +2987,405 @@ def test_a_quiet_header_earlier_today_counts_for_right_now_pings() -> None:
     assert today_route._written_earlier_today(quiet) is True
     assert today_route._written_earlier_today(yesterday) is False
     assert today_route._written_earlier_today(None) is False
+
+
+# --------------------------------------------------------------------------- #
+# Done for you
+# --------------------------------------------------------------------------- #
+
+
+def test_an_approved_card_leaves_needs_you_and_is_one_row_in_done_for_you(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Home keeps every item in one place: a card the owner approved leaves
+    the proposals and shows once in Done for you, its status changing in
+    place, and a retry replaces the failed try instead of adding a row."""
+    from openexecutive.alerts import approvals
+
+    db = tmp_path / "done.db"
+    _setup_isolated_db(db, monkeypatch)
+    pid = people_store.upsert_person(
+        full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db,
+    )
+    alert_store.insert_alert(
+        source="system", external_id="a-1", severity="medium",
+        headline="Answer Casey about the lease", body="...", routed_to_person_id=pid, db_path=db,
+    )
+    alert_id = alert_store.list_alerts(db_path=db)[0].id
+    headers = {"x-caller-email": "jordan@example.com"}
+
+    first = approvals.claim(alert_id, approved_by_person_id=pid, db_path=db)
+    assert first is not None
+    body = _make_client().get("/today", headers=headers).json()
+    assert [p["alert_id"] for p in body["proposals"]] == []
+    rows = [r for r in body["done_for_you"] if r["kind"] == "approval"]
+    assert [(r["title"], r["status"]) for r in rows] == [("Answer Casey about the lease", "working")]
+
+    approvals.finish(first.id, approvals.STATUS_FAILED, "The mailbox was offline.", db_path=db)
+    retry = approvals.claim(alert_id, approved_by_person_id=pid, db_path=db)
+    assert retry is not None
+    approvals.set_session(retry.id, "s-42", db_path=db)
+    approvals.finish(retry.id, approvals.STATUS_DONE, db_path=db)
+
+    rows = [
+        r for r in _make_client().get("/today", headers=headers).json()["done_for_you"]
+        if r["kind"] == "approval"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "done"
+    assert rows[0]["session_id"] == "s-42"
+    assert rows[0]["approval_id"] == retry.id
+
+
+def test_done_for_you_shows_an_approval_on_an_install_with_no_owner_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before anyone claims the install, an unsigned approval has no person;
+    Home still lists it, since whoever is there may approve."""
+    from openexecutive.alerts import approvals
+
+    db = tmp_path / "unclaimed.db"
+    _setup_isolated_db(db, monkeypatch)
+    alert_store.insert_alert(
+        source="system", external_id="a-2", severity="medium",
+        headline="Renew the domain", body="...", db_path=db,
+    )
+    alert_id = alert_store.list_alerts(db_path=db)[0].id
+    claimed = approvals.claim(alert_id, approved_by_person_id=None, db_path=db)
+    assert claimed is not None
+    approvals.finish(claimed.id, approvals.STATUS_FAILED, "Couldn't reach the registrar", db_path=db)
+    rows = [r for r in _make_client().get("/today").json()["done_for_you"] if r["kind"] == "approval"]
+    assert [(r["title"], r["status"], r["approval_id"]) for r in rows] == [
+        ("Renew the domain", "failed", claimed.id),
+    ]
+
+
+def test_done_for_you_leaves_out_what_is_not_done_for_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cards raised, advice and decisions noted from their own chats stay out
+    of Done for you; what it did on its own is in."""
+    db = tmp_path / "done_kinds.db"
+    _setup_isolated_db(db, monkeypatch)
+    now = datetime.now(UTC).isoformat()
+    monkeypatch.setattr(today_route, "_build_activity", lambda *a, **k: today_route.ActivityResponse(items=[
+        today_route.ActivityItem(kind="alert_raised", summary="Flagged a late invoice", actor="executive",
+                                 target=None, department=None, at=now),
+        today_route.ActivityItem(kind="advice_given", summary="Advised on pricing", actor="executive",
+                                 target=None, department=None, at=now),
+        today_route.ActivityItem(kind="workflow_done", summary="Wrote the weekly sales report",
+                                 actor="executive", target=None, department=None, at=now),
+        # A reminder it sent the reader is something they got, not work.
+        today_route.ActivityItem(kind="dm_sent", summary="Right now: pricing is overdue",
+                                 actor="executive", target="jordan ", department=None, at=now),
+        today_route.ActivityItem(kind="dm_sent", summary="Reminded Sam about the invoice",
+                                 actor="executive", target="Sam", department=None, at=now),
+    ]))
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    people_store.upsert_person(full_name="Sam", email="sam@example.com", db_path=db)
+    client = _make_client()
+    rows = client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
+    assert sorted(r["title"] for r in rows) == ["Reminded Sam about the invoice", "Wrote the weekly sales report"]
+    # What it did for the company isn't done for a teammate.
+    theirs = client.get("/today", headers={"x-caller-email": "sam@example.com"}).json()["done_for_you"]
+    assert theirs == []
+
+
+def test_an_email_it_sent_on_its_own_names_who_and_what_in_done_for_you(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An email it sent on its own reads "Emailed Riley Park: <subject>" on
+    the owner's Done for you, never the raw tool name; the team's activity
+    feed names teammates only, never a contact, an address or the subject;
+    one it sent the owner themselves is something they already got."""
+    from openexecutive.orchestrator import take_the_lead
+
+    db = tmp_path / "done_mail.db"
+    _setup_isolated_db(db, monkeypatch)
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    people_store.upsert_person(full_name="Riley Park", email="riley@example.com", kind="contact", db_path=db)
+    people_registry.invalidate()
+    send = "google_workspace__send_gmail_message"
+    for to, subject in (("Riley@Example.com", "Re: Status - forum drafts"), ("jordan@example.com", "Forum post: yes")):
+        tool_input = {"to": to, "subject": subject, "body": "Hi"}
+        take_the_lead.record(
+            scope=take_the_lead.SCOPE_EXECUTIVE, source="scheduled", tool=send,
+            summary=take_the_lead.summarize(send, tool_input, mcp=True, quote=False), status="done",
+            mail=take_the_lead.mail_sent(send, tool_input),
+        )
+    take_the_lead.record(
+        scope=take_the_lead.SCOPE_EXECUTIVE, source="scheduled", tool=send, summary="Send gmail message",
+        status="done", mail=take_the_lead.mail_sent(send, {"to": ["sam@example.com", "lee@example.com"]}),
+    )
+
+    client = _make_client()
+    owner = {"x-caller-email": "jordan@example.com"}
+    rows = [r for r in client.get("/today", headers=owner).json()["done_for_you"] if r["kind"] == "took_the_lead"]
+    assert sorted(r["title"] for r in rows) == [
+        "Emailed Riley Park: Re: Status - forum drafts",
+        "Emailed lee@example.com and sam@example.com",
+    ]
+    feed = client.get("/today/activity", headers=owner).json()["items"]
+    led = sorted(i["summary"] for i in feed if i["kind"] == "took_the_lead")
+    # The team's feed names teammates only: a contact or an outside address
+    # is "Sent an email", and the subject is never in it.
+    assert led == ["Emailed Jordan", "Sent an email", "Sent an email"]
+    assert all("mail_subject" not in i and "mail_to" not in i for i in feed)
+    assert all(i["target"] is None for i in feed if i["summary"] == "Sent an email")
+
+
+def test_reads_and_unaddressed_sends_never_show_as_raw_tool_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connected-app read logged as done ("Get gmail messages content
+    batch") did nothing for anyone and is left out; a send logged without
+    its addresses reads "Sent an email", never "Send gmail message"."""
+    from openexecutive.orchestrator import take_the_lead
+
+    db = tmp_path / "done_raw.db"
+    _setup_isolated_db(db, monkeypatch)
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    people_registry.invalidate()
+    for tool, summary in (
+        ("google_workspace__get_gmail_messages_content_batch", "Get gmail messages content batch"),
+        ("google_workspace__send_gmail_message", "Send gmail message"),
+    ):
+        take_the_lead.record(
+            scope=take_the_lead.SCOPE_EXECUTIVE, source="scheduled", tool=tool, summary=summary, status="done",
+        )
+
+    client = _make_client()
+    owner = {"x-caller-email": "jordan@example.com"}
+    rows = [r for r in client.get("/today", headers=owner).json()["done_for_you"] if r["kind"] == "took_the_lead"]
+    assert [r["title"] for r in rows] == ["Sent an email"]
+    feed = client.get("/today/activity", headers=owner).json()["items"]
+    assert [i["summary"] for i in feed if i["kind"] == "took_the_lead"] == ["Sent an email"]
+
+
+def test_held_back_page_lines_are_the_principals_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "held.db"
+    _setup_isolated_db(db, monkeypatch)
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    people_store.upsert_person(full_name="Sam", email="sam@example.com", db_path=db)
+    item = today_route.HeldBackItem(event_id=1, surface="morning brief", at="2026-11-04T08:00:00+00:00",
+                                    lines=["Call Robin about the 4% raise"])
+    monkeypatch.setattr(today_route, "_held_back", lambda now: [item])
+
+    client = _make_client()
+    assert client.get("/today/held-back", headers={"x-caller-email": "jordan@example.com"}).json()[0][
+        "lines"] == ["Call Robin about the 4% raise"]
+    assert client.get("/today/held-back", headers={"x-caller-email": "sam@example.com"}).json() == []
+
+
+# ── As me on Home: the result line, Watching next ─────────────────────────────
+
+
+def test_done_for_you_says_how_why_and_what_came_of_what_it_did_as_me(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row As me did reads "By email, as me · When <what woke it> ·
+    Sent"; a step for a standing job names the job instead; a message to
+    someone who has answered says when."""
+    from openexecutive.orchestrator import take_the_lead
+
+    db = tmp_path / "done_line.db"
+    _setup_isolated_db(db, monkeypatch)
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    riley = people_store.upsert_person(full_name="Riley Park", email="riley@example.com", db_path=db)
+    people_registry.invalidate()
+    send = "google_workspace__send_gmail_message"
+    mail = {"to": "riley@example.com", "subject": "Cell warranty terms", "body": "Hi"}
+    with take_the_lead.looking(take_the_lead.prompted_line("the goal “Ramp gate” slipped")):
+        take_the_lead.record(
+            scope=take_the_lead.SCOPE_EXECUTIVE, source="reflection", tool=send,
+            summary=take_the_lead.summarize(send, mail, mcp=True, quote=False), status="done",
+            mail=take_the_lead.mail_sent(send, mail), outcome=take_the_lead.outcome_of(send, mail, "{}", mcp=True),
+        )
+    job = take_the_lead.add_job("Keep the dealer onboarding moving", created_by="t")
+    with take_the_lead.looking(take_the_lead.DAILY_LOOK):
+        take_the_lead.focus_job(job.id)
+        take_the_lead.record(
+            scope=take_the_lead.SCOPE_EXECUTIVE, source="reflection", tool="message_person",
+            summary="Messaged Riley Park", status="done", outcome="Sent", to_person_id=riley,
+        )
+    # Riley answered the message.
+    context_id = episodic.insert_outbound_context(
+        channel="slack_dm", channel_ref="U1", outbound_text="Hi", recipient_person_id=riley,
+    )
+    episodic.mark_outbound_context_consumed(context_id)
+
+    client = _make_client()
+    rows = {
+        r["title"]: r["detail"]
+        for r in client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
+        if r["kind"] == "took_the_lead"
+    }
+    assert rows["Emailed Riley Park: Cell warranty terms"] == (
+        "By email, as me · When the goal “Ramp gate” slipped · Sent"
+    )
+    line = rows["Messaged Riley Park"]
+    assert "For your standing job: Keep the dealer onboarding moving" in line
+    assert "Riley answered at" in line
+    # The team's feed never carries the line.
+    feed = client.get("/today/activity", headers={"x-caller-email": "jordan@example.com"}).json()["items"]
+    assert all("lead_line" not in i for i in feed)
+    # An answer to a later message isn't credited to an earlier one.
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    from openexecutive.api.routes import today as today_route
+
+    earlier = (_dt.now(_UTC) - _td(hours=1)).isoformat()
+    assert today_route._answers([(riley, earlier)]) == {}
+    # Many messages in one read: only the one answered gets a line.
+    sam = people_store.upsert_person(full_name="Sam Lee", email="sam@example.com", db_path=db)
+    episodic.insert_outbound_context(
+        channel="slack_dm", channel_ref="U2", outbound_text="Hi", recipient_person_id=sam,
+    )
+    just_now = _dt.now(_UTC).isoformat()
+    got = today_route._answers([(riley, just_now), (riley, earlier), (sam, just_now)])
+    assert list(got) == [(riley, just_now)]
+    assert got[(riley, just_now)].startswith("Riley answered at")
+    # Two sends to Riley a minute apart, one answered: one line, on the nearer send.
+    a_minute_ago = (_dt.now(_UTC) - _td(minutes=1, seconds=30)).isoformat()
+    got = today_route._answers([(riley, a_minute_ago), (riley, just_now)])
+    assert list(got) == [(riley, just_now)]
+
+
+def test_watching_next_lists_follow_ups_and_standing_jobs_and_stop_ends_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner sees every follow-up it will send and the standing jobs; a
+    teammate sees only what they asked for and can stop only that; Stop
+    cancels that one thing."""
+    from openexecutive.orchestrator import take_the_lead
+
+    db = tmp_path / "watching.db"
+    _setup_isolated_db(db, monkeypatch)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    priya = people_store.upsert_person(full_name="Priya Nair", email="priya@example.com", db_path=db)
+    sam = people_store.upsert_person(full_name="Sam Lee", email="sam@example.com", db_path=db)
+    people_registry.invalidate()
+    soon = (datetime.now(UTC) + timedelta(hours=18)).isoformat()
+    owners = episodic.insert_scheduled_action(
+        run_at=soon, channel="slack_dm", channel_ref="U1", intent_text="Ask Priya about the partners' pre-read",
+        assigned_to_person_id=priya,
+    )
+    sams = episodic.insert_scheduled_action(
+        run_at=soon, channel="slack_dm", channel_ref="U2", intent_text="Remind Priya about the venue",
+        assigned_to_person_id=priya, created_by_person_id=sam,
+    )
+    episodic.insert_scheduled_action(  # plumbing never shows
+        run_at=soon, channel="__internal__", channel_ref="principal", intent_text="x", kind="dept_cadence",
+    )
+    job = take_the_lead.add_job("Chase overdue tasks every morning", created_by="t")
+    # Plenty of other work due sooner doesn't push the follow-ups out.
+    sooner = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    for n in range(110):
+        episodic.insert_scheduled_action(
+            run_at=sooner, channel="slack_dm", channel_ref="U9", intent_text=f"other {n}", kind="dept_cadence",
+        )
+
+    client = _make_client()
+    owner = {"x-caller-email": "jordan@example.com"}
+    lines = client.get("/today", headers=owner).json()["watching"]
+    assert [(w["key"], w["kind"]) for w in lines] == [
+        (f"action:{owners}", "follow_up"), (f"action:{sams}", "follow_up"), (f"job:{job.id}", "standing_job"),
+    ]
+    assert lines[0]["detail"] == "I follow up with Priya Nair" and lines[0]["at"] == soon
+    assert lines[2]["title"] == "Chase overdue tasks every morning"
+
+    teammate = {"x-caller-email": "sam@example.com"}
+    assert [w["key"] for w in client.get("/today", headers=teammate).json()["watching"]] == [f"action:{sams}"]
+    # Not theirs to stop.
+    assert client.post("/today/watching/stop", json={"key": f"action:{owners}"}, headers=teammate).status_code == 404
+    assert client.post("/today/watching/stop", json={"key": f"job:{job.id}"}, headers=teammate).status_code == 404
+    assert client.post("/today/watching/stop", json={"key": f"action:{sams}"}, headers=teammate).json() == {
+        "stopped": True,
+    }
+    assert episodic.get_scheduled_action(sams).status == "cancelled"  # type: ignore[union-attr]
+    # A second stop (another tab) still says stopped, never "went out".
+    assert client.post("/today/watching/stop", json={"key": f"action:{sams}"}, headers=teammate).json() == {
+        "stopped": True,
+    }
+    # Plumbing Watching next never lists can't be stopped from it.
+    plumbing = episodic.insert_scheduled_action(
+        run_at=soon, channel="__internal__", channel_ref="principal", intent_text="x", kind="ad_hoc",
+    )
+    assert client.post("/today/watching/stop", json={"key": f"action:{plumbing}"}, headers=owner).status_code == 404
+
+    assert client.post("/today/watching/stop", json={"key": f"job:{job.id}"}, headers=owner).json() == {
+        "stopped": True,
+    }
+    assert [w["key"] for w in client.get("/today", headers=owner).json()["watching"]] == [f"action:{owners}"]
+
+
+def test_today_says_why_a_booking_waits_and_who_waits_on_a_held_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gated booking's card says why it waited (as recorded when held); a
+    teammate's held ask names them, and the reader's own held ask names
+    nobody."""
+    db = tmp_path / "waiting.db"
+    _setup_isolated_db(db, monkeypatch)
+
+    def card(headline: str, decision_class: str, payload: dict[str, object]) -> None:
+        decision_id = decision_ledger.create_decision_instance(
+            decision_class=decision_class, department="ops", originating_session_id=None,
+            proposed_payload=payload, idempotency_key=None, gate_mode="propose",
+            approver_person_id=5, confidence=None, db_path=db,
+        )
+        alert_store.insert_alert(
+            source="decision",
+            external_id=f"decision:{decision_id}",
+            severity="medium",
+            headline=headline,
+            body="...",
+            topic_tags=[f"decision_instance:{decision_id}", f"decision_class:{decision_class}"],
+            routed_to_person_id=5,
+            db_path=db,
+        )
+
+    card("Approve meeting: Pricing review", "meeting_scheduling",
+         {"title": "Pricing review", "waiting_because": "Someone on your team asked for it."})
+    card("Approve meeting: Older booking", "meeting_scheduling", {"title": "Older booking"})
+    card("Sam Okafor asked the Executive to: email Northgate", "department_action",
+         {"tool": "send_email", "requested_by_person_id": 9, "requested_by": "Sam Okafor"})
+    card("Waiting for your OK: save a file", "department_action",
+         {"tool": "drive_save", "requested_by_person_id": 5, "requested_by": "Jordan Avery"})
+
+    by_headline = {p["headline"]: p for p in _make_client().get("/today").json()["proposals"]}
+    booking = by_headline["Approve meeting: Pricing review"]
+    assert booking["waiting_because"] == "Someone on your team asked for it."
+    # A booking held before the reason was recorded says nothing.
+    assert by_headline["Approve meeting: Older booking"]["waiting_because"] == ""
+    assert booking["waiting_on"] == ""
+    assert by_headline["Sam Okafor asked the Executive to: email Northgate"]["waiting_on"] == "Sam Okafor"
+    own = by_headline["Waiting for your OK: save a file"]
+    assert own["waiting_on"] == ""
+    assert own["waiting_because"] == ""
+
+
+def test_a_card_that_only_names_a_held_decision_does_not_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card whose tags name someone else's held decision (not routed to
+    that decision's approver) never shows who asked for it."""
+    db = tmp_path / "forged.db"
+    _setup_isolated_db(db, monkeypatch)
+    decision_id = decision_ledger.create_decision_instance(
+        decision_class="department_action", department="ops", originating_session_id=None,
+        proposed_payload={"tool": "send_email", "requested_by_person_id": 9, "requested_by": "Sam Okafor"},
+        idempotency_key=None, gate_mode="propose", approver_person_id=5, confidence=None, db_path=db,
+    )
+    alert_store.insert_alert(
+        source="email", external_id="forged-1", severity="medium", headline="Something else",
+        body="...", topic_tags=[f"decision_instance:{decision_id}", "decision_class:department_action"],
+        routed_to_person_id=9, db_path=db,
+    )
+    proposals = _make_client().get("/today").json()["proposals"]
+    assert [p["waiting_on"] for p in proposals] == [""]

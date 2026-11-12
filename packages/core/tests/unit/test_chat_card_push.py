@@ -126,7 +126,7 @@ def test_send_in_a_chat_app_sends_the_draft_as_its_person(owner: int, monkeypatc
     card = _reply(owner)
     line = asyncio.run(channel_cards.resolve(card, get_person(owner), approve=True))
     assert line == "Sent."
-    assert calls == [{"caller": ChatTap(OWNER), "resolver": owner, "confirm": {}}]
+    assert calls == [{"caller": ChatTap(OWNER), "resolver": owner, "confirm": {}, "allow": False}]
 
 
 def test_a_reply_with_a_question_left_isnt_sent_from_a_chat(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,7 +182,7 @@ def test_accept_answers_the_invite(owner: int, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(invites, "answer", answer)
     card = _card("delegation_invite", {"private": True, "person_id": owner, "title": "Pilot review"}, owner)
     assert asyncio.run(channel_cards.resolve(card, get_person(owner), approve=True)) == "Accepted."
-    assert calls == [{"caller": ChatTap(OWNER), "resolver": owner, "answer": "accept"}]
+    assert calls == [{"caller": ChatTap(OWNER), "resolver": owner, "answer": "accept", "allow": False}]
 
 
 def test_a_take_the_lead_card_is_done_as_it_stands(owner: int, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,7 +195,7 @@ def test_a_take_the_lead_card_is_done_as_it_stands(owner: int, monkeypatch: pyte
     monkeypatch.setattr(take_the_lead, "carry_out", carry_out)
     payload = {"tool": "send_slack_dm", "input": {"text": "hi"}, "summary": "Message Ben: hi", "reason": "it's new"}
     card = _card("take_the_lead_action", payload, owner)
-    assert channel_cards.card_text(card) == "Waiting for your OK\nMessage Ben: hi\nIt waited because it's new.\n\ntext: hi"
+    assert channel_cards.card_text(card) == "Waiting for your OK\nMessage Ben: hi\nIt waited because it's new.\n\nMessage: hi"
     assert asyncio.run(channel_cards.resolve(card, get_person(owner), approve=True)) == "Approved."
     assert done == [(payload, True)]
     assert get_decision_instance(card).status == decision_ledger.STATUS_APPROVED_UNCHANGED
@@ -355,7 +355,7 @@ def test_a_held_action_card_shows_every_field_it_would_send(owner: int) -> None:
     }, owner)
     text = channel_cards.card_text(card)
     assert text is not None
-    assert 'bcc: ["x@evil.example"]' in text and "body: Quick note. And more." in text
+    assert "Bcc: x@evil.example" in text and "Message: Quick note. And more." in text
     # No call stored: not shown.
     assert channel_cards.card_text(_card("take_the_lead_action", {"tool": "x", "summary": "Do x"}, owner)) is None
 

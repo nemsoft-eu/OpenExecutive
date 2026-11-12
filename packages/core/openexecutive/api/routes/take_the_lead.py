@@ -1,15 +1,20 @@
-"""Take the lead (orchestrator.take_the_lead): the switches and rules on
-Delegate → Take the lead. What it did shows in Recent activity
+"""Take the lead (orchestrator.take_the_lead): In training and the rules on
+Delegate → As me and Approvals. What it did shows in Recent activity
 (``today._build_activity``), with each person's own As you rows.
 
   GET    /take-the-lead              — the As the Executive switch, its Ask
                                        first switches and the company's rules
                                        (the principal's alone)
   PUT    /take-the-lead              — {enabled?, training?, ask_first?}
-  POST   /take-the-lead/rules        — {kind, value}: a company rule
+  POST   /take-the-lead/rules        — {kind, value, effect?}: a company rule,
+                                       "wait" (default) or "go"
   DELETE /take-the-lead/rules/{id}
   POST   /take-the-lead/learned      — {key}: allow a suggested action
   DELETE /take-the-lead/learned/{id} — ask first again for an allowed one
+  POST   /take-the-lead/jobs         — {text}: a standing job, something to
+                                       keep doing (each look works it; every
+                                       step still goes through Approvals)
+  DELETE /take-the-lead/jobs/{id}    — stop a standing job
 
 What it's learned (``learned``: actions allowed in training, from a card or
 a suggestion, with any edit kept as an example, then the owner's own Act as
@@ -47,6 +52,9 @@ class RuleOut(BaseModel):
     id: int
     kind: str
     value: str
+    # "wait": always waits for the owner; "go": goes on its own where the
+    # level would hold it (never past Careful or In training).
+    effect: str
 
 
 class LearnedOut(BaseModel):
@@ -66,6 +74,15 @@ class SuggestedOut(BaseModel):
     approvals: int
 
 
+class JobOut(BaseModel):
+    id: int
+    text: str
+    created_at: str
+    # What it did for it in the last seven days ("6 follow-ups, 2 meetings
+    # booked"), "" when nothing yet.
+    this_week: str
+
+
 class LeadOut(BaseModel):
     enabled: bool
     # In training: everything waits for a yes unless allowed (``learned``).
@@ -79,6 +96,11 @@ class LeadOut(BaseModel):
     available: bool
     # The Executive is paused: nothing here runs until it resumes.
     paused: bool
+    # Things the owner asked it to keep doing (Standing jobs).
+    jobs: list[JobOut] = []
+    # Today: how many things it did on its own, and how many it left for a yes.
+    done_today: int = 0
+    left_today: int = 0
 
 
 class LeadUpdate(BaseModel):
@@ -95,11 +117,18 @@ class LearnIn(BaseModel):
     key: str
 
 
+class JobIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+
+
 class RuleIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: str
     value: str
+    effect: str = "wait"
 
 
 def _principal(request: Request) -> Any:
@@ -153,8 +182,11 @@ def _out(principal: Any) -> LeadOut:
             *take_the_lead.list_allowed(feature=take_the_lead.FEATURE_ACT_AS_ME, person_id=principal.id),
         ]
         suggested = take_the_lead.suggestions()
+        jobs = take_the_lead.list_jobs()
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Couldn't read the rules.") from exc
+    week = take_the_lead.job_week()
+    done_today, left_today = take_the_lead.done_today()
     return LeadOut(
         enabled=lead.enabled,
         training=lead.training,
@@ -167,7 +199,7 @@ def _out(principal: Any) -> LeadOut:
             )
             for k in take_the_lead.KINDS
         ],
-        rules=[RuleOut(id=r.id, kind=r.kind, value=r.value) for r in rules],
+        rules=[RuleOut(id=r.id, kind=r.kind, value=r.value, effect=r.effect) for r in rules],
         learned=[
             LearnedOut(id=a.id, label=a.label, feature=a.feature, example=_example(a.example), uses=a.uses, created_at=a.created_at)
             for a in learned
@@ -175,6 +207,9 @@ def _out(principal: Any) -> LeadOut:
         suggested=[SuggestedOut(key=s.key, label=s.label, approvals=s.approvals) for s in suggested],
         available=_signing_available(),
         paused=_paused(),
+        jobs=[JobOut(id=j.id, text=j.text, created_at=j.created_at, this_week=week.get(j.id, "")) for j in jobs],
+        done_today=done_today,
+        left_today=left_today,
     )
 
 
@@ -210,11 +245,9 @@ def update_take_the_lead(request: Request, body: LeadUpdate) -> LeadOut:
     if unknown:
         raise HTTPException(status_code=422, detail=f"Unknown kind: {unknown[0]}.")
     turning_on = bool(body.enabled) and not current.enabled
-    # Leaving training while on lets everything it was asking about go.
-    leaving_training = (
-        body.training is False and current.training and (body.enabled if body.enabled is not None else current.enabled)
-    )
-    loosening = turning_on or bool(leaving_training) or any(
+    # Leaving training lets everything it was asking about go.
+    leaving_training = body.training is False and current.training
+    loosening = turning_on or leaving_training or any(
         value is False and current.asks_first(kind) for kind, value in (body.ask_first or {}).items()
     )
     if loosening and not _provably_theirs(request, principal):
@@ -228,7 +261,7 @@ def update_take_the_lead(request: Request, body: LeadUpdate) -> LeadOut:
     )
     if after != current:
         _audit(
-            f"Take the lead as the Executive {'in training' if after.enabled and after.training else 'on' if after.enabled else 'off'}",
+            f"As me {'in training' if after.enabled and after.training else 'on' if after.enabled else 'off'}",
             {"scope": "executive", "enabled": after.enabled, "training": after.training, "ask_first": after.ask_first},
         )
     return _out(principal)
@@ -239,13 +272,24 @@ def add_company_rule(request: Request, body: RuleIn) -> LeadOut:
     from openexecutive.orchestrator import take_the_lead
 
     principal = _principal(request)
+    # A Goes rule lets more go on its own, so, like removing a rule, it
+    # needs a request tied to the owner.
+    if body.effect == take_the_lead.EFFECT_GO and not _provably_theirs(request, principal):
+        raise HTTPException(
+            status_code=409,
+            detail="This needs signed sign-ins on this server, so that nobody else can change it for you.",
+        )
     try:
         rule = take_the_lead.add_rule(
             take_the_lead.SCOPE_COMPANY, body.kind, body.value, created_by=f"person:{principal.id}",
+            effect=body.effect,
         )
     except take_the_lead.RuleError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    _audit("Added a Take the lead rule", {"scope": "company", "kind": rule.kind, "value": rule.value})
+    _audit(
+        "Added an As me rule",
+        {"scope": "company", "kind": rule.kind, "value": rule.value, "effect": rule.effect},
+    )
     return _out(principal)
 
 
@@ -261,7 +305,7 @@ def delete_company_rule(request: Request, rule_id: int) -> LeadOut:
         )
     if not take_the_lead.delete_rule(rule_id, take_the_lead.SCOPE_COMPANY):
         raise HTTPException(status_code=404, detail="That rule isn't there.")
-    _audit("Removed a Take the lead rule", {"scope": "company", "rule_id": rule_id})
+    _audit("Removed an As me rule", {"scope": "company", "rule_id": rule_id})
     return _out(principal)
 
 
@@ -298,4 +342,33 @@ def remove_learned(request: Request, allowed_id: int) -> LeadOut:
     if not take_the_lead.disallow(allowed_id, person_id=principal.id):
         raise HTTPException(status_code=404, detail="That isn't there.")
     _audit("Removed something it learned", {"scope": "executive", "allowed_id": allowed_id})
+    return _out(principal)
+
+
+@router.post("/take-the-lead/jobs", response_model=LeadOut)
+def add_job(request: Request, body: JobIn) -> LeadOut:
+    """Give it a standing job. Nothing new is allowed by it: every step it
+    takes for the job still goes through Approvals, the rules and In
+    training, so it needs no more proof than the owner's sign-in."""
+    from openexecutive.orchestrator import take_the_lead
+
+    principal = _principal(request)
+    try:
+        job = take_the_lead.add_job(body.text, created_by=f"person:{principal.id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit("Standing job added", {"job_id": job.id})
+    return _out(principal)
+
+
+@router.delete("/take-the-lead/jobs/{job_id}", response_model=LeadOut)
+def stop_job(request: Request, job_id: int) -> LeadOut:
+    from openexecutive.orchestrator import take_the_lead
+
+    principal = _principal(request)
+    job = take_the_lead.stop_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="That standing job isn't there.")
+    if job.stopped_at is None:
+        _audit("Standing job stopped", {"job_id": job_id})
     return _out(principal)

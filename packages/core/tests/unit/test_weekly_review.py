@@ -62,12 +62,14 @@ def _solo() -> None:
 
 def _decision(db: Path, *, days_ago: float, summary: str, outcome: str = "") -> int:
     ts = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    from openexecutive.memory import facts
+
+    # A decision is a standing fact; its own subject keeps it from replacing another.
+    fact, _ = facts.record_fact(subject=f"Decision: {summary}", statement=summary, source_quote="",
+                                decision=True, db_path=db)
     with sqlite3.connect(str(db)) as conn:
-        cur = conn.execute(
-            "INSERT INTO decisions (timestamp, domain, summary, outcome) VALUES (?, ?, ?, ?)",
-            (ts, "strategy", summary, outcome),
-        )
-        return int(cur.lastrowid or 0)
+        conn.execute("UPDATE facts SET created_at = ?, outcome = ? WHERE id = ?", (ts, outcome, fact.id))
+    return fact.id
 
 
 def _initiative(db: Path, *, title: str, status: str, days_ago: float) -> int:
@@ -347,6 +349,23 @@ def test_the_briefing_reads_the_top_three_back_from_the_artifact(
         "period": "W", "top_three": [], "excerpt": "x — y\nz\nq",
     }
     assert summarize_review("(no artifact)") == {"period": "", "top_three": [], "excerpt": ""}
+
+
+def test_an_area_whose_goals_are_all_done_is_skipped(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ids = _seed_areas()
+    for key in ("buffer", "invoices"):
+        dept_store.update_goal(ids[key], status="done")
+    dept_registry.invalidate()
+    calls = _stub_models(monkeypatch)
+
+    artifact = _artifact(_run())
+
+    # Finance has only done goals: no grader call, no section in the review.
+    assert [c[0] for c in calls["specialist"]] == []
+    assert "### Finance" not in artifact
+    assert "### Client work" in artifact
 
 
 def test_a_failing_specialist_leaves_the_area_ungraded(

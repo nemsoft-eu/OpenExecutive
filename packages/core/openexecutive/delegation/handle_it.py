@@ -1,21 +1,16 @@
 """Handle it for me: the inbox watcher sends some replies on its own.
 
-**The switch.** A third switch under Act as me, after "Draft replies to my
-inbox" (``delegation_handle_it``, one row per person, absent means off), with
-one setting, like the Agent Council's quality (``MODES``, ``RULES``):
-
-- ``careful``: short replies to people the person knows (someone on their
-  team, a contact, or someone they have written to), when it's very sure.
-- ``balanced`` (where it starts): replies to people they know.
-- ``bold``: also replies to strangers, longer ones, and replies with a link
-  or an amount when it's very sure.
-
-**In training.** Act as me's Replies and Follow-ups can each be put in
-training (``delegation.training``): then the dial lets nothing go by itself.
-Only a reply to a sender, or a follow-up to people, the person allowed with
-Send + allow goes on its own, under the dial's limits (a stranger they
-allowed included) and every check below. Take the lead as you doesn't lift
-those limits while in training.
+**No switch of its own.** It is on whenever Act as me writes replies to the
+person's inbox (``delegation.settings.is_enabled`` and the inbox watcher,
+``delegation.inbox.get_watch``): one setting, What it writes as you, on the
+Delegate page. Whether a reply then goes on its own is Approvals' alone
+(``orchestrator.outside_mode``, ``approvals_hold``): on Careful every reply
+waits on a card, since any outside read waits there; on Balanced and
+Hands-off a reply goes on its own unless one of the checks below holds it;
+below Hands-off that includes a reply to someone they don't know
+(``stranger``). On every level the last look (``injection_check``) holds
+anything it flags. ``delegation_handle_it`` (one row per person) is kept
+for what was sent, not read as a switch any more.
 
 Every other email waits on a card for the person to tap Send, as it did
 before. Only the person turns it on, from a session the API knows is theirs
@@ -31,29 +26,39 @@ with the reason recorded.
 
 **What it refuses.** Every one of these keeps the reply on a card:
 
-- it's off, or the sender is a stranger and the setting isn't ``bold``, or
-  signed sign-ins are off on a server (nothing would tie the switch to the
-  person);
+- Act as me doesn't write replies to their inbox, or Approvals is on
+  Careful, or signed sign-ins are off on a server (nothing would tie the
+  sends to the person);
 - Gmail couldn't authenticate the sender;
-- the classifier wasn't sure enough for the setting (``Rules``), or the
-  email isn't one of the kinds that need a reply;
+- the classifier wasn't sure enough (``MIN_CONFIDENCE``), or the email
+  isn't one of the kinds that need a reply;
 - the reply goes to anyone the email didn't already go to;
-- the reply, the email or its subject touches money, contracts, legal,
-  hiring, pay, the board, the press, health or credentials (``SENSITIVE``),
-  or the reply is longer than the setting allows, or has an amount, a
-  percentage or a link in it (``bold`` allows those when it's very sure);
+- the reply is longer than ``MAX_BODY_CHARS``;
+- one of the owner's Waits rules (Delegate → Approvals → Your rules,
+  ``take_the_lead.rule_waits``) matches, on every level;
+- below Hands-off, the email or the reply touches money, contracts,
+  credentials and the like (``SENSITIVE``), or the reply carries a link or
+  an amount (``content_hold``), unless a Goes rule
+  (``take_the_lead.rule_goes``) covers it. A link still waits;
 - the draft carries a flag other than ``ALLOWED_FLAGS`` (they asked whether
   it's an AI, recipients were trimmed, the draft names the Executive
   (``names_the_executive``), ...). The Executive merely being on the email
   (``executive_on_thread``) is fine: it is never a recipient of the reply;
+- the reply leaves something for the person to answer (an open question on
+  its card with no answer yet, ``leaves_questions``), checked at send time
+  (``reply_send.send_on_its_own``), after any work the Executive did first;
 - it already sent one in this thread in the last day, or the last thing the
   person "said" in this thread was itself sent on its own;
 - the day's limit (``DELEGATION_HANDLE_IT_MAX_SENDS_PER_DAY``) is reached;
 - after all of these pass, the last look (``injection_check``) finds the
   email trying to steer an assistant, or can't tell.
 
-Never sent on its own whatever the setting: anything with an attachment (the
-watcher's drafts have none), a new recipient, or a sensitive topic.
+Never sent on its own: a reply to a new recipient. A reply the Executive
+rewrote after doing what the email asked (``delegation.card_work``), files
+and all, is checked again here once that work is on its card, with its new
+words (``content_hold``), and goes on its own only when they pass and the
+email came from someone they know (``KNOWN_RELATIONS``): what the work made
+for anyone else waits for them (``work_stranger``), on every level.
 
 **Meeting invites.** It also accepts a meeting invite on its own
 (``delegation.invites``, never a decline) from someone the person knows,
@@ -78,7 +83,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from openexecutive.delegation.schema import HANDLE_IT_TABLE, HANDLED_TABLE, ensure_schema
+from openexecutive.delegation.schema import HANDLED_TABLE, ensure_schema
 
 logger = logging.getLogger(__name__)
 
@@ -89,39 +94,14 @@ KINDS: tuple[str, ...] = (KIND_REPLY_KNOWN, KIND_REPLY_STRANGER)
 LEVEL_ASK = "ask"
 LEVEL_HANDLE = "handle"
 
-MODE_CAREFUL = "careful"
-MODE_BALANCED = "balanced"
-MODE_BOLD = "bold"
-MODES: tuple[str, ...] = (MODE_CAREFUL, MODE_BALANCED, MODE_BOLD)
-DEFAULT_MODE = MODE_BALANCED
+# Kept in the table's ``mode`` column by older installs; read by nothing.
+DEFAULT_MODE = "balanced"
 
-
-@dataclass(frozen=True)
-class Rules:
-    """What one setting lets go on its own."""
-
-    strangers: bool
-    max_body_chars: int
-    min_confidence: float
-    # How sure it must be to send a reply with a link or an amount in it;
-    # None: never.
-    details_confidence: float | None = None
-    # Who a follow-up to an unanswered email of theirs may go to on its own
-    # (``delegation.follow_ups``), by ``inbox.relation_of``.
-    follow_up_to: frozenset[str] = frozenset()
-
-
-RULES: dict[str, Rules] = {
-    MODE_CAREFUL: Rules(strangers=False, max_body_chars=400, min_confidence=0.9),
-    MODE_BALANCED: Rules(
-        strangers=False, max_body_chars=1200, min_confidence=0.8, follow_up_to=frozenset({"team", "contact"}),
-    ),
-    MODE_BOLD: Rules(
-        strangers=True, max_body_chars=2000, min_confidence=0.8, details_confidence=0.9,
-        follow_up_to=frozenset({"team", "contact", "correspondent"}),
-    ),
-}
-# A follow-up is a nudge: never longer than this, whatever the setting.
+# How sure the classifier must be that a simple reply is all it needs.
+MIN_CONFIDENCE = 0.8
+# The longest reply or follow-up it sends on its own.
+MAX_BODY_CHARS = 4000
+# A follow-up is a nudge: it stays short.
 FOLLOW_UP_MAX_CHARS = 600
 
 KNOWN_RELATIONS = frozenset({"team", "contact", "correspondent"})
@@ -131,8 +111,9 @@ THREAD_WINDOW = timedelta(days=1)
 # Draft flags a reply may carry and still be sent on its own.
 ALLOWED_FLAGS = frozenset({"others_on_thread", "executive_on_thread"})
 
-# Topics that always wait for the person, matched as whole words in the email,
-# its subject and the reply. Deliberately broad: a false match costs a tap.
+# Below Hands-off, replies about these topics, or with a link or an amount,
+# wait on a card (``content_hold``); Hands-off sends them. Matched as whole
+# words in the email, its subject and the reply. A false match costs a tap.
 SENSITIVE = (
     "access token", "acquisition", "agreement", "api key", "attorney", "bank", "board", "bonus",
     "budget", "compensation", "compliance", "confidential", "contract", "contracts", "counsel",
@@ -144,16 +125,32 @@ SENSITIVE = (
     "resignation", "salary", "secret", "secrets", "settlement", "social security", "ssn",
     "subpoena", "term sheet", "terminate", "termination", "token", "tokens", "wire",
 )
+# The money words: an amount Goes rule covers them, a words one doesn't.
+MONEY_WORDS = frozenset({
+    "bank", "budget", "discount", "invoice", "invoices", "paid", "pay", "payment", "payments", "payroll",
+    "price", "prices", "pricing", "quote", "refund", "wire",
+})
+# Never sent on its own below Hands-off, whatever a Goes rule says.
+CREDENTIALS = (
+    "access token", "api key", "credentials", "login", "passcode", "password", "passwords", "secret",
+    "secrets", "social security", "ssn", "token", "tokens",
+)
+_CREDENTIALS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w).replace(r"\ ", r"\s+") for w in CREDENTIALS) + r")\b", re.IGNORECASE,
+)
 _SENSITIVE_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(w).replace(r"\ ", r"\s+") for w in SENSITIVE) + r")\b", re.IGNORECASE,
 )
 # A scheme, www., a bare host with a path ("bit.ly/x9Z"), or a bare host on
-# a common top-level domain. A false match only costs the person a tap.
+# a common top-level domain.
 _LINK_RE = re.compile(
     r"(?:https?://|www\.|\b[\w-]+(?:\.[\w-]+)+/\S*"
     r"|\b[\w-]+(?:\.[\w-]+)*\.(?:com|net|org|io|co|ly|ai|app|dev|me|info|biz|us|uk|link|xyz|gl|to|site|online)\b)",
     re.IGNORECASE,
 )
+# An email address (a signature's, say) is not a link: its domain alone would
+# read as a bare host, so addresses are taken out before looking for links.
+_EMAIL_RE = re.compile(r"(?:mailto:)?[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.IGNORECASE)
 _AMOUNT_RE = re.compile(
     r"[$€£¥₹]\s*\d|\d\s*%|\b\d[\d,.]*\s*(?:usd|eur|gbp|dollars?|euros?|pounds?|percent)\b",
     re.IGNORECASE,
@@ -161,17 +158,18 @@ _AMOUNT_RE = re.compile(
 
 # What each refusal tells the person on the card.
 REASONS: dict[str, str] = {
-    "level": "Handle it for me asks you about email from people you don't know yet (Most mail sends those).",
+    "level": "Approvals is on Careful, so what it would send as you waits for you.",
+    # In training (delegation.training): only people they allowed.
+    "training": "In training: you haven't let it send to them on its own yet.",
+    "off": "Sending on its own is off.",
     "signing_off": "Sending on its own needs signed sign-ins on this server.",
     "sender_unverified": "Your mail service couldn't confirm who sent it.",
     "unsure": "It wasn't sure enough this needs only a simple reply.",
     "kind": "It isn't the kind of email it answers on its own.",
     "recipients": "The reply would go to someone the email didn't.",
-    "sensitive": "It touches a topic that always waits for you.",
-    "amount": "The reply mentions an amount or a percentage.",
-    "link": "The reply has a link in it.",
     "long": "The reply is longer than the ones it sends on its own.",
     "flagged": "Something about the draft needs your eye.",
+    "questions": "It left something for you to answer, so it waits for you.",
     "thread_recent": "It already replied on its own in this conversation today.",
     "in_a_row": "Its last message in this conversation was sent on its own too.",
     "daily_limit": "Today's limit of replies sent on its own is reached.",
@@ -180,86 +178,132 @@ REASONS: dict[str, str] = {
     "suspicious": "The email reads like it's trying to give an assistant instructions.",
     # Found just before sending (reply_send.send_on_its_own).
     "draft_changed": "You changed the draft in your mailbox, so it's yours to send.",
-    "handle_it_off": "Handle it for me was off by the time it came to send.",
-    # Follow-ups as you (delegation.follow_ups).
-    "follow_up_level": "On this setting, a follow-up to this person waits for you to send it.",
-    # Take the lead as you (orchestrator.take_the_lead).
-    "lead_rule": "One of the rules you or your company added says this waits for you.",
-    # In training (delegation.training).
-    "training": "Replies are in training, and you haven't allowed replies to them yet.",
-    "follow_up_training": "Follow-ups are in training, and you haven't allowed follow-ups to them yet.",
+    "handle_it_off": "Sending on its own was off by the time it came to send.",
+    # After the Executive did what the email asked (delegation.card_work).
+    "work_unfinished": "I couldn't finish what they asked, so it waits for you.",
+    "work_theirs": "What they asked is yours to do, so this waits for you.",
+    "work_stranger": "I did what they asked, and they aren't in your People, so it waits for you to look.",
     # Meeting invites (delegation.invites).
+    "stranger": "Below Hands-off it acts on its own only for people you know.",
+    "sensitive": "Below Hands-off, mail about money, contracts, passwords and the like waits for you.",
+    "link": "Below Hands-off, a reply with a link waits for you.",
+    "amount": "Below Hands-off, a reply with an amount waits for you.",
+    "rule": "One of your rules says this waits for you.",
     "clash": "It clashes with something already on your calendar.",
     "calendar_unread": "It couldn't check your calendar for clashes, so it asked instead.",
-    "calendar_write": "Your calendar sign-in can't answer invites yet. Connect it again under Read my calendar.",
-    "invite_training": "Replies are in training, and you haven't let it accept their invites on its own yet.",
+    "calendar_write": "Your calendar sign-in can't answer invites yet. Connect it again under Read your calendar.",
 }
 
-# Take the lead as you lifts the setting's limits, but not this ceiling.
-LEAD_MAX_BODY_CHARS = 4000
+
+def leaves_questions(payload: dict[str, Any]) -> bool:
+    """Whether the reply on this card leaves the person something to answer:
+    an open question with no answer on the card yet. Such a reply never goes
+    on its own; it waits on Home for them."""
+    from openexecutive.delegation.answers import questions_for
+
+    return any(q["text"].strip() and not q["answer"].strip() for q in questions_for(payload))
 
 
-def leading(person_id: int, *, db_path: Path | None = None) -> bool:
-    """Whether Take the lead as you is on for ``person_id``: the setting's
-    limits give way to the added rules. Never raises: unreadable is off."""
-    from openexecutive.orchestrator import take_the_lead
-
+def hands_off(*, db_path: Path | None = None) -> bool:
+    """Whether Approvals is on Hands-off. Never raises: unreadable is no."""
     try:
-        return take_the_lead.as_you_on(person_id, db_path=db_path)
+        from openexecutive.orchestrator import outside_mode
+
+        return outside_mode.get_mode(db_path=db_path) == outside_mode.TRUST
     except Exception:
+        logger.warning("delegation.handle_it: couldn't read Approvals — not Hands-off", exc_info=True)
         return False
 
 
-def allowed_in_training(person_id: int, sender: str, *, db_path: Path | None = None) -> bool:
-    """Whether ``person_id`` allowed replies to ``sender`` (Send + allow).
-    Never raises: unreadable is no."""
-    from openexecutive.delegation import training
-
-    return training.allowed_sender(person_id, sender, db_path=db_path) is not None
-
-
-def follow_up_allowed(person_id: int, recipients: list[str], *, db_path: Path | None = None) -> bool:
-    """Whether ``person_id`` allowed follow-ups to exactly ``recipients``."""
-    from openexecutive.delegation import training
-
-    return training.allowed_follow_up(person_id, recipients, db_path=db_path) is not None
-
-
-def in_training(person_id: int, setting: str, *, db_path: Path | None = None) -> bool:
-    """Whether Act as me's ``setting`` is in training for ``person_id``.
-    Never raises (``training.get``)."""
-    from openexecutive.delegation import training
-
-    return training.get(person_id, db_path=db_path).on(setting)
-
-
-def _lead_rule(person_id: int, texts: list[str], going: list[str], db_path: Path | None) -> bool:
+def content_hold(
+    *texts: str, link_texts: tuple[str, ...] = (), recipients: tuple[str, ...] = (), db_path: Path | None = None,
+) -> str | None:
+    """Why what it would send on its own must wait, or None: a Waits rule
+    (``rule``) on every level; then, below Hands-off, money, contracts,
+    credentials and the like (``sensitive``), a link (``link``) or an amount
+    (``amount``), unless a Goes rule covers it: a person or company rule
+    covers all of them, an amount rule the money (a link or credentials
+    always wait). ``texts`` are read for rules, topics and amounts,
+    ``link_texts`` (what it would send) for links and Goes amounts,
+    ``recipients`` for person and domain rules. Unreadable rules hold, on
+    Hands-off too."""
     from openexecutive.orchestrator import take_the_lead
 
-    return take_the_lead.reply_hit(person_id, texts, going, db_path=db_path) is not None
+    going = [r.strip().lower() for r in recipients if r and r.strip()]
+    joined = "\n".join(t or "" for t in texts)
+    try:
+        rules = take_the_lead.list_rules([take_the_lead.SCOPE_COMPANY], db_path=db_path)
+    except Exception:
+        logger.warning("delegation.handle_it: couldn't read the rules — holding", exc_info=True)
+        return "rule"
+    if take_the_lead.rule_waits(rules, joined, going) is not None:
+        return "rule"
+    if hands_off(db_path=db_path):
+        return None
+    if any(_LINK_RE.search(_EMAIL_RE.sub(" ", t or "")) for t in link_texts):
+        return "link"
+    if any(_CREDENTIALS_RE.search(t or "") for t in texts):
+        return "sensitive"
+    own = "\n".join(t or "" for t in link_texts)
+    goes = take_the_lead.goes_rules(rules, joined, going, words_text=own)
+    kinds = {r.kind for r in goes}
+    if kinds & {take_the_lead.RULE_PERSON, take_the_lead.RULE_DOMAIN}:
+        return None
+    topics = {m.group(0).lower() for t in texts for m in _SENSITIVE_RE.finditer(t or "")}
+    money = {t for t in topics if re.sub(r"\s+", " ", t) in MONEY_WORDS}
+    if take_the_lead.RULE_AMOUNT not in kinds and money:
+        return "sensitive"
+    if topics - money:
+        return "sensitive"
+    if take_the_lead.RULE_AMOUNT not in kinds and any(_AMOUNT_RE.search(t or "") for t in texts):
+        return "amount"
+    return None
+
+
+def in_training(person_id: int, *, db_path: Path | None = None) -> bool:
+    """Whether the person's As you is in training (``delegation.training``):
+    then nothing goes on its own but to people they allowed."""
+    from openexecutive.delegation import training
+
+    return training.in_training(person_id, db_path=db_path)
+
+
+def training_hold(person_id: int, addresses: list[str], *, db_path: Path | None = None) -> str | None:
+    """``"training"`` when As you is in training and any of ``addresses``
+    isn't allowed yet, someone with no address on file included; None when
+    it may go (not in training, or every one allowed). An unreadable
+    setting holds, as Approvals does."""
+    from openexecutive.delegation import training
+
+    try:
+        if not training.in_training(person_id, db_path=db_path, strict=True):
+            return None
+    except Exception:
+        logger.warning("delegation.handle_it: couldn't read In training — holding", exc_info=True)
+        return "training"
+    going = [a for a in addresses if a]
+    if len(going) != len(addresses) or training.all_allowed(person_id, going, db_path=db_path) is None:
+        return "training"
+    return None
+
+
+def approvals_hold(*, db_path: Path | None = None) -> bool:
+    """Whether Approvals holds what it would send as someone on its own:
+    Careful does (any outside read waits there). Never raises: unreadable
+    holds."""
+    try:
+        from openexecutive.orchestrator import outside_mode
+
+        return outside_mode.get_mode(db_path=db_path) == outside_mode.ASK
+    except Exception:
+        logger.warning("delegation.handle_it: couldn't read Approvals — asking", exc_info=True)
+        return True
 
 
 @dataclass
 class HandleIt:
     person_id: int
     enabled: bool = False
-    mode: str = DEFAULT_MODE
-
-    @property
-    def rules(self) -> Rules:
-        return RULES.get(self.mode, RULES[DEFAULT_MODE])
-
-    def level(self, kind: str) -> str:
-        """``handle`` when a reply to this kind of sender may go on its own
-        by the dial (Replies in training overrides it: ``refusal``)."""
-        if not self.enabled or (kind != KIND_REPLY_KNOWN and not self.rules.strangers):
-            return LEVEL_ASK
-        return LEVEL_HANDLE
-
-    def follows_up(self, relation: str) -> bool:
-        """Whether a follow-up to someone with this ``relation`` may go on
-        its own."""
-        return self.enabled and relation in self.rules.follow_up_to
 
 
 # --------------------------------------------------------------------------- #
@@ -283,51 +327,18 @@ def _connect(db_path: Path | None = None) -> sqlite3.Connection:
 
 
 def get(person_id: int, *, db_path: Path | None = None) -> HandleIt:
-    """``person_id``'s switch and setting. Never raises: unreadable is off."""
+    """Whether replies may go on their own for ``person_id``: Act as me is
+    on and it writes replies to their inbox. No row of its own. Never
+    raises: unreadable is off."""
     try:
-        conn = _connect(db_path)
-        try:
-            row = conn.execute(
-                f"SELECT enabled, mode FROM {HANDLE_IT_TABLE} WHERE person_id = ?",  # noqa: S608 — constant table name
-                (person_id,),
-            ).fetchone()
-        finally:
-            conn.close()
+        from openexecutive.delegation import inbox
+        from openexecutive.delegation.settings import is_enabled
+
+        enabled = is_enabled(person_id, db_path=db_path) and inbox.get_watch(person_id, db_path=db_path).enabled
     except Exception:
-        logger.warning("delegation.handle_it: couldn't read the switch — treating it as off", exc_info=True)
+        logger.warning("delegation.handle_it: couldn't read the inbox settings — treating it as off", exc_info=True)
         return HandleIt(person_id=person_id)
-    if row is None:
-        return HandleIt(person_id=person_id)
-    mode = row["mode"] if row["mode"] in MODES else DEFAULT_MODE
-    return HandleIt(person_id=person_id, enabled=bool(row["enabled"]), mode=mode)
-
-
-def set_(
-    person_id: int,
-    *,
-    enabled: bool | None = None,
-    mode: str | None = None,
-    updated_by: str,
-    db_path: Path | None = None,
-) -> HandleIt:
-    """Change ``person_id``'s switch and/or setting (callers authorize
-    first). An unknown setting is ignored."""
-    current = get(person_id, db_path=db_path)
-    new_enabled = current.enabled if enabled is None else enabled
-    new_mode = mode if mode in MODES else current.mode
-    now = datetime.now(UTC).isoformat()
-    conn = _connect(db_path)
-    try:
-        conn.execute(
-            f"INSERT INTO {HANDLE_IT_TABLE} (person_id, enabled, mode, updated_at, updated_by) "  # noqa: S608
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(person_id) DO UPDATE SET enabled = excluded.enabled, "
-            "mode = excluded.mode, updated_at = excluded.updated_at, updated_by = excluded.updated_by",
-            (person_id, 1 if new_enabled else 0, new_mode, now, updated_by),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return get(person_id, db_path=db_path)
+    return HandleIt(person_id=person_id, enabled=enabled)
 
 
 def record_handled(
@@ -385,10 +396,6 @@ def signing_ok() -> bool:
         return False
 
 
-def sensitive(*texts: str) -> bool:
-    return any(_SENSITIVE_RE.search(t or "") for t in texts)
-
-
 def _own_messages(thread: Any, own: set[str]) -> list[Any]:
     return [
         m for m in getattr(thread, "messages", []) or []
@@ -425,31 +432,31 @@ def _refusal(
     person_id: int, message: Any, thread: Any, reply: Any, verdict: Any, *, relation: str, own: set[str],
     exec_address: str, now: datetime, db_path: Path | None,
 ) -> str | None:
-    from openexecutive.delegation import training
     from openexecutive.delegation.threads import MAX_RECIPIENTS
-    from openexecutive.integrations.email_poller import sender_new_text
 
     settings = get(person_id, db_path=db_path)
-    # In training only Send + allow lets a reply go: Take the lead as you
-    # doesn't lift its limits.
-    trained = in_training(person_id, training.REPLIES, db_path=db_path)
-    lead = settings.enabled and not trained and leading(person_id, db_path=db_path)
-    if trained:
-        if not settings.enabled:
-            return "level"
-        if not allowed_in_training(person_id, message.from_addr, db_path=db_path):
-            return "training"
-    elif not lead and settings.level(kind_for(relation)) != LEVEL_HANDLE:
+    if not settings.enabled:
+        return "off"
+    if approvals_hold(db_path=db_path):
         return "level"
+    # In training, only when everyone the reply reaches (its sender and the
+    # others on it) was allowed; otherwise, below Hands-off, a reply to
+    # someone they don't know waits on a card, as an invite from one does
+    # (delegation.invites).
+    held = training_hold(person_id, [*reply.to, *reply.cc], db_path=db_path)
+    if held is not None:
+        return held
+    if not in_training(person_id, db_path=db_path) and kind_for(relation) != KIND_REPLY_KNOWN and not hands_off(
+        db_path=db_path
+    ):
+        return "stranger"
     if not signing_ok():
         return "signing_off"
     if getattr(message, "sender_authenticated", False) is not True:
         return "sender_unverified"
     if verdict is None or verdict.kind not in REPLY_KINDS:
         return "kind"
-    rules = settings.rules
-    confidence = float(verdict.confidence)
-    if not lead and confidence < rules.min_confidence:
+    if float(verdict.confidence) < MIN_CONFIDENCE:
         return "unsure"
 
     # Exactly the people the email already went to, minus the person and the
@@ -458,31 +465,16 @@ def _refusal(
     going = [*reply.to, *reply.cc]
     if not going or len(going) > MAX_RECIPIENTS or not set(going) <= allowed or message.from_addr not in reply.to:
         return "recipients"
-
-    body = reply.body or ""
-    texts = [message.subject or "", sender_new_text(message.text or ""), reply.subject or "", body]
-    if sensitive(*texts):
-        return "sensitive"
-    if lead:
-        if _lead_rule(person_id, texts, going, db_path):
-            return "lead_rule"
-        # A link still waits on a tap: sent as them, it's the shape a phish takes.
-        if _LINK_RE.search(body):
-            return "link"
-        if len(body) > LEAD_MAX_BODY_CHARS:
-            return "long"
-        if any(f not in ALLOWED_FLAGS for f in reply.flags):
-            return "flagged"
-        return _last_checks(person_id, thread, own, now, db_path)
-    sure_of_details = rules.details_confidence is not None and confidence >= rules.details_confidence
-    if not sure_of_details and (_AMOUNT_RE.search(body) or _AMOUNT_RE.search(reply.subject or "")):
-        return "amount"
-    if not sure_of_details and _LINK_RE.search(body):
-        return "link"
-    if len(body) > rules.max_body_chars:
+    if len(reply.body or "") > MAX_BODY_CHARS:
         return "long"
     if any(f not in ALLOWED_FLAGS for f in reply.flags):
         return "flagged"
+    held = content_hold(
+        getattr(message, "subject", "") or "", getattr(message, "text", "") or "", reply.subject or "",
+        reply.body or "", link_texts=(reply.body or "",), recipients=(*reply.to, *reply.cc), db_path=db_path,
+    )
+    if held:
+        return held
     return _last_checks(person_id, thread, own, now, db_path)
 
 
@@ -524,42 +516,40 @@ def _follow_up_refusal(
     person_id: int, sent: Any, reply: Any, *, relation: str, own: set[str], exec_address: str, now: datetime,
     db_path: Path | None,
 ) -> str | None:
-    from openexecutive.delegation import training
     from openexecutive.delegation.threads import MAX_RECIPIENTS
-    from openexecutive.integrations.email_poller import sender_new_text
 
     settings = get(person_id, db_path=db_path)
-    trained = in_training(person_id, training.FOLLOW_UPS, db_path=db_path)
-    lead = settings.enabled and not trained and leading(person_id, db_path=db_path)
+    if not settings.enabled:
+        return "off"
+    if approvals_hold(db_path=db_path):
+        return "level"
+    # In training, only follow-ups to people they allowed, every one of them;
+    # otherwise, below Hands-off, one to someone they don't know waits on a
+    # card, as a reply to one does.
+    held = training_hold(person_id, [*reply.to, *reply.cc], db_path=db_path)
+    if held is not None:
+        return held
+    if not in_training(person_id, db_path=db_path) and kind_for(relation) != KIND_REPLY_KNOWN and not hands_off(
+        db_path=db_path
+    ):
+        return "stranger"
+    if not signing_ok():
+        return "signing_off"
     # Exactly the people their own email went to: nobody added, nobody left out.
     allowed = {*sent.to, *sent.cc} - own - ({exec_address} if exec_address else set())
     going = [*reply.to, *reply.cc]
-    if trained:
-        # Only follow-ups to exactly the people they allowed, whoever they are.
-        if not settings.enabled:
-            return "follow_up_level"
-        if not follow_up_allowed(person_id, going, db_path=db_path):
-            return "follow_up_training"
-    elif not lead and not settings.follows_up(relation):
-        return "follow_up_level"
-    if not signing_ok():
-        return "signing_off"
     if not going or len(going) > MAX_RECIPIENTS or set(going) != allowed:
         return "recipients"
-    body = reply.body or ""
-    texts = [sent.subject or "", sender_new_text(sent.text or ""), reply.subject or "", body]
-    if sensitive(*texts):
-        return "sensitive"
-    if lead and _lead_rule(person_id, texts, going, db_path):
-        return "lead_rule"
-    if _AMOUNT_RE.search(body) or _AMOUNT_RE.search(reply.subject or ""):
-        return "amount"
-    if _LINK_RE.search(body):
-        return "link"
-    if len(body) > min(settings.rules.max_body_chars, FOLLOW_UP_MAX_CHARS):
+    if len(reply.body or "") > FOLLOW_UP_MAX_CHARS:
         return "long"
     if any(f not in ALLOWED_FLAGS for f in reply.flags):
         return "flagged"
+    held = content_hold(
+        getattr(sent, "subject", "") or "", reply.subject or "", reply.body or "",
+        link_texts=(reply.body or "",), recipients=(*reply.to, *reply.cc), db_path=db_path,
+    )
+    if held:
+        return held
     return count_refusal(person_id, str(getattr(sent, "thread_id", "") or ""), now, db_path=db_path)
 
 

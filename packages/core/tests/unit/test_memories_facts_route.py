@@ -265,3 +265,57 @@ def test_others_proposals_cannot_crowd_out_a_teammates_view(monkeypatch: pytest.
     mine = _teammate_fact(SAM, "Sam Lee", subject="Elm Yard", proposed=True)
     body = _as_teammate(monkeypatch, SAM).get("/memories/facts?limit=2").json()
     assert {f["id"] for f in body["facts"]} == {live, mine}
+
+
+# --------------------------------------------------------------------------- #
+# Edit (POST /memories/facts/{id}/edit)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_principal_edits_a_fact_and_the_old_wording_is_kept(
+    monkeypatch: pytest.MonkeyPatch, db: list[dict[str, Any]],
+) -> None:
+    _, new, prof = _seed()
+    client = _client(monkeypatch, principal=True)
+    res = client.post(f"/memories/facts/{new}/edit", json={"statement": "Maple House has 50 units."})
+    assert res.status_code == 200
+    edited = res.json()
+    assert edited["statement"] == "Maple House has 50 units." and edited["subject"] == "Units"
+    assert edited["kind"] == "correction" and edited["previous_statement"] == "Maple House has 48 units."
+    assert "Units: Maple House has 50 units. (corrects: Maple House has 48 units.)" in facts.render_facts_for_prompt()
+    replaced = facts.get_fact(new)
+    assert replaced is not None and replaced.status == "superseded"
+    assert [r["event_type"] for r in db] == ["fact_edited"] and db[0]["private"] is True
+    # A replaced fact, a profile row and an empty edit are refused.
+    assert client.post(f"/memories/facts/{new}/edit", json={"statement": "x y"}).status_code == 409
+    assert client.post(f"/memories/facts/{prof}/edit", json={"statement": "42"}).status_code == 404
+    assert client.post(f"/memories/facts/{edited['id']}/edit", json={"statement": "  "}).status_code == 422
+
+
+def test_a_teammate_edits_only_their_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, new, _ = _seed()
+    monkeypatch.setattr(episodic_route, "_caller_id", lambda request: 7)
+    client = _client(monkeypatch, principal=False)
+    assert client.post(f"/memories/facts/{new}/edit", json={"statement": "Maple House has 50 units."}).status_code == 403
+    theirs, _ = facts.record_fact(subject="Cedar Court", statement="Cedar Court has 38 units.", source_quote="q",
+                                  recorded_by_role="teammate", recorded_by_name="Sam Lee",
+                                  recorded_by_person_id=7)
+    res = client.post(f"/memories/facts/{theirs.id}/edit", json={"statement": "Cedar Court has 40 units."})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["statement"] == "Cedar Court has 40 units." and body["recorded_by_name"] == "Sam Lee"
+
+
+def test_only_the_principal_changes_or_removes_a_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    kept, _ = facts.record_fact(subject="Expense cards", statement="Going with Brex.", source_quote="",
+                                decision=True, department="finance")
+    teammate = _client(monkeypatch, principal=False)
+    assert teammate.patch(f"/memories/decisions/{kept.id}", json={"summary": "Going with Ramp."}).status_code == 403
+    assert teammate.delete(f"/memories/decisions/{kept.id}").status_code == 403
+    assert [d.summary for d in episodic.list_decisions()] == ["Going with Brex."]
+
+    principal = _client(monkeypatch, principal=True)
+    res = principal.patch(f"/memories/decisions/{kept.id}", json={"summary": "Going with Ramp."})
+    assert res.status_code == 200 and res.json()["summary"] == "Going with Ramp."
+    assert principal.delete(f"/memories/decisions/{res.json()['id']}").status_code == 204
+    assert episodic.list_decisions() == []

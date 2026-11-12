@@ -31,6 +31,7 @@ import {
   senderShort,
 } from "@/lib/replyCards";
 import FeatureName from "@/components/FeatureName";
+import GoOnItsOwnOffer from "@/components/briefing/GoOnItsOwnOffer";
 import NextTimeTick from "@/components/NextTimeTick";
 
 // Home: the replies the Executive wrote as you for mail that needs you
@@ -83,7 +84,7 @@ export function useReplyCards() {
     }
   }, []);
 
-  const settling = (cards ?? []).some((c) => c.status === "executing");
+  const settling = (cards ?? []).some((c) => c.status === "executing" || c.working);
   useEffect(() => {
     if (!settling) return;
     const timer = setInterval(() => void refresh(), SETTLE_POLL_MS);
@@ -113,8 +114,8 @@ export const REPLIES_WAITING_TIP =
 
 // What the row is doing: idle, asking before sending (first or second
 // time), or waiting on the backend.
-// `allow`: Send with the "on its own next time" tick, in training (replies
-// to them, or follow-ups to these people, go on their own after).
+// `allow`: Send with the "on its own next time" tick, In training (everything
+// sent as you to them, or to a follow-up's people, goes on its own after).
 type Step =
   | { kind: "idle" }
   | { kind: "ask"; recipients: string[]; allow: boolean }
@@ -153,7 +154,7 @@ export function ReplyCardItem({
   const [open, setOpen] = useState(defaultOpen);
   // Edit: the draft's words in a box on the card, until Save or Cancel.
   const [editing, setEditing] = useState<string | null>(null);
-  // Drafts in training: keep what you sent as an example when you changed it first.
+  // Learn from my edits: keep what you sent as an example when you changed it first.
   const [keepExample, setKeepExample] = useState(true);
   // "Something else…": which question's answer box is open, and its words.
   const [typing, setTyping] = useState<{ index: number; text: string } | null>(null);
@@ -332,8 +333,8 @@ export function ReplyCardItem({
       checked={nextTime}
       disabled={busy}
       onChange={setNextTime}
-      label={followUp ? "Follow up with them on its own next time" : `Reply to ${firstName} on its own next time`}
-      help="You can undo this in Handle it for me."
+      label={followUp ? "Send to them on its own next time" : `Send to ${firstName} on its own next time`}
+      help="Everything sent as you to them goes on its own from then on, where Approvals lets it. Undo it on Delegate."
     />
   ) : null;
   const askToSend = () => {
@@ -527,7 +528,7 @@ export function ReplyCardItem({
                   </Button>
                 ) : (
                   <>
-                    <Button variant="primary" onClick={askToSend} disabled={busy}>
+                    <Button variant="primary" onClick={askToSend} disabled={busy || card.working}>
                       Send
                     </Button>
                     <Button variant="secondary" onClick={() => setOpen(true)} disabled={busy}>
@@ -593,6 +594,11 @@ export function ReplyCardItem({
               {i === lastNote && hasOpen && decideBlock}
             </ExecBubble>
           ),
+        )}
+        {card.working && (
+          <ExecBubble>
+            <p aria-live="polite">Working on what {followUp ? "you" : card.from_name.split(" ")[0] || "they"} asked…</p>
+          </ExecBubble>
         )}
         {busy && (step.label === "Writing it in…" || step.label === "Changing it…") && (
           <p className="text-xs text-fg-subtle" aria-live="polite">Writing it into your reply…</p>
@@ -669,6 +675,18 @@ export function ReplyCardItem({
                   )
                 : card.draft_body}
             </p>
+            {(card.files ?? []).length > 0 && (
+              <ul className="mt-2 flex flex-wrap gap-2" aria-label="Attached">
+                {(card.files ?? []).map((name) => (
+                  <li
+                    key={name}
+                    className="max-w-full truncate rounded-lg border border-line-strong bg-surface-overlay px-2.5 py-1 text-[13px] text-fg"
+                  >
+                    {name}
+                  </li>
+                ))}
+              </ul>
+            )}
             {!unconfirmed && !confirming && (
               <button
                 type="button"
@@ -732,8 +750,8 @@ export function ReplyCardItem({
           {step.kind === "ask" && nextTimeTick("mt-2")}
           {allowNow && (
             <p className="mt-2 text-sm text-fg">
-              From now on, {followUp ? "follow-ups" : "replies"} to {who} go on their own while Handle it for me is
-              on. Topics that always wait, links and new people still wait for you.
+              From now on, replies and follow-ups to {who} go on their own, where Approvals lets them. Careful still
+              holds everything, and your rules always wait.
             </p>
           )}
           {learnsStyle && (
@@ -799,6 +817,9 @@ export function ReplyCardItem({
         </>
       )}
         </>
+      )}
+      {!unconfirmed && editing === null && (
+        <GoOnItsOwnOffer addresses={card.draft_to?.length ? card.draft_to : [card.from_email]} />
       )}
       {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
     </article>

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import BrandMark from "@/components/BrandMark";
+import ApprovalsChip from "@/components/shell/ApprovalsChip";
 import Icon, { IconName } from "@/components/Icon";
 import UserBadge from "@/components/UserBadge";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
@@ -15,7 +16,8 @@ import {
   NEW_CHAT_DESCRIPTION,
   SETTINGS_NAV_ITEM,
 } from "@/components/shell/navConfig";
-import { getReviewStats } from "@/lib/api";
+import { getReviewStats, listMemoryChanges, listUnansweredQuestions } from "@/lib/api";
+import { MEMORY_VISITED_EVENT, readLastVisit, writeLastVisit } from "@/lib/memoryChanges";
 
 /**
  * Wiring the chat home passes in. `/` keeps its state in memory (mode,
@@ -60,14 +62,22 @@ export default function AppSidebar({
   const { mode, role, hasDepartments } = useWorkspace();
   const [reviewBadge, setReviewBadge] = useState(0);
 
-  // Knowledge base badge: items waiting in its review queue. Refetched on
-  // navigation so approving items clears the badge once you move on, rather
-  // than only on a full reload.
+  // Knowledge badge: items waiting in its review queue plus the questions it
+  // could not answer. Refetched on navigation so approving an item or
+  // answering a question clears it once you move on, rather than only on a
+  // full reload. Either count failing leaves it out.
   useEffect(() => {
-    getReviewStats()
-      .then((s) => setReviewBadge(s.pending + s.needs_revision))
-      .catch(() => {});
+    Promise.all([
+      getReviewStats()
+        .then((s) => s.pending + s.needs_revision)
+        .catch(() => 0),
+      listUnansweredQuestions()
+        .then((q) => q.count)
+        .catch(() => 0),
+    ]).then(([review, questions]) => setReviewBadge(review + questions));
   }, [pathname]);
+
+  const memoryNews = useMemoryNews(pathname);
 
   const destinations = buildDestinations({
     isOnboarded,
@@ -130,7 +140,7 @@ export default function AppSidebar({
 
       {/* The six places. Everything else is a tab inside one of them, or a
           tool on Settings. */}
-      <nav aria-label="Main" className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
+      <nav aria-label="Main" className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 py-2">
         <div className="space-y-1">
           {destinations.map((d) => {
             const isHome = d.key === "home";
@@ -146,6 +156,7 @@ export default function AppSidebar({
                 description={d.description}
                 active={active}
                 badge={d.badge}
+                dot={d.key === "pulse" && memoryNews}
               />
             );
           })}
@@ -153,6 +164,7 @@ export default function AppSidebar({
       </nav>
 
       <div className="px-3 pb-2 pt-2 border-t border-line flex-shrink-0">
+        <ApprovalsChip onNavigate={onClose} />
         <NavRow
           href={SETTINGS_NAV_ITEM.href}
           onClick={onClose}
@@ -224,6 +236,7 @@ function NavRow({
   description,
   active,
   badge,
+  dot,
 }: {
   href?: string;
   onClick: () => void;
@@ -233,6 +246,8 @@ function NavRow({
   description?: string;
   active: boolean;
   badge?: number;
+  /** Something new to see there (Memory, since the last visit). */
+  dot?: boolean;
 }) {
   const tone = active
     ? "bg-accent/10 text-accent font-semibold"
@@ -248,8 +263,54 @@ function NavRow({
       <Icon name={icon} size="w-5 h-5" />
       <span className="flex-1 truncate">{label}</span>
       {badge != null && badge > 0 && <Badge count={badge} />}
+      {dot && (
+        <span className="h-2 w-2 rounded-full bg-emerald-400" role="status" aria-label="New since your last visit" />
+      )}
     </SidebarEntry>
   );
+}
+
+/** Whether Memory has something new since it was last opened in this
+ * browser: looked at on each move and every few minutes, cleared when
+ * Memory is opened. The first time, the clock starts now. */
+function useMemoryNews(pathname: string): boolean {
+  const [news, setNews] = useState(false);
+  const [visits, setVisits] = useState(0);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const onVisit = () => {
+      setNews(false);
+      setVisits((n) => n + 1);
+    };
+    window.addEventListener(MEMORY_VISITED_EVENT, onVisit);
+    const timer = window.setInterval(() => setTick((n) => n + 1), 3 * 60_000);
+    return () => {
+      window.removeEventListener(MEMORY_VISITED_EVENT, onVisit);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (pathname.startsWith("/memories")) return;
+    const since = readLastVisit();
+    if (!since) {
+      writeLastVisit(new Date().toISOString());
+      return;
+    }
+    let cancelled = false;
+    listMemoryChanges(since)
+      .then((rows) => {
+        if (!cancelled) setNews(Boolean(rows && rows.length > 0));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname, visits, tick]);
+
+  // On Memory itself there is nothing to point at; the visit restarts the clock.
+  return news && !pathname.startsWith("/memories");
 }
 
 function Badge({ count }: { count: number }) {

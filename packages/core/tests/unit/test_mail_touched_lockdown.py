@@ -24,6 +24,7 @@ from openexecutive.orchestrator.chat_search_tools import CHAT_SEARCH_TOOLS
 from openexecutive.orchestrator.delegation_tools import DELEGATION_TOOLS
 from openexecutive.orchestrator.history_tools import HISTORY_TOOLS
 from openexecutive.orchestrator.mcp_gateway import MCP_TOOLS
+from openexecutive.orchestrator.reply_card_tools import REPLY_CARD_TOOLS
 from openexecutive.orchestrator.router import SPECIALIST_TOOLS
 from openexecutive.orchestrator.schedule_tools import PRIVATE_TURN_MCP_TOOLS, current_session
 from openexecutive.orchestrator.searxng_search import SEARXNG_WEB_SEARCH_TOOL, SearchBudget
@@ -36,6 +37,12 @@ from openexecutive.workflows import step_script
 from ._agent_loop_fakes import FinalMsg, TextBlock, ToolUseBlock
 from .test_delegation_tools import FakeMailbox
 from .test_delegation_turn import _TextProvider
+
+
+def _held(result: Any) -> bool:
+    """The step came to the owner as an Approve card (orchestrator.levels)."""
+    parsed = json.loads(result)
+    return parsed.get("status") == "waiting_for_approval" and isinstance(parsed.get("decision_instance_id"), int)
 
 GHOSTWRITE = {"intent": "Yes.", "thread_id": "t1"}
 SLACK = {"slack_user_id": "U123", "text": "Replied to Dana."}
@@ -146,6 +153,7 @@ def test_every_tool_is_classified_once() -> None:
         t["name"]
         for t in [
             *ex._ALL_SKILL_TOOLS, *SPECIALIST_TOOLS, *MCP_TOOLS, *DELEGATION_TOOLS, *HISTORY_TOOLS, *CHAT_SEARCH_TOOLS,
+            *REPLY_CARD_TOOLS,
             step_script.CHAT_TOOL_DEFINITION, step_script.LIST_SAVED_TOOLS_DEFINITION,
             # The client search tools a local model gets per turn.
             SEARXNG_WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
@@ -168,7 +176,7 @@ def test_call_tool_runs_only_reads_and_recipient_checked_sends() -> None:
     assert not lockdown.mail_touched_withholds("ghostwrite_email", {})
 
 
-def test_only_links_scripts_workflows_posts_and_lasting_text_are_withheld() -> None:
+def test_only_links_scripts_workflows_posts_lasting_text_and_card_answers_are_withheld() -> None:
     assert {
         "web_fetch", "web_search",
         "load_mcp_server", "add_watchlist_entry", "tune_watchlist_entry",
@@ -177,7 +185,7 @@ def test_only_links_scripts_workflows_posts_and_lasting_text_are_withheld() -> N
         "send_department_message", "send_company_broadcast", "create_alert",
         "archive_person", "set_department_head", "resolve_roster_request",
         "schedule_followup", "create_goal", "update_department_goal",
-        "record_decision_outcome",
+        "record_decision_outcome", "answer_card",
     } == lockdown.MAIL_TOUCHED_WITHHELD_TOOLS
     for tool in ("message_person", "send_slack_dm", "create_calendar_event",
                  "remember_fact", "remind_me", "update_company_profile",
@@ -201,10 +209,9 @@ def test_a_link_after_the_turn_read_mail_is_refused(fetched: list[dict[str, Any]
         [ToolUseBlock("tu2", "run_executive_research", LINK)],
     )
     assert fetched == []
-    refusal = json.loads(_tool_results(calls[2])["tu2"])["error"]
-    assert "read the user's own mail" in refusal and "next message" in refusal
+    assert _held(_tool_results(calls[2])["tu2"])
     rows = [r for r in audit_logger._default_logger.query(event_type="tool_invocation", limit=50)
-            if (r.details or {}).get("refused") == "mail_touched"]
+            if (r.details or {}).get("held") == "mail_touched"]
     assert len(rows) == 1 and rows[0].private
 
 
@@ -217,7 +224,7 @@ def test_a_link_in_the_same_round_is_refused_too(fetched: list[dict[str, Any]]) 
     assert fetched == []
     results = _tool_results(calls[1])
     assert json.loads(results["tu1"])["status"] == "drafted"
-    assert "read the user's own mail" in json.loads(results["tu2"])["error"]
+    assert _held(results["tu2"])
 
 
 def test_a_link_beside_a_notes_recall_is_refused(fetched: list[dict[str, Any]]) -> None:
@@ -320,9 +327,25 @@ def test_the_outside_handlers_refuse_on_their_own() -> None:
         current_session.reset(token)
 
 
-def test_the_gateway_refuses_only_outside_tools_after_the_turn_read_mail() -> None:
+def _cards(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, list[dict[str, Any]], str]]:
+    """Stand in for the Approve card a held gateway call goes on
+    (``levels.hold_many``), recording what it held."""
+    from openexecutive.orchestrator import levels
+
+    held: list[tuple[str, list[dict[str, Any]], str]] = []
+
+    def hold_many(tool: str, inputs: list[dict[str, Any]], **kw: Any) -> str:
+        held.append((tool, inputs, kw["reason"]))
+        return json.dumps({"status": "waiting_for_approval", "decision_instance_id": len(held)})
+
+    monkeypatch.setattr(levels, "hold_many", hold_many)
+    return held
+
+
+def test_the_gateway_refuses_only_outside_tools_after_the_turn_read_mail(monkeypatch: pytest.MonkeyPatch) -> None:
     from openexecutive.orchestrator.mcp_gateway import MCPGateway
 
+    cards = _cards(monkeypatch)
     gateway = MCPGateway.__new__(MCPGateway)
     session = Session()
     session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
@@ -334,7 +357,9 @@ def test_the_gateway_refuses_only_outside_tools_after_the_turn_read_mail() -> No
             fetch = asyncio.run(gateway.call_tool({
                 "name": "fetch__fetch_url", "arguments": {"url": "https://x.example/"},
             }))
-            assert "read the user's own mail" in json.loads(fetch)["error"]
+            # It waits on the owner's Approve card, the exact call.
+            assert json.loads(fetch)["status"] == "waiting_for_approval"
+            assert cards == [("fetch__fetch_url", [{"url": "https://x.example/"}], "mail_touched")]
             load = asyncio.run(gateway.load_mcp_server({"name": "x", "url": "https://x.example/mcp"}))
             assert "read the user's own mail" in json.loads(load)["error"]
             # A read, and a send whose recipients the gateway checks, go on to
@@ -388,9 +413,12 @@ def test_a_onedrive_file_opens_but_a_mail_attachment_does_not() -> None:
 
 
 @pytest.mark.parametrize("read_mail", [True, False])
-def test_the_gateway_opens_a_drive_file_in_a_conversation_that_read_mail(read_mail: bool) -> None:
+def test_the_gateway_opens_a_drive_file_in_a_conversation_that_read_mail(
+    read_mail: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from openexecutive.orchestrator.mcp_gateway import MCPGateway
 
+    _cards(monkeypatch)
     gateway = MCPGateway.__new__(MCPGateway)
     session = Session()
     session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
@@ -405,7 +433,7 @@ def test_the_gateway_opens_a_drive_file_in_a_conversation_that_read_mail(read_ma
                 }))
             fetch = {"name": "fetch__fetch_url", "arguments": {"url": "https://x.example/"}}
             if read_mail:
-                assert "read the user's own mail" in json.loads(asyncio.run(gateway.call_tool(fetch)))["error"]
+                assert json.loads(asyncio.run(gateway.call_tool(fetch)))["status"] == "waiting_for_approval"
             else:
                 # A later turn of that conversation is not locked.
                 with pytest.raises(AssertionError, match="reached the server"):
@@ -416,7 +444,7 @@ def test_the_gateway_opens_a_drive_file_in_a_conversation_that_read_mail(read_ma
 
 class _Collect(logging.Handler):
     def __init__(self) -> None:
-        super().__init__(logging.WARNING)
+        super().__init__(logging.INFO)
         self.lines: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -432,7 +460,7 @@ def test_the_log_never_carries_a_call_tools_own_words(sent: list[dict[str, Any]]
     log = logging.getLogger("openexecutive.orchestrator.executive")
     collect, prior = _Collect(), log.level
     log.addHandler(collect)
-    log.setLevel(logging.WARNING)
+    log.setLevel(logging.INFO)
     try:
         _turn(
             [ToolUseBlock("tu1", "ghostwrite_email", GHOSTWRITE)],
@@ -447,9 +475,8 @@ def test_the_log_never_carries_a_call_tools_own_words(sent: list[dict[str, Any]]
     assert ex._loggable_tool("google_workspace__send_gmail_message") == "google_workspace__send_gmail_message"
     assert ex._loggable_tool(leak) == "call_tool:<unlisted>"
     rows = [r for r in audit_logger._default_logger.query(event_type="tool_invocation", limit=50)
-            if (r.details or {}).get("refused") == "mail_touched"]
+            if (r.details or {}).get("held") == "mail_touched"]
     assert rows and rows[0].private and rows[0].details["tool"] == leak
-
 
 
 @pytest.mark.parametrize("tool", sorted(lockdown.MAIL_TOUCHED_WITHHELD_TOOLS))
@@ -564,67 +591,10 @@ def test_a_contact_the_speaker_names_is_added_after_reading_mail(
     assert added == ([jamie] if reads_mail else [jamie, stranger, planted])
 
 
-def test_a_go_runs_the_held_step_while_its_mail_read_waits(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The chat loop end to end: a step held after a mail read runs on the
-    person's go, in the same round as a mailbox read, which waits a round
-    (outside_content.defers_read) and so doesn't hold it again."""
-    from openexecutive.orchestrator import outside_content
-
-    followups: list[dict[str, Any]] = []
-
-    async def handler(tool_input: dict[str, Any]) -> str:
-        followups.append(tool_input)
-        return json.dumps({"status": "scheduled"})
-
-    monkeypatch.setitem(ex._ALL_SKILL_HANDLERS, "schedule_followup", handler)
-    outside_content._HELD.clear()
-    principal = people_store.upsert_person(full_name="Olivia Owner", is_principal=True, email="olivia@co.example")
-    people_registry.invalidate()
-    person = people_store.get_person(principal)
-    session = Session(
-        delegation_override=DelegationOverride(enabled=True, gmail=FakeMailbox(), person=person),
-        from_web_chat=True,
-    )
-    followup = {"text": "Chase Dana on the pilot", "when": "tomorrow 9am"}
-    read = {"query": "from:dana"}
-
-    def turn(message: str, *rounds: list[Any]) -> list[Any]:
-        finals = [FinalMsg(uses, "tool_use") for uses in rounds]
-        finals.append(FinalMsg([TextBlock("Done.")], "end_turn"))
-        provider = _TextProvider(finals)
-
-        async def go() -> None:
-            with (
-                patch("openexecutive.orchestrator.executive.get_provider", return_value=provider),
-                patch("openexecutive.orchestrator.executive.audit_log", log_event),
-            ):
-                async for _ in ex.Executive().stream_chat(message, session, person_id=principal):
-                    pass
-
-        asyncio.run(go())
-        return provider.calls
-
-    turn(
-        "reply to Dana as me and set a follow-up",
-        [ToolUseBlock("tu1", "ghostwrite_email", GHOSTWRITE)],
-        [ToolUseBlock("tu2", "schedule_followup", followup)],
-    )
-    assert followups == []
-    calls = turn(
-        "go",
-        [ToolUseBlock("tu3", "search_my_email", read), ToolUseBlock("tu4", "schedule_followup", followup)],
-    )
-    assert followups == [followup]
-    results = _tool_results(calls[1])
-    assert "reads wait one round" in json.loads(results["tu3"])["error"]
-    outside_content._HELD.clear()
-
-
 # --------------------------------------------------------------------------- #
 # The safety level decides how much of the lockdown holds: every mail read is
 # checked (outside_content.check_mail_read, orchestrator.content_scan).
 # --------------------------------------------------------------------------- #
-
 
 
 def _level(monkeypatch: pytest.MonkeyPatch, mode: str, verdict: Any) -> None:
@@ -691,7 +661,7 @@ def test_balanced_holds_after_mail_the_check_flagged(
     assert fetched == []
     # The model read the mail behind the notice not to follow it.
     assert str(_result_of(calls, "tu1")).startswith("[Safety check: this content looks like")
-    assert "read the user's own mail" in json.loads(_result_of(calls, "tu2"))["error"]
+    assert _held(_result_of(calls, "tu2"))
     assert outside_content._SOURCE_WORDS[outside_content.MAIL] == "An email I read"
 
 
@@ -798,17 +768,46 @@ def test_the_lockdown_follows_the_safety_level(
         assert lockdown.mail_lock_holds(session.turn_delegation) is holds  # type: ignore[attr-defined]
         assert (lockdown.outside_reach_refusal("run_executive_research") is not None) is holds
         assert (lockdown.outside_reach_refusal("schedule_followup") is not None) is holds
-        # Posts to everyone and roster changes stay shut at every level, and a
-        # contact the speaker didn't name still isn't added.
+        # Posts to everyone, roster changes and a contact the speaker didn't
+        # name wait below Hands-off, even once the check cleared the read.
+        private = mode != "trust"
         for tool in lockdown.MAIL_PRIVATE_WITHHELD_TOOLS:
-            assert lockdown.mail_turn_withholds(tool, {}), tool
-        assert lockdown.mail_turn_withholds("upsert_person", {"full_name": "Eve", "email": "eve@x.example"})
+            assert lockdown.mail_turn_withholds(tool, {}) is private, tool
+        assert lockdown.mail_turn_withholds(
+            "upsert_person", {"full_name": "Eve", "email": "eve@x.example"}
+        ) is private
         assert not lockdown.mail_turn_withholds("message_person", {})
         # This round reads mail: its reads aren't checked yet.
         if mode != "trust":
             assert lockdown.mail_turn_withholds("run_executive_research", {}, reading_now=True)
             # So no script runs beside an unchecked read.
             assert lockdown.mail_turn_withholds("run_script", {}, reading_now=True)
+    finally:
+        outside_content.end_turn(state)
+        current_session.reset(token)
+
+
+@pytest.mark.parametrize(
+    ("mode", "pin", "holds"),
+    [
+        ("ask", {"mail_vetted": True}, False),
+        ("ask", {"mail_vetted": True, "mail_held": True}, True),
+        ("outsiders", {}, False),
+        ("outsiders", {"mail_held": True}, True),
+    ],
+)
+def test_after_a_go_only_a_flagged_mail_read_holds_again(
+    monkeypatch: pytest.MonkeyPatch, mode: str, pin: dict[str, Any], holds: bool,
+) -> None:
+    from openexecutive.orchestrator import content_trust, outside_content
+
+    monkeypatch.setattr(content_trust, "principal_only_withheld", lambda session: frozenset())
+    session, token, state = _pinned_turn(mode, **pin)
+    state.go_first = ("run_script",)
+    try:
+        assert lockdown.mail_lock_holds(session.turn_delegation) is holds  # type: ignore[attr-defined]
+        # A round that reads mail still waits for its check.
+        assert lockdown.mail_lock_holds(session.turn_delegation, reading_now=True)  # type: ignore[attr-defined]
     finally:
         outside_content.end_turn(state)
         current_session.reset(token)
@@ -1144,6 +1143,24 @@ def test_posts_to_everyone_stay_held_whatever_the_lockdown_allows(
         current_session.reset(token)
 
 
+def test_hands_off_holds_no_post_or_roster_change_after_reading_mail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Approvals is the one gate: on Hands-off a mail read keeps nothing shut.
+    from openexecutive.orchestrator import content_trust, outside_content
+
+    monkeypatch.setattr(content_trust, "principal_only_withheld", lambda session: frozenset())
+    session, token, state = _pinned_turn("trust", mail_held=True)
+    try:
+        for tool in lockdown.MAIL_PRIVATE_WITHHELD_TOOLS:
+            assert not lockdown.mail_turn_withholds(tool, {}), tool
+            assert lockdown.outside_reach_refusal(tool) is None, tool
+        assert not lockdown.mail_turn_withholds("upsert_person", {"full_name": "Eve", "email": "eve@x.example"})
+    finally:
+        outside_content.end_turn(state)
+        current_session.reset(token)
+
+
 def test_a_misnumbered_search_flag_flags_the_whole_list(monkeypatch: pytest.MonkeyPatch) -> None:
     # The check names thread 1 but the text is in thread 2: the second check
     # still flags what is left, so nothing is let through.
@@ -1178,3 +1195,48 @@ def test_a_reply_or_forward_subject_is_someone_elses(subject: str) -> None:
     assert outside_content._CARRIED_SUBJECT.match(subject)
     assert not outside_content._CARRIED_SUBJECT.match("Index: Pilot")
     assert not outside_content._CARRIED_SUBJECT.match("For Pat: offers")
+
+
+def test_a_code_built_call_after_a_mail_read_holds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Attaching Drive files to a draft runs Drive calls built in code: they
+    run, and nothing waits on a card or a "Go ahead"."""
+    from openexecutive.orchestrator import outside_content
+    from openexecutive.orchestrator.mcp_gateway import MCPGateway, code_built_call
+
+    cards = _cards(monkeypatch)
+    gateway = MCPGateway.__new__(MCPGateway)
+    session = Session()
+    session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
+        enabled=True, offered=True, touched_mail=True, read_mail=True, session_id=session.session_id,
+    )
+    token = current_session.set(session)
+    state = outside_content.begin_turn(session, user_message="attach the scans to the draft")
+    try:
+        built = {"name": "google_workspace__get_drive_file_permissions", "arguments": {"file_id": "f1"}}
+        with (
+            patch.object(MCPGateway, "_require_session", side_effect=AssertionError("reached the server")),
+            code_built_call(built),
+            pytest.raises(AssertionError, match="reached the server"),
+        ):
+            asyncio.run(gateway.call_tool(built))
+        assert cards == [] and state.held == []
+    finally:
+        outside_content.end_turn(state)
+        current_session.reset(token)
+
+
+def test_a_skill_a_handler_stops_waits_on_a_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    cards = _cards(monkeypatch)
+    session = Session()
+    session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
+        enabled=True, offered=True, touched_mail=True, read_mail=True, session_id=session.session_id,
+    )
+    token = current_session.set(session)
+    try:
+        held = lockdown.outside_reach_refusal("schedule_followup", {"intent": "chase Kyle"})
+        assert held is not None and json.loads(held)["status"] == "waiting_for_approval"
+        assert cards == [("schedule_followup", [{"intent": "chase Kyle"}], "mail_touched")]
+        # With no input to carry out, it is refused instead.
+        assert "was not run" in json.loads(lockdown.outside_reach_refusal("run_workflow") or "{}")["error"]
+    finally:
+        current_session.reset(token)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from openexecutive.departments import registry, store
@@ -25,7 +25,6 @@ from openexecutive.departments.cadence import (
     reschedule_check_in,
 )
 from openexecutive.departments.models import (
-    AuthorityLevel,
     DepartmentCharter,
     DepartmentState,
     Goal,
@@ -67,7 +66,6 @@ class DepartmentCreate(BaseModel):
 class DepartmentPatch(BaseModel):
     title: str | None = None
     charter: DepartmentCharter | None = None
-    authority_level: AuthorityLevel | None = None
     head_person_id: int | None = None
     head_persona_slug: str | None = None
     cadences: dict[str, str] | None = None
@@ -113,9 +111,18 @@ class DepartmentDetail(DepartmentState):
     next_check_in_at: str | None = None
 
 
+def _with_level(state: DepartmentState) -> DepartmentState:
+    """``state`` showing the level its work runs at: Approvals
+    (``authority.department_level``), not the "How it acts" it once stored."""
+    from openexecutive.departments.authority import department_level
+
+    config = state.config.model_copy(update={"authority_level": department_level(state.config.slug)})
+    return state.model_copy(update={"config": config})
+
+
 def _detail(state: DepartmentState) -> DepartmentDetail:
     return DepartmentDetail(
-        **state.model_dump(),
+        **_with_level(state).model_dump(),
         next_check_in_at=next_check_in_at(state.config.slug),
     )
 
@@ -167,6 +174,8 @@ class GoalView(Goal):
     owner_id: int | None = None
     owner_name: str = ""
     department_title: str | None = None
+    # Names of the watch-list items that are for this goal.
+    watching: list[str] = []
 
 
 def _translate_legacy_body(body: dict) -> dict:
@@ -193,7 +202,7 @@ def list_departments() -> list[DepartmentState]:
     """List all departments with their Goals."""
     # Read straight through the store (not the cache) so the API view is always
     # fresh; the registry cache is for the per-turn prompt-block path only.
-    return store.list_departments()
+    return [_with_level(state) for state in store.list_departments()]
 
 
 @router.get("/departments/{slug}", response_model=DepartmentDetail)
@@ -273,7 +282,6 @@ def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentDetail:
         slug,
         title=patch.title,
         charter=patch.charter,
-        authority_level=patch.authority_level,
         # Use _UNSET when the field was not present in the request so "not
         # provided" and "explicitly null (clear)" are distinguishable.
         head_person_id=patch.head_person_id if "head_person_id" in raw else _UNSET,
@@ -370,6 +378,12 @@ def _patch_goal(slug: str | None, goal_id: int, body: GoalPatch) -> Goal:
         if body.department_slug and store.get_department(body.department_slug) is None:
             raise HTTPException(status_code=422, detail="Unknown department")
         moves["department_slug"] = body.department_slug or None
+    # A person changing the status grades the goal: it counts as checked, so
+    # a goal they move back to on track doesn't read "not checked yet".
+    # Stamped before update_goal sets updated_at, so the edit stays newer
+    # than the stamp and the next check-in or goal review still grades it.
+    if body.status is not None and body.status != existing.status:
+        moves["last_reviewed_at"] = datetime.now(UTC).isoformat()
     store.update_goal(
         goal_id,
         period_type=body.period_type,
@@ -409,15 +423,97 @@ def list_all_goals() -> list[GoalView]:
     """Every goal, with or without a department, with its owner resolved."""
     from openexecutive.departments.goals import list_goal_views
 
+    watching = _watching_by_goal()
     return [
         GoalView(
             **v.goal.model_dump(),
             owner_id=v.owner_id,
             owner_name=v.owner_name,
             department_title=v.department_title,
+            watching=watching.get(v.goal.id or 0, []),
         )
         for v in list_goal_views()
     ]
+
+
+class GoalWeekLine(BaseModel):
+    text: str
+    at: str
+
+
+class GoalWaitingLine(BaseModel):
+    text: str
+    at: str
+    # The card on Home (``/?card=<id>``), when it can be found.
+    card_id: int | None = None
+
+
+class GoalWeekOut(BaseModel):
+    done: list[GoalWeekLine]
+    waiting: list[GoalWaitingLine]
+
+
+class GoalWeeksOut(BaseModel):
+    # Goal id (as a string, JSON keys) -> what was done for it.
+    goals: dict[str, GoalWeekOut]
+
+
+# "See everything" reads this far back.
+GOAL_ACTIVITY_DAYS = 90
+
+
+def _goal_weeks(goal_ids: list[int], request: Request, days: int) -> GoalWeeksOut:
+    """What the Executive did for each goal (``departments.goal_week``), as
+    the caller may see it: the owner sees everything, anyone else the
+    shared lines and their own."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.api.routes.people import caller_is_principal
+    from openexecutive.departments.goal_week import goal_week
+
+    principal = caller_is_principal(request)
+    viewer = None if principal else _resolve_caller_person_id(request)
+    weeks = goal_week(goal_ids, days=days, principal=principal, viewer=viewer)
+    return GoalWeeksOut(goals={
+        str(goal_id): GoalWeekOut(
+            done=[GoalWeekLine(text=line.text, at=line.at) for line in week.done],
+            waiting=[GoalWaitingLine(text=w.text, at=w.at, card_id=w.card_id) for w in week.waiting],
+        )
+        for goal_id, week in weeks.items()
+    })
+
+
+@router.get("/goals/week", response_model=GoalWeeksOut)
+def goals_this_week(request: Request) -> GoalWeeksOut:
+    """For every goal, what the Executive did for it in the last seven days
+    and what waits on the owner: the Goals page's "What I did for this goal
+    this week"."""
+    ids = [g.id for g in store.list_all_goals() if g.id is not None]
+    return _goal_weeks(ids, request, 7)
+
+
+@router.get("/goals/{goal_id}/activity", response_model=GoalWeekOut)
+def goal_activity(goal_id: int, request: Request) -> GoalWeekOut:
+    """Everything the Executive did for one goal in the last 90 days: the
+    Goals page's "See everything"."""
+    if store.get_goal(goal_id) is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return _goal_weeks([goal_id], request, GOAL_ACTIVITY_DAYS).goals[str(goal_id)]
+
+
+def _watching_by_goal() -> dict[int, list[str]]:
+    """``{goal id: names of its watches}``; empty when the watch list can't
+    be read (the goals still list)."""
+    try:
+        from openexecutive.monitoring import store as watch_store
+        from openexecutive.monitoring.describe import watch_title
+
+        return {
+            goal_id: [watch_title(item) for item in items]
+            for goal_id, items in watch_store.watches_for_goals().items()
+        }
+    except Exception:
+        logger.debug("goals: watch list unavailable", exc_info=True)
+        return {}
 
 
 @router.post("/goals", response_model=Goal, status_code=status.HTTP_201_CREATED)

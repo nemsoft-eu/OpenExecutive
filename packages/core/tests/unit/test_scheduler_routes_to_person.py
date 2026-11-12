@@ -23,6 +23,8 @@ from openexecutive.workflows import persistence as wf_persistence
 from openexecutive.workflows.base import WorkflowEvent
 from openexecutive.workflows.department_check_in import DepartmentCheckInWorkflow
 
+pytestmark = pytest.mark.usefixtures("stored_department_levels")
+
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,7 +281,7 @@ def test_escalate_creates_urgent_alert_and_holds() -> None:
     # An urgent card went to the approver instead.
     alerts = alert_store.list_alerts()
     assert len(alerts) == 1
-    assert alerts[0].headline.startswith("[ESCALATION]")
+    assert alerts[0].headline.startswith("Urgent: ")
     assert alerts[0].severity == "high"  # ranks above routine proposals
     assert alerts[0].routed_to_person_id == principal_id
     assert "department:legal" in alerts[0].topic_tags
@@ -347,7 +349,7 @@ def test_escalate_with_nobody_to_ask_files_an_unrouted_card() -> None:
     mock_chat.assert_not_called()
     alerts = alert_store.list_alerts()
     assert len(alerts) == 1
-    assert alerts[0].headline.startswith("[ESCALATION]")
+    assert alerts[0].headline.startswith("Urgent: ")
     assert alerts[0].routed_to_person_id is None
     assert not any(t.startswith("person:") for t in alerts[0].topic_tags)
     updated = episodic.get_scheduled_action(action.id)

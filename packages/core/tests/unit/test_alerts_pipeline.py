@@ -403,6 +403,35 @@ def test_pipeline_dedup_hint_overrides_model_key(monkeypatch, db: Path) -> None:
     assert row is not None and row.dedup_key == "watch:acme-news" and row.occurrence_count == 2
 
 
+@pytest.mark.parametrize("private", [False, True])
+def test_pipeline_a_follow_up_from_one_sender_joins_the_first_card(
+    monkeypatch, db: Path, private: bool,
+) -> None:
+    from openexecutive.alerts import pipeline
+
+    _count_dispatches(monkeypatch)
+
+    async def run():
+        ids = []
+        for n in ("1", "2"):
+            _stub_triage(monkeypatch, dedup_key=f"model-{n}")
+            _, aid = await pipeline.evaluate_and_dispatch(
+                AlertEvent(
+                    source="email", external_id=n, body="x", private=private,
+                    dedup_hint="email-from:casey@example.com", follow_up=True,
+                ),
+                db_path=db,
+            )
+            ids.append(aid)
+        return ids
+
+    first, second = asyncio.run(run())
+    assert first is not None and second is None
+    row = alert_store.get_alert(first, db_path=db)
+    assert row is not None and row.occurrence_count == 2
+    assert row.body == "body for 1\n\nThen: body for 2"
+
+
 def test_triage_text_naming_people_or_figures_not_in_the_event_is_dropped(
     monkeypatch, db: Path,
 ) -> None:
@@ -472,3 +501,21 @@ def test_grounded_triage_text_is_stored_unchanged(monkeypatch, db: Path) -> None
     assert (stored.headline, stored.body, stored.suggested_action) == (
         "Dana Whitfield: renew 48 units", "Renewal of 48 units due Friday.", "Reply to Dana",
     )
+
+
+def test_open_alerts_keyed_lists_one_senders_open_cards(db: Path) -> None:
+    for n, key in enumerate([
+        "email-from:casey@example.com",
+        "email-from:casey@example.com#ab12cd34",
+        "email-from:casey@example.com:person:7",
+        "email-from:casey@example.comx",
+        "private:email-from:casey@example.com",
+    ]):
+        alert_store.insert_alert(
+            source="email", external_id=str(n), severity="medium", headline=f"h{n}", body="b",
+            dedup_key=key, db_path=db,
+        )
+    cards = alert_store.open_alerts_keyed("email", "email-from:casey@example.com", db_path=db)
+    assert [c.dedup_key for c in cards] == [
+        "email-from:casey@example.com", "email-from:casey@example.com#ab12cd34",
+    ]

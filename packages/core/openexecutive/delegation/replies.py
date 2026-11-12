@@ -41,8 +41,8 @@ class ReplyCard:
     # "follow_up" when the draft chases the person's own unanswered email
     # (delegation.follow_ups); "" for a reply to someone else's.
     source: str = ""
-    # Send + allow: Replies (Follow-ups, on a follow-up) is in training and
-    # this sender (these people) isn't allowed yet (delegation.training).
+    # In training: "Send to them on its own next time" (this sender, or a
+    # follow-up's people, aren't allowed yet; delegation.training).
     can_allow: bool = False
     # Drafts is in training: "Do it like this next time" keeps a draft they
     # changed as how they write to this person.
@@ -71,6 +71,11 @@ class ReplyCard:
     # When it was last brought up to date with newer mail ("" never): Send
     # passes it back, so a version the card never showed asks again.
     caught_up_at: str = ""
+    # The Executive is doing what the email asks right now
+    # (delegation.card_work); the card shows it working.
+    working: bool = False
+    # The files the reply carries, by name (delegation.card_work).
+    files: list[str] = field(default_factory=list)
 
 
 def _strings(value: Any) -> list[str]:
@@ -79,7 +84,7 @@ def _strings(value: Any) -> list[str]:
 
 def cards(person: Any) -> list[ReplyCard]:
     """``person``'s open reply cards, newest first."""
-    from openexecutive.delegation import training
+    from openexecutive.delegation import card_work, training
     from openexecutive.delegation.answers import CAUGHT_UP_KEY, conversation, questions_for
     from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
     from openexecutive.delegation.gmail import credential_provider, mailbox_link
@@ -122,7 +127,7 @@ def cards(person: Any) -> list[ReplyCard]:
             ),
             waited_because=REASONS.get(str(payload.get("handle_it_reason") or ""), ""),
             source="follow_up" if payload.get("source") == "follow_up" else "",
-            can_allow=_can_allow(person.id, payload, trained),
+            can_allow=training.can_allow_reply(person.id, payload, trained),
             learns_style=trained.drafts,
             in_mailbox=bool(draft_id),
             mailbox=mailbox,
@@ -132,18 +137,13 @@ def cards(person: Any) -> list[ReplyCard]:
             gist=str(payload.get("gist") or ""),
             conversation=conversation(payload),
             caught_up_at=str(payload.get(CAUGHT_UP_KEY) or ""),
+            working=payload.get(card_work.WORK_KEY) == card_work.WORKING and card_work.running(card.id),
+            files=[
+                str(f.get("name") or "") for f in payload.get(card_work.FILES_KEY) or []
+                if isinstance(f, dict) and f.get("name")
+            ],
         ))
     return out
-
-
-def _can_allow(person_id: int, payload: dict[str, Any], trained: Any) -> bool:
-    from openexecutive.delegation import handle_it
-
-    if payload.get("source") == "follow_up":
-        going = _strings(payload.get("draft_to"))
-        return bool(trained.follow_ups and going and not handle_it.follow_up_allowed(person_id, going))
-    sender = str(payload.get("from_email") or "")
-    return bool(trained.replies and sender and not handle_it.allowed_in_training(person_id, sender))
 
 
 async def dismiss(instance: Any, *, gmail: Any = None) -> str:

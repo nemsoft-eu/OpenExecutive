@@ -25,10 +25,11 @@ import HubTabs from "@/components/ui/HubTabs";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 
 // Routes that own their full layout and should not be wrapped by the
-// shell — sign-in, the onboarding wizard (full-screen flow), and the
+// shell — sign-in, the onboarding wizard (full-screen flow), a shared
+// document's public page (opened by people with no account), and the
 // chat home (`/`), which keeps its own top bar and debug panel but
 // renders the same `AppSidebar` as every other route.
-const EXEMPT_PREFIXES = ["/signin", "/onboard", "/api"];
+const EXEMPT_PREFIXES = ["/signin", "/onboard", "/api", "/shared"];
 const EXEMPT_EXACT = new Set(["/"]);
 
 // Human-readable labels for path segments shown in the breadcrumb.
@@ -42,7 +43,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   people: "People",
   departments: "Departments",
   goals: "Goals",
-  memories: "Pulse",
+  memories: "Memory",
   knowledge: "Knowledge",
   jobs: "Workflows",
   artifacts: "Documents",
@@ -58,17 +59,15 @@ const SEGMENT_LABELS: Record<string, string> = {
   demo: "Company Simulator",
   onboard: "Setup",
   watchlist: "Watch list",
+  tasks: "Tasks",
   settings: "Settings",
   status: "Setup status",
   executive: "Your Executive",
-  "act-as-me": "Act as me",
   delegate: "Delegate",
-  "handle-it": "Handle it for me",
-  "take-the-lead": "Take the lead",
   memory: "About you",
   workspace: "Workspace",
   advanced: "Advanced",
-  tools: "Custom tools",
+  tools: "Tools I built",
   about: "About",
   guide: "User Guide",
   clients: "Client Companies",
@@ -155,7 +154,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <AskOEProvider>
       <PageCrumbProvider>
-      <div className="flex h-full bg-surface text-fg">
+      {/* relative + overflow-clip: an absolutely positioned element inside a
+          page (Tailwind's sr-only labels, for one) has no positioned
+          ancestor in the scroll slot, so it escapes the slot's overflow and
+          stretches the document. On a phone that made the whole page
+          scrollable: the bottom bar slid up off the bottom edge, and
+          scrolling the drawer chained to the page behind it. This box is
+          their containing block now, and clip (unlike hidden) can't be
+          scrolled by script or focus either. */}
+      <div className="relative flex h-full overflow-clip bg-surface text-fg">
         {/* Mobile backdrop */}
         {drawerOpen && (
           <div

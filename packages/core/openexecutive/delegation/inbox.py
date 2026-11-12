@@ -52,6 +52,12 @@ stranger's holding reply starts with the sender alone. The card flags
 ``others_on_thread`` and lets the person choose: the sender only, or
 everyone (``card_drafts.set_recipients``).
 
+**Then the Executive does the ask.** When the reply left an ask open, the
+Executive takes a turn on the email as the person (``delegation.card_work``):
+it does what its tools can, and the reply on the card is rewritten to
+deliver it, with any files. Approvals decides each of its steps, and whether
+the reply then goes on its own.
+
 **Limits.** Per scan 5 drafts; per day ``DELEGATION_INBOX_MAX_DRAFTS_PER_DAY``
 within the shared daily limit (``delegation.caps``), 200 classifications, 2
 drafts per sender (1 for a stranger) and 10 for strangers in all; and never
@@ -199,7 +205,7 @@ STATUS_MESSAGES: dict[str, str] = {
     "checking": "Checking your inbox now.",
     "daily_limit": "On, but today's limit of drafts is reached. It carries on tomorrow.",
     "backlog_full": "On, but 25 replies are already waiting for you. Send or dismiss some first.",
-    "act_as_me_off": "Paused: Act as me is off.",
+    "act_as_me_off": "Paused: As you is off.",
     "client_slot": "Paused while a client is active.",
     "rate_limited": "Your mail service asked it to slow down. It tries again shortly.",
     "error": "Couldn't reach your mailbox. It tries again shortly.",
@@ -800,6 +806,13 @@ async def compose_reply(
         signature=stored.profile.signature,
         exec_name=get_settings().exec_display_name,
         model=composer_model(),
+        writer_person_id=person.id,
+        # The intent is a fixed instruction: it says nothing about this email.
+        recall_from_intent=False,
+        # A stranger's words pick nothing out of the writer's memory, and
+        # only the writer's own team picks facts by what they write.
+        recall_from_thread=relation != "stranger",
+        facts_from_thread=relation == "team",
     )
     if not composed.subject:
         return "no_subject"
@@ -1442,6 +1455,14 @@ async def _draft_card(
         "flags": reply.flags,
         **({"handle_it": held or "send"} if on_its_own_allowed else {}),
     })
+    from openexecutive.delegation import card_work
+
+    # It asks for something the reply only put off: the Executive does what
+    # it can first, and the reply goes (or waits) once that is on the card.
+    if decision_id is not None and card_work.wanted({"open_questions": reply.open_questions}) and card_work.start(
+        person, decision_id, gmail=client,
+    ):
+        return False
     if held is None and decision_id is not None:
         await _send_on_its_own(person, client, decision_id, result, now=now)
     return False

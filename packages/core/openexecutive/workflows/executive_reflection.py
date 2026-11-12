@@ -81,7 +81,7 @@ _LEAD_TOKENS = 4000
 _LEAD_RESULT_CHARS = 4000
 # Added to the user turn (never the cached system prompt) while it leads.
 _LEAD_NOTE = (
-    "\n\nTake the lead is on: act on what you find instead of only reporting "
+    "\n\nAs me (acting in your own name without being asked) is on: act on what you find instead of only reporting "
     "it. Message people, book, start workflows, and when a task needs "
     "something you don't have here (a spreadsheet to track something, a "
     "document, a record in another system), call search_tools to find what "
@@ -205,9 +205,9 @@ def _build_reflection_system(configured: set[str], has_roster: bool = True) -> s
         "on the previous run. Do NOT re-act on or re-notify anyone about a "
         "signal listed there unless the input shows it changed since — "
         "repeating a DM or a proposal a day later is noise, not diligence. "
-        "OPEN LOOPS are commitments and asks people made in conversation; "
-        "the nudge engine already chases overdue ones, so don't DM about a "
-        "loop just because it's overdue — use them to connect signals or to "
+        "TASKS are commitments and asks people made in conversation (call "
+        "them tasks, never open loops); the nudge engine already chases "
+        "overdue ones, so don't DM about a task just because it's overdue — use them to connect signals or to "
         "flag a slipped promise that matters for the brief. "
         "WHAT LANDS shows, per person, how often each kind of proactive DM "
         "got an answer: prefer the kind of outreach that lands with that "
@@ -282,8 +282,9 @@ def _build_reflection_system_solo() -> str:
         + "Memory: the block YESTERDAY'S STANDUP lists what you already did "
         "on the previous run. Do NOT re-act on or re-raise a signal listed "
         "there unless the input shows it changed since — repeating an alert "
-        "or a follow-up a day later is noise, not diligence. OPEN LOOPS are "
-        "commitments made in conversation; the nudge engine already chases "
+        "or a follow-up a day later is noise, not diligence. TASKS are "
+        "commitments made in conversation (call them tasks, never open "
+        "loops); the nudge engine already chases "
         "overdue ones, so use them to connect signals or to flag a slipped "
         "promise that matters for the brief. Open alerts carry the review "
         "verdict of your alert-review job (relevant / changed / likely_stale) "
@@ -462,7 +463,7 @@ def _render_reflection_context(
         # Pre-rendered, soonest-due first (attunement.open_loops). Overdue
         # ones are already chased by the nudge engine; listing them lets the
         # standup connect a slipped promise to the rest of the org state.
-        parts.append("OPEN LOOPS (what people owe, soonest due first):")
+        parts.append("TASKS (what people owe, soonest due first):")
         parts.extend(open_loops)
         parts.append("")
 
@@ -516,7 +517,7 @@ def _with_lead_tools(
             return tools, handlers, False
         gateway = get_active_gateway()
     except Exception:
-        logger.warning("reflection: couldn't check Take the lead — no gateway tools", exc_info=True)
+        logger.warning("reflection: couldn't check As me — no gateway tools", exc_info=True)
         return tools, handlers, False
     if gateway is None:
         return tools, handlers, True
@@ -850,9 +851,12 @@ class ExecutiveReflectionWorkflow(Workflow):
             "send_discord_dm",
             "send_telegram_message",
             "ack_alert",
+            "answer_card",
             # Same reasoning as ack_alert: loop descriptions are quoted from
             # what people wrote, and nobody is watching this pass.
             "close_open_loop",
+            "reopen_open_loop",
+            "update_open_loop",
         }
         # search_knowledge is this pass's own: chat looks knowledge up
         # before the turn, so it isn't in the shared skill tools.
@@ -876,10 +880,27 @@ class ExecutiveReflectionWorkflow(Workflow):
             tools, {**_ALL_SKILL_HANDLERS, **KNOWLEDGE_TOOL_HANDLERS}, mode, source="reflection"
         )
         tools, handlers, leading = _with_lead_tools(tools, handlers)
+        # Added to the turn after the grounding scope is built (as lessons
+        # are): teammates write goals, so their text grounds no send.
+        goals_note = ""
         if leading:
             from openexecutive.orchestrator import take_the_lead
 
             user_content += _LEAD_NOTE + take_the_lead.learned_note()
+            look = take_the_lead.current_look()
+            if look is not None and look.prompted_by and look.prompted_by != take_the_lead.DAILY_LOOK:
+                # A wake: what made it look. Only the kind of event (a
+                # channel, "a meeting ended"), never text someone else wrote.
+                user_content += f"\n\nWhy you are looking now: {look.prompted_by}."
+            jobs = take_the_lead.jobs_note()
+            if jobs:
+                user_content += jobs
+                tools = sorted([*tools, take_the_lead.FOCUS_JOB_TOOL], key=lambda t: t["name"])
+                handlers = {**handlers, take_the_lead.FOCUS_JOB_TOOL["name"]: take_the_lead.handle_focus_job}
+            goals_note = take_the_lead.goals_note()
+            if goals_note:
+                tools = sorted([*tools, take_the_lead.FOCUS_GOAL_TOOL], key=lambda t: t["name"])
+                handlers = {**handlers, take_the_lead.FOCUS_GOAL_TOOL["name"]: take_the_lead.handle_focus_goal}
         # Nobody reads what this pass sends before it goes: an outward tool
         # whose text names a person or figure absent from the input (or a
         # tool result so far) is refused with a reason the model can act on.
@@ -894,6 +915,18 @@ class ExecutiveReflectionWorkflow(Workflow):
             surface="executive reflection", private=private_context,
         )
         handlers = grounding.guard(handlers)
+        user_content += goals_note
+        # How the principal asked for things to be done (memory.lessons), so
+        # what this pass starts on its own is done the way they taught it.
+        # Added after the grounding scope is built: a name or figure in a
+        # lesson is no evidence for anything this pass sends. Not gated on
+        # who reads the output, unlike the briefs: this pass runs for the
+        # principal and acts for them, and every send passes Approvals.
+        from openexecutive.memory import lessons as lessons_store
+
+        user_content = await asyncio.to_thread(
+            lessons_store.with_owner_lessons, user_content, surface=lessons_store.SURFACE_LEAD
+        )
         # Build the system prompt for the SAME configured set, so the
         # audience rule never names a DM channel the model can't use.
         reflection_system = (

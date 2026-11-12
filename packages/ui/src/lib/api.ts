@@ -38,6 +38,24 @@ export interface ChatDraft {
   subject: string;
   // The start of the draft's text, as saved.
   preview: string;
+  // Earlier drafts' rows this one replaced (written again in the same reply).
+  replaces?: number[];
+}
+
+// A chat draft as its card shows it now (GET /delegation/drafts/{row}):
+// waiting in your Drafts ("open", with who it goes to and its words),
+// changed in your mailbox since, sent, replaced by a newer version, or gone.
+export interface ChatDraftState {
+  status: "open" | "changed" | "sent" | "replaced" | "gone";
+  to: string[];
+  cc: string[];
+  subject: string;
+  body: string;
+  // The names of the files attached to it (an older backend sends none).
+  files?: string[];
+  // After a change: the sentences that are new, and a line on what changed.
+  changed_sentences: string[];
+  note: string;
 }
 
 // Names the round of tool calls currently in flight, so the progress line can
@@ -61,6 +79,9 @@ export interface Activity {
   // Canonical tool behind the label; for MCP this is the underlying tool name.
   tool: string;
   iteration?: number;
+  // What the round read that the turn hadn't yet, counted by kind
+  // ("email", "file", "person"…), for the long-turn card.
+  reads?: Record<string, number>;
 }
 
 export interface ChatChunk {
@@ -185,16 +206,39 @@ export interface FlagsEvent {
   flags: string[];
 }
 
-// A long turn's plan, every step up front, and the step it is on now
-// (orchestrator/turn_plan.py). Sent again each time it moves on or the plan
-// changes; a turn that sends none shows its steps as they happen.
-export interface PlanEvent {
-  type: "plan";
-  steps: string[];
-  current: number;
+// What a long turn shows while it works (orchestrator/turn_progress.py): the
+// task, what it is doing now, and everything it has used and found so far.
+// Sent again whenever it changes; a turn that sends none shows its activity
+// line and the reads counted from its rounds.
+export interface ProgressEvent {
+  type: "progress";
+  task: string;
+  now: string;
+  used: string[];
+  found: string[];
+}
+
+// An offer to do an ask the person has made on a few different days on a
+// schedule (workflows/repeat_asks.py). Sent at the end of the reply to it,
+// and listed on Workflows until they answer it.
+export interface RepeatOffer {
+  id: number;
+  // Their latest ask, in their own words.
+  ask: string;
+  // When it would run (workflow cadence, UTC): "weekly@mon@13:00".
+  cadence: string;
+  // When they asked, oldest first (ISO).
+  asked_at: string[];
+}
+
+export interface RepeatOfferEvent {
+  type: "repeat_offer";
+  offer: RepeatOffer;
+  session_id?: string;
 }
 
 export type StreamItem =
+  | RepeatOfferEvent
   | ChatChunk
   | DebugEvent
   | ActionTaken
@@ -205,7 +249,7 @@ export type StreamItem =
   | HandingOver
   | HeldStepsEvent
   | FlagsEvent
-  | PlanEvent;
+  | ProgressEvent;
 
 export interface StreamChatOptions {
   committeeReview?: boolean;
@@ -368,22 +412,6 @@ export async function transcribeRecording(recording: Blob, filename: string): Pr
 export async function stopChat(clientTurnId: string): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/chat/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_turn_id: clientTurnId }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-// I'll finish it: stop the running turn's work and have it write up what it
-// has for the person to finish. False when the turn won't take it (finished
-// or stopped); the reply that arrives is then the turn's own.
-export async function handOverChat(clientTurnId: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/chat/hand-over`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ client_turn_id: clientTurnId }),
@@ -1506,6 +1534,8 @@ export interface Advice {
 export interface PersonConclusion {
   content: string;
   created_at: string;
+  // "" when it can't be removed from here.
+  id?: string;
 }
 
 export interface PersonMemory {
@@ -1529,21 +1559,6 @@ export async function listDecisions(): Promise<Decision[]> {
   const res = await fetch(`${API_BASE}/memories/decisions`);
   if (!res.ok) throw new Error("Failed to list decisions");
   return res.json();
-}
-
-export async function updateDecision(id: number, patch: Partial<Omit<Decision, "id" | "timestamp">>): Promise<Decision> {
-  const res = await fetch(`${API_BASE}/memories/decisions/${id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-  });
-  if (!res.ok) throw new Error("Failed to update decision");
-  return res.json();
-}
-
-export async function deleteDecision(id: number): Promise<void> {
-  const res = await fetch(`${API_BASE}/memories/decisions/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete decision");
 }
 
 /** A standing fact or correction the principal or a teammate asked the
@@ -1574,6 +1589,10 @@ export interface StandingFact {
   recorded_by_name: string;
   /** A proposal: the active fact it replaces once approved. */
   replaces_fact_id: number | null;
+  /** A decision that was made, with its department and, once known, outcome. */
+  decision?: boolean;
+  department?: string;
+  outcome?: string;
 }
 
 export interface StandingFactsPage {
@@ -1605,6 +1624,17 @@ export async function retireStandingFact(id: number, reason = ""): Promise<Stand
     body: JSON.stringify({ reason }),
   });
   if (!res.ok) throw new Error("Failed to retire standing fact");
+  return res.json();
+}
+
+// Change what a standing fact says. The old wording is kept as what it corrects.
+export async function editStandingFact(id: number, statement: string): Promise<StandingFact> {
+  const res = await fetch(`${API_BASE}/memories/facts/${id}/edit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ statement }),
+  });
+  if (!res.ok) throw new Error(res.status === 403 ? "You can't change this fact" : "Couldn't save that change");
   return res.json();
 }
 
@@ -1747,6 +1777,17 @@ export async function listPersonConclusions(
   return res.json();
 }
 
+// Remove one line of what it learned about you (your own only).
+export async function forgetPersonConclusion(personId: number, conclusionId: string): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/memories/people/${personId}/conclusions/${encodeURIComponent(conclusionId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw new Error("Couldn't remove that line");
+  // The overview is shared for a few seconds; the next read must be fresh.
+  peopleMemoryShared = null;
+}
+
 export interface ScheduledAction {
   id: number;
   created_at: string;
@@ -1878,7 +1919,7 @@ export async function pauseExecutive(reason?: string): Promise<ExecutiveStatus> 
 
 export async function resumeExecutive(): Promise<ExecutiveStatus> {
   const res = await fetch(`${API_BASE}/executive/resume`, { method: "POST" });
-  if (res.status === 403) throw new Error("Only the principal can resume the Executive.");
+  if (res.status === 403) throw new Error("Only the account owner can resume the Executive.");
   if (!res.ok) throw new Error("Failed to resume the Executive");
   delegationChanged();
   return res.json();
@@ -1960,7 +2001,7 @@ export async function updateWorkspace(update: WorkspaceUpdate): Promise<Workspac
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(update),
   });
-  if (res.status === 403) throw new Error("Only the principal can change workspace settings.");
+  if (res.status === 403) throw new Error("Only the owner can change workspace settings.");
   if (res.status === 422) {
     // FastAPI validation errors: `detail` is a list of {msg}; surface the
     // first one ("timezone 'Mars/Base' is not a known IANA zone",
@@ -2006,7 +2047,7 @@ export interface DelegationSettings {
   inbox?: InboxWatch;
   // Absent (or null) on a backend that predates Handle it for me.
   handle_it?: HandleIt | null;
-  // Absent (or null) on a backend that predates per-setting training.
+  // Learn from my edits. Absent (or null) on an older backend.
   training?: Training | null;
   // Absent (or null) on a backend that predates the AI line on replies.
   disclosure?: ReplyDisclosure | null;
@@ -2033,7 +2074,7 @@ export interface DelegationTeam {
   members: DelegationTeamMember[];
 }
 
-// "Draft replies to my inbox": the Executive watches your own inbox and, for
+// "Draft replies to your inbox": the Executive watches your own inbox and, for
 // mail that needs you, saves a first reply in your Gmail Drafts; each waits
 // on a card on Today (GET /delegation/replies).
 export interface InboxWatch {
@@ -2050,35 +2091,26 @@ export interface InboxWatch {
   mailbox_drafts?: boolean;
 }
 
-// Handle it for me: the inbox watcher sends some replies on its own,
-// decided by plain code (delegation/handle_it.py). Each kind of reply has a
-// level; "ask" leaves a card as before.
-// How much Handle it for me sends on its own (delegation/handle_it.py RULES).
-export type HandleItMode = "careful" | "balanced" | "bold";
-
-// Act as me's settings that can each be in training (delegation/training.py).
-export type TrainingSetting = "replies" | "follow_ups" | "actions" | "drafts";
-
-// Something Act as me learned in training, yours alone (DELETE
-// /delegation/learned/{id}): a person replies or follow-ups may go to, an
-// action allowed with Approve + allow, or how you write to someone.
+// Something Act as me learned, yours alone (DELETE /delegation/learned/{id}):
+// someone it may send to on its own ("training"), or how you write to
+// someone ("drafts").
 export interface TrainingLearned {
   id: number;
   label: string;
-  setting: TrainingSetting;
+  setting: "training" | "drafts" | string;
   // What you sent after changing a draft, kept as an example ("").
   example: string;
   uses: number;
   created_at: string;
 }
 
+// In training and Learn from my edits (delegation/training.py). `training`:
+// nothing goes out as you on its own, on any Approvals level, until you tick
+// "Send to them on its own next time" on a card; `drafts`: a draft you change
+// before sending is kept as how you write to that person.
 export interface Training {
-  replies: boolean;
-  follow_ups: boolean;
-  actions: boolean;
+  training: boolean;
   drafts: boolean;
-  // Suggested actions On: carried out with no tick (false while in training).
-  actions_on?: boolean;
   learned: TrainingLearned[];
 }
 
@@ -2102,17 +2134,15 @@ export interface ReplyDisclosure {
   line: string;
 }
 
+// Whether replies to your inbox may go on their own (delegation/handle_it.py):
+// no switch of its own. On while Your inbox drafts is on; Approvals and In
+// training decide each one.
 export interface HandleIt {
   enabled: boolean;
-  mode: HandleItMode;
   // Whether this server can tie the switch to you (signed sign-ins or local
   // login); without it nothing is sent on its own.
   available: boolean;
   sent_today: number;
-  // Take the lead as you: the setting gives way to your rules. Only the
-  // owner can have it for now (lead_available).
-  lead?: boolean;
-  lead_available?: boolean;
 }
 
 // One reply sent on its own, yours alone (GET /delegation/handled).
@@ -2170,10 +2200,10 @@ export interface ReplyCard {
   waited_because?: string;
   // "follow_up": the draft chases your own unanswered email.
   source?: string;
-  // In training: Send + allow is offered (replies, or a follow-up's people,
-  // aren't allowed yet).
+  // In training: "Send to them on its own next time" is offered (this
+  // sender, or a follow-up's people, aren't allowed yet).
   can_allow?: boolean;
-  // Drafts in training: "Do it like this next time" keeps your changed draft.
+  // Learn from my edits: "Do it like this next time" keeps your changed draft.
   learns_style?: boolean;
   // Also saved in your mailbox's Drafts; false when it waits on this card
   // alone until you send it.
@@ -2200,6 +2230,11 @@ export interface ReplyCard {
   // When the reply was last brought up to date with newer mail; Send passes
   // it back, so a version you never saw asks again.
   caught_up_at?: string;
+  // The Executive is doing what the email asks right now; the card polls
+  // until it is done.
+  working?: boolean;
+  // The files your reply carries, by name: attached when it is sent.
+  files?: string[];
 }
 
 // One thing a reply leaves you to decide (GET /delegation/replies).
@@ -2271,7 +2306,7 @@ async function delegationError(res: Response, fallback: string): Promise<Error> 
 export async function getDelegation(signal?: AbortSignal): Promise<DelegationSettings | null> {
   const res = await fetch(`${API_BASE}/delegation`, { signal });
   if (res.status === 403 || res.status === 404) return null;
-  if (!res.ok) throw await delegationError(res, "Couldn't load Act as me.");
+  if (!res.ok) throw await delegationError(res, "Couldn't load As you.");
   return res.json();
 }
 
@@ -2436,7 +2471,12 @@ export interface ReflectionLesson {
   shown: number;
   fine_after: number;
   miss_after: number;
+  /** How often it was used on each surface. */
+  used_in?: Partial<Record<LessonSurface, number>>;
 }
+
+/** Where a lesson can be used. */
+export type LessonSurface = "chat" | "one_on_one" | "email" | "meeting" | "brief" | "lead";
 
 export interface ReflectionState {
   misses: ReflectionMiss[];
@@ -2447,6 +2487,10 @@ export interface ReflectionState {
   replay: ReflectionReplay;
   /** The principal also sees shared chats' misses; a teammate their own only. */
   sees_everyone: boolean;
+  /** This week, over the lessons listed: how many were learned and how often
+   * they were used on each surface. */
+  learned_this_week?: number;
+  used_this_week?: Partial<Record<LessonSurface, number>>;
 }
 
 /** The caller's misses and weekly counts; null when there is nothing for
@@ -2482,7 +2526,7 @@ export async function setDelegationEnabled(enabled: boolean): Promise<Delegation
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled }),
   });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Act as me.");
+  if (!res.ok) throw await delegationError(res, "Couldn't change As you.");
   delegationChanged();
   return res.json();
 }
@@ -2493,7 +2537,7 @@ export async function setDelegationTeam(enabled: boolean): Promise<DelegationSet
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled }),
   });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Act as me for your team.");
+  if (!res.ok) throw await delegationError(res, "Couldn't change As you for your team.");
   delegationChanged();
   return res.json();
 }
@@ -2506,7 +2550,7 @@ export async function setInboxWatch(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(update),
   });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Draft replies to my inbox.");
+  if (!res.ok) throw await delegationError(res, "Couldn't change Draft replies to your inbox.");
   delegationChanged();
   return res.json();
 }
@@ -2562,7 +2606,7 @@ export async function changeReply(id: number, text: string): Promise<ReplyCard> 
   return (await res.json()) as ReplyCard;
 }
 
-// Forget one thing it learned in training: it asks again from now on.
+// Forget one thing it learned from your edits.
 export async function removeTrainingLearned(id: number): Promise<DelegationSettings> {
   const res = await fetch(`${API_BASE}/delegation/learned/${id}`, { method: "DELETE" });
   if (!res.ok) throw await delegationError(res, "Couldn't remove that.");
@@ -2570,16 +2614,14 @@ export async function removeTrainingLearned(id: number): Promise<DelegationSetti
   return (await res.json()) as DelegationSettings;
 }
 
-// Put Act as me's settings in or out of training.
-export async function setTraining(
-  update: Partial<Record<TrainingSetting | "actions_on", boolean>>,
-): Promise<DelegationSettings> {
+// In training, or Learn from my edits, on or off.
+export async function setTraining(update: { training?: boolean; drafts?: boolean }): Promise<DelegationSettings> {
   const res = await fetch(`${API_BASE}/delegation/training`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(update),
   });
-  if (!res.ok) throw await delegationError(res, "Couldn't change training.");
+  if (!res.ok) throw await delegationError(res, "Couldn't change that.");
   delegationChanged();
   return (await res.json()) as DelegationSettings;
 }
@@ -2590,7 +2632,7 @@ export async function setReadMyCalendar(enabled: boolean): Promise<DelegationSet
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled }),
   });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Read my calendar.");
+  if (!res.ok) throw await delegationError(res, "Couldn't change Read your calendar.");
   return res.json();
 }
 
@@ -2604,20 +2646,6 @@ export async function setReplyDisclosure(update: {
     body: JSON.stringify(update),
   });
   if (!res.ok) throw await delegationError(res, "Couldn't change the AI line on your replies.");
-  return res.json();
-}
-
-export async function setHandleIt(update: {
-  enabled?: boolean;
-  mode?: HandleItMode;
-}): Promise<DelegationSettings> {
-  const res = await fetch(`${API_BASE}/delegation/handle-it`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(update),
-  });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Handle it for me.");
-  delegationChanged();
   return res.json();
 }
 
@@ -2707,9 +2735,10 @@ function strings(value: unknown): string[] {
 // Send the reply's draft from your Gmail, exactly as it is there (POST
 // /decisions/{id}/approve). `confirm` is your second yes: the recipients you
 // were shown, and that a newer message in the thread is fine.
-// `allow` is Send + allow in training: replies to this sender (follow-ups to
-// these people) go on their own from now on; `example` keeps your sent
-// version when you changed the draft (Drafts in training).
+// `allow` is "Send to them on its own next time" (In training): replies and
+// follow-ups to this sender (a follow-up's people) go on their own from now
+// on, where Approvals lets them; `example` keeps your sent version when you
+// changed the draft (Learn from my edits).
 export async function sendReplyCard(
   id: number,
   confirm?: {
@@ -2757,6 +2786,53 @@ export async function sendChatDraft(row: number, threadMovedOn = false): Promise
   throw new ReplySendError(message, code);
 }
 
+// The draft as it is now. null when the backend predates it (404 on the
+// route itself) or it isn't yours.
+export async function getChatDraft(row: number, signal?: AbortSignal): Promise<ChatDraftState | null> {
+  const res = await fetch(`${API_BASE}/delegation/drafts/${row}`, { signal });
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw await delegationError(res, "Couldn't read the draft.");
+  return (await res.json()) as ChatDraftState;
+}
+
+async function chatDraftError(res: Response, fallback: string): Promise<ReplySendError> {
+  const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
+  const detail = (body.detail && typeof body.detail === "object" ? body.detail : {}) as Record<string, unknown>;
+  const message = typeof detail.message === "string" ? detail.message : fallback;
+  return new ReplySendError(message, typeof detail.code === "string" ? detail.code : "error");
+}
+
+// Delete the draft from your Drafts (DELETE /delegation/drafts/{row}): only
+// the version its card last saw. Sends nothing.
+export async function deleteChatDraft(row: number): Promise<ChatDraftState> {
+  const res = await fetch(`${API_BASE}/delegation/drafts/${row}`, { method: "DELETE" });
+  if (!res.ok) throw await chatDraftError(res, "Couldn't delete the draft.");
+  return (await res.json()) as ChatDraftState;
+}
+
+// Your own words in the draft, here and in your Drafts. Sends nothing.
+export async function setChatDraftText(row: number, text: string): Promise<ChatDraftState> {
+  const res = await fetch(`${API_BASE}/delegation/drafts/${row}/text`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await chatDraftError(res, "Couldn't save your change.");
+  return (await res.json()) as ChatDraftState;
+}
+
+// Rewrite the draft the way you asked ("Make it shorter", or your own
+// words), here and in your Drafts. Sends nothing.
+export async function changeChatDraft(row: number, text: string): Promise<ChatDraftState> {
+  const res = await fetch(`${API_BASE}/delegation/drafts/${row}/change`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await chatDraftError(res, "Couldn't change the email.");
+  return (await res.json()) as ChatDraftState;
+}
+
 // A card of actions the Executive suggested from your email (Act as me),
 // yours alone. Nothing on it happens until you approve it here: Approve
 // (POST /decisions/{id}/approve) does the ticked actions exactly as shown;
@@ -2776,7 +2852,7 @@ export interface ActionCard {
   created_at: string;
   why: string;
   actions: ActionCardAction[];
-  // In training: Approve + allow is offered.
+  // In training: "on its own next time" is offered.
   can_allow?: boolean;
 }
 
@@ -2798,8 +2874,8 @@ export async function getActionCards(signal?: AbortSignal): Promise<ActionCard[]
 }
 
 // Do the ticked actions (`only`, by index) of an action card. Returns what
-// happened to each. `allow` is Approve + allow (Suggested actions in
-// training): the same kind, with the same people, happens on its own from now on.
+// happened to each. `allow` is "on its own next time" (In training): everyone
+// the ticked actions reach may be written to on its own from now on.
 export async function approveActionCard(id: number, only: number[], allow = false): Promise<ActionCardResult[]> {
   const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
     method: "POST",
@@ -2838,9 +2914,9 @@ export interface InviteCard {
   clash_checked: boolean;
   // false: your calendar sign-in can read but not answer invites yet.
   can_answer: boolean;
-  // Replies in training: the "Accept from them on its own next time" tick.
-  can_allow: boolean;
-  // Why Handle it for me left it for you ("" when it was off).
+  // In training: "Accept from them on its own next time" is offered.
+  can_allow?: boolean;
+  // Why it waited for you instead of accepting ("" when nothing held it).
   waited_because: string;
   connect_command: string;
 }
@@ -2854,8 +2930,8 @@ export async function getInviteCards(signal?: AbortSignal): Promise<InviteCard[]
   return body.cards;
 }
 
-// Accept or decline an invite in your own calendar. `allow` (accept, Replies
-// in training): their invites are accepted on their own from now on.
+// Accept or decline an invite in your own calendar. `allow` (accept, In
+// training): everything sent as you to that person goes on its own from now on.
 export async function answerInviteCard(id: number, answer: "accept" | "decline", allow = false): Promise<void> {
   const res = await fetch(`${API_BASE}/decisions/${id}/approve`, {
     method: "POST",
@@ -2980,7 +3056,7 @@ export async function setDecisionClassMode(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
   });
-  if (res.status === 403) throw new Error("Only the principal can change this setting.");
+  if (res.status === 403) throw new Error("Only the owner can change this setting.");
   // 409: auto-booking can't be turned on before a principal exists; the
   // backend's detail says so in plain words.
   if (res.status === 409) throw await onboardError(res, "This setting can't be turned on yet.");
@@ -3375,7 +3451,8 @@ export type WorkflowRunStatus =
   | "error"
   | "awaiting_human"
   | "resolved"
-  | "timed_out";
+  | "timed_out"
+  | "stopped";
 
 /** Statuses the run will not move on from by itself. Anything else means a
  *  poll is worth repeating: `running` is working, `awaiting_human` is waiting
@@ -3384,6 +3461,7 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRunStatus> = new Set([
   "done",
   "error",
   "timed_out",
+  "stopped",
 ]);
 
 /** How the gate's question actually reached the approver. Anything other than
@@ -3445,7 +3523,9 @@ export interface WorkflowEvent {
     | "artifact"
     | "done"
     | "error"
-    | "awaiting_human";
+    | "awaiting_human"
+    // Someone pressed Stop run; the stream ends here.
+    | "stopped";
   run_id?: string;
   title?: string;
   workflow?: string;
@@ -3518,6 +3598,17 @@ export async function getWorkflowRun(runId: string): Promise<WorkflowRunDetail> 
   return res.json();
 }
 
+/** Stop a run that hasn't finished. Nothing more runs; what it did stays done. */
+export async function stopWorkflowRun(runId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workflows/runs/${encodeURIComponent(runId)}/stop`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(typeof body?.detail === "string" ? body.detail : "Couldn't stop the run.");
+  }
+}
+
 export async function deleteWorkflowRun(runId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/workflows/runs/${encodeURIComponent(runId)}`, {
     method: "DELETE",
@@ -3554,6 +3645,14 @@ export interface ArtifactSummary {
   // (packages/core/openexecutive/orchestrator/extensions.py).
   collection?: string | null;
   collection_label?: string | null;
+  // The Documents page group ("chats" | "briefs" | "c:<name>" | "wf:<name>")
+  // and its plain name.
+  group: string;
+  group_label: string;
+  // Share by link: whether you may share it, and the link's path on this
+  // app's address while it is shared.
+  can_share?: boolean;
+  share_path?: string | null;
 }
 
 export type ArtifactFormat = "docx" | "html" | "link" | "markdown" | "xlsx";
@@ -3579,10 +3678,14 @@ export function artifactDownloadUrl(id: string, as?: ArtifactFormat): string {
 }
 
 export async function listArtifacts(
-  opts?: { archived?: boolean }
+  opts?: { archived?: boolean; q?: string; signal?: AbortSignal }
 ): Promise<ArtifactSummary[]> {
-  const qs = opts?.archived ? "?archived=true" : "";
-  const res = await fetch(`${API_BASE}/artifacts${qs}`);
+  const params = new URLSearchParams();
+  if (opts?.archived) params.set("archived", "true");
+  const q = opts?.q?.trim();
+  if (q) params.set("q", q);
+  const qs = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/artifacts${qs}`, { signal: opts?.signal });
   if (!res.ok) throw new Error("Failed to list artifacts");
   const data = await res.json();
   return data.artifacts;
@@ -3615,6 +3718,35 @@ export async function deleteArtifact(id: string): Promise<void> {
     method: "DELETE",
   });
   if (!res.ok) throw new Error("Failed to delete artifact");
+}
+
+// Share by link: answers the link's path on this app's address.
+export async function shareArtifact(id: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/artifacts/${encodeURIComponent(id)}/share`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(
+      typeof detail?.detail === "string" && res.status === 409
+        ? detail.detail
+        : "That couldn't be shared. Try again."
+    );
+  }
+  const data = (await res.json()) as { share_path: string };
+  return data.share_path;
+}
+
+export async function stopSharingArtifact(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/artifacts/${encodeURIComponent(id)}/share`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("The link couldn't be stopped. Try again.");
+}
+
+// The full link to give someone, on this app's own address.
+export function shareLink(sharePath: string): string {
+  return `${window.location.origin}${sharePath}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3700,6 +3832,57 @@ export async function getReviewStats(): Promise<ReviewStats> {
   const res = await fetch(`${API_BASE}/review/stats`);
   if (!res.ok) throw new Error("Failed to get review stats");
   return res.json();
+}
+
+// Questions it could not answer (knowledge_questions route): what people
+// asked about the company that no document covered. Owner only; anyone else
+// gets an empty list.
+export interface UnansweredQuestion {
+  id: number;
+  question: string;
+  /** "You", or the name of who asked it last. */
+  asked_by: string;
+  /** "chat", or the chat app it was asked in. */
+  place: string;
+  last_asked_at: string;
+  times: number;
+}
+
+export interface UnansweredQuestions {
+  questions: UnansweredQuestion[];
+  count: number;
+}
+
+export async function listUnansweredQuestions(): Promise<UnansweredQuestions> {
+  const res = await fetch(`${API_BASE}/knowledge/questions`);
+  if (!res.ok) throw new Error("Failed to load the questions");
+  return res.json();
+}
+
+async function closeUnansweredQuestion(
+  id: number,
+  action: "answer" | "document" | "dismiss",
+  body?: unknown
+): Promise<UnansweredQuestions> {
+  const res = await fetch(`${API_BASE}/knowledge/questions/${id}/${action}`, {
+    method: "POST",
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't update the question"));
+  return res.json();
+}
+
+export function answerUnansweredQuestion(id: number, answer: string): Promise<UnansweredQuestions> {
+  return closeUnansweredQuestion(id, "answer", { answer });
+}
+
+export function markQuestionDocumented(id: number): Promise<UnansweredQuestions> {
+  return closeUnansweredQuestion(id, "document");
+}
+
+export function dismissUnansweredQuestion(id: number): Promise<UnansweredQuestions> {
+  return closeUnansweredQuestion(id, "dismiss");
 }
 
 export async function patchReviewItem(itemId: string, patch: ReviewItemPatch): Promise<ReviewItem> {
@@ -3917,8 +4100,6 @@ export interface PersonaMeta {
   display_name: string;
   is_builtin: boolean;
   is_customized: boolean;
-  // Hidden from the voice picker but still loadable (named built-in voices).
-  is_legacy: boolean;
   // Picker copy from a built-in voice's frontmatter ("" for custom voices).
   description: string;
   sample: string;
@@ -3931,7 +4112,6 @@ export interface Persona {
   is_builtin: boolean;
   is_customized: boolean;
   source_notes: string;
-  is_legacy: boolean;
   description: string;
   sample: string;
 }
@@ -4584,7 +4764,8 @@ export interface Goal {
   key_result: string;
   target: string;
   current: string;
-  status: "on_track" | "at_risk" | "off_track";
+  // "done" is a person's call; the weekly reviews leave a done goal alone.
+  status: "on_track" | "at_risk" | "off_track" | "done";
   created_at: string;
   updated_at: string;
   // When OE last graded this goal (department_check_in workflow, or
@@ -4625,7 +4806,6 @@ export async function getDepartment(slug: string): Promise<DepartmentDetail> {
 export interface DepartmentPatch {
   title?: string;
   charter?: DepartmentCharter;
-  authority_level?: DepartmentConfig["authority_level"];
   cadences?: Record<string, string>;
   head_person_id?: number | null;
   headcount?: number | null;
@@ -4687,12 +4867,34 @@ export interface GoalView extends Goal {
   owner_id: number | null;
   owner_name: string;
   department_title: string | null;
+  /** Names of the watch-list items that are for this goal. */
+  watching?: string[];
 }
 
 /** Every goal, with or without a department. */
 export async function listGoals(): Promise<GoalView[]> {
   const res = await fetch(`${API_BASE}/goals`, { cache: "no-store" });
   if (!res.ok) throw await goalError(res, "Couldn't load goals");
+  return res.json();
+}
+
+// What the Executive did for a goal (GET /goals/week, /goals/{id}/activity).
+export interface GoalWeek {
+  done: { text: string; at: string }[];
+  /** Steps held for a yes; card_id opens that card on Home. */
+  waiting: { text: string; at: string; card_id: number | null }[];
+}
+
+export async function listGoalWeeks(): Promise<Record<string, GoalWeek>> {
+  const res = await fetch(`${API_BASE}/goals/week`, { cache: "no-store" });
+  if (!res.ok) throw await goalError(res, "Couldn't load what was done for the goals");
+  const body = (await res.json()) as { goals: Record<string, GoalWeek> };
+  return body.goals;
+}
+
+export async function getGoalActivity(id: number): Promise<GoalWeek> {
+  const res = await fetch(`${API_BASE}/goals/${id}/activity`, { cache: "no-store" });
+  if (!res.ok) throw await goalError(res, "Couldn't load what was done for this goal");
   return res.json();
 }
 
@@ -4907,6 +5109,8 @@ export interface ContactNote {
   emailed_count: number;
   met_count: number;
   note_written_at: string | null;
+  // You wrote this note; it keeps your words.
+  edited_by_you?: boolean;
   updated_at: string;
 }
 
@@ -4922,6 +5126,23 @@ export async function getContactNote(personId: number): Promise<ContactNote | nu
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Request failed: ${res.statusText}`);
   return res.json();
+}
+
+// Your own wording for what it remembers about someone; it keeps your words.
+export async function editContactNote(personId: number, note: string): Promise<ContactNote> {
+  const res = await fetch(`${API_BASE}/contacts/${personId}/note`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  if (res.status === 422) throw new Error("Write it in plain words, without links or addresses");
+  if (!res.ok) throw new Error("Couldn't save the note");
+  return res.json();
+}
+
+export async function removeContactNote(personId: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/contacts/${personId}/note`, { method: "DELETE" });
+  if (!res.ok) throw new Error("Couldn't remove the note");
 }
 
 export function setContactKeeperMode(mode: ContactKeeperMode): Promise<ContactChanges> {
@@ -5001,7 +5222,7 @@ export async function findSlackPersonByEmail(email: string): Promise<DirectoryOp
 
 // Adding, editing and archiving people is the principal's alone (403 for anyone
 // else): the People list is also who can sign in and who the Executive emails.
-const PEOPLE_PRINCIPAL_ONLY = "Only the principal can change the People list.";
+const PEOPLE_PRINCIPAL_ONLY = "Only the owner can change the People list.";
 
 export async function createPerson(body: PersonCreate): Promise<Person> {
   const res = await fetch(`${API_BASE}/people`, {
@@ -5136,7 +5357,7 @@ export interface AssignNotice {
 
 export async function getPersonOpenLoops(id: number): Promise<OpenLoop[]> {
   const res = await fetch(`${API_BASE}/people/${id}/open-loops`);
-  if (!res.ok) throw new Error(`Failed to load open loops: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Failed to load tasks: ${res.statusText}`);
   return res.json();
 }
 
@@ -5167,7 +5388,129 @@ export async function closeOpenLoop(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reason }),
   });
-  if (!res.ok) throw new Error(`Failed to close open loop: ${res.statusText}`);
+  if (!res.ok) throw new Error(`Failed to close task: ${res.statusText}`);
+}
+
+// ---- Tasks (the Tasks page) ----
+// What people owe: the same records as a person's tasks above, every state.
+// The principal sees everyone's; anyone else on the team only their own.
+
+export type TaskStatus = "open" | "in_progress" | "waiting" | "done";
+
+export interface Task {
+  task_id: number;
+  title: string;
+  description: string;
+  notes: string;
+  status: TaskStatus;
+  owner_person_id: number;
+  owner_name: string;
+  // When it is due (open), or was due when it closed.
+  due_at: string | null;
+  created_at: string;
+  updated_at: string | null;
+  completed_at: string | null;
+  closed_reason: string | null;
+  // The chat it came from, only when that chat is the viewer's own.
+  session_id: string | null;
+}
+
+export interface TaskList {
+  tasks: Task[];
+  total: number;
+}
+
+export interface TaskChanges {
+  title?: string;
+  notes?: string;
+  status?: Exclude<TaskStatus, "done">;
+  due_date?: string;
+  owner_person_id?: number;
+}
+
+// The values the editor saw for the fields they change. A 409 means someone
+// else changed one of them meanwhile: it carries the latest copy.
+export interface TaskBase {
+  title?: string;
+  notes?: string;
+  status?: string;
+  due_date?: string | null;
+  owner_person_id?: number;
+}
+
+export class TaskConflict extends Error {
+  constructor(
+    message: string,
+    readonly fields: string[],
+    readonly latest: Task,
+  ) {
+    super(message);
+  }
+}
+
+export async function listTasks(
+  opts: { state?: "open" | "done"; ownerPersonId?: number; limit?: number; offset?: number } = {},
+): Promise<TaskList> {
+  const q = new URLSearchParams();
+  if (opts.state) q.set("state", opts.state);
+  if (opts.ownerPersonId != null) q.set("owner_person_id", String(opts.ownerPersonId));
+  if (opts.limit != null) q.set("limit", String(opts.limit));
+  if (opts.offset != null) q.set("offset", String(opts.offset));
+  const res = await fetch(`${API_BASE}/tasks?${q.toString()}`);
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't load tasks"));
+  return res.json();
+}
+
+export async function createTask(body: {
+  task: string;
+  owner_person_id?: number;
+  due_date?: string;
+  notes?: string;
+}): Promise<Task> {
+  const res = await fetch(`${API_BASE}/tasks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't add the task"));
+  return res.json();
+}
+
+export async function updateTask(taskId: number, changes: TaskChanges, base: TaskBase): Promise<Task> {
+  const res = await fetch(`${API_BASE}/tasks/${taskId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...changes, base }),
+  });
+  if (res.status === 409) {
+    const body = await res.json().catch(() => null);
+    const detail = body?.detail;
+    if (detail && typeof detail === "object" && detail.task) {
+      throw new TaskConflict(String(detail.message ?? "Changed meanwhile"), detail.fields ?? [], detail.task);
+    }
+    throw new Error(typeof detail === "string" ? detail : "Couldn't save the task");
+  }
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't save the task"));
+  return res.json();
+}
+
+export async function completeTask(
+  taskId: number,
+  reason: "done" | "not_needed" | "cancelled" = "done",
+): Promise<Task> {
+  const res = await fetch(`${API_BASE}/tasks/${taskId}/done`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't close the task"));
+  return res.json();
+}
+
+export async function reopenTask(taskId: number): Promise<Task> {
+  const res = await fetch(`${API_BASE}/tasks/${taskId}/reopen`, { method: "POST" });
+  if (!res.ok) throw new Error(await errorDetail(res, "Couldn't reopen the task"));
+  return res.json();
 }
 
 // Attunement outcome ledger: how a person responded to proactive outreach
@@ -5186,6 +5529,34 @@ export async function getPersonOutreach(id: number): Promise<OutreachStat[]> {
   const res = await fetch(`${API_BASE}/people/${id}/outreach`);
   if (!res.ok) throw new Error(`Failed to load outreach: ${res.statusText}`);
   return res.json();
+}
+
+// A reply time or channel to suggest from how the person really answers
+// (GET /people/{id}/reply-habits). Use it is a plain updatePerson; Keep mine
+// hides that suggestion until the evidence changes.
+export interface ReplyHabitSuggestion {
+  kind: "reply_time" | "channel";
+  /** reply_time: whole hours; channel: email, slack, telegram or discord. */
+  value: string;
+  headline: string;
+  evidence: string;
+}
+
+export async function getPersonReplyHabits(id: number): Promise<ReplyHabitSuggestion[]> {
+  const res = await fetch(`${API_BASE}/people/${id}/reply-habits`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to load reply habits: ${res.statusText}`);
+  const body = (await res.json()) as { suggestions: ReplyHabitSuggestion[] };
+  return body.suggestions;
+}
+
+export async function keepPersonReplyHabit(id: number, kind: ReplyHabitSuggestion["kind"]): Promise<void> {
+  const res = await fetch(`${API_BASE}/people/${id}/reply-habits/keep`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  });
+  // 409: nothing left to keep (the evidence moved); the panel just reloads.
+  if (!res.ok && res.status !== 409) throw new Error(`Couldn't keep it: ${res.statusText}`);
 }
 
 // Attunement working style: a few short "how they like replies" rules pinned
@@ -5272,6 +5643,9 @@ export interface DepartmentBriefItem {
   at_risk_count: number;
   off_track_count: number;
   awaiting_count: number;
+  // Goals on their "on track" default that nothing has checked yet. Optional
+  // so older API builds / test mocks without it still typecheck.
+  unchecked_count?: number;
   // The actual problem goals (worst first, capped). Optional so older API
   // builds / test mocks without the field still typecheck.
   attention_goals?: GoalBrief[];
@@ -5326,6 +5700,9 @@ export interface ProposalItem {
   // /decisions endpoints (which book/cancel server-side) instead of the
   // ack-and-handoff-to-chat flow. Null/absent for ordinary alert proposals.
   decision_instance_id?: number | null;
+  // Approvals one request held together (same chat turn, same kind of step)
+  // share this key; Needs you shows them as one card. Null on a lone card.
+  group_key?: string | null;
   // A scheduled run that failed: the run its Run again queues once more.
   failed_run_id?: string | null;
   // Set when the card is a roster request ("who is this new sender?"): the
@@ -5351,10 +5728,22 @@ export interface ProposalItem {
   superseded_count?: number;
   // Registry workflow the review suggested as the next step ('' = none).
   suggested_workflow?: string;
+  // What the card needs from its reader: "answer" (a box on the card),
+  // "choice" (a button per choice), "ok" (Approve), "fyi" (Got it). '' or
+  // absent keeps the card's own buttons.
+  needs?: CardNeeds;
+  question?: string;
+  choices?: string[];
   // Drafted artifacts only: the format (body is already Markdown for every
   // format) and, for "link" artifacts, the URL in the connected app.
   artifact_format?: ArtifactFormat | null;
   artifact_url?: string | null;
+  // Why an Approve card waited for you, when its own text doesn't say it
+  // (a gated booking). '' or absent otherwise.
+  waiting_because?: string;
+  // Who else waits on this card: the teammate whose ask was held for your
+  // OK. Home puts these cards first.
+  waiting_on?: string;
 }
 
 // One autonomous alert-review move since the last delivered morning brief
@@ -5442,6 +5831,84 @@ export interface PointSource {
   alert_id?: number | null;
 }
 
+// One row of Home's Right now list: what it is, who it is from or to, its
+// subject, the newest activity on it (ISO UTC), why it is listed, and what
+// Home can open from it. `key` is what dismissRightNowRow takes.
+// One row of Home's Done for you (GET /today `done_for_you`): a card the
+// viewer approved (`kind` "approval", one row per card, its status changing
+// in place) or something the Executive did on its own in the last day.
+// One line of Home's Watching next (GET /today `watching`): a follow-up it
+// will send (`action:<id>`) or a standing job (`job:<id>`), what it does
+// next and when. Stop ends that one thing (POST /today/watching/stop).
+export interface WatchingItem {
+  key: string;
+  kind: "follow_up" | "standing_job";
+  title: string;
+  detail: string;
+  at: string | null;
+}
+
+export async function stopWatching(key: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/today/watching/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) {
+    let message = "Couldn't stop it.";
+    try {
+      const body = await res.json();
+      if (typeof body?.detail === "string") message = body.detail;
+    } catch {
+      // keep the fallback
+    }
+    throw new Error(message);
+  }
+}
+
+export interface DoneRow {
+  key: string;
+  kind: string;
+  title: string;
+  detail: string;
+  status: "working" | "done" | "failed";
+  at: string;
+  session_id?: string | null;
+  alert_id?: number | null;
+  approval_id?: number | null;
+  artifact_id?: string | null;
+}
+
+/** Something waiting on the reader that lives on another page: Home's Needs
+ *  you shows it as one row whose button opens that page. */
+export interface WaitingElsewhereItem {
+  key: string;
+  title: string;
+  detail: string;
+  count: number;
+  href: string;
+  action: string;
+  at: string;
+}
+
+export interface RightNowRow {
+  key: string;
+  kind: "mail" | "draft" | "chat";
+  who: string;
+  subject: string;
+  at: string;
+  note?: string;
+  source?: {
+    kind: "mail" | "alert" | "link";
+    message_id?: string | null;
+    thread_id?: string | null;
+    decision_id?: number | null;
+    alert_id?: number | null;
+    url?: string | null;
+    app?: string | null;
+  } | null;
+}
+
 export interface MorningBriefItem {
   at: string;
   text: string;
@@ -5480,6 +5947,11 @@ export interface Today {
   // own inbox from people they don't deal with. Optional for older API builds.
   narrative_checked_at?: string | null;
   inbox_also?: string[];
+  // The owner's Right now list (empty for anyone else, and from older API builds).
+  right_now?: RightNowRow[];
+  // Done for you: what the Executive did or is doing for the viewer today.
+  done_for_you?: DoneRow[];
+  watching?: WatchingItem[];
   inbox_also_total?: number;
   // The owner's own: today's delivered morning brief and the meetings still
   // ahead today.
@@ -5489,6 +5961,9 @@ export interface Today {
   // card shows instead of a quiet day. Optional for older API builds.
   first_week?: boolean;
   first_week_card?: FirstWeekCard | null;
+  // What waits on the reader on other pages (watch suggestions, …): one row
+  // each in Needs you. Optional for older API builds.
+  waiting_elsewhere?: WaitingElsewhereItem[];
   // In-flight commitments (pending follow-ups/nudges) + people we're awaiting
   // a reply from. Optional/default-empty for older API builds + test mocks.
   in_flight?: InFlightItem[];
@@ -5524,13 +5999,13 @@ export async function markTodaySeen(): Promise<string | null> {
   return body.seen_at ?? null;
 }
 
-// The reader cleared a Right now point: gone for the rest of the day, and
-// the Executive doesn't raise it again. True when it was kept.
-export async function dismissTodayPoint(text: string): Promise<boolean> {
-  const res = await fetch(`${API_BASE}/today/dismiss`, {
+// The owner cleared a Right now row: gone until something newer lands on it.
+// True when it was kept.
+export async function dismissRightNowRow(key: string): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/today/right-now/dismiss`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ key }),
   });
   if (!res.ok) return false;
   const body = (await res.json()) as { dismissed?: boolean };
@@ -5704,6 +6179,14 @@ export interface ActivityResponse {
   items: ActivityItem[];
 }
 
+// The lines grounding left out of the principal's briefs in the last day
+// (Memory, What it does). Anyone else gets an empty list.
+export async function getHeldBack(signal?: AbortSignal): Promise<HeldBackItem[]> {
+  const res = await fetch(`${API_BASE}/today/held-back`, { signal });
+  if (!res.ok) throw new Error(`Failed to load what was left out of your brief: ${res.status}`);
+  return res.json();
+}
+
 export async function getActivity(limit: number = 20): Promise<ActivityResponse> {
   const res = await fetch(`${API_BASE}/today/activity?limit=${limit}`);
   if (!res.ok) throw new Error(`Failed to load activity: ${res.statusText}`);
@@ -5808,6 +6291,23 @@ export interface WatchlistItem {
   trust_score: number;
   notes: string;
   origin: WatchlistOrigin | string;
+  /** The goal it is for, when it has one. */
+  goal_id: number | null;
+  /** What the last check found, and why it stayed quiet when it did. */
+  last_check_note: string;
+  /** Its name as a person would say it ("Initech (INTC) stock"). */
+  title: string;
+  /** What makes it speak, e.g. "It moves 5% or more in a day, up or down". */
+  tells_you_when: string;
+  /** "It checks every 15 minutes." */
+  checks: string;
+  /** The newest thing it told you; null when it has said nothing yet. */
+  last_told: { at: string; summary: string; url: string } | null;
+  goal_title: string;
+  /** Who it tells, when that is a teammate; "" means the owner. */
+  person_name: string;
+  person_role: string;
+  department_title: string;
   /** Detail route only: how many of its recent alerts were dismissed. */
   noise?: WatchNoise;
 }
@@ -5829,13 +6329,10 @@ export interface WatchDraft {
   trigger: Record<string, unknown>;
   cadence: WatchlistCadence | string;
   mode: WatchlistMode | string;
-  severity_floor: WatchlistSeverity;
-  severity_ceiling: WatchlistSeverity;
   notes: string;
   watching: string;
   tell_you_when: string;
   how_often: string;
-  how_loud: string;
 }
 
 export interface WatchlistSignal {
@@ -5863,8 +6360,6 @@ export interface WatchlistCreate {
   trigger?: Record<string, unknown>;
   config?: Record<string, unknown>;
   cadence?: WatchlistCadence | string;
-  severity_floor?: WatchlistSeverity;
-  severity_ceiling?: WatchlistSeverity;
   mode?: WatchlistMode | string;
   route_to_specialist?: string;
   notes?: string;
@@ -5875,10 +6370,12 @@ export interface WatchlistPatch {
   enabled?: boolean;
   mode?: WatchlistMode | string;
   cadence?: WatchlistCadence | string;
-  severity_floor?: WatchlistSeverity;
-  severity_ceiling?: WatchlistSeverity;
   trigger?: Record<string, unknown>;
   notes?: string;
+  /** The goal it is for; null clears it. */
+  goal_id?: number | null;
+  /** The teammate it tells; null means the owner. */
+  person_id?: number | null;
   /** Stop asking whether this watch is too noisy (for the alerts so far). */
   quiet_noise_nudge?: boolean;
 }
@@ -5906,8 +6403,6 @@ export function draftToCreate(draft: WatchDraft): WatchlistCreate {
     trigger: draft.trigger,
     cadence: draft.cadence,
     mode: draft.mode,
-    severity_floor: draft.severity_floor,
-    severity_ceiling: draft.severity_ceiling,
     notes: draft.notes,
   };
 }
@@ -5931,12 +6426,13 @@ export async function getWatchlistItem(slug: string): Promise<WatchlistItem> {
   return res.json();
 }
 
+/** What a watch told you, newest first (only what reached you). */
 export async function getWatchlistSignals(
   slug: string,
   limit: number = 50,
 ): Promise<WatchlistSignal[]> {
   const res = await fetch(
-    `${API_BASE}/watchlist/${encodeURIComponent(slug)}/signals?limit=${limit}`,
+    `${API_BASE}/watchlist/${encodeURIComponent(slug)}/signals?limit=${limit}&told=true`,
   );
   if (!res.ok) throw new Error(`Failed to load signals: ${res.statusText}`);
   return res.json();
@@ -5997,7 +6493,7 @@ export async function approveWatchSuggestion(slug: string): Promise<WatchlistIte
 export interface WatchDeclineResponse {
   slug: string;
   reason: string;
-  /** "removed" (declined + deleted) or "kept_high_floor" (too_noisy → live, only high-severity signals surface). */
+  /** "removed" (declined + deleted) or "kept_high_floor" (too_noisy → live, big changes only). */
   result: "removed" | "kept_high_floor" | string;
 }
 
@@ -6018,9 +6514,10 @@ export async function declineWatchSuggestion(
   return res.json();
 }
 
-// How far it goes as you (PUT /delegation/reach): one dial over Act as me,
-// the inbox watcher, Handle it for me and its level, and Everything.
-export type ReachStep = "off" | "when_asked" | "inbox" | HandleItMode | "everything";
+// How far it goes as you (PUT /delegation/reach): Off, When you ask, or
+// Your inbox too (drafts for mail that needs you; Approvals decides which
+// go on their own).
+export type ReachStep = "off" | "when_asked" | "inbox";
 
 export async function setReach(step: ReachStep): Promise<DelegationSettings> {
   const res = await fetch(`${API_BASE}/delegation/reach`, {
@@ -6120,6 +6617,34 @@ export async function approveAlert(alertId: number, editedBody?: string): Promis
     throw new Error(`Failed to approve: ${res.statusText}${text ? ` — ${text}` : ""}`);
   }
   return res.json();
+}
+
+// What a Needs you card asks of its reader (ProposalItem.needs).
+export type CardNeeds = "" | "answer" | "choice" | "ok" | "fyi";
+
+// Answer a card that asks something; the Executive carries on
+// with the work it was for in a new chat (like an approval).
+export async function answerAlert(alertId: number, answer: string): Promise<AlertApproval> {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text ? detailOf(text) : `Couldn't send your answer: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+function detailOf(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return parsed.detail;
+  } catch {
+    // not JSON: the text itself
+  }
+  return text;
 }
 
 export async function getAlertApproval(approvalId: number): Promise<AlertApproval> {
@@ -6396,11 +6921,15 @@ export async function updateClientMeta(
 // ── Take the lead (Delegate → Take the lead) ────────────────
 
 export type LeadRuleKind = "person" | "domain" | "words" | "amount";
+// "wait": always waits for your yes; "go": goes on its own where the level
+// would hold it (never past Careful or In training).
+export type LeadRuleEffect = "wait" | "go";
 
 export interface LeadRule {
   id: number;
   kind: LeadRuleKind;
   value: string;
+  effect: LeadRuleEffect;
 }
 
 // An action it was allowed in training, and the edit it keeps as an example.
@@ -6430,6 +6959,18 @@ export interface TakeTheLead {
   suggested: LeadSuggested[];
   available: boolean;
   paused: boolean;
+  // Things you asked it to keep doing, with what it did for each this week.
+  jobs?: LeadJob[];
+  // Today: what it did on its own, and what it left for your yes.
+  done_today?: number;
+  left_today?: number;
+}
+
+export interface LeadJob {
+  id: number;
+  text: string;
+  created_at: string;
+  this_week: string;
 }
 
 async function leadError(res: Response, fallback: string): Promise<Error> {
@@ -6447,7 +6988,7 @@ async function leadError(res: Response, fallback: string): Promise<Error> {
 export async function getTakeTheLead(signal?: AbortSignal): Promise<TakeTheLead | null> {
   const res = await fetch(`${API_BASE}/take-the-lead`, { signal });
   if (res.status === 403 || res.status === 404) return null;
-  if (!res.ok) throw await leadError(res, "Couldn't load Take the lead.");
+  if (!res.ok) throw await leadError(res, "Couldn't load As me.");
   return res.json();
 }
 
@@ -6461,16 +7002,20 @@ export async function setTakeTheLead(update: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(update),
   });
-  if (!res.ok) throw await leadError(res, "Couldn't change Take the lead.");
+  if (!res.ok) throw await leadError(res, "Couldn't change As me.");
   delegationChanged();
   return res.json();
 }
 
-export async function addCompanyLeadRule(kind: LeadRuleKind, value: string): Promise<TakeTheLead> {
+export async function addCompanyLeadRule(
+  kind: LeadRuleKind,
+  value: string,
+  effect: LeadRuleEffect = "wait",
+): Promise<TakeTheLead> {
   const res = await fetch(`${API_BASE}/take-the-lead/rules`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind, value }),
+    body: JSON.stringify({ kind, value, effect }),
   });
   if (!res.ok) throw await leadError(res, "Couldn't add the rule.");
   delegationChanged();
@@ -6495,6 +7040,88 @@ export async function allowLeadSuggestion(key: string): Promise<TakeTheLead> {
   return res.json();
 }
 
+export async function addLeadJob(text: string): Promise<TakeTheLead> {
+  const res = await fetch(`${API_BASE}/take-the-lead/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await leadError(res, "Couldn't add it.");
+  return res.json();
+}
+
+export async function stopLeadJob(id: number): Promise<TakeTheLead> {
+  const res = await fetch(`${API_BASE}/take-the-lead/jobs/${id}`, { method: "DELETE" });
+  if (!res.ok) throw await leadError(res, "Couldn't stop it.");
+  return res.json();
+}
+
+// Delegate → Approvals (GET /approvals/summary): the reader's last 7 days,
+// and what they approved three times unchanged that could go on its own.
+export type ApprovalsSide = "as_you" | "as_me";
+
+export interface ApprovalsWaited {
+  at: string;
+  side: ApprovalsSide;
+  label: string;
+  // Why it waited, as a sentence ('' when it didn't say).
+  why: string;
+  outcome: "approved" | "declined" | "waiting" | "closed";
+}
+
+export interface ApprovalsWeek {
+  days: number;
+  went: number;
+  waited: number;
+  approved: number;
+  declined: number;
+  because_count: number;
+  because: string;
+  items: ApprovalsWaited[];
+}
+
+export interface ApprovalsOffer {
+  key: string;
+  side: ApprovalsSide;
+  label: string;
+  approvals: number;
+  last_at: string;
+  // As you: who replies would go to on their own ('' for As me).
+  address: string;
+  name: string;
+}
+
+export interface ApprovalsSummary {
+  week: ApprovalsWeek;
+  offers: ApprovalsOffer[];
+}
+
+// Fired with the new summary after Let it go or Keep asking, so the
+// Approvals tab and the cards on Home drop the same offer.
+export const APPROVALS_OFFERS_CHANGED = "oe:approvals-offers-changed";
+
+export async function getApprovalsSummary(signal?: AbortSignal): Promise<ApprovalsSummary | null> {
+  const res = await fetch(`${API_BASE}/approvals/summary`, { signal });
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw await leadError(res, "Couldn't load what Approvals did.");
+  return res.json();
+}
+
+export async function answerApprovalsOffer(key: string, answer: "let-go" | "keep-asking"): Promise<ApprovalsSummary> {
+  const res = await fetch(`${API_BASE}/approvals/offers/${answer}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) throw await leadError(res, "Couldn't save that.");
+  const next: ApprovalsSummary = await res.json();
+  if (answer === "let-go") delegationChanged();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<ApprovalsSummary>(APPROVALS_OFFERS_CHANGED, { detail: next }));
+  }
+  return next;
+}
+
 export async function removeLeadLearned(id: number): Promise<TakeTheLead> {
   const res = await fetch(`${API_BASE}/take-the-lead/learned/${id}`, { method: "DELETE" });
   if (!res.ok) throw await leadError(res, "Couldn't remove it.");
@@ -6514,6 +7141,12 @@ export interface LeadCardField {
 // Edit and Approve + allow. Only its approver and the owner can read it.
 export interface LeadCardPayload {
   summary: string;
+  // Who and what in a few words, and where it would go ("On Slack"). Empty on
+  // cards made before they were saved.
+  headline: string;
+  where: string;
+  // What a connected app's call would send, read-only (to, subject, message).
+  details: LeadCardField[];
   reason: string;
   kind: string;
   fields: LeadCardField[];
@@ -6527,6 +7160,9 @@ export async function getLeadCard(id: number, signal?: AbortSignal): Promise<Lea
   const payload = JSON.parse(instance.proposed_payload_json || "{}");
   return {
     summary: String(payload.summary ?? ""),
+    headline: String(payload.headline ?? ""),
+    where: String(payload.where ?? ""),
+    details: Array.isArray(payload.details) ? payload.details : [],
     reason: String(payload.reason ?? ""),
     kind: String(payload.kind ?? ""),
     fields: Array.isArray(payload.fields) ? payload.fields : [],
@@ -6574,41 +7210,6 @@ export async function approveLeadCard(
   });
   if (!res.ok) throw await leadError(res, "Couldn't approve it.");
   return res.json();
-}
-
-export async function setLeadAsYou(enabled: boolean): Promise<DelegationSettings> {
-  const res = await fetch(`${API_BASE}/delegation/take-the-lead`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!res.ok) throw await delegationError(res, "Couldn't change Take the lead as you.");
-  delegationChanged();
-  return res.json();
-}
-
-export async function getMyLeadRules(signal?: AbortSignal): Promise<LeadRule[]> {
-  const res = await fetch(`${API_BASE}/delegation/take-the-lead/rules`, { signal });
-  if (!res.ok) throw await delegationError(res, "Couldn't load your rules.");
-  return ((await res.json()) as { rules: LeadRule[] }).rules;
-}
-
-export async function addMyLeadRule(kind: LeadRuleKind, value: string): Promise<LeadRule[]> {
-  const res = await fetch(`${API_BASE}/delegation/take-the-lead/rules`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind, value }),
-  });
-  if (!res.ok) throw await delegationError(res, "Couldn't add the rule.");
-  delegationChanged();
-  return ((await res.json()) as { rules: LeadRule[] }).rules;
-}
-
-export async function deleteMyLeadRule(id: number): Promise<LeadRule[]> {
-  const res = await fetch(`${API_BASE}/delegation/take-the-lead/rules/${id}`, { method: "DELETE" });
-  if (!res.ok) throw await delegationError(res, "Couldn't remove the rule.");
-  delegationChanged();
-  return ((await res.json()) as { rules: LeadRule[] }).rules;
 }
 
 // ── Custom tools (Settings → Advanced → Custom tools) ───────────────────────
@@ -6711,4 +7312,117 @@ export async function rollbackSavedTool(name: string, version: number): Promise<
   });
   if (!res.ok) throw await savedToolError(res, "Couldn't switch the version.");
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// What it worked out: the signed-in person's own figures (GET/PATCH/DELETE
+// /memories/worked-out). Each person sees only theirs.
+// ---------------------------------------------------------------------------
+
+export interface WorkedOutFigure {
+  id: number;
+  subject: string;
+  figure: string;
+  source: string;
+  as_of: string | null;
+  private: boolean;
+  created_at: string;
+}
+
+/** The caller's figures, newest first; null for someone with none to keep
+ *  (not signed in, or not on the People list). */
+export async function listWorkedOut(): Promise<WorkedOutFigure[] | null> {
+  const res = await fetch(`${API_BASE}/memories/worked-out`);
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw new Error("Couldn't load what it worked out.");
+  return ((await res.json()) as { figures: WorkedOutFigure[] }).figures;
+}
+
+export async function editWorkedOut(
+  id: number,
+  patch: { subject?: string; figure?: string; source?: string },
+): Promise<WorkedOutFigure> {
+  const res = await fetch(`${API_BASE}/memories/worked-out/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { detail?: { message?: string } | string } | null;
+    const detail = body?.detail;
+    throw new Error(typeof detail === "object" && detail?.message ? detail.message : "Couldn't save that change.");
+  }
+  return res.json();
+}
+
+export async function forgetWorkedOut(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/memories/worked-out/${id}`, { method: "DELETE" });
+  if (!res.ok && res.status !== 404) throw new Error("Couldn't remove it.");
+}
+
+// --- What it remembered lately (memory.changes) ----------------------------
+// The chat's "Memory updated" chip and the Memory page's "New since your last
+// visit". Only the caller's own; null for someone with none to see.
+
+export interface MemoryChange {
+  kind: "fact" | "decision" | "worked_out" | "lesson" | "note";
+  id: number;
+  title: string;
+  // Where a worked-out figure came from; "" for the other kinds.
+  source: string;
+  // "proposed" is a fact waiting for the owner's OK.
+  status: "active" | "proposed";
+  created_at: string;
+  can_undo: boolean;
+}
+
+export async function listMemoryChanges(since: string, sessionId?: string): Promise<MemoryChange[] | null> {
+  const params = new URLSearchParams({ since });
+  if (sessionId) params.set("session_id", sessionId);
+  const res = await fetch(`${API_BASE}/memories/changes?${params.toString()}`);
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw new Error("Couldn't load what it remembered.");
+  return ((await res.json()) as { changes: MemoryChange[] }).changes;
+}
+
+/** Take one change back, through the route its own list uses. */
+export async function undoMemoryChange(change: MemoryChange): Promise<void> {
+  switch (change.kind) {
+    case "fact":
+    case "decision":
+      await retireStandingFact(change.id, "undone right after it was kept");
+      return;
+    case "worked_out":
+      return forgetWorkedOut(change.id);
+    case "lesson":
+      return forgetReflectionLesson(change.id);
+    case "note":
+      return forgetHistoryNote(change.id);
+  }
+}
+
+// ── Offers to do a repeated ask on a schedule (workflows/repeat_asks.py) ─────
+
+/** The signed-in person's own open offers, newest first. Empty on an older backend. */
+export async function listRepeatOffers(signal?: AbortSignal): Promise<RepeatOffer[]> {
+  try {
+    const res = await fetch(`${API_BASE}/workflow-offers`, { signal });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { offers?: RepeatOffer[] };
+    return body.offers ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Set it up (`accept`) or Not now. Best-effort: false when it didn't go through. */
+export async function answerRepeatOffer(id: number, accept: boolean): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/workflow-offers/${id}/${accept ? "accept" : "dismiss"}`, {
+      method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }

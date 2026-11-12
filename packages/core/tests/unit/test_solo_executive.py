@@ -49,15 +49,17 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # And again: Domain Expertise says when to consult a specialist. And again:
 # the wording was tightened (same rules, ~27% shorter) to cut the cached prefix.
 # And again: People is checked first when asked how to reach someone.
+# And again: a name that fits more than one person is never picked silently.
 #
-# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-11-03): this digest
-# necessarily differs from upstream's. The fork adds a "## Consulting Your
-# Leadership Team" section — the local model ignores `tool_choice`, so the
-# persona has to ask for the consult in prose — and it lives in the SHARED
-# _PERSONA_TAIL so BOTH the team and solo prompts carry it. Upstream's value is
-# e391cbc648ed2089e43d8fc0c0aecd0c50d74081cd99f4091c5fc4adbf971ba6.
+# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-11-03 and 2026-11-12):
+# this digest necessarily differs from upstream's. The fork adds a
+# "## Consulting Your Leadership Team" section — the local model ignores
+# `tool_choice`, so the persona has to ask for the consult in prose — and it
+# lives in the SHARED _PERSONA_TAIL so BOTH the team and solo prompts carry
+# it. Upstream's value is
+# 86ed4f8ebf8a1040978dd63d30a507a71cc4abe4e498c709fd56f0c5a43c1b73.
 # The test keeps its purpose: any *unintended* byte change still fails here.
-TEAM_PERSONA_SHA256 = "4465fbd5169355907f22900f8684002e3fc99444e0dba7f02face952e5b69e52"
+TEAM_PERSONA_SHA256 = "61faf6b91bded0ff64fd1b968e53de44213cc1c8f1b757c2b77d8311e1196962"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",

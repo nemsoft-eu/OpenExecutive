@@ -38,6 +38,12 @@ _CHANNEL_LABELS = {
 _RESOLVER_CHANNELS = frozenset({"slack", "discord", "telegram"})
 
 
+def answers_signoffs(channel: str) -> bool:
+    """Whether a reply on ``channel`` can answer a workflow sign-off: its
+    adapter calls the inbound resolver (``_RESOLVER_CHANNELS``)."""
+    return channel in _RESOLVER_CHANNELS
+
+
 def build_channel_context_block(
     channel: str, *, ui_base_url: str | None = None, cards_here: bool = False
 ) -> str:
@@ -148,15 +154,27 @@ def attach_briefing_context(session: object, *, is_dm: bool, person: object) -> 
 
     Synchronous SQLite — call it via ``asyncio.to_thread``. Never raises.
     """
-    if not is_dm or not getattr(person, "is_principal", False):
+    if not is_dm:
+        return ""
+    # A team member gets their own cards only: the ones assigned to them,
+    # which are all `answer_card` lets them answer.
+    teammate = (
+        not getattr(person, "is_principal", False)
+        and getattr(person, "kind", "") == "team"
+        and not getattr(person, "archived", False)
+        and isinstance(getattr(person, "id", None), int)
+    )
+    if not getattr(person, "is_principal", False) and not teammate:
         return ""
     try:
         from openexecutive.briefing.context import render_and_trust
 
+        if teammate:
+            return render_and_trust(session, routed_to=person.id)  # type: ignore[attr-defined]
         return render_and_trust(session)
     except Exception:
         logger.exception("channel_context: could not build the briefing block")
         return ""
 
 
-__all__ = ["attach_briefing_context", "build_channel_context_block"]
+__all__ = ["answers_signoffs", "attach_briefing_context", "build_channel_context_block"]

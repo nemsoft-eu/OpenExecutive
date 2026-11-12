@@ -15,10 +15,13 @@ stays stable. No new outbound capability is granted: approval-gate and cadence
 recipients must be rostered people (enforced by ``validate_definition``), and
 cadence delivery reuses the scheduler's existing guarded send.
 
-A workflow with action (tool-using) steps is saved **inactive**. The chat
-confirmation is a token this model holds itself, so it cannot stand in for a
-person seeing the tools; the workflow runs (or schedules) only after someone
-turns it on from its review card at ``/jobs/{name}``.
+Approvals decides the rest (``workflow_change.hands_off``). On Hands-off a
+workflow is saved switched on, straight after drafting. Below it, the
+person confirms the summary first, and a workflow with action (tool-using)
+steps is saved **inactive**: the chat confirmation is a token this model
+holds itself, so it cannot stand in for a person seeing the tools; the
+workflow runs (or schedules) only after someone turns it on from its review
+card at ``/jobs/{name}``.
 """
 from __future__ import annotations
 
@@ -73,14 +76,14 @@ DEFINITION_SCHEMA: dict[str, Any] = {
                 "'google_workspace__append_table_rows' or 'oe__read_document'. The tools you "
                 "use in chat are available to steps as 'oe__<name>', e.g. "
                 "'oe__send_slack_dm', 'oe__web_search' or 'oe__run_workflow'. To email as "
-                "the user (only when they turned on Act as me and connected their "
+                "the user (only when they turned on As you and connected their "
                 "mailbox): 'oe__draft_email_as_me' saves a draft for them to send, "
                 "'oe__send_email_as_me' sends it as them; ask which they want, or the "
                 "Executive's own email, when it isn't clear. To read their own mail or "
                 "calendar (the same condition): 'oe__search_my_email', "
                 "'oe__read_my_email', 'oe__my_email_awaiting_reply', 'oe__my_calendar', and "
-                "'oe__answer_email_as_me' answers a thread from those as their Handle it "
-                "for me would. The gateway's mail and calendar tools "
+                "'oe__answer_email_as_me' answers a thread from those the way its inbox "
+                "replies as them would. The gateway's mail and calendar tools "
                 "(google_workspace__*, microsoft_365__*) act as YOUR account, not theirs: "
                 "a calendar step with no calendar named reads your own calendar. To read "
                 "the user's, use 'oe__my_calendar', or write their email address into the "
@@ -122,9 +125,9 @@ DRAFT_WORKFLOW_TOOL: dict[str, Any] = {
         "Draft a new reusable executive workflow (a structured, multi-step job "
         "the user can re-run from /jobs) WITHOUT saving it. Use when the user "
         "asks you to create, build, or set up a custom workflow. Returns a "
-        "confirm_token and a summary of the plan. You MUST show the summary to "
-        "the user and get explicit confirmation, then call save_workflow with "
-        "the SAME definition and the confirm_token. Do NOT invent specialists, "
+        "confirm_token, a summary of the plan and a note. Follow the note: "
+        "usually show the summary to the user and get their confirmation, then "
+        "call save_workflow with the SAME definition and the confirm_token. Do NOT invent specialists, "
         "people, or metrics — only use the specialist roles and people the "
         "user has identified. If validation fails, the response lists exactly "
         "what to fix; re-draft and try again. A workflow with action (tool) "
@@ -206,7 +209,8 @@ def _reads_refusal(defn: Any) -> str | None:
 
 
 def _needs_review(defn: Any) -> bool:
-    """True when the workflow has tool-using steps, which a person must approve.
+    """True when the workflow has tool-using steps, which a person must
+    approve below Hands-off.
 
     Their approval is turning the workflow on from its review card on the Workflows
     page — a chat confirmation (a token this model holds itself) is not a
@@ -214,6 +218,8 @@ def _needs_review(defn: Any) -> bool:
     """
     from openexecutive.workflows.dynamic_models import ActionStepSpec
 
+    if workflow_change.hands_off():
+        return False
     return any(isinstance(step, ActionStepSpec) for step in defn.steps)
 
 
@@ -271,7 +277,10 @@ async def handle_draft_workflow(tool_input: dict[str, Any]) -> str:
         return json.dumps({"error": error})
     token = _canonical_token(tool_input["definition"])
     note = (
-        "Show this summary to the user. After they confirm, call "
+        "Approvals is on Hands-off: save it now with save_workflow, the same "
+        "definition and this confirm_token, then tell the user what you saved."
+        if not on_card and workflow_change.hands_off()
+        else "Show this summary to the user. After they confirm, call "
         "save_workflow with the same definition and this confirm_token."
     )
     if on_card:

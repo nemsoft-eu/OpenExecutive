@@ -673,7 +673,7 @@ def _find_discord_sender(discord_user_id: str) -> object:
 _MAX_CARD_TEXT = 1900
 
 
-def _card_view(decision_id: int, labels: tuple[str, str] = ("Approve", "Skip")) -> Any:
+def _card_view(decision_id: int, labels: tuple[str, ...] = ("Approve", "Skip")) -> Any:
     """A card's Approve and Skip buttons. Their custom ids carry the card
     (``channel_cards.callback_data``); ``on_interaction`` takes the tap, so it
     still works after a restart."""
@@ -690,6 +690,11 @@ def _card_view(decision_id: int, labels: tuple[str, str] = ("Approve", "Skip")) 
         label=labels[1], style=discord.ButtonStyle.secondary,
         custom_id=channel_cards.callback_data(decision_id, channel_cards.SKIP),
     ))
+    if len(labels) > 2:
+        view.add_item(discord.ui.Button(
+            label=labels[2], style=discord.ButtonStyle.primary,
+            custom_id=channel_cards.callback_data(decision_id, channel_cards.ALLOW),
+        ))
     return view
 
 
@@ -743,10 +748,11 @@ async def handle_card_tap(interaction: Any) -> None:
         await interaction.response.send_message("This card is no longer there.", ephemeral=True)
         return
     decision_id, approve = parsed
+    allow = channel_cards.tapped_allow(data.get("custom_id") if isinstance(data, dict) else None)
     # Deciding can take longer than Discord's three seconds.
     await interaction.response.defer()
-    line = await channel_cards.resolve(decision_id, person, approve=approve)
-    choice = "approve" if approve else "skip"
+    line = await channel_cards.resolve(decision_id, person, approve=approve, allow=allow)
+    choice = "allow" if allow else "approve" if approve else "skip"
     await asyncio.to_thread(
         audit_log,
         "integration_inbound",
@@ -765,6 +771,37 @@ async def handle_card_tap(interaction: Any) -> None:
         await interaction.edit_original_response(content=text[:2000], view=None)
     except Exception:
         logger.exception("Discord: couldn't update card %d after the tap", decision_id)
+
+
+async def _reply_context(message: Any, bot_user: Any) -> str:
+    """The message ``message`` answers, when the person used Discord's Reply
+    (``integrations.reply_context``); "" otherwise, and for a forward."""
+    import discord
+
+    from openexecutive.integrations import reply_context
+
+    reference = getattr(message, "reference", None)
+    if reference is None or getattr(reference, "message_id", None) is None:
+        return ""
+    if str(getattr(getattr(reference, "type", None), "name", "reply")) != "reply":
+        return ""
+    replied = getattr(reference, "resolved", None) or getattr(reference, "cached_message", None)
+    if not isinstance(replied, discord.Message):
+        try:
+            replied = await message.channel.fetch_message(reference.message_id)
+        except Exception:
+            logger.info("Discord: couldn't read the message %s answers", getattr(message, "id", "?"))
+            return ""
+    quoted = _clean_message(replied.content or "")
+    if not quoted and replied.attachments:
+        quoted = "[" + ", ".join(a.filename for a in replied.attachments[:5]) + "]"
+    author = replied.author
+    writer = reply_context.whose(
+        by_executive=bot_user is not None and author.id == bot_user.id,
+        by_sender=author.id == message.author.id,
+        name=getattr(author, "display_name", None) or getattr(author, "name", "") or "",
+    )
+    return reply_context.quote(writer, quoted)
 
 
 # The rows this handler writes before the turn binds its session (the inbound
@@ -796,8 +833,14 @@ async def _handle_message(
     response_router: Callable[[str], Awaitable[MentionRouteResult]] | None = None,
     own_words: str | None = None,
     send_card: Callable[[int, str], Awaitable[None]] | None = None,
+    reply_context: str = "",
 ) -> None:
     """Core handler shared by on_message and slash commands.
+
+    `reply_context` is the message this one answers (Discord's Reply), from
+    `_reply_context`: put in front of the words for the Executive's turn and
+    the stored history only, after the waiting-question resolver, alert
+    triage and the response gate have read the person's own words.
 
     `on_first_turn_complete(user_msg, assistant_msg)` runs after a successful
     reply has been sent and persisted, but ONLY when there was no prior
@@ -942,7 +985,7 @@ async def _handle_message(
         attach_briefing_context,
         build_channel_context_block,
     )
-    from openexecutive.knowledge.retriever import retrieve
+    from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
     from openexecutive.memory.episodic import format_for_prompt
     from openexecutive.memory.session_store import (
         create_session,
@@ -1003,6 +1046,14 @@ async def _handle_message(
                     )
                     return
 
+    # The person's own words search knowledge and name the conversation;
+    # the quote is for the turn and its history.
+    own_text = text
+    if reply_context:
+        from openexecutive.integrations.reply_context import with_context
+
+        text = with_context(reply_context, text)
+
     # Author-prefixed content for the Executive and the persisted user turn.
     # In threads this becomes `[Alice]: ...`; in DMs it's identical to `text`.
     formatted_user_text = _format_user_content(text, author_display_name, session_id)
@@ -1033,7 +1084,9 @@ async def _handle_message(
             if is_dm and discord_user_id:
                 session.seen_channel_refs.add(("discord_dm", discord_user_id))
 
-            retrieved_context = retrieve(query=text, max_chars=get_settings().knowledge_chat_max_chars)
+            retrieved_context = retrieve(
+                query=own_text, max_chars=get_settings().knowledge_chat_max_chars, n_builtin=chat_builtin_results()
+            )
             episodic_context = format_for_prompt(session_id=session_id)
 
             # Sender was already resolved at the roster gate above; reuse it
@@ -1102,8 +1155,9 @@ async def _handle_message(
                 cards=cards if cards_here else None,
                 person_id=person_id,
                 co_present_person_ids=co_present_person_ids or None,
-                # Never the attachment text or the DM hydration above.
-                memory_text=own_words if own_words is not None else text,
+                # Never the attachment text, the DM hydration or the quoted
+                # message this one answers: memory keeps their own words.
+                memory_text=own_words if own_words is not None else own_text,
                 fetch_own_urls=True,  # past the roster gate above
             )
 
@@ -1183,7 +1237,7 @@ async def _handle_message(
         else:
             from openexecutive.integrations.conversations import title_after_turn
 
-            title_after_turn(session_id, text, response)
+            title_after_turn(session_id, own_text, response)
 
         # Promoted-thread double-write: when the router opened a brand-
         # new bot-owned thread for this reply, also persist the turn
@@ -1223,7 +1277,7 @@ async def _handle_message(
     # must not bubble up to the on_message handler.
     if is_first_turn and response is not None and on_first_turn_complete is not None:
         try:
-            await on_first_turn_complete(text, response)
+            await on_first_turn_complete(own_text, response)
         except Exception:
             logger.exception(
                 "Discord: on_first_turn_complete hook failed for session %s", session_id
@@ -1243,7 +1297,7 @@ async def _handle_message(
             _schedule_thread_rename(
                 route_result.promoted_thread,
                 f"discord:thread:{route_result.promoted_thread_id}",
-                text,
+                own_text,
                 response,
             )
         except Exception:
@@ -1712,6 +1766,11 @@ def create_discord_bot():
         # replies that arrive in the same DM or thread channel.
         await _handle_message(
             send_card=send_card,
+            # Only for someone on People: reading an old message is an API
+            # call, and an unrostered sender's turn is dropped anyway.
+            reply_context=(
+                await _reply_context(message, bot.user) if _is_rostered(discord_user_id) else ""
+            ),
             text=cleaned,
             own_words=own_words,
             attachment_count=len(message.attachments or []),
@@ -1811,7 +1870,7 @@ async def send_dm(discord_user_id: str, text: str) -> str | None:
     return last_message_id
 
 
-async def send_dm_card(discord_user_id: str, decision_id: int, text: str, labels: tuple[str, str]) -> None:
+async def send_dm_card(discord_user_id: str, decision_id: int, text: str, labels: tuple[str, ...]) -> None:
     """Send a card waiting outside any chat to ``discord_user_id``'s DM with
     the bot, with its two buttons (``channel_cards.push_waiting``); the
     bot's ``on_interaction`` takes the tap. Raises when it couldn't."""
@@ -1843,6 +1902,9 @@ async def send_dm_card(discord_user_id: str, decision_id: int, text: str, labels
                      "custom_id": channel_cards.callback_data(decision_id, channel_cards.APPROVE)},
                     {"type": 2, "style": 2, "label": labels[1],
                      "custom_id": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
+                    *([{"type": 2, "style": 1, "label": labels[2],
+                        "custom_id": channel_cards.callback_data(decision_id, channel_cards.ALLOW)}]
+                      if len(labels) > 2 else []),
                 ]}],
             },
         )

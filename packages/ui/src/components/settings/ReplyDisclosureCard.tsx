@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 import SettingsCard from "@/components/settings/SettingsCard";
 import { setReplyDisclosure, type DelegationSettings, type ReplyDisclosure } from "@/lib/api";
@@ -20,12 +20,14 @@ const SWITCHES: { key: Switch; label: string; help: string }[] = [
   },
 ];
 
-// Under Advanced on Delegate → Act as me (`only="approved_sends"`) and on
-// Handle it for me (`only="handle_it"`): your own switch for the AI line on
-// replies sent as you (PUT /delegation/disclosure, delegation/disclosure.py). The line is
-// written into each reply when it's drafted, so a change applies to the next
-// one. Turning off the Handle it line asks first. Nothing shows when the
-// install has AI disclosure off.
+// Your own switches for the AI line on replies sent as you (PUT
+// /delegation/disclosure, delegation/disclosure.py), on the ones that go on
+// their own and on the drafts you send. `only` shows one of them. The line
+// is written into each reply when it's drafted, so a change applies to the
+// next one. Turning off the line on replies sent on their own asks first.
+// Nothing shows when the install has AI disclosure off. The As you row of
+// Say it was written with AI on Delegate → Approvals (AiLineCard); `title`
+// puts them in a card of their own.
 export default function ReplyDisclosureCard({
   disclosure,
   onSettings,
@@ -34,9 +36,29 @@ export default function ReplyDisclosureCard({
 }: {
   disclosure: ReplyDisclosure;
   onSettings: (next: DelegationSettings) => void;
-  only: Switch;
+  only?: Switch;
   title: string;
 }) {
+  if (!disclosure.enabled) return null;
+  return (
+    <SettingsCard
+      title={title}
+      description={`Choose whether these replies end with “${disclosure.line}”, so people can tell your AI assistant wrote them.`}
+    >
+      <ReplyDisclosureSwitches disclosure={disclosure} onSettings={onSettings} only={only} />
+    </SettingsCard>
+  );
+}
+
+export function ReplyDisclosureSwitches({
+  disclosure,
+  onSettings,
+  only,
+}: {
+  disclosure: ReplyDisclosure;
+  onSettings: (next: DelegationSettings) => void;
+  only?: Switch;
+}): ReactNode {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmOff, setConfirmOff] = useState(false);
@@ -65,12 +87,9 @@ export default function ReplyDisclosureCard({
   };
 
   return (
-    <SettingsCard
-      title={title}
-      description={`Choose whether these replies end with “${disclosure.line}”, so people can tell your AI assistant wrote them.`}
-    >
+    <>
       <div className="flex flex-col gap-4">
-        {SWITCHES.filter((s) => s.key === only).map((s) => (
+        {SWITCHES.filter((s) => !only || s.key === only).map((s) => (
           <label key={s.key} className="flex cursor-pointer items-start gap-3">
             <input
               id={`reply-disclosure-${s.key}`}
@@ -89,7 +108,7 @@ export default function ReplyDisclosureCard({
         {confirmOff && (
           <div className="rounded-md border border-line p-3 text-sm">
             <p className="text-fg">
-              Replies Handle it for me sends on their own will no longer say your AI assistant wrote them.
+              Replies it sends on its own as you will no longer say your AI assistant wrote them.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -114,6 +133,6 @@ export default function ReplyDisclosureCard({
         <p className="text-sm text-fg-muted">A change applies to the next reply it writes.</p>
       </div>
       {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
-    </SettingsCard>
+    </>
   );
 }

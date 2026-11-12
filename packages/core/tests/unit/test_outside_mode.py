@@ -17,6 +17,7 @@ from openexecutive.memory import episodic
 from openexecutive.orchestrator import content_scan, outside_mode
 from openexecutive.orchestrator import outside_content as oc
 from openexecutive.orchestrator.session import Session
+from openexecutive.people import store as people_store
 
 _REAL_TEAM_ADDRESSES = oc._team_addresses
 FLAGGED = content_scan.Verdict(flagged=True, categories=("forward_or_share",))
@@ -27,6 +28,9 @@ TEAM = {"exec@example.com", "dana@example.com", "lee@example.com"}
 def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db = tmp_path / "episodic.db"
     monkeypatch.setattr(episodic, "DB_PATH", db)
+    # The roster keeps its own path. Left on ./episodic_memory.db, a copy
+    # another test made without a people table makes every turn "Ask".
+    monkeypatch.setattr(people_store, "DB_PATH", db)
     monkeypatch.setattr(oc, "_team_addresses", lambda: set(TEAM))
     monkeypatch.setattr(oc, "_exec_address", lambda: "exec@example.com")
     return db
@@ -77,19 +81,47 @@ def test_an_unknown_choice_is_refused(tmp_path: Path) -> None:
 # --- whose turn it applies to ---------------------------------------------
 
 
-@pytest.mark.parametrize("attr", ["shared_chat", "sender_off_team", "from_mcp_client"])
-def test_shared_chats_strangers_and_other_apps_always_ask(monkeypatch: pytest.MonkeyPatch, attr: str) -> None:
-    _use(monkeypatch, outside_mode.TRUST)
+@pytest.mark.parametrize("attr", ["shared_chat", "from_mcp_client", "from_web_chat"])
+@pytest.mark.parametrize("mode", [outside_mode.ASK, outside_mode.OUTSIDERS, outside_mode.TRUST])
+def test_every_kind_of_turn_runs_at_the_companys_level(
+    monkeypatch: pytest.MonkeyPatch, attr: str, mode: str,
+) -> None:
+    _use(monkeypatch, mode)
     session = Session()
     setattr(session, attr, True)
+    # Another AI app's words may not be the owner's: Hands-off is for the
+    # owner's own turns (orchestrator.outside_mode._someone_else).
+    expected = outside_mode.OUTSIDERS if (attr, mode) == ("from_mcp_client", outside_mode.TRUST) else mode
+    assert outside_mode.for_turn(session) == expected
+
+
+@pytest.mark.parametrize("channel", ["slack", "telegram", "google_chat", "discord", "teams"])
+def test_hands_off_is_hands_off_on_every_channel(monkeypatch: pytest.MonkeyPatch, channel: str) -> None:
+    _use(monkeypatch, outside_mode.TRUST, principal=False)
+    assert outside_mode.for_turn(Session(origin_channel=channel)) == outside_mode.TRUST
+
+
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_mail_is_hands_off_only_when_it_is_the_owners_proven_mail(
+    monkeypatch: pytest.MonkeyPatch, authenticated: bool,
+) -> None:
+    # The poller sets no caller, and anyone can write a teammate's or the
+    # owner's address in From: only the owner's authenticated mail is them.
+    _use(monkeypatch, outside_mode.TRUST, principal=False)
+    session = Session(origin_channel="email")
+    session.email_from = "owner@example.com"
+    session.email_authenticated = authenticated
+    expected = outside_mode.TRUST if authenticated else outside_mode.OUTSIDERS
+    assert outside_mode.for_turn(session) == expected
+    _use(monkeypatch, outside_mode.ASK, principal=False)
     assert outside_mode.for_turn(session) == outside_mode.ASK
 
 
-def test_dont_ask_is_only_for_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
-    _use(monkeypatch, outside_mode.TRUST, principal=True)
-    assert outside_mode.for_turn(Session()) == outside_mode.TRUST
-    _use(monkeypatch, outside_mode.TRUST, principal=False)
-    assert outside_mode.for_turn(Session()) == outside_mode.OUTSIDERS
+def test_mail_from_a_stranger_is_never_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use(monkeypatch, outside_mode.TRUST)
+    assert outside_mode.for_turn(Session(sender_off_team=True)) == outside_mode.OUTSIDERS
+    _use(monkeypatch, outside_mode.ASK)
+    assert outside_mode.for_turn(Session(sender_off_team=True)) == outside_mode.ASK
 
 
 def test_a_failing_check_asks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -306,14 +338,17 @@ def test_dont_ask_still_holds_mail_from_a_stranger(monkeypatch: pytest.MonkeyPat
     assert _turn(session, lambda state: (oc.read_outside(), oc.trusted_turn())) == (True, False)
 
 
-def test_dont_ask_keeps_a_new_contact_for_the_next_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    _use(monkeypatch, outside_mode.TRUST)
+@pytest.mark.parametrize(("mode", "kept"), [(outside_mode.TRUST, False), (outside_mode.OUTSIDERS, True)])
+def test_only_below_hands_off_a_new_contact_waits_for_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch, mode: str, kept: bool,
+) -> None:
+    _use(monkeypatch, mode)
 
     def body(state: Any) -> bool:
         oc.note_added_person(9)
         return oc.added_this_turn(9)
 
-    assert _turn(Session(caller_person_id=1), body) is True
+    assert _turn(Session(caller_person_id=1), body) is kept
 
 
 # --- the route ---------------------------------------------------------------
@@ -335,7 +370,7 @@ def test_the_owner_sees_and_changes_it(
     http, events = client
     monkeypatch.setattr(executive_route, "_is_principal", lambda request: True)
     assert http.get("/executive/outside-content").json() == {
-        "mode": "outsiders", "channels": {}, "channel_ids": list(outside_mode.CHANNELS), "can_change": True,
+        "mode": "outsiders", "channels": {}, "channel_ids": [], "can_change": True,
     }
     res = http.put("/executive/outside-content", json={"mode": "trust"})
     assert res.status_code == 200
@@ -654,48 +689,29 @@ def test_a_column_another_worker_just_added_is_fine(tmp_path: Path) -> None:
     assert "channels" in {row[1] for row in conn.execute(f"PRAGMA table_info({outside_mode.TABLE})")}
 
 
-def test_unreadable_channels_are_careful(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import sqlite3
-
-    _use(monkeypatch, outside_mode.TRUST)
-    db = tmp_path / "e.db"
-    outside_mode.set_mode(outside_mode.TRUST, updated_by="o", channels={"slack": outside_mode.ASK}, db_path=db)
-    conn = sqlite3.connect(str(db))
-    conn.execute(f"UPDATE {outside_mode.TABLE} SET channels = 'not json'")
-    conn.commit()
-    conn.close()
-    monkeypatch.setattr(outside_mode, "_db_path", lambda _p: db)
-    assert outside_mode.stored_channels() == {}
-    assert outside_mode.channel_mode("slack") == outside_mode.ASK
-    assert outside_mode.channel_mode(None) == outside_mode.TRUST
-
-
-def test_a_turn_takes_its_channels_level(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_channel_set_apart_before_follows_the_company(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _use(monkeypatch, outside_mode.OUTSIDERS)
     monkeypatch.setattr(
         outside_mode, "_read_channels", lambda *_: {"slack": outside_mode.TRUST, "web": outside_mode.ASK},
     )
-    assert outside_mode.for_turn(Session(origin_channel="slack")) == outside_mode.TRUST
-    assert outside_mode.for_turn(Session(from_web_chat=True)) == outside_mode.ASK
-    assert outside_mode.for_turn(Session(origin_channel="telegram")) == outside_mode.OUTSIDERS
-    # Hands-off on a channel still needs the principal's own turn.
-    _use(monkeypatch, outside_mode.OUTSIDERS, principal=False)
     assert outside_mode.for_turn(Session(origin_channel="slack")) == outside_mode.OUTSIDERS
+    assert outside_mode.for_turn(Session(from_web_chat=True)) == outside_mode.OUTSIDERS
+    assert outside_mode.channel_mode("slack") == outside_mode.OUTSIDERS
 
 
-def test_the_owner_sets_a_channel_through_the_route(
+def test_the_route_sets_one_level_for_every_channel(
     client: tuple[TestClient, list[str]], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     http, events = client
     monkeypatch.setattr(executive_route, "_is_principal", lambda request: True)
-    res = http.put("/executive/outside-content", json={"mode": "outsiders", "channels": {"slack": "trust"}})
+    outside_mode.set_mode(outside_mode.OUTSIDERS, updated_by="o", channels={"slack": outside_mode.ASK})
+    res = http.put("/executive/outside-content", json={"mode": "trust"})
     assert res.status_code == 200
-    assert res.json()["channels"] == {"slack": "trust"}
-    assert events == ["outside_content_mode_changed"]
-    res = http.put("/executive/outside-content", json={"mode": "outsiders", "channels": {"slack": None}})
+    # Setting the level clears a channel an older version set apart.
     assert res.json()["channels"] == {}
-    assert http.put("/executive/outside-content", json={"mode": "ask", "channels": {"fax": "ask"}}).status_code == 422
-    assert http.put("/executive/outside-content", json={"mode": "ask", "channels": {"web": "maybe"}}).status_code == 422
+    assert outside_mode.stored_channels() == {}
+    assert events == ["outside_content_mode_changed"]
+    assert http.put("/executive/outside-content", json={"mode": "ask", "channels": {"slack": "trust"}}).status_code == 422
 
 
 def test_nobody_else_may_set_a_channel(

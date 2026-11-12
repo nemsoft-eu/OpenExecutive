@@ -27,6 +27,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from openexecutive.orchestrator.card_answers import ANSWER_CARD_TOOL, handle_answer_card
 from openexecutive.orchestrator.disclosure import with_chat_line
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,21 @@ def _record_send_to_activity(
         logger.exception("record_send_to_activity: outer guard caught failure")
 
 
+def _own_outreach() -> bool:
+    """Whether a send is the Executive's own outreach: a proactive pass
+    tagged it (``attunement.outcomes``), or no person is in the turn (an
+    unattended run, or no session at all). Errors count as its own."""
+    try:
+        from openexecutive.attunement.outcomes import current_tag
+
+        if current_tag() is not None:
+            return True
+        session = current_session.get()
+        return session is None or getattr(session, "unattended", False) is True
+    except Exception:
+        return True
+
+
 def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> str | None:
     """Run the outbound anti-spam guard before a direct send.
 
@@ -209,7 +225,11 @@ def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> 
     if outside_content.added_ref(channel_ref):
         # On the roster only since this turn (outside_content).
         return outside_content.added_person_error(f"{channel_ref!r}")
-    reason = check_outbound_allowed(channel, channel_ref, text)
+    # The duplicate and rate checks stop a runaway loop whoever started the
+    # turn (a stranger's mail could steer a burst of sends). Quiet hours are
+    # for the Executive's own outreach (a tagged proactive send, or a run
+    # nobody is in): what a person asks for in the turn isn't refused for them.
+    reason = check_outbound_allowed(channel, channel_ref, text, availability=_own_outreach())
     if reason is None:
         return _hold_outbound(tool=tool, channel=channel, channel_ref=channel_ref, text=text)
     from openexecutive.audit import log_event as audit_log
@@ -296,13 +316,29 @@ def _resolve_recipient_person_id(channel: str, channel_ref: str) -> int | None:
         return None
 
 
+def _off_roster_runs() -> bool:
+    """Whether a direct message to someone not in People goes ahead: under
+    Hands-off, or for a step the owner approved (``orchestrator.levels``)."""
+    from openexecutive.orchestrator import levels
+
+    return levels.relaxed()
+
+
+def _off_roster_card(blocked: str, tool: str, tool_input: dict[str, Any]) -> str:
+    """Below Hands-off, a direct message to someone not in People is an
+    Approve card for the owner; with nobody in the turn, the refusal."""
+    from openexecutive.orchestrator import levels
+
+    return levels.card_or(blocked, tool, dict(tool_input), reason=levels.NEW_PERSON, mcp=False)
+
+
 def _dm_recipient_on_roster(finder: Callable[..., Any], ref: str) -> bool:
     """Whether a raw DM tool may send to ``ref``: a team member always, a
     contact only when the principal asked on a verified surface (see
     ``people_tools.contacts_reachable_now``)."""
     from openexecutive.orchestrator.people_tools import (
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
     person = finder(ref)
@@ -311,7 +347,7 @@ def _dm_recipient_on_roster(finder: Callable[..., Any], ref: str) -> bool:
     if person is None:
         return False
     # A turn about the principal's private mail reaches the principal only.
-    return not turn_is_private_to_principal() or getattr(person, "is_principal", False) is True
+    return not private_turn_holds() or getattr(person, "is_principal", False) is True
 
 
 def _record_outbound_context(
@@ -575,10 +611,9 @@ ACK_ALERT_TOOL: dict[str, Any] = {
         "the call is refused; do not retry the same id — if the principal named the "
         "item, look it up with find_alerts, otherwise say you cannot clear that one.\n"
         "Status 'ack' means the user approved (you are about to execute the suggested "
-        "action); 'dismissed' means declined. Note this clears the card only — a "
-        "proposal that books something (a meeting, a calendar hold) also needs the "
-        "Approve button on the briefing page, which you cannot press; say so rather "
-        "than implying an ack completed it."
+        "action); 'dismissed' means declined. Note this clears the card only: to carry "
+        "out what a card proposes or held back (book the meeting, send what it "
+        "held), or to answer its question, use answer_card instead."
     ),
     "input_schema": {
         "type": "object",
@@ -642,6 +677,16 @@ FIND_ALERTS_TOOL: dict[str, Any] = {
         "required": ["query"],
     },
 }
+
+
+# Said with every lookup that finds more than one person: the model must not
+# pick one of two Alexes silently, nor tell the principal something "wasn't
+# sent" after checking only one of them.
+SEVERAL_MATCH_NOTE = (
+    "More than one person matches. Unless the conversation makes clear which "
+    "one is meant, ask. Whatever you send or say was sent, name the person by "
+    "full name and email address."
+)
 
 
 LOOKUP_PERSON_TOOL: dict[str, Any] = {
@@ -735,6 +780,37 @@ def _turn_speaker_id(session: Any) -> int | None:
     a row the turn queues so the scheduler can run it as them."""
     speaker = getattr(session, "caller_person_id", None) if session is not None else None
     return speaker if isinstance(speaker, int) and not isinstance(speaker, bool) else None
+
+
+def _speakers_own_ref(session: Any, channel: str, channel_ref: str) -> bool:
+    """Whether ``channel_ref`` is the turn's speaker's own address on
+    ``channel`` (their People email, Slack, Discord or Telegram id). A
+    follow-up to yourself is allowed from any surface, so "check my inbox at
+    5 and tell me" works from a chat app that seeds no addresses (Google
+    Chat). Fails closed."""
+    speaker = _turn_speaker_id(session)
+    if speaker is None or not channel_ref:
+        return False
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(speaker)
+    except Exception:
+        logger.warning("schedule: couldn't read the speaker", exc_info=True)
+        return False
+    if person is None or getattr(person, "archived", False):
+        return False
+    own = {
+        "email": getattr(person, "email", None),
+        "slack_dm": getattr(person, "slack_user_id", None),
+        "discord_dm": getattr(person, "discord_user_id", None),
+        "telegram": getattr(person, "telegram_chat_id", None),
+    }.get(channel)
+    if not own:
+        return False
+    if channel == "email":
+        return str(own).strip().lower() == channel_ref.strip().lower()
+    return str(own) == channel_ref
 
 
 def _is_principal_recipient(
@@ -832,12 +908,12 @@ async def handle_schedule_followup(tool_input: dict[str, Any]) -> str:
     seen: set[tuple[str, str]] | None = (
         getattr(session, "seen_channel_refs", None) if session is not None else None
     )
-    if seen is not None and (channel, channel_ref) not in seen:
+    if seen is not None and (channel, channel_ref) not in seen and not _speakers_own_ref(session, channel, channel_ref):
         return json.dumps({
             "error": (
                 f"channel_ref {channel_ref!r} on channel {channel!r} was not seen in this "
                 f"session — refusing to schedule. Only schedule follow-ups to channels the "
-                f"user has actually used."
+                f"user has actually used, or to the speaker's own address."
             ),
         })
 
@@ -961,10 +1037,12 @@ async def handle_send_telegram_message(tool_input: dict[str, Any]) -> str:
                 "send_telegram_message: refused chat_id=%s (not in People roster)",
                 chat_id,
             )
-            return json.dumps({"error": (
+            blocked = json.dumps({"error": (
                 f"chat_id {chat_id!r} is not in the People roster. Pass the person's "
                 "telegram_chat_id from lookup_person — NOT their person_id."
             )})
+            if not _off_roster_runs():
+                return _off_roster_card(blocked, "send_telegram_message", tool_input)
 
     # Anti-spam guard: suppress duplicates / rate-cap breaches / quiet-hours sends.
     suppressed = _guard_outbound(
@@ -1034,11 +1112,11 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
     # lose a real distinction.
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
     from openexecutive.people.store import find_person_by_slack_id
 
-    if turn_is_private_to_principal():
+    if private_turn_holds():
         recipient = find_person_by_slack_id(user_id)
         if recipient is None or not recipient.is_principal:
             return json.dumps({"error": PRIVATE_TURN_REFUSAL})
@@ -1061,11 +1139,13 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
         logger.warning(
             "send_slack_dm: refused user_id=%s (not in People roster)", user_id
         )
-        return json.dumps({"error": (
+        blocked = json.dumps({"error": (
             f"user_id {user_id!r} is not in the People roster. Pass the person's "
             "slack_user_id from lookup_person (a Slack member id like U01ABCDEF) "
             "— NOT their person_id."
         )})
+        if not _off_roster_runs():
+            return _off_roster_card(blocked, "send_slack_dm", tool_input)
 
     settings = get_settings()
     if not settings.slack_bot_token:
@@ -1158,12 +1238,12 @@ def _recover_channel_id_from_person_id(value: str, channel: str) -> str | None:
         return None
     from openexecutive.orchestrator.people_tools import (
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
     if person.kind != "team" and not contacts_reachable_now():
         return None
-    if turn_is_private_to_principal() and not person.is_principal:
+    if private_turn_holds() and not person.is_principal:
         return None
     if channel == "discord":
         # Discord user ids are positive numeric snowflakes; reject a malformed
@@ -1216,11 +1296,13 @@ async def handle_send_discord_dm(tool_input: dict[str, Any]) -> str:
                 "send_discord_dm: refused user_id=%s (not in People roster)",
                 discord_user_id,
             )
-            return json.dumps({"error": (
+            blocked = json.dumps({"error": (
                 f"discord_user_id {discord_user_id!r} is not in the People roster. "
                 "Pass the person's discord_user_id from lookup_person (a long Discord "
                 "snowflake) — NOT their person_id."
             )})
+            if not _off_roster_runs():
+                return _off_roster_card(blocked, "send_discord_dm", tool_input)
 
     # Anti-spam guard: suppress duplicates / rate-cap breaches / quiet-hours sends.
     suppressed = _guard_outbound(
@@ -1387,6 +1469,10 @@ async def handle_lookup_person(tool_input: dict[str, Any]) -> str:
     # The audit log is readable by every signed-in user: count the team
     # matches only, so the principal's turn logs what anyone else's would.
     _audit(ok=True, matches_count=min(team_matches, _LOOKUP_PERSON_MAX_MATCHES))
+    # Only names make it ambiguous: two engineers matched by role are not.
+    name_hits = sum(1 for m in matches if query in (m["full_name"] or "").lower())
+    if name_hits > 1:
+        return json.dumps({"matches": matches, "note": SEVERAL_MATCH_NOTE})
     return json.dumps({"matches": matches})
 
 
@@ -1508,6 +1594,20 @@ async def handle_message_person(tool_input: dict[str, Any]) -> str:
     return await message_person(tool_input)
 
 
+def usable_chat_ref(channel: str, channel_ref: str | None) -> bool:
+    """Whether ``channel_ref`` is an id ``message_person`` can send to on
+    ``channel``: a Discord snowflake is all digits, a Telegram chat id an
+    integer with at most one leading '-' (a group's), a Slack id anything."""
+    if not channel_ref:
+        return False
+    if channel == "discord":
+        return channel_ref.isascii() and channel_ref.isdigit()
+    if channel == "telegram":
+        digits = channel_ref[1:] if channel_ref.startswith("-") else channel_ref
+        return channel_ref.isascii() and digits.isdigit()
+    return channel == "slack"
+
+
 def _chat_candidates(person: Any) -> list[tuple[str, str | None]]:
     """The person's chat channels as (channel, stored id) pairs, in
     ``people.reach.reach_order``'s order."""
@@ -1562,10 +1662,10 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
-    if turn_is_private_to_principal() and not person.is_principal:
+    if private_turn_holds() and not person.is_principal:
         return json.dumps({"error": PRIVATE_TURN_REFUSAL})
     from openexecutive.orchestrator import outside_content
 
@@ -1597,20 +1697,13 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
     for channel, channel_ref in candidates:
         if channel not in configured or not channel_ref:
             continue
+        if not usable_chat_ref(channel, channel_ref):
+            continue  # e.g. a Discord "@handle" or a Telegram "--1"
         if channel == "discord":
-            if not (channel_ref.isascii() and channel_ref.isdigit()):
-                continue  # not a usable Discord snowflake
             result = await handle_send_discord_dm(
                 {"discord_user_id": channel_ref, "text": text}
             )
         elif channel == "telegram":
-            # Telegram chat ids are integers; group ids carry ONE leading '-'.
-            # Strip a single sign (not lstrip, which would accept "--1") and
-            # require the rest to be ascii digits, so the value round-trips
-            # through int() in the delegate.
-            digits = channel_ref[1:] if channel_ref.startswith("-") else channel_ref
-            if not (channel_ref.isascii() and digits.isdigit()):
-                continue  # not a usable Telegram chat id (e.g. "--1", "@handle")
             result = await handle_send_telegram_message(
                 {"chat_id": channel_ref, "text": text}
             )
@@ -1764,6 +1857,7 @@ SCHEDULE_TOOLS: list[dict[str, Any]] = [
     LOOKUP_PERSON_TOOL,
     ACK_ALERT_TOOL,
     FIND_ALERTS_TOOL,
+    ANSWER_CARD_TOOL,
 ]
 
 
@@ -1914,6 +2008,8 @@ UNATTENDED_WITHHELD_TOOLS: frozenset[str] = frozenset({
     "remember_fact",
     "resolve_roster_request",
     "update_company_profile",
+    # Answers a Needs you card as the person (orchestrator/card_answers.py).
+    "answer_card",
     # App control (orchestrator/app_control.py) acts as the person asking, and
     # its cards wait for their tap: nobody is there to ask or to tap.
     "do_in_app",
@@ -2152,8 +2248,11 @@ def private_turn_withheld_error(tool_name: str) -> str:
 # the model emits anyway (`mcp_client_withholds`, `mcp_client_withheld_error`).
 MCP_CLIENT_WITHHELD_TOOLS: frozenset[str] = PRIVATE_TURN_WITHHELD_TOOLS | UNATTENDED_WITHHELD_TOOLS | frozenset({
     "ack_alert",
+    "answer_card",
     "archive_person",
     "close_open_loop",
+    "reopen_open_loop",
+    "update_open_loop",
     "create_alert",
     "draft_workflow",
     "leave_out_of_brief",
@@ -2216,6 +2315,8 @@ MCP_CLIENT_RUNS_WHEN_ACTING: frozenset[str] = frozenset({
     "assign_open_loop",
     "cancel_followup",
     "close_open_loop",
+    "reopen_open_loop",
+    "update_open_loop",
     "create_alert",
     "create_goal",
     "forget_fact",
@@ -2335,6 +2436,8 @@ def mcp_client_withheld_error(tool_name: str, *, acting: bool = False) -> str:
 # acts later with the full tool set, past this turn's check. A fixed set, so
 # the variant keeps a stable tool prefix of its own.
 SHARED_CHAT_WITHHELD_TOOLS: frozenset[str] = frozenset({
+    # A Needs you card is answered by its person, not by whoever wrote here.
+    "answer_card",
     "archive_person",
     # Changes in the app as the owner: their word, not a guest's.
     "do_in_app",
@@ -2633,7 +2736,7 @@ async def handle_suggest_workflow(tool_input: dict[str, Any]) -> str:
     seen: set[tuple[str, str]] | None = (
         getattr(session, "seen_channel_refs", None) if session is not None else None
     )
-    if seen is not None and (channel, channel_ref) not in seen:
+    if seen is not None and (channel, channel_ref) not in seen and not _speakers_own_ref(session, channel, channel_ref):
         return json.dumps({
             "error": (
                 f"channel_ref {channel_ref!r} on channel {channel!r} was not seen in this "
@@ -3008,4 +3111,5 @@ SCHEDULE_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = 
     "lookup_person": handle_lookup_person,
     "ack_alert": handle_ack_alert,
     "find_alerts": handle_find_alerts,
+    "answer_card": handle_answer_card,
 }

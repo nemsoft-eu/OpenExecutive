@@ -29,6 +29,7 @@ from openexecutive.memory.episodic import (
 from openexecutive.memory.replay import CHAT_REPLAY_KIND
 from openexecutive.orchestrator.mcp_gateway import MCPGateway
 from openexecutive.scheduler.pause import is_paused
+from openexecutive.workflows import run_control
 from openexecutive.workflows.gate import ensure_workflow_event
 
 if TYPE_CHECKING:
@@ -181,6 +182,32 @@ def _maybe_send_reminders(now: datetime) -> bool:
         return maybe_send(now)
     except Exception:
         logger.exception("scheduler: reminders failed to start")
+        return False
+
+
+def _maybe_watch_for_lead(now: datetime) -> bool:
+    """As me's other times to look: a goal slips, a workflow fails, a
+    meeting ends, a task goes overdue (orchestrator.take_the_lead.watch,
+    throttled there; it wakes the look like new mail). Never raises."""
+    try:
+        from openexecutive.orchestrator.take_the_lead import watch
+
+        return watch(now) is not None
+    except Exception:
+        logger.exception("scheduler: As me's watch failed")
+        return False
+
+
+def _maybe_check_mail_watches(now: datetime) -> bool:
+    """Act as me's watch_for_email: look in the person's own mailbox for the
+    email they are waiting on and tell them when it lands
+    (delegation/mail_watch.py). A hook, like the reminders. Never raises."""
+    try:
+        from openexecutive.delegation.mail_watch import maybe_check
+
+        return maybe_check(now)
+    except Exception:
+        logger.exception("scheduler: mail watches failed to start")
         return False
 
 
@@ -386,6 +413,8 @@ async def run_scheduler(
             _maybe_keep_contacts(now)
             _maybe_remind_notes(now)
             _maybe_send_reminders(now)
+            _maybe_check_mail_watches(now)
+            _maybe_watch_for_lead(now)
             _maybe_release_held(now)
             _maybe_push_cards(now)
             _maybe_send_monthly_value(now)
@@ -598,7 +627,7 @@ async def _execute_action(
                 card_id = escalate_via_alert(
                     action.department,
                     decision.assignee_person_id,
-                    summary=f"[ESCALATION] {action.intent_text[:140]}",
+                    summary=f"Urgent: {action.intent_text[:140]}",
                     body=action.intent_text,
                     suggested_action=_proposed_action_phrase(urgent=True),
                     action_key="|".join((
@@ -705,7 +734,10 @@ async def _execute_action(
             )
             workflow = DepartmentCheckInWorkflow()
             artifact = ""
-            async for event in workflow.run(inputs=wf_inputs, store=store):
+            # Stop run ends it quietly: no artifact, the cadence carries on.
+            async for event in run_control.watch(
+                run_id, workflow.run(inputs=wf_inputs, store=store), quiet=True
+            ):
                 event = ensure_workflow_event(event, site="scheduler.dept_cadence")
                 if event.type == "artifact" and event.content:
                     artifact = event.content
@@ -2403,6 +2435,7 @@ async def deliver_to_each_principal(
     label: str = "Update",
     recipients: list[Person] | None = None,
     held_kind: str | None = None,
+    held_only: bool = False,
 ) -> list[tuple[Person, PrincipalDelivery]]:
     """Send ``text`` to every active principal, one DM each.
 
@@ -2469,6 +2502,9 @@ async def deliver_to_each_principal(
     (``_with_held_messages``): each recipient's own are appended to their copy
     only, claimed before their send, marked sent once it went and given back
     otherwise. One founder's held messages never reach the other.
+    ``held_only`` (a quiet day's digest, ``text`` empty): each recipient gets
+    their held messages alone, and one with none is skipped and left out of
+    the results, as nothing was sent to them.
 
     Empty list when there is no principal at all, which the caller records
     as ``no_owner``. A not-ok result means no channel was configured or
@@ -2502,6 +2538,10 @@ async def deliver_to_each_principal(
             own_text = text
             if held_kind is not None:
                 own_text, held_ids = _with_held_messages(held_kind, text, live)
+            if held_only:
+                if not held_ids:
+                    continue
+                own_text = own_text.strip()
             # Everything sent here is a brief or digest to its reader: its
             # done row must not read as work done, or the next brief
             # repeats it as news (as in _deliver_to_principal).
@@ -2675,9 +2715,12 @@ async def _send_on_plan(
     for channel in plan:
         try:
             if channel == "slack_dm" and principal.slack_user_id:
+                from openexecutive.alerts.card_refs import slack_links
                 from openexecutive.orchestrator.schedule_tools import handle_send_slack_dm
+                # Slack shows a Markdown link as typed: a card's link
+                # (alerts.card_refs) goes in Slack's own form.
                 result = await handle_send_slack_dm({
-                    "user_id": principal.slack_user_id, "text": text,
+                    "user_id": principal.slack_user_id, "text": slack_links(text),
                 })
                 if _delivered_ok(result):
                     await _remember_in_chat(result, f"slack:dm:{principal.slack_user_id}", principal, text, label)
@@ -2706,6 +2749,7 @@ async def _send_on_plan(
             elif channel == "email":
                 error = await _email_principal(principal, text, label)
                 if error is None:
+                    await asyncio.to_thread(_remember_for_email_reply, principal, text)
                     return _sent(channel, principal.email, plan[0])
                 failures.append(f"email: {error}")
             else:
@@ -2742,6 +2786,35 @@ async def _remember_in_chat(
         )
     except Exception:
         logger.exception("scheduler: couldn't save the delivery into %s", base_id)
+
+
+# A brief or digest runs longer than a DM; this keeps its items whole.
+_EMAIL_REPLY_CONTEXT_CHARS = 6000
+
+
+def _remember_for_email_reply(person: Person, text: str) -> None:
+    """Record ``text``, just emailed to ``person``, as the message their next
+    email may answer (``integrations.inbound_hydration``), the way a DM the
+    Executive sends is recorded. A chat app has it in the conversation
+    (``_remember_in_chat``); an email reply starts a turn of its own, so
+    without this "why did you do the second one?" after the evening digest
+    has nothing to point at. Keyed on their own address, so a reply from
+    anyone else never sees it. Never raises."""
+    address = (person.email or "").strip().lower()
+    if not address or not (text or "").strip():
+        return
+    try:
+        from openexecutive.memory.episodic import insert_outbound_context
+
+        insert_outbound_context(
+            channel="email",
+            channel_ref=address,
+            outbound_text=text,
+            recipient_person_id=person.id,
+            max_chars=_EMAIL_REPLY_CONTEXT_CHARS,
+        )
+    except Exception:
+        logger.exception("scheduler: couldn't record the email for its reply")
 
 
 def _sent(channel: str, to: str | None, first_tried: str | None = None) -> PrincipalDelivery:
@@ -2806,15 +2879,17 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
             paused = False
             as_owner = pinned_viewer(viewer_for_person(owner)) if owner is not None else contextlib.nullcontext()
             with as_owner:
-                async for event in workflow.run(inputs=wf_inputs, store=store):
-                    # The one pause a scheduled run CAN take: an action step held
-                    # writes to new targets. Nothing waits in-process — the run is
-                    # checkpointed, its owner is asked, and the resumer finishes it
-                    # (and DMs the artifact to this cadence's recipient) later.
+                async for event in run_control.watch(run_id, workflow.run(inputs=wf_inputs, store=store)):
+                    # The pauses a scheduled run CAN take: an action step held
+                    # writes (or a call its tool held for an OK), or its tool waits
+                    # for something it needs. Nothing waits in-process — the run is
+                    # checkpointed, its owner is asked or told, and the resumer
+                    # finishes it (and DMs the artifact to this cadence's recipient)
+                    # later.
                     if (
                         isinstance(event, WaitForHumanEvent)
                         and event.resume_state is not None
-                        and event.resume_state.kind == "held_writes"
+                        and event.resume_state.kind in ("held_writes", "waiting")
                     ):
                         event.resume_state.deliver_to_person_id = deliver_to
                         await checkpoint_gate(run_id=run_id, event=event, workflow_title=workflow.title)
@@ -2838,6 +2913,9 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
                 artifact = ""  # the resumer delivers it once the owner answers
             else:
                 complete_run(run_id, artifact or "(no artifact)")
+        except run_control.RunStopped:
+            # Someone pressed Stop: the run is marked stopped, nothing to file.
+            artifact = ""
         except Exception as exc:
             logger.exception("scheduler: dynamic_workflow %r (action %d) failed", name, action.id)
             with contextlib.suppress(Exception):
@@ -2947,6 +3025,7 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         artifact = ""
         fingerprint: str | None = None
         suppressed = False
+        quiet = False
         private_to_principal = False
         # Who this brief is for, resolved BEFORE the run because it decides
         # what the brief may contain.
@@ -2976,13 +3055,16 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
 
         delivery_token = PRINCIPAL_DELIVERY.set(private_run)
         try:
-            async for event in workflow.run(inputs=wf_inputs, store=store):
+            async for event in run_control.watch(
+                run_id, workflow.run(inputs=wf_inputs, store=store), quiet=True
+            ):
                 event = ensure_workflow_event(event, site="scheduler.principal_brief")
                 if event.type == "artifact" and event.content:
                     artifact = event.content
                 elif event.type == "result" and event.data and event.data.get("brief_fingerprint"):
                     fingerprint = str(event.data["brief_fingerprint"])
                     suppressed = bool(event.data.get("suppressed"))
+                    quiet = bool(event.data.get("quiet"))
                     private_to_principal = bool(event.data.get("private_to_principal"))
                 elif event.type == "error" and event.message:
                     raise RuntimeError(event.message)
@@ -3044,7 +3126,22 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             or "(no artifact)",
         )
 
-        if not artifact:
+        # Nothing new today (the end-of-day digest): no message, unless a
+        # recipient asked to get messages in it, which then go alone, to that
+        # recipient only (`held_only`: the fan-out skips anyone with none).
+        held_only = quiet and not artifact and _anyone_has_held(kind, recipients)
+        if quiet and not artifact and not held_only:
+            # No outcome recorded: the last one stays, and so does the
+            # "since last brief" window, so the next digest covers this day.
+            recorded = True
+            logger.info("scheduler: %s skipped — nothing new", kind)
+            audit_log(
+                "scheduled_action",
+                f"{kind} skipped — nothing new",
+                actor="scheduler",
+                details={"phase": "skipped_quiet", "kind": kind},
+            )
+        elif not artifact and not held_only:
             # `recipients=[]`, not omitted: this run is KNOWN to have reached
             # nobody, which is a different fact from a record that predates
             # per-recipient outcomes and so cannot say.
@@ -3098,7 +3195,7 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                 # (people.held_messages), as one "While you were away" block.
                 sends = await deliver_to_each_principal(
                     artifact, label=workflow.title, recipients=recipients,
-                    held_kind=kind,
+                    held_kind=kind, held_only=held_only,
                 )
             delivered = [(p, d) for p, d in sends if d.ok]
 
@@ -3129,10 +3226,13 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                 )
                 for person, d in sends
             ]
-            reason, channel = brief_state.delivery_summary(recipient_outcomes)
-            brief_state.record_delivery_outcome(
-                kind, reason=reason, channel=channel, recipients=recipient_outcomes
-            )
+            # Held messages going out alone on a quiet day are not a digest,
+            # so they record no outcome, like a quiet skip.
+            if not held_only:
+                reason, channel = brief_state.delivery_summary(recipient_outcomes)
+                brief_state.record_delivery_outcome(
+                    kind, reason=reason, channel=channel, recipients=recipient_outcomes
+                )
             recorded = True
 
             # One audit row per recipient: a founder whose channel is broken
@@ -3177,8 +3277,10 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                 # the shared artifact, so ANY recipient receiving it is
                 # enough: not advancing would replay yesterday's window to
                 # the founder who did get it. A recipient who got nothing is
-                # surfaced by the outcome above, not by re-sending.
-                if fingerprint:
+                # surfaced by the outcome above, not by re-sending. Held
+                # messages alone on a quiet day leave the window where it
+                # was, like a quiet skip.
+                if fingerprint and artifact:
                     brief_state.record_delivered(kind, fingerprint, artifact)
             else:
                 logger.warning("scheduler: %s NOT delivered — %s", kind, detail)
@@ -3230,6 +3332,21 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
 
 # The briefs that carry held messages ("In my briefs", people.notifications).
 _DIGEST_BRIEF_KINDS: frozenset[str] = frozenset({"principal_brief_morning", "principal_brief_eod"})
+
+
+def _anyone_has_held(kind: str, recipients: list[Person]) -> bool:
+    """Whether any of ``recipients`` has messages waiting for the ``kind``
+    brief, so a quiet day still sends them alone. A peek, not a claim: the
+    fan-out claims each recipient's own. False when they can't be read."""
+    if kind not in _DIGEST_BRIEF_KINDS:
+        return False
+    try:
+        from openexecutive.people.held_messages import for_brief
+
+        return any(p.id is not None and for_brief(p.id) for p in recipients)
+    except Exception:
+        logger.exception("scheduler: couldn't read held messages for a quiet %s", kind)
+        return False
 
 
 def _with_held_messages(
@@ -3374,9 +3491,12 @@ async def _run_take_the_lead_wake(action: ScheduledAction, now: datetime) -> Non
     assert action.id is not None
     try:
         if take_the_lead.executive_on():
-            await _reflect(now, kind=TAKE_THE_LEAD_WAKE_KIND)
+            await _reflect(
+                now, kind=TAKE_THE_LEAD_WAKE_KIND,
+                prompted_by=take_the_lead.prompted_line(take_the_lead.wake_reason(action.intent_text)),
+            )
         else:
-            logger.info("scheduler: Take the lead is off — skipping the wake")
+            logger.info("scheduler: As me is off — skipping the wake")
     finally:
         mark_action_done(action.id)
 
@@ -3415,9 +3535,11 @@ async def _run_chat_review(action: ScheduledAction, now: datetime) -> None:
     await chat_review.run_scheduled(action.channel_ref, now)
 
 
-async def _reflect(now: datetime, *, kind: str) -> None:
+async def _reflect(now: datetime, *, kind: str, prompted_by: str = "") -> None:
     """One executive_reflection run, stored and audited under ``kind``.
-    Never raises."""
+    ``prompted_by`` is what made it look ("When new mail came in"), which
+    the run is told and what it does is recorded with; the daily look's
+    own line when empty. Never raises."""
     import contextlib
     import uuid
 
@@ -3445,12 +3567,17 @@ async def _reflect(now: datetime, *, kind: str) -> None:
         )
         store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
         artifact = ""
-        async for event in workflow.run(inputs=wf_inputs, store=store):
-            event = ensure_workflow_event(event, site="scheduler.executive_reflection")
-            if event.type == "artifact" and event.content:
-                artifact = event.content
-            elif event.type == "error" and event.message:
-                raise RuntimeError(event.message)
+        from openexecutive.orchestrator import take_the_lead
+
+        with take_the_lead.looking(prompted_by or take_the_lead.DAILY_LOOK):
+            async for event in run_control.watch(
+                run_id, workflow.run(inputs=wf_inputs, store=store), quiet=True
+            ):
+                event = ensure_workflow_event(event, site="scheduler.executive_reflection")
+                if event.type == "artifact" and event.content:
+                    artifact = event.content
+                elif event.type == "error" and event.message:
+                    raise RuntimeError(event.message)
         complete_run(run_id, artifact or "(no artifact)")
         audit_log(
             "scheduled_action",

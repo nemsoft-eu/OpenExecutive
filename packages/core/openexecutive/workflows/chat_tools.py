@@ -97,7 +97,7 @@ ACCESS: dict[str, tuple[str, str]] = {
     "list_people": (USE, "read the roster"),
     "lookup_person": (USE, "find someone on the roster"),
     "ask_about_person": (USE, "ask what is known about someone"),
-    "list_open_loops": (USE, "list open loops"),
+    "list_open_loops": (USE, "list tasks"),
     "list_department_goals": (USE, "list goals"),
     "list_watchlist": (USE, "list the watchlist"),
     "add_watchlist_entry": (USE, "watch something new"),
@@ -114,6 +114,7 @@ ACCESS: dict[str, tuple[str, str]] = {
     "my_email_read_before": (AS_ME, "mail opened for the person before"),
     "my_calendar": (AS_ME, "the person's own calendar"),
     "remind_me": (AS_ME, "a reminder for the person"),
+    "watch_for_email": (AS_ME, "a watch on the person's own mailbox"),
     "propose_actions": (AS_ME, "an approval card from the person's mail"),
     "recall_history": (AS_ME, "the person's own conversation notes"),
     "search_past_chats": (AS_ME, "the person's own earlier chats"),
@@ -126,7 +127,7 @@ ACCESS: dict[str, tuple[str, str]] = {
     "list_saved_tools": (COVERED, "every action step's script lists them"),
     "open_tools": (COVERED, "a step names its tools up front"),
     "use_tool": (COVERED, "a step names its tools up front"),
-    "plan_steps": (COVERED, "a workflow's steps are its plan"),
+    "show_progress": (COVERED, "a workflow shows its own steps"),
     # CHAT_ONLY: needs the person (module docstring).
     "remember_fact": (CHAT_ONLY, "changes what the Executive takes as fact"),
     "forget_fact": (CHAT_ONLY, "changes what the Executive takes as fact"),
@@ -135,7 +136,10 @@ ACCESS: dict[str, tuple[str, str]] = {
     "record_decision_outcome": (CHAT_ONLY, "only the principal records an outcome"),
     "assign_open_loop": (CHAT_ONLY, "takes the task in the speaker's own words"),
     "close_open_loop": (CHAT_ONLY, "only the principal or the loop's owner closes it"),
+    "update_open_loop": (CHAT_ONLY, "only the principal or the task's owner changes it"),
+    "reopen_open_loop": (CHAT_ONLY, "only the principal or the task's owner reopens it"),
     "ack_alert": (CHAT_ONLY, "clears an alert on quoted text"),
+    "answer_card": (CHAT_ONLY, "answers a card as the person"),
     "leave_out_of_brief": (CHAT_ONLY, "a correction the person asks for"),
     "cancel_followup": (CHAT_ONLY, "a correction the person asks for"),
     "move_followup": (CHAT_ONLY, "a correction the person asks for"),
@@ -165,7 +169,7 @@ MAX_DEPTH = 3
 def chat_tool_definitions() -> dict[str, dict[str, Any]]:
     """Every tool the chat can offer, by name (definitions as chat offers
     them; web search is the model's server tool and has none here)."""
-    from openexecutive.orchestrator import tool_groups, turn_plan
+    from openexecutive.orchestrator import tool_groups, turn_progress
     from openexecutive.orchestrator.chat_search_tools import CHAT_SEARCH_TOOLS
     from openexecutive.orchestrator.delegation_tools import DELEGATION_TOOLS
     from openexecutive.orchestrator.executive import _offered_skill_tools
@@ -179,7 +183,7 @@ def chat_tool_definitions() -> dict[str, dict[str, Any]]:
         *SPECIALIST_TOOLS, *_offered_skill_tools(), *MCP_TOOLS, *DELEGATION_TOOLS,
         *HISTORY_TOOLS, *CHAT_SEARCH_TOOLS, *KNOWLEDGE_TOOLS, tool_groups.USE_TOOL_TOOL,
         {"name": tool_groups.OPEN_TOOLS},
-        {"name": turn_plan.PLAN_STEPS},
+        {"name": turn_progress.SHOW_PROGRESS},
         {"name": step_script.RUN_SCRIPT_TOOL}, {"name": step_script.LIST_SAVED_TOOLS_TOOL},
     ]
     return {str(t["name"]): t for t in tools}

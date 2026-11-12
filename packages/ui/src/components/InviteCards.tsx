@@ -119,7 +119,7 @@ export function InviteCardItem({
         <>
           <p className="mt-3 text-sm text-emerald-700 dark:text-emerald-300">{answeredLine(done, card)}</p>
           {done === "accept" && card.can_allow && nextTime && (
-            <p className="mt-1 text-sm text-fg-muted">From now on, their invites with no clash are accepted on their own.</p>
+            <p className="mt-1 text-sm text-fg-muted">From now on, their invites with no clash are accepted on their own, where Approvals lets it.</p>
           )}
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Button variant="secondary" onClick={() => onGone(card.decision_id)}>
@@ -136,7 +136,7 @@ export function InviteCardItem({
               disabled={busy !== null}
               onChange={setNextTime}
               label={inviteNextTimeLabel(card)}
-              help="Only when nothing on your calendar clashes. You can undo this in Handle it for me."
+              help="Their invites with no clash, and everything else sent as you to them. Undo it on Delegate."
             />
           )}
           <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -155,7 +155,7 @@ export function InviteCardItem({
         <>
           <p className="mt-3 text-sm text-fg-muted">
             Your calendar sign-in can read your calendar but not answer invites. Connect it again under Read my
-            calendar in Delegate → Act as me, then answer here. Until then, answer it in your calendar.
+            calendar in Delegate → As you, then answer here. Until then, answer it in your calendar.
           </p>
           {card.connect_command && (
             <code className="mt-2 block overflow-x-auto rounded-lg bg-surface px-2 py-1 text-[13px] text-fg-muted">

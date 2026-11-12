@@ -88,8 +88,10 @@ export const APP_ROUTES = [
   "people",
   "review",
   "settings",
+  "shared",
   "signin",
   "skills",
+  "tasks",
   "today",
   "watchlist",
 ] as const;

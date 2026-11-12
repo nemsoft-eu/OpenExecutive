@@ -193,3 +193,32 @@ export function isPutOff(stored: string | null | undefined, move: string, now: D
     return false;
   }
 }
+
+/** What a Right now row opens: its source read the same way as a point's. */
+export function rowTarget(row: { source?: TimedPoint["source"] }): PointTarget {
+  return pointTarget({ text: "", source: row.source });
+}
+
+/** The draft a "draft" row is about (its `draft:<id>` key), for the draft's
+ * own Send, See draft and Delete; null for any other row. */
+export function draftRowId(row: { kind: string; key: string }): number | null {
+  if (row.kind !== "draft") return null;
+  const m = /^draft:(\d+)$/.exec(row.key);
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A row's time: "2:31 PM" today, "Yesterday", else "Nov 2"; null for a
+ * missing or bad time. */
+export function rowWhen(iso: string | null | undefined, now: Date): string | null {
+  if (!iso) return null;
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  if (sameLocalDay(t, now)) return clockLabel(iso);
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameLocalDay(t, yesterday)) return "Yesterday";
+  return `${MONTHS[t.getMonth()]} ${t.getDate()}`;
+}

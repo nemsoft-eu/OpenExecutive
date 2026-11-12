@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { type FormEvent, Fragment, type ReactNode, useCallback, useEffect, useId, useState } from "react";
 
 import Icon from "@/components/Icon";
 import { ChatAppPickers } from "@/components/people/ChatAppPickers";
 import { PersonContactChanges, PersonContactNote } from "@/components/people/ContactChanges";
+import ReplyHabits from "@/components/people/ReplyHabits";
 import { TeamModeSwitch } from "@/components/people/TeamModeSwitch";
 import { usePageCrumb } from "@/components/shell/PageCrumb";
 import Button from "@/components/ui/Button";
@@ -40,6 +42,7 @@ import { assignNoticeLine } from "@/lib/assignNotice";
 import { DETAIL_LABELS, detailHref, detailsToText, detailText, textToDetails } from "@/lib/contactChanges";
 import { isContact, shouldSwitchToTeam } from "@/lib/peopleKinds";
 import { onLeaveLine, reachLine } from "@/lib/personReach";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -55,7 +58,7 @@ const ALL_SCOPES = [
   { value: "legal_sign", label: "Legal", hint: "Receives proposals with legal implications." },
   { value: "board_comms", label: "Board", hint: "Receives proposals before board communications." },
   { value: "meeting_scheduling", label: "Meetings", hint: "Receives meetings the Executive wants to book." },
-  { value: "wildcard", label: "All (wildcard)", hint: "Receives anything no one else is scoped for — usually the principal." },
+  { value: "wildcard", label: "All (wildcard)", hint: "Receives anything no one else is scoped for, usually the owner." },
 ];
 
 const CHANNELS = [
@@ -87,7 +90,7 @@ function OutreachSection({ personId }: { personId: number }) {
       .catch(() => setRows([]));
   }, [personId]);
 
-  if (!rows) return <p className="text-[15px] text-fg-muted">Loading…</p>;
+  if (!rows) return <PageSpinner />;
   return (
     <section>
       <h2 className={SECTION_TITLE_CLS}>How they respond</h2>
@@ -153,7 +156,7 @@ function WorkingStyleSection({ personId }: { personId: number }) {
     }
   }
 
-  if (!style) return <p className="text-[15px] text-fg-muted">Loading…</p>;
+  if (!style) return <PageSpinner />;
   const rules = draft
     .split("\n")
     .map((line) => line.replace(/^[-•]\s*/, "").trim())
@@ -325,16 +328,19 @@ function OpenLoopsSection({
   const now = mountedAt;
   return (
     <section className="mt-8">
-      <h2 className={SECTION_TITLE_CLS}>Open loops</h2>
+      <h2 className={SECTION_TITLE_CLS}>Tasks</h2>
       <p className={INTRO_CLS}>
         Things they committed to, were asked for in conversation, or were assigned here.
-        Overdue ones are followed up automatically; close one once it&apos;s done.
+        Overdue ones are followed up automatically; close one once it&apos;s done.{" "}
+        <Link href="/tasks" className="text-accent hover:underline">
+          All tasks
+        </Link>
       </p>
       {canList && (
         <>
           {error && <p className="text-sm text-rose-500 mb-3">{error}</p>}
           {loops === null ? (
-            !error && <p className="text-[15px] text-fg-muted">Loading…</p>
+            !error && <PageSpinner />
           ) : loops.length === 0 ? (
             <p className="text-[15px] text-fg-muted">Nothing open.</p>
           ) : (
@@ -767,7 +773,7 @@ export default function PersonDetailPage() {
       {switchedFor && <TeamModeSwitch name={switchedFor} onDone={() => setSwitchedFor(null)} />}
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
-          {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
+          {loading && <PageSpinner />}
           {error && (
             <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-500 text-[15px]">
               {error}
@@ -789,7 +795,7 @@ export default function PersonDetailPage() {
                     <span className="text-[15px] text-fg-muted">{person.role || "No role set"}</span>
                     {person.is_principal && (
                       <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-accent/10 text-accent">
-                        Principal
+                        Owner
                       </span>
                     )}
                     {contact && (
@@ -855,7 +861,7 @@ export default function PersonDetailPage() {
               {viewerIsPrincipal && !editing && !person.is_principal && contactChanges.length > 0 && (
                 <PersonContactChanges changes={contactChanges} onChanged={reloadAfterUndo} />
               )}
-              {viewerIsPrincipal && !editing && !person.is_principal && <PersonContactNote note={contactNote} />}
+              {viewerIsPrincipal && !editing && !person.is_principal && <PersonContactNote note={contactNote} personId={personId} onChange={setContactNote} />}
               {/* Core fields */}
               <section className="rounded-2xl border border-line bg-surface-elevated px-5">
                 {editing ? (
@@ -1059,6 +1065,9 @@ export default function PersonDetailPage() {
                       </li>
                     )}
                   </ul>
+                )}
+                {!editing && viewerIsPrincipal && !person.archived && !contact && (
+                  <ReplyHabits person={person} onUpdated={(p) => { setPerson(p); resetForm(p); }} />
                 )}
               </section>
 

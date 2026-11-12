@@ -20,6 +20,7 @@ from openexecutive.api import caller as api_caller
 from openexecutive.api.routes import (
     agents,
     alerts,
+    approvals,
     architecture,
     artifacts,
     audit,
@@ -40,7 +41,9 @@ from openexecutive.api.routes import (
     health,
     history,
     knowledge,
+    knowledge_questions,
     may_do,
+    memory_changes,
     notifications,
     onboarding,
     people,
@@ -57,7 +60,9 @@ from openexecutive.api.routes import (
     today,
     version,
     watchlist,
+    worked_out,
     workflow_designer,
+    workflow_offers,
     workflows,
     workspace,
 )
@@ -890,7 +895,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.6.8",  # x-release-please-version
+        version="0.7.2",  # x-release-please-version
         lifespan=lifespan,
     )
 
@@ -994,6 +999,7 @@ def create_app() -> FastAPI:
     app.include_router(workflow_designer.router, tags=["workflows"])
     app.include_router(workflows.router, tags=["workflows"])
     app.include_router(saved_tools.router, tags=["workflows"])
+    app.include_router(workflow_offers.router, tags=["workflows"])
     app.include_router(python_jobs.router, tags=["workflows"])
     app.include_router(evals.router, tags=["evals"])
     app.include_router(episodic.router, tags=["memories"])
@@ -1003,9 +1009,13 @@ def create_app() -> FastAPI:
     app.include_router(decisions.router, tags=["decisions"])
     app.include_router(delegation.router, tags=["delegation"])
     app.include_router(take_the_lead.router, tags=["take-the-lead"])
+    app.include_router(approvals.router, tags=["delegation"])
     app.include_router(may_do.router, tags=["delegation"])
     app.include_router(history.router, tags=["memories"])
     app.include_router(reflection.router, tags=["memories"])
+    app.include_router(knowledge_questions.router, tags=["knowledge"])
+    app.include_router(worked_out.router, tags=["memories"])
+    app.include_router(memory_changes.router, tags=["memories"])
     app.include_router(audit.router, tags=["audit"])
     app.include_router(departments.router, tags=["departments"])
     app.include_router(people.router, tags=["people"])

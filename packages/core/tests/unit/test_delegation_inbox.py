@@ -253,6 +253,8 @@ def models(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         # The rewrite that brings a card up to date with newer mail
         # (answers.catch_up): none by default, so the card only warns.
         "rewrites": [], "rewritten": {},
+        # What the composed reply leaves the person to answer.
+        "questions": ["Can the call move to Friday at 10?"],
     }
 
     async def classifier(model: str, turn: str) -> dict[str, Any]:
@@ -267,7 +269,7 @@ def models(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return {
             "subject": "Re: Thursday call",
             "body": "Hi Dana,\n\nThanks for the note. I'll get back to you shortly.\n\nOlivia",
-            "open_questions": ["Can the call move to Friday at 10?"],
+            "open_questions": list(seen["questions"]),
         }
 
     async def checker(model: str, turn: str) -> dict[str, Any]:
@@ -1317,10 +1319,9 @@ def _ask(person: Any, mailbox: FakeInbox, thread_id: str, message_id: str) -> in
 def test_reply_from_home_drafts_what_the_watcher_passed_over(
     db: Path, owner: Any, models: dict[str, Any]
 ) -> None:
-    from openexecutive.delegation import handle_it
 
     # Handle it for me is on, yet a reply they asked for waits for them.
-    handle_it.set_(owner.id, enabled=True, mode="bold", updated_by="test")
+    inbox.set_watch(owner.id, True, updated_by="test")
     models["verdicts"]["LOIs"] = {"needs_reply": False, "kind": "fyi", "asked_of_them": True, "confidence": 0.9}
     mailbox = FakeInbox()
     mailbox.add(_msg("m1", "t1", text="Attached are the two LOIs. Let me know if you have any questions."))
