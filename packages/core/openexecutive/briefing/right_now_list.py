@@ -140,8 +140,13 @@ def rows(now: datetime | None = None) -> list[Row]:
 
 
 def _all_rows(now: datetime) -> list[Row]:
-    from openexecutive.briefing.live_signals import _principal
+    from openexecutive.briefing.live_signals import _one_reader, _principal
 
+    # The rows are the lowest-id principal's own mail, drafts and asks, and
+    # every principal reads /today: with co-principals there is no list
+    # (nor anything to dismiss), as for the brief's own private lines.
+    if not _one_reader():
+        return []
     principal = _principal()
     if principal is None or principal.id is None:
         return []

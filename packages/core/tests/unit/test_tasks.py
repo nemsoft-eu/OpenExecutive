@@ -92,6 +92,15 @@ def test_reopen_refuses_an_archived_owner_or_one_at_cap(
     people_registry.invalidate()
     assert open_loops.reopen_task(left, reopened_by_person_id=team.principal).reason == "owner_archived"
 
+    # Moved to Contacts closed their tasks too: they stay closed.
+    gone = _task(team.ben, "the vendor list")
+    people_store.update_person(team.ben, kind="contact")
+    people_registry.invalidate()
+    assert open_loops.get_task(gone).status == "done"  # type: ignore[union-attr]
+    assert open_loops.reopen_task(gone, reopened_by_person_id=team.principal).reason == "owner_is_contact"
+    people_store.update_person(team.ben, kind="team")
+    people_registry.invalidate()
+
     full = _task(team.ben, "the Q3 numbers")
     open_loops.close_open_loop(full, reason="done")
     _task(team.ben, "the board deck")

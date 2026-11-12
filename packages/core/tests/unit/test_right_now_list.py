@@ -152,6 +152,24 @@ def test_drafts_and_chat_asks_are_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [r.key for r in right_now_list.rows(NOW)] == ["chat:3"]
 
 
+def test_co_principals_get_no_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rows are the lowest-id principal's own, and every principal reads
+    # /today: another owner would see their mail, drafts and asks.
+    from openexecutive.briefing import context
+    from openexecutive.integrations import chat_asks
+
+    monkeypatch.setattr(chat_asks, "waiting", lambda pid, now=None: [
+        chat_asks.ChatAsk(
+            id=3, channel="slack", place_name="ops", from_name="Kim Ono", text="Sign off?",
+            link="https://chat.example.com/m/3", asked_at=(NOW - timedelta(hours=1)).isoformat(),
+        ),
+    ])
+    assert [r.key for r in right_now_list.rows(NOW)] == ["chat:3"]
+    monkeypatch.setattr(context, "single_principal", lambda: False)
+    assert right_now_list.rows(NOW) == []
+    assert right_now_list.dismiss("chat:3", NOW) is False
+
+
 def test_no_principal_no_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(live_signals, "_principal", lambda: None)
     assert right_now_list.rows(NOW) == []

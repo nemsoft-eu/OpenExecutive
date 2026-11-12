@@ -844,6 +844,7 @@ def reopen_task(loop_id: int, *, reopened_by_person_id: int, db_path: Path | Non
     """Open a closed task again, due when it was if that is still ahead, else
     after the default window. ``reason`` ``not_found``, ``open`` (it already
     is), ``owner_archived`` (its owner left: their tasks closed with them),
+    ``owner_is_contact`` (moved to Contacts, which closed them too),
     ``owner_at_cap`` or ``duplicate`` (the same task is open again already)."""
     from openexecutive.config import get_settings
     from openexecutive.memory.episodic import _get_conn
@@ -857,6 +858,9 @@ def reopen_task(loop_id: int, *, reopened_by_person_id: int, db_path: Path | Non
     owner = get_person(loop.owner_person_id)
     if owner is None or owner.archived:
         return TaskChange(loop, "owner_archived")
+    # Moved to Contacts closed their tasks too (people.store._left_the_team).
+    if owner.kind != "team":
+        return TaskChange(loop, "owner_is_contact")
     if count_open_loops(loop.owner_person_id, db_path=db_path) >= get_settings().attunement_max_open_loops_per_person:
         return TaskChange(loop, "owner_at_cap")
     now = datetime.now(UTC)
