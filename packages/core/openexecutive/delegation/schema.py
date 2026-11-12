@@ -271,7 +271,8 @@ _DDL: tuple[str, ...] = (
     "  current INTEGER NOT NULL DEFAULT 1,"
     "  PRIMARY KEY (provider, folder_id)"
     ")",
-    # One-time upgrades of what is stored (``_keep_the_old_opt_in``), by name.
+    # One-time upgrades of what is stored (``_keep_the_old_opt_in``,
+    # ``_carry_per_setting_training``), by name.
     f"CREATE TABLE IF NOT EXISTS {UPGRADES_TABLE} ("
     "  name TEXT PRIMARY KEY,"
     "  done_at TEXT NOT NULL"
@@ -375,6 +376,33 @@ def _keep_the_old_opt_in(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _carry_per_setting_training(conn: sqlite3.Connection) -> None:
+    """Training was once a switch per setting (``replies``, ``follow_ups``,
+    ``actions`` rows); it is now the one ``training`` switch, and those rows
+    are ignored. Once, on upgrade: anyone with one of them on is put In
+    training, so what waited on a card still does. ``_keep_the_old_opt_in``
+    skips anyone who had Handle it for me on, so without this their training
+    was dropped and replies could go on their own. Turning it off afterwards
+    sticks."""
+    name = "per_setting_training"
+    if conn.execute(f"SELECT 1 FROM {UPGRADES_TABLE} WHERE name = ?", (name,)).fetchone():  # noqa: S608
+        return
+    for (person_id,) in conn.execute(
+        f"SELECT DISTINCT person_id FROM {TRAINING_TABLE} "  # noqa: S608 — constant table name
+        "WHERE enabled = 1 AND setting IN ('replies', 'follow_ups', 'actions')"
+    ).fetchall():
+        conn.execute(
+            f"INSERT INTO {TRAINING_TABLE} (person_id, setting, enabled, updated_by) "  # noqa: S608
+            "VALUES (?, 'training', 1, 'migration') ON CONFLICT(person_id, setting) DO NOTHING",
+            (person_id,),
+        )
+    conn.execute(
+        f"INSERT INTO {UPGRADES_TABLE} (name, done_at) VALUES (?, ?)",  # noqa: S608
+        (name, datetime.now(UTC).isoformat()),
+    )
+    conn.commit()
+
+
 def _add_mailbox_drafts(conn: sqlite3.Connection) -> None:
     """Give a watch table made before ``mailbox_drafts`` existed the column,
     off: replies wait on their cards and no longer fill the person's Drafts."""
@@ -419,3 +447,4 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _add_draft_replaced_by(conn)
     _move_training_off_the_dial(conn)
     _keep_the_old_opt_in(conn)
+    _carry_per_setting_training(conn)

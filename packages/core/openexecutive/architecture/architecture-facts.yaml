@@ -12944,7 +12944,14 @@ delegation:
     training settings and Suggested actions On. Removed (2026-11-09): the
     Handle it for me switch (PUT /delegation/handle-it). Back (2026-11-09):
     one In training for everything sent as the person, with the "on its
-    own next time" tick (edits.allow) on every card.
+    own next time" tick (edits.allow) on every card. Upgrades, once each
+    (delegation_upgrades): handle_it_opt_in puts In training anyone set up
+    who never turned Handle it for me on; per_setting_training
+    (schema._carry_per_setting_training) puts In training anyone with a
+    replies, follow_ups or actions training row on. The second exists
+    because the first skips anyone who had Handle it on, and the old rows
+    are ignored, so their training was dropped and replies could go on
+    their own (found in review of nemsoft-eu/OpenExecutive#70).
   prompt: |
     DELEGATION_ADDENDUM (prompts/executive_persona.py, a constant naming
     nobody) follows the unchanged identity addendum in block 0 while

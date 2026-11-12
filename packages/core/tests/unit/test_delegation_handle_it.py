@@ -162,6 +162,38 @@ def test_someone_who_never_turned_it_on_starts_in_training(tmp_path: Path) -> No
     assert not training.get(9, db_path=db).training
 
 
+def test_training_per_setting_carries_over_for_someone_who_had_it_on(tmp_path: Path) -> None:
+    """Training was a switch per setting. Someone who had Handle it for me on
+    (so the opt-in upgrade skips them) and Replies or Follow-ups in training
+    stays in training, rather than having replies go on their own."""
+    from openexecutive.delegation import training
+    from openexecutive.delegation.schema import ensure_schema
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    ensure_schema(conn)
+    # A file from before the upgrade: the per-setting rows, no markers.
+    conn.execute("DELETE FROM delegation_upgrades")
+    for person_id in (1, 2, 3, 5):
+        conn.execute("INSERT INTO delegation_handle_it (person_id, enabled) VALUES (?, 1)", (person_id,))
+    for person_id, setting, enabled in ((1, "replies", 1), (2, "follow_ups", 1), (3, "replies", 0), (5, "drafts", 1)):
+        conn.execute(
+            "INSERT INTO delegation_training (person_id, setting, enabled, updated_by) VALUES (?, ?, ?, 't')",
+            (person_id, setting, enabled),
+        )
+    conn.commit()
+    ensure_schema(conn)
+    conn.close()
+    assert training.get(1, db_path=db).training and training.get(2, db_path=db).training
+    assert not training.get(3, db_path=db).training and not training.get(5, db_path=db).training
+    # Once only: turning it off afterwards sticks.
+    training.set_(1, {"training": False}, updated_by="t", db_path=db)
+    conn = sqlite3.connect(str(db))
+    ensure_schema(conn)
+    conn.close()
+    assert not training.get(1, db_path=db).training
+
+
 # ── sending on its own ────────────────────────────────────────────────────────
 
 
