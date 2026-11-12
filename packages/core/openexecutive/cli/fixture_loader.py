@@ -883,6 +883,10 @@ async def reset_all_state(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
                     ).fetchone():
                         _conn.execute(f"DELETE FROM {_table}")
+                # Decisions live in facts now; "decisions" above is the old table.
+                from openexecutive.memory.facts import drop_decisions
+
+                drop_decisions(_conn)
 
         # 3c. Knowledge review state (same DB as the episodic rows above). A
         # "factory reset" that keeps the previous operator's approvals,
@@ -1569,11 +1573,9 @@ def _seed_episodic_memory(memory_path: Path, settings: Any) -> dict[str, int]:
         counts["decisions"] = len(decisions)
         # Decisions are standing facts now: drop the decision facts and the
         # copied-once marker, so the next facts read copies these rows in.
-        facts_cols = {r[1] for r in conn.execute("PRAGMA table_info(facts)")}
-        if "decision" in facts_cols:
-            conn.execute("DELETE FROM facts WHERE decision = 1")
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts_meta'").fetchone():
-            conn.execute("DELETE FROM facts_meta WHERE key = 'decisions_copied_to_facts'")
+        from openexecutive.memory.facts import drop_decisions
+
+        drop_decisions(conn)
 
         initiatives = data.get("initiatives", [])
         for row in initiatives:

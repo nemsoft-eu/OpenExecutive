@@ -527,6 +527,10 @@ def _wipe_per_client_tables() -> None:
         for table in _BLANK_WIPE_TABLES:
             if table in existing:
                 conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed allowlist
+        # Decisions live in facts now ("decisions" above is the old table).
+        from openexecutive.memory.facts import drop_decisions
+
+        drop_decisions(conn)
         conn.commit()
     finally:
         conn.close()

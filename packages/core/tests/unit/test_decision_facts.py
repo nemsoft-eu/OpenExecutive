@@ -155,3 +155,27 @@ def test_a_reason_alone_is_kept_on_the_decision() -> None:
     assert now.summary == "Raise prices 5%. Costs rose 8%."
     assert episodic.update_decision(now.id, domain="legal", tags="x")
     assert [d.id for d in episodic.list_decisions()] == [now.id], "nothing else is kept, so nothing changes"
+
+
+def test_a_blank_client_and_a_factory_reset_drop_the_decisions(db: Path) -> None:
+    # Decisions are facts now: wiping the old decisions table alone left the
+    # previous company's in the next one's Memory page and prompts.
+    import inspect
+
+    from openexecutive.cli.fixture_loader import reset_all_state
+    from openexecutive.clients import slots
+
+    _old_decision(db, "Slow hiring through Q3.", days_ago=5)
+    facts.ensure_ready(db)
+    facts.record_fact(subject="Pricing", statement="Raise prices 5%.", source_quote="", decision=True)
+    facts.record_fact(subject="Office", statement="The office is on Pine St.", source_quote="")
+    assert len(facts.decision_rows()) == 2
+    slots._wipe_per_client_tables()
+    # The copied-once marker went too, so the next company's decisions
+    # table is copied in on the next read.
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM facts_meta").fetchone()[0] == 0
+    facts.ensure_ready(db)
+    assert facts.decision_rows() == []
+    assert [f.statement for f in facts.list_facts()] == ["The office is on Pine St."]
+    assert "drop_decisions(_conn)" in inspect.getsource(reset_all_state)

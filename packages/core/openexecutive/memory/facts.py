@@ -298,6 +298,20 @@ def _copy_old_decisions(conn: sqlite3.Connection) -> None:
         raise
 
 
+def drop_decisions(conn: sqlite3.Connection) -> None:
+    """Drop the decision facts and the copied-once marker, for a path that
+    swaps or wipes the company's decisions (a blank client, a factory reset,
+    a fixture load): decisions live here now, not in ``decisions``, so
+    wiping that table alone left them. With the marker gone, the next read
+    copies in whatever ``decisions`` then holds. Existence-guarded; the
+    caller commits."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "facts" in tables and "decision" in {r[1] for r in conn.execute("PRAGMA table_info(facts)")}:
+        conn.execute("DELETE FROM facts WHERE decision = 1")
+    if "facts_meta" in tables:
+        conn.execute("DELETE FROM facts_meta WHERE key = ?", (_OLD_DECISIONS_COPIED,))
+
+
 def ensure_ready(db_path: Path | None = None) -> None:
     """Create and migrate the store (copying the older decisions in once),
     for a reader that queries the table with its own SQL."""

@@ -3033,7 +3033,7 @@ knowledge:
 memory:
   episodic_db: ./episodic_memory.db
   tables:
-    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written."
+    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written. A blank client, a factory reset and a fixture load drop the decision facts and that marker (facts.drop_decisions), since wiping this table alone left the previous company's decisions in facts (found in review of nemsoft-eu/OpenExecutive#70)."
     - initiatives
     - "advice_given — legacy. No longer written; old rows stay readable."
     - scheduled_actions
