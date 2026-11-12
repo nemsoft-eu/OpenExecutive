@@ -279,6 +279,11 @@ async def _google(
             raise SaveFailed(f"Couldn't open that folder: {_why(info)}")
         refused, outside = folder_check(info, folder, account, _team_emails())
         if refused is not None and refused.startswith(_OUTSIDE_OWNER):
+            # A held turn (_turn_held: mail lock or outside read) never saves
+            # into a folder someone outside the company owns, whatever the
+            # level: what it read may have named that folder.
+            if held:
+                raise SaveFailed(refused + ".")
             # Where the file goes follows the owner's level (orchestrator.levels):
             # Hands-off saves it; below, it's their Approve card.
             if not _place_relaxed():

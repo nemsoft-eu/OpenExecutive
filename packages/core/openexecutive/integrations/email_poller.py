@@ -1449,7 +1449,14 @@ async def _run_executive(
             "above and the images you could see are with this message; any other attachment is "
             "listed by name only, so ask for what you need in the body if it matters.\n"
         )
-    if from_addr:
+    # What went to a principal (a brief or digest, scheduler.runner
+    # _remember_for_email_reply, can carry what is private to them) is read
+    # back only by mail the mailbox proved is theirs: a forged From in a
+    # principal's name must not pull it into a turn its own text steers.
+    principal_unproven = getattr(person, "is_principal", False) is True and not (
+        session.email_authenticated or other_principal_proven
+    )
+    if from_addr and not principal_unproven:
         from openexecutive.integrations.inbound_hydration import (
             hydrate_user_message,
         )

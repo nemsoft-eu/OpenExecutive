@@ -513,8 +513,10 @@ async def _process_and_reply(
                 person_id=person_id,
                 # Their own words: never attachment text or the quote.
                 memory_text=own_words,
-                # a group chat can reach here from someone off the roster
-                fetch_own_urls=person_id is not None,
+                # A group chat (negative id) can reach here from anyone in it,
+                # roster or not, under the group's own row: only a rostered
+                # person's private chat may have its links opened.
+                fetch_own_urls=person_id is not None and chat_id > 0,
                 cards=cards if cards_here else None,
             )
             from openexecutive.orchestrator.disclosure import with_chat_line

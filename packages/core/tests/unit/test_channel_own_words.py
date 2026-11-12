@@ -128,6 +128,24 @@ def test_telegram_opens_pasted_links_only_for_someone_on_the_roster(rostered: bo
     assert captured["fetch_own_urls"] is rostered
 
 
+def test_telegram_never_opens_links_from_a_group_on_the_roster() -> None:
+    """A group's chat id can be on someone's People row, and anyone in the
+    group then reaches the Executive as that row: their links stay shut."""
+    from openexecutive.integrations import telegram_bot
+
+    captured: dict[str, Any] = {}
+    with (
+        _adapter_stubs(captured),
+        patch("openexecutive.people.store.find_person_by_telegram_chat_id", return_value=SimpleNamespace(id=7)),
+        patch.object(telegram_bot, "send_message", new=AsyncMock(return_value=None)),
+    ):
+        asyncio.run(telegram_bot._process_and_reply(
+            message_text=f"Read {PLANTED}", sender_name="Ben", chat_id=-100123, message_id=1,
+            token="t",
+        ))
+    assert captured["fetch_own_urls"] is False
+
+
 @pytest.mark.parametrize(("own_words", "expected"), [
     ("Summarise this\n\n(Attached files: notes.pdf)", "Summarise this\n\n(Attached files: notes.pdf)"),
     (None, "Summarise this"),  # a slash command or replay: the text is all theirs

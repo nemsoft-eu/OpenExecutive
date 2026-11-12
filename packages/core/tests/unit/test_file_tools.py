@@ -243,6 +243,23 @@ def test_hands_off_saves_into_an_outsiders_folder(
     assert any(n.endswith("create_drive_file") for n, _ in drive[1:])
 
 
+def test_a_held_turn_never_saves_into_an_outsiders_folder_even_at_hands_off(
+    company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hands-off lets an owner's own save go into a folder an outsider owns;
+    a turn held by what it read (here an outside read) is refused, since that
+    content may be what named the folder."""
+    from openexecutive.orchestrator import levels, outside_content
+
+    monkeypatch.setattr(levels, "relaxed", lambda: True)
+    monkeypatch.setattr(outside_content, "read_outside", lambda: True)
+    drive[0][1]["value"] = "Mallory (mallory@outside.example)"
+    conversation_files.keep(company.session_id, {"a.pdf": b"x"})
+    out = _save({"file": "file:a.pdf", "folder": FOLDER})
+    assert out["status"] == "failed" and "outside" in out["detail"]
+    assert not any(n.endswith("create_drive_file") for n, _ in drive[1:])
+
+
 def test_after_an_outside_read_it_saves_without_their_exact_words(
     company: Session, drive: list, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

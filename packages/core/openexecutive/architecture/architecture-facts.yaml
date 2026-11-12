@@ -7951,7 +7951,10 @@ workflows:
     get_drive_file_permissions answer must have exactly one ID line, Type and
     Owners read at fixed offsets from it, since the name comes first and may
     hold anything; a folder an outsider owns or one open by link or to a domain
-    is refused, and one shared with an outsider or group is saved into, the
+    follows the level (an Approve card below Hands-off, saved at Hands-off),
+    but a turn the mail lock or an outside read holds (_turn_held) is refused
+    an outsider's folder at every level, since what it read may have named
+    it; one shared with an outsider or group is saved into, the
     answer naming them as also_open_to (file_tools.folder_check). The gateway's own Drive
     write check (mcp_gateway._company_owned) likewise looks at who owns a
     file or folder, not who else it is shared with;
