@@ -172,11 +172,13 @@ def test_training_per_setting_carries_over_for_someone_who_had_it_on(tmp_path: P
     db = tmp_path / "old.db"
     conn = sqlite3.connect(str(db))
     ensure_schema(conn)
-    # A file from before the upgrade: the per-setting rows, no markers.
-    conn.execute("DELETE FROM delegation_upgrades")
-    for person_id in (1, 2, 3, 5):
+    # A file from before this upgrade, on an install that already ran the
+    # opt-in one: the per-setting rows, and only that marker gone.
+    conn.execute("DELETE FROM delegation_upgrades WHERE name = 'per_setting_training'")
+    for person_id in (1, 2, 3, 5, 6):
         conn.execute("INSERT INTO delegation_handle_it (person_id, enabled) VALUES (?, 1)", (person_id,))
-    for person_id, setting, enabled in ((1, "replies", 1), (2, "follow_ups", 1), (3, "replies", 0), (5, "drafts", 1)):
+    rows = ((1, "replies", 1), (2, "follow_ups", 1), (3, "replies", 0), (5, "drafts", 1), (6, "actions", 1))
+    for person_id, setting, enabled in rows:
         conn.execute(
             "INSERT INTO delegation_training (person_id, setting, enabled, updated_by) VALUES (?, ?, ?, 't')",
             (person_id, setting, enabled),
@@ -185,6 +187,7 @@ def test_training_per_setting_carries_over_for_someone_who_had_it_on(tmp_path: P
     ensure_schema(conn)
     conn.close()
     assert training.get(1, db_path=db).training and training.get(2, db_path=db).training
+    assert training.get(6, db_path=db).training
     assert not training.get(3, db_path=db).training and not training.get(5, db_path=db).training
     # Once only: turning it off afterwards sticks.
     training.set_(1, {"training": False}, updated_by="t", db_path=db)
