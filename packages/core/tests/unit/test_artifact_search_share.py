@@ -32,13 +32,17 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     wf_persistence.initialize_runs_db(db_path)
     monkeypatch.setattr(alerts_store, "DB_PATH", db_path)
     monkeypatch.setattr(wf_persistence, "DB_PATH", db_path)
-    who: dict[str, Any] = {"viewer": PRINCIPAL, "left": set(), "path": db_path}
+    who: dict[str, Any] = {"viewer": PRINCIPAL, "left": set(), "contacts": set(), "path": db_path}
     monkeypatch.setattr(artifacts_route, "_viewer", lambda request: who["viewer"])
-    # The roster: 1 is the principal, 2 and 3 teammates; "left" are archived.
+    # The roster: 1 is the principal, 2 and 3 teammates; "left" are archived,
+    # "contacts" moved to Contacts.
     by_id = {1: PRINCIPAL, 2: TEAMMATE, 3: OTHER}
     monkeypatch.setattr(
         "openexecutive.people.store.get_person",
-        lambda pid: SimpleNamespace(archived=pid in who["left"], is_principal=by_id[pid].is_principal)
+        lambda pid: SimpleNamespace(
+            archived=pid in who["left"], is_principal=by_id[pid].is_principal,
+            kind="contact" if pid in who["contacts"] else "team",
+        )
         if pid in by_id else None,
     )
 
@@ -265,6 +269,17 @@ async def test_link_ends_when_its_sharer_leaves(db: dict[str, Any]) -> None:
     # Sharing again makes a new link.
     again = _key((await artifacts_route.share_artifact(cid, _REQ))["share_path"])
     assert again != key
+
+
+async def test_link_ends_when_its_sharer_moves_to_contacts(db: dict[str, Any]) -> None:
+    # Moving to Contacts keeps the row, unarchived: it is leaving the team all the same.
+    db["viewer"] = TEAMMATE
+    cid = _draft(db, "a1", "Their memo", "text", owner_person_id=2)
+    key = _key((await artifacts_route.share_artifact(cid, _REQ))["share_path"])
+    db["contacts"].add(2)
+    with pytest.raises(HTTPException):
+        await artifacts_route.shared_document(key, Response())
+    assert artifact_shares.share_keys([cid]) == {}
 
 
 async def test_a_busy_people_list_doesnt_end_a_link(db: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:

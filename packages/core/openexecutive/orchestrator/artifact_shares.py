@@ -255,7 +255,8 @@ def _sharer(person_id: int) -> Viewer | Literal[False] | None:
     except Exception:
         logger.warning("shares: couldn't read the People list", exc_info=True)
         return None
-    if person is None or person.archived:
+    # Moved to Contacts is leaving the team too: that keeps the row, unarchived.
+    if person is None or person.archived or person.kind != "team":
         return False
     return Viewer(person_id=person_id, is_principal=bool(person.is_principal))
 

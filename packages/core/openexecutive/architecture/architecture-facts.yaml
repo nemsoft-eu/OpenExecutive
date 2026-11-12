@@ -8635,6 +8635,10 @@ artifacts:
     it removes the canonical row, so a deleted draft/run is gone from
     `/today`, `/jobs`, and everywhere else, not just `/artifacts`.
     Store helpers: `set_alert_archived` / `set_run_archived`.
+    A share-by-link (orchestrator.artifact_shares) ends for good when its
+    sharer leaves the team: archived, or moved to Contacts (PATCH /people
+    sets kind='contact' and keeps the row unarchived, so _sharer checks
+    kind too; found in review of nemsoft-eu/OpenExecutive#70).
   addressing: |
     Composite id `"{kind}:{native_id}"` — `alert:<int>` or `run:<hex>`.
     The kind prefix is the dispatch key for EVERY per-artifact route
