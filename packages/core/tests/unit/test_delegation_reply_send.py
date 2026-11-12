@@ -592,6 +592,24 @@ def test_send_with_allow_lets_that_sender_go_on_its_own(owner: Any, models: dict
     assert [training.setting_of(a.key) for a in training.learned(owner.id)] == [training.TRAINING]
 
 
+def test_allow_learns_only_who_it_really_went_to(owner: Any, models: dict[str, Any]) -> None:
+    # They swapped Dana for Sam in their mailbox and confirmed: Dana, who got
+    # nothing, is not allowed, and Sam, never on the card, stays in training.
+    from openexecutive.delegation import training
+
+    sam = "sam@northpeak.example"
+    training.set_(owner.id, {training.TRAINING: True}, updated_by="test")
+    mailbox, card = _card(owner)
+    mailbox.edit("d1", to=[sam])
+    asyncio.run(send_approved_reply(
+        card, caller=LOCAL, resolver=owner.id, allow=True, confirm={"recipients": [sam]}, gmail=mailbox,
+        now=NOW + timedelta(minutes=30),
+    ))
+    assert mailbox.sent == ["d1"]
+    assert training.allowed_person(owner.id, DANA) is None
+    assert training.allowed_person(owner.id, sam) is None
+
+
 def test_allow_is_refused_out_of_training_before_anything_is_sent(owner: Any, models: dict[str, Any]) -> None:
     from openexecutive.delegation import training
 

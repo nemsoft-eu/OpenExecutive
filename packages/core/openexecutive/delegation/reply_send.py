@@ -482,7 +482,7 @@ async def _send_checked(
         except Exception as exc:
             logger.warning("delegation.reply_send: recording a sent reply failed (%s)", type(exc).__name__)
         if allow:
-            _learn(person.id, payload, decision_id=instance.id)
+            _learn(person.id, payload, recipients, decision_id=instance.id)
         if example and edited:
             _keep_example(person.id, payload, current.message, decision_id=instance.id)
         if not on_its_own:
@@ -506,16 +506,21 @@ def _going(payload: dict[str, Any]) -> list[str]:
     return [sender] if sender else []
 
 
-def _learn(person_id: int, payload: dict[str, Any], *, decision_id: int) -> None:
+def _learn(person_id: int, payload: dict[str, Any], recipients: list[str], *, decision_id: int) -> None:
     """"On its own next time", once the reply went: its sender (a
-    follow-up's people) may be written to on its own from now on. A failure
-    here never undoes the send."""
+    follow-up's people) may be written to on its own from now on. Only
+    those the reply really went to (``recipients``, what the person
+    confirmed in their mailbox): one they took off the draft is not
+    allowed, and one they added stays in training. A failure here never
+    undoes the send."""
     from openexecutive.delegation import training
+    from openexecutive.delegation.gmail import normalize_email
     from openexecutive.delegation.inbox import _audit
 
     follow_up = payload.get("source") == "follow_up"
+    sent_to = {normalize_email(a) for a in recipients}
     allowed: list[int] = []
-    for address in _going(payload):
+    for address in (a for a in _going(payload) if a in sent_to):
         try:
             found = training.allow_person(
                 person_id, address, "" if follow_up else str(payload.get("from_name") or ""), decision_id=decision_id,

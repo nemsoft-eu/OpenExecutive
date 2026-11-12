@@ -12842,7 +12842,9 @@ delegation:
     all allowed; 422 cant_allow otherwise) calls training.allow_person per
     address (take_the_lead_allowed, feature act_as_me, key
     act_as_me|person:<id>|person|<address>, label "Send to Name (addr) on
-    its own", audit delegation_reply_allowed), checked before anything is
+    its own", audit delegation_reply_allowed; for a reply, only the
+    addresses in draft_to that it really went to, so one the person took
+    off the draft in their mailbox is not allowed), checked before anything is
     sent; training.all_allowed(person, reply_goes_to(payload)) gates the
     reply (everyone in draft_to, else the sender), invites by sender,
     action cards by every address. Chat-app cards carry the same as a
