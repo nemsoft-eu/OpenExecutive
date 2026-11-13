@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 from openexecutive.delegation import sign_in_notice
@@ -304,6 +305,7 @@ def swap_tables(
     *,
     restore_also: tuple[str, ...] = (),
     save_to: Path | None = None,
+    before_change: Callable[[], None] | None = None,
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Wipe ``tables``, then restore them (and ``restore_also``) from a saved copy.
 
@@ -315,6 +317,13 @@ def swap_tables(
     from before the copy until the wipe commits, so no row another connection
     commits can land in between and be lost with the wipe. Not combinable
     with ``saved_path`` (the transaction would hold that file's lock too).
+
+    ``before_change``: called once the ``save_to`` copy is on disk and before
+    the first row changes, so a caller can durably mark the swap at the one
+    point where a crash would otherwise lose something: earlier, a kill during
+    the copy would leave the mark over a stale copy and live rows that are
+    still the user's; later, a crash after COMMIT would leave wiped tables
+    unmarked. An exception from it rolls back like any other failure here.
 
     For a saved copy of this same database: a table the copy lacks is left
     empty; one the live database lacks is created from the copy's own
@@ -351,6 +360,8 @@ def swap_tables(
         try:
             if save_to is not None:
                 _copy_database(db_path, save_to)
+            if before_change is not None:
+                before_change()
             live = _existing_tables(conn)
             cleared: dict[str, int] = {}
             restored: dict[str, int] = {}

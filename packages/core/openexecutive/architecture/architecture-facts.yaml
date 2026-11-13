@@ -10764,43 +10764,79 @@ clients:
     The fixture path could not simply wipe more: its YAML snapshot carried
     only profile/docs/memory.json/people/departments/workspace, so wiping a
     table on load destroyed the user's own rows on unload. The user backup
-    now also holds `state.db` (VACUUM INTO, written by snapshot_user_state
-    and refreshed by `refresh_user_state_db` whenever a backup is reused
-    while the live state is the user's own: fixture load, first slot
-    activation, create-from-current, and an unload with nothing loaded,
-    which only refreshes the copy and leaves the live tables alone). Every
-    refresh also copies the live profile.yaml, docs/ and workspace.yaml
+    now also holds `state.db`, written by snapshot_user_state and retaken
+    whenever a backup is reused while the live state is the user's own. A
+    fixture load retakes it inside `swap_tables(save_to=...)`; an unload
+    with nothing loaded (which leaves the live tables alone) through
+    `_save_user_state_db`; a first slot activation and create-from-current
+    through `refresh_user_state_db`, which calls it too. Every copy goes
+    through `company_tables._copy_database`: VACUUM INTO a file beside
+    state.db, fsynced, moved over it, directory fsynced. Every retake also
+    copies the live profile.yaml, docs/ and workspace.yaml
     (`_refresh_user_files`), so a restore never pairs a fresh copy with an
-    older profile. On a fixture load the copy is retaken inside
-    `swap_tables(save_to=...)`: VACUUM INTO from a second connection while
-    the swap's own connection holds BEGIN IMMEDIATE, so no writer can commit
-    between the copy and the wipe (the copy cannot be taken on the locked
-    connection itself: SQLite refuses a backup or VACUUM from a connection
-    mid-write). It is written beside state.db and moved over it. The slot
-    paths and an unload still copy outside that lock (`_save_user_state_db`):
-    a first activation restores a saved slot through the backup API, which
-    needs its destination outside any transaction. A failed refresh raises
-    and aborts the load, activation or create before it changes anything.
-    snapshot_user_state writes state.db last
+    older profile. Inside `swap_tables(save_to=...)` the copy is taken from
+    a second connection while the swap's own connection holds BEGIN
+    IMMEDIATE, so no writer can commit between the copy and the wipe (the
+    copy cannot be taken on the locked connection itself: SQLite refuses a
+    backup or VACUUM from a connection mid-write). The slot paths and the
+    unload refresh still copy outside that lock: a first activation restores
+    a saved slot through the backup API, which needs its destination outside
+    any transaction.
+    Ordering rule, on all three paths: every fallible preparation step
+    finishes before the first destructive change. Parsing and validation
+    (the incoming profile.yaml, and `check_seed_files` on the people.yaml /
+    memory.json / departments.yaml the seeders will read, against
+    `_SEED_ROW_KEYS`: what each seeder does with each key it reads, so a row
+    that is not a mapping, a null or a list where a value is bound or a list
+    iterated, non-text run_at, a non-numeric response_sla_hours or a value
+    json.dumps refuses fails here; keys the seeders do not read are not
+    checked) and the user's backup copy both finish before the swap marker
+    and the first DELETE or restore. On a first load or activation the copy
+    is taken before the incoming files are parsed; that only writes the
+    backup. A fixture is checked before an active client is parked, so a
+    malformed one leaves client mode as it was. A failed snapshot or
+    refresh raises and aborts the load, activation or create-from-current
+    before anything changes (`clients.slots._preserve_user_state`; a
+    create's slot dir is made only after it; a snapshot refused for an
+    unfinished switch is a ClientSlotConflictError). None of them continues
+    past a failed snapshot any more; an empty install snapshots cleanly, so
+    it still switches. snapshot_user_state writes state.db last
     (removing any older copy first), so a failed copy still leaves the YAML
     artifacts for the legacy path. "Live is the user's" is inferred from
     absent sentinels, which a swap failing half-way also leaves, so
     `_user_backup/.swap_in_progress` (begin_swap/end_swap) blocks every
-    refresh, snapshot and create-from-current until the swap completes, and
-    load/unload count it as "not the user's". It is written (fsynced with
-    its directory) BEFORE the live state stops being the user's: before
-    swap_tables, before a first activation's wipe/restore, and in
+    refresh, unforced snapshot and create-from-current until the swap
+    completes, and load/unload count it as "not the user's". It is written
+    (fsynced with its directory) after the backup's copy is on disk and
+    before the live state stops being the user's: on fixture load/unload
+    through swap_tables' `before_change` hook, called after the `save_to`
+    copy and before the first DELETE (so after a kill during the copy the
+    live rows are still the user's and unmarked, and a retry retakes the
+    copy; and it still precedes COMMIT, so a crash right after the commit
+    leaves the wiped tables marked); before a first activation's
+    wipe/restore, its copy having been taken first; and in
     `park_active_client` before the client's sentinel goes (a client
-    rotation never sets it). It is removed only when the swap completed,
-    or when the database step raised `SwapRolledBack` and that same swap
-    wrote the marker (one left by an earlier interrupted swap, or by
-    parking a client, stays): swap_tables raises it only for a failure
-    that provably changed nothing (locked, missing or empty copy, a
-    statement failing before the COMMIT and rolled back, by us or by
-    SQLite itself); any other error, a saved slot's backup-API restore
-    included, leaves the outcome unknown and keeps the marker (CPython's
-    backup retries a busy destination until it is free rather than
-    raising). A blank slot's wipe goes through swap_tables for that reason.
+    rotation never sets it). It is removed when the swap completed, when a
+    forced snapshot succeeds (that declares the live state the user's, like
+    the fixture sentinel it clears), or when the database step raised
+    `SwapRolledBack` and that same swap wrote the marker (one left by an
+    earlier interrupted swap, or by parking a client, stays): swap_tables
+    raises it only for a failure that provably changed nothing (locked,
+    missing or empty copy, the marker hook failing, a statement or COMMIT
+    failing with the transaction still open and rolled back by us, or one
+    SQLite rolled back itself before any COMMIT); any other error, a COMMIT
+    reporting an error once the transaction has ended, an interrupt, or a
+    saved slot's backup-API restore included, leaves the outcome unknown
+    and keeps the marker (CPython's backup retries a busy destination until
+    it is free rather than raising). A blank slot's wipe goes through
+    swap_tables for that reason. Residual: a kill after the marker is
+    written and before COMMIT leaves the marker while SQLite's journal
+    recovery has put the user's rows back, and an interrupt whose ROLLBACK
+    succeeded is still treated as unknown. If the user keeps working rather
+    than retrying, the next load skips the refresh and unload restores the
+    copy that swap took, losing what was written in between. Closing it
+    needs a token committed with the wipe, so a marker whose token never
+    committed can be cleared.
     With it, load wipes every swapped
     table and unload restores them from state.db with their own ids
     (`swap_tables`: one transaction, common columns, FK off, creates a table

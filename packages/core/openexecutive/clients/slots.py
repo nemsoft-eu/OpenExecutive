@@ -42,14 +42,21 @@ from typing import Any
 from openexecutive.cli.fixture_loader import (
     _FIXTURE_OP_LOCK,
     _SAFE_NAME_RE,
+    FixtureActiveError,
     begin_swap,
+    check_seed_files,
     end_swap,
     get_fixture_status,
     refresh_user_state_db,
     snapshot_user_state,
     swap_in_progress,
 )
-from openexecutive.memory.company_tables import PER_COMPANY_TABLES, SwapRolledBack, swap_tables
+from openexecutive.memory.company_tables import (
+    PER_COMPANY_TABLES,
+    SwapRolledBack,
+    _copy_database,
+    swap_tables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,18 +279,19 @@ def _save_slot_state(settings: Any, slot: Path) -> dict[str, Any]:
         mcp_dst.unlink(missing_ok=True)
 
     # 4. state.db — VACUUM INTO produces a transactionally-consistent copy
-    #    even while other connections hold the live DB open.
+    #    even while other connections hold the live DB open. A switch restores
+    #    the next client over the live DB right after this, so the copy is
+    #    flushed to disk first, and written beside the old one: a failed save
+    #    keeps the previous save point instead of leaving the slot without a
+    #    state.db, which would make its next activation a blank wipe.
     db_path = _episodic_db_path()
     state_dst = slot / "state.db"
-    state_dst.unlink(missing_ok=True)
     db_saved = False
     if db_path.exists():
-        conn = sqlite3.connect(str(db_path))
-        try:
-            conn.execute("VACUUM INTO ?", (str(state_dst),))
-            db_saved = True
-        finally:
-            conn.close()
+        _copy_database(db_path, state_dst)
+        db_saved = True
+    else:
+        state_dst.unlink(missing_ok=True)
 
     _write_meta(slot, saved_at=datetime.now(UTC).isoformat())
     return {"docs_saved": docs_copied, "db_saved": db_saved}
@@ -323,6 +331,20 @@ async def _restore_slot_state(
     # Once any slot has been saved back, state.db exists and wins.
     is_blank = not (slot / "state.db").exists()
 
+    # 0. Everything that can fail on bad input, before the database step
+    #    changes anything: after it, a failure leaves the company
+    #    half-replaced.
+    from openexecutive.memory.company_profile import CompanyProfile
+
+    profile_path = slot / "profile.yaml"
+    profile = (
+        CompanyProfile.load_from_yaml(profile_path)
+        if profile_path.exists()
+        else CompanyProfile()
+    )
+    if is_blank:
+        check_seed_files(slot)
+
     # 1. SQLite state — whole-DB restore (or factory wipe for blank slots),
     #    with operator-level tables carried across.
     preserved = _dump_global_tables()
@@ -353,14 +375,6 @@ async def _restore_slot_state(
         _reseed_blank_defaults()
 
     # 2. Company directory artifacts.
-    from openexecutive.memory.company_profile import CompanyProfile
-
-    profile_path = slot / "profile.yaml"
-    profile = (
-        CompanyProfile.load_from_yaml(profile_path)
-        if profile_path.exists()
-        else CompanyProfile()
-    )
     profile.save_to_yaml(settings.company_profile_path)
     _replace_dir_copy(slot / "docs", company_dir / "docs")
     (company_dir / "docs").mkdir(parents=True, exist_ok=True)
@@ -798,6 +812,26 @@ def park_active_client(settings: Any) -> str | None:
     return active
 
 
+def _preserve_user_state(settings: Any) -> None:
+    """Snapshot the user's live state, or refresh a reused backup's copy.
+
+    For callers about to leave the user's own state, while it is the user's.
+    Raises on failure (a full disk, a lock) so the caller aborts before it
+    changes anything: a switch past a failed snapshot would leave the user's
+    rows nowhere else. An empty environment snapshots cleanly. A refused
+    snapshot (an unfinished switch) is a conflict, not a server error.
+    """
+    if (settings.company_profile_path.parent / "_user_backup" / "profile.yaml").exists():
+        # A reused backup: refresh its database copy, which unload restores
+        # every per-company table from, as the fixture switcher does.
+        refresh_user_state_db(settings)
+        return
+    try:
+        snapshot_user_state(settings)
+    except FixtureActiveError as exc:
+        raise ClientSlotConflictError(str(exc)) from exc
+
+
 # ── Public operations (each holds the shared destructive-op lock) ───────────
 
 
@@ -875,12 +909,13 @@ async def create_client_slot(
                     "state is not a company to capture. Retry that switch, or "
                     "unload, first."
                 )
-            # A reused backup: refresh the database copy unload restores. It
-            # raises, so a failed refresh leaves no slot behind.
-            if (
-                settings.company_profile_path.parent / "_user_backup" / "profile.yaml"
-            ).exists():
-                refresh_user_state_db(settings)
+            # Preserve the user's original company in _user_backup before
+            # entering client mode, so POST /fixtures/unload remains a working
+            # "exit client mode" path (the slot holds the same data, but
+            # unload restores from _user_backup specifically): a first
+            # snapshot, or a reused backup's refreshed database copy. Before
+            # the slot exists, so a failure raises and leaves no slot behind.
+            _preserve_user_state(settings)
 
         # Parse + validate a generated bundle BEFORE creating the slot dir so
         # a rejected draft never leaves an empty husk behind.
@@ -909,19 +944,6 @@ async def create_client_slot(
         )
 
         if source == "current":
-            # Preserve the user's original company in _user_backup before
-            # entering client mode, so POST /fixtures/unload remains a working
-            # "exit client mode" path (the slot holds the same data, but
-            # unload restores from _user_backup specifically).
-            if not (
-                settings.company_profile_path.parent / "_user_backup" / "profile.yaml"
-            ).exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-create user snapshot failed"
-                    )
             saved = _save_slot_state(settings, slot)
             _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
             _set_honcho_client_workspace(slug)
@@ -1003,21 +1025,8 @@ async def activate_client_slot(
                 _save_slot_state(settings, previous_slot)
         else:
             # Mirror the fixture switcher's first-load behavior: preserve the
-            # user's original company before replacing it. Best-effort — an
-            # empty environment has nothing worth snapshotting.
-            if not (settings.company_profile_path.parent / "_user_backup" / "profile.yaml").exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-activation user snapshot failed"
-                    )
-            else:
-                # A reused backup: refresh its database copy, which unload
-                # restores every per-company table from, as the fixture
-                # switcher does. Raises, aborting the activation before it
-                # changes anything, rather than leave a stale copy behind.
-                refresh_user_state_db(settings)
+            # user's original company before replacing it.
+            _preserve_user_state(settings)
 
         summary = await _restore_slot_state(
             settings, slot, app_state=app_state, mark_swap=active is None

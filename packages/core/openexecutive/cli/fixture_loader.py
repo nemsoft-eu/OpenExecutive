@@ -14,7 +14,7 @@ import re
 import shutil
 import sqlite3
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -304,6 +304,14 @@ async def _load_from_dir(
     of where ``fixture_dir`` came from.
     """
     async with _FIXTURE_OP_LOCK:
+        # A malformed fixture fails here, before an active client is parked
+        # (which leaves client mode); _apply_state_from_source checks again
+        # for unload, whose source is the user's backup.
+        from openexecutive.memory.company_profile import CompanyProfile
+
+        CompanyProfile.load_from_yaml(fixture_dir / "profile.yaml")
+        check_seed_files(fixture_dir)
+
         # If a client slot is active, the live state belongs to that client —
         # save it back to its slot and leave client mode before the fixture
         # replaces everything. Without this, loading a demo would silently
@@ -334,13 +342,11 @@ async def _load_from_dir(
             and not (backup_dir / "profile.yaml").exists()
             and not sentinel.exists()
         ):
-            try:
-                snapshot_user_state(settings)
-                auto_snapshot_taken = True
-            except Exception:
-                # Best-effort: do not block the fixture load if snapshot fails
-                # on a truly empty environment. User can call snapshot manually.
-                pass
+            # A failure aborts the load before anything changes: without the
+            # snapshot the user's state would be replaced with no way back. An
+            # empty environment snapshots cleanly (empty artifacts).
+            snapshot_user_state(settings)
+            auto_snapshot_taken = True
 
         # A reused backup (unload keeps _user_backup) gets the live profile,
         # docs and workspace settings, and the database copy unload restores
@@ -461,19 +467,28 @@ async def _apply_state_from_source(
 
     ``save_user_state``: the live state is the user's own, so refresh the
     backup from it first: its profile, docs and workspace settings, then its
-    database copy under the swap's write lock. The swap marker is written
-    before any table changes; the caller ends it (``end_swap``) once the
-    incoming state is recorded as active.
+    database copy under the swap's write lock. Everything that can fail on bad
+    input is parsed first; the swap marker is written once that copy is on
+    disk and before any table changes, and the caller ends it (``end_swap``)
+    once the incoming state is recorded as active.
     """
     from openexecutive.knowledge.loader import ingest_file
     from openexecutive.knowledge.store import ChromaDBStore
     from openexecutive.memory.company_profile import CompanyProfile
 
-    # ── 0. Read + validate the optional workspace.yaml before anything is
-    #       swapped; it is applied at 4b. Never raises — a bad value is
-    #       logged and skipped, so it cannot abort the load half-way.
+    # ── 0. Everything that can fail on bad input, before anything changes ──
+    # The workspace.yaml is applied at 4b and never raises (a bad value is
+    # logged and skipped). The profile and the seed files the seeders read at
+    # step 4 do raise, so they are parsed and checked here: after the swap
+    # below, a failure leaves the company half-replaced.
     workspace_wanted = _read_workspace_file(source_dir / "workspace.yaml")
     restoring_user_backup = _same_dir(source_dir, _user_backup_dir(settings))
+    profile_path = source_dir / "profile.yaml"
+    profile = (
+        CompanyProfile.load_from_yaml(profile_path)
+        if profile_path.exists()
+        else CompanyProfile()
+    )
 
     # ── 0b. Swap every per-company table (memory.company_tables) ───────────
     # Only when the user's backup holds a database copy: wiping a table the
@@ -494,6 +509,12 @@ async def _apply_state_from_source(
     backup_dir = _user_backup_dir(settings)
     state_db = backup_dir / USER_STATE_DB
     refresh = save_user_state and backup_dir.is_dir() and not swap_in_progress(settings)
+    # A refresh with no live database drops the backup's copy (below), so
+    # this is decided before the refresh changes the backup.
+    full_swap = EPISODIC_DB_PATH.exists() if refresh else state_db.exists()
+    if not (full_swap and restoring_user_backup):
+        # Step 4 seeds from the source's files rather than restoring rows.
+        check_seed_files(source_dir)
     if refresh:
         # Raises, aborting the swap before it changes anything; the database
         # copy is taken below, so the backup's files and copy match.
@@ -502,7 +523,6 @@ async def _apply_state_from_source(
             # Nothing to copy: an older copy would restore rows the user no
             # longer has.
             state_db.unlink(missing_ok=True)
-    full_swap = (refresh and EPISODIC_DB_PATH.exists()) or state_db.exists()
     tables_cleared: dict[str, int] = {}
     restored: dict[str, int] | None = None
     if full_swap and restoring_user_backup and refresh:
@@ -519,12 +539,14 @@ async def _apply_state_from_source(
         # from the user's own state it first retakes the backup's copy under
         # the same write lock, so no row committed in between is lost.
         saved = source_dir / USER_STATE_DB if restoring_user_backup else None
-        # Durably marked before any table changes: from the wipe until the
-        # caller records the incoming state, the live state is not the
-        # user's, and an unmarked crash would let a retry copy it over the
-        # backup. Left set after a failure that may have changed something.
+        # Durably marked once that copy is on disk and before any table
+        # changes (``before_change``): from the wipe until the caller records
+        # the incoming state, the live state is not the user's, and an
+        # unmarked crash would let a retry copy it over the backup. A mark
+        # written before the copy would, after a kill during it, guard a stale
+        # copy while the live rows are still the user's. Left set after a
+        # failure that may have changed something.
         marked_here = not swap_in_progress(settings)
-        begin_swap(settings)
         try:
             tables_cleared, restored_rows = swap_tables(
                 EPISODIC_DB_PATH,
@@ -532,6 +554,7 @@ async def _apply_state_from_source(
                 saved,
                 restore_also=MIGRATION_MARKER_TABLES,
                 save_to=state_db if refresh else None,
+                before_change=lambda: begin_swap(settings),
             )
         except SwapRolledBack:
             if marked_here:
@@ -545,13 +568,6 @@ async def _apply_state_from_source(
         # shipped knowledge's review rows, the user's own uploads as pending),
         # any table an older copy lacks, and the in-process caches.
         _ensure_schemas()
-
-    profile_path = source_dir / "profile.yaml"
-    profile = (
-        CompanyProfile.load_from_yaml(profile_path)
-        if profile_path.exists()
-        else CompanyProfile()
-    )
 
     # ── 1. Write profile.yaml (empty profile is fine — produces empty company)
     profile.save_to_yaml(settings.company_profile_path)
@@ -1251,8 +1267,9 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     real company with fixture data, silently destroying it. Callers that
     really mean it can pass ``force=True``.
 
-    Idempotent when allowed. Clears the ``.fixture_active`` sentinel after
-    writing so the current state becomes "the user's company" by declaration.
+    Idempotent when allowed. Clears the ``.fixture_active`` sentinel and any
+    unfinished swap's marker after writing so the current state becomes "the
+    user's company" by declaration.
     Safe to call on empty environments — missing sources produce empty
     snapshot artifacts that round-trip cleanly through restore.
     """
@@ -1306,6 +1323,12 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
 
     # Clear active-fixture marker — this state IS the user's company now.
     _fixture_active_sentinel(settings).unlink(missing_ok=True)
+    # Likewise an unfinished swap's marker, which only a forced snapshot gets
+    # past: it guarded the copy just replaced. Left set, it would keep every
+    # later refresh off this copy and refuse every unforced snapshot until a
+    # switch completes. Only on success, like the sentinel: a snapshot that
+    # failed part-way has declared nothing.
+    end_swap(settings)
 
     return {
         "snapshot_taken": True,
@@ -1358,22 +1381,19 @@ def _save_user_state_db(backup_dir: Path) -> None:
     ``VACUUM INTO`` gives a transactionally consistent copy while other
     connections hold the live file open, as a client slot's save does. No copy
     is left behind on failure, so a half-written or stale one can never be
-    restored: without it the fixture path keeps to its narrower wipe.
+    restored: without it the fixture path keeps to its narrower wipe. On disk
+    (flushed) when this returns, like the copy ``swap_tables(save_to=...)``
+    takes, since a swap marks itself only after the copy and a mark must never
+    survive a crash that the copy did not.
     """
+    from openexecutive.memory import company_tables
     from openexecutive.memory.episodic import DB_PATH
 
     target = backup_dir / USER_STATE_DB
     target.unlink(missing_ok=True)
     if not Path(DB_PATH).exists():
         return
-    conn = sqlite3.connect(str(DB_PATH))
-    try:
-        conn.execute("VACUUM INTO ?", (str(target),))
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
-    finally:
-        conn.close()
+    company_tables._copy_database(Path(DB_PATH), target)
 
 
 def refresh_user_state_db(settings: Any) -> None:
@@ -1411,9 +1431,11 @@ def swap_in_progress(settings: Any) -> bool:
 def begin_swap(settings: Any) -> None:
     """Mark a swap as started: until ``end_swap``, the backup's copy is kept.
 
-    Written before the live state stops being the user's (before the wipe,
-    before a parked client's sentinel goes), and flushed to disk with its
-    directory entry, so a crash right after cannot leave the state unmarked.
+    Written after the backup's copy is on disk and before the live state
+    stops being the user's (before the first DELETE, before a parked client's
+    sentinel goes), and flushed to disk with its directory entry, so a crash
+    right after cannot leave the state unmarked. Written any earlier, a kill
+    while the copy is taken would leave it guarding a stale copy.
     Without a backup directory there is no copy to protect, and nothing is
     written.
     """
@@ -1674,6 +1696,161 @@ def _dump_departments(dept_path: Path) -> int:
 
     dept_path.write_text(yaml.safe_dump({"departments": rows}, sort_keys=False), encoding="utf-8")
     return len(rows)
+
+
+# What the seeders below do with each key they read from a row (keys they do
+# not read are not checked). "value": bound to SQL, so one value and not null
+# (a default applies only to a missing key). "nullable": the same, or null.
+# "text": parsed as a timestamp, so text or empty. "stamp": the same, but
+# also bound when it does not parse, so not null. "number": passed to int().
+# "list": iterated or list()-ed and stored as JSON, so not null. "rows": a list of mappings, or
+# empty. "map": a mapping, or empty. "json": passed to json.dumps. "any":
+# read in a way that cannot fail.
+_V, _N, _T = "value", "nullable", "text"
+_SEED_ROW_KEYS: dict[str, dict[str, str]] = {
+    "decisions": dict.fromkeys(
+        ("timestamp", "domain", "summary", "rationale", "outcome", "tags", "department"), _V
+    ),
+    "initiatives": dict.fromkeys(
+        ("title", "status", "created_at", "updated_at", "summary", "department"), _V
+    ),
+    "advice_given": {
+        # Bound as given when it is not a relative stamp, into a NOT NULL column.
+        "timestamp": "stamp", "domain": _V, "query_summary": _V, "advice_summary": _V, "department": _V,
+    },
+    "scheduled_actions": {
+        **dict.fromkeys(
+            ("channel", "channel_ref", "intent_text", "status", "department", "kind"), _V
+        ),
+        "run_at": _T, "awaiting_response_since": _T,
+        "assigned_to_person": _N, "scope_key": _N, "required_scope": _N,
+    },
+    "alerts": {
+        **dict.fromkeys(
+            ("external_id", "source", "severity", "headline", "body", "suggested_action",
+             "dedup_key", "status"),
+            _V,
+        ),
+        "created_at": _T, "routed_to_person": _N, "topic_tags": "json",
+    },
+    "people": {
+        **dict.fromkeys(
+            ("full_name", "name", "email", "slack_user_id", "telegram_chat_id", "discord_user_id"), _N
+        ),
+        "role": _V, "preferred_channel": _V, "response_sla_hours": "number", "is_principal": "any",
+        "department_slugs": "list", "authority_scope": "list", "availability": "list",
+    },
+    "departments": {
+        **dict.fromkeys(
+            ("slug", "title", "specialist_key", "head_person_name", "headcount", "budget_usd"), _N
+        ),
+        "authority_level": "any", "charter": "map", "cadences": "json", "goals": "rows", "okrs": "rows",
+    },
+    "charter": {"mission": _V, "scope": "json", "out_of_scope": "json"},
+    "goals": {
+        **dict.fromkeys(("key_result", "target", "current", "status", "period_type"), _V),
+        "period_value": _N, "quarter": _N,
+    },
+}
+
+
+def check_seed_files(source_dir: Path) -> None:
+    """Raise ``ValueError`` for a seed file the seeders below would fail on.
+
+    The seeders run after a swap has emptied the live tables, so one failing
+    part-way leaves the company half-replaced. They skip a file that does not
+    parse; what they fail on is a parsed file of the wrong shape, checked here
+    against ``_SEED_ROW_KEYS`` before anything changes.
+    """
+    import yaml
+
+    memory = _parsed_seed_file(source_dir / "memory.json", json.loads)
+    if memory is not _UNREAD:
+        # Unlike the YAML seeders, the memory seeder reads any parsed value
+        # as an object (a JSON null included).
+        if not isinstance(memory, dict):
+            raise ValueError("memory.json must be an object")
+        for key in ("decisions", "initiatives", "advice_given", "scheduled_actions", "alerts"):
+            # Iterated as given, so a list (or missing); stricter than the
+            # seeder for an empty string, which it would iterate harmlessly.
+            if not isinstance(memory.get(key, []), list):
+                raise ValueError(f"memory.json {key} must be a list")
+            for row in _seed_rows(memory.get(key), f"memory.json {key}"):
+                _check_seed_row(row, key, f"memory.json {key}")
+
+    for name, key in (("people.yaml", "people"), ("departments.yaml", "departments")):
+        data = _parsed_seed_file(source_dir / name, yaml.safe_load)
+        if isinstance(data, dict):
+            for row in _seed_rows(data.get(key), f"{name} {key}"):
+                _check_seed_row(row, key, f"{name} {key}")
+
+
+_UNREAD = object()
+
+
+def _parsed_seed_file(path: Path, parse: Any) -> Any:
+    """``path`` parsed, or ``_UNREAD`` when it is missing or does not parse (the seeder skips it)."""
+    if not path.is_file():
+        return _UNREAD
+    try:
+        return parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return _UNREAD
+
+
+def _seed_rows(value: Any, where: str) -> list[dict[str, Any]]:
+    """The rows of a list the seeders iterate; an empty value is no rows, as for them."""
+    if not value:
+        return []
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError(f"{where} must be a list of mappings")
+    return value
+
+
+def _check_seed_row(row: dict[str, Any], kind: str, where: str) -> None:
+    for key, how in _SEED_ROW_KEYS[kind].items():
+        if key not in row:
+            continue
+        value = row[key]
+        scalar = isinstance(value, str | int | float | date)
+        if how == _V:
+            ok = scalar
+        elif how == _N:
+            ok = scalar or value is None
+        elif how == _T:
+            ok = isinstance(value, str) or not value
+        elif how == "stamp":
+            ok = isinstance(value, str) or (not value and value is not None)
+        elif how == "number":
+            try:
+                int(value)
+                ok = True
+            except (TypeError, ValueError):
+                ok = False
+        elif how == "list":
+            try:
+                ok = isinstance(value, list | str) and bool(json.dumps(value))
+            except (TypeError, ValueError):
+                ok = False
+        elif how == "rows":
+            _seed_rows(value, f"{where}: {key}")
+            for sub in value or []:
+                _check_seed_row(sub, "goals", f"{where}: {key}")
+            ok = True
+        elif how == "map":
+            ok = not value or isinstance(value, dict)
+            if ok and value:
+                _check_seed_row(value, key, f"{where}: {key}")
+        elif how == "json":
+            try:
+                json.dumps(value)
+                ok = True
+            except (TypeError, ValueError):
+                ok = False
+        else:
+            ok = True
+        if not ok:
+            raise ValueError(f"{where}: {key} has the wrong shape for the seeder ({how})")
 
 
 def _seed_episodic_memory(memory_path: Path, settings: Any) -> dict[str, int]:
