@@ -260,8 +260,9 @@ def swap_tables(
     column was added still restores. Foreign keys are off for the transaction:
     it writes back a consistent snapshot as it was, orphans included, and
     every table that references a swapped one is swapped too (a test checks).
-    Raises ``FileNotFoundError`` if ``saved_path`` does not exist: a caller that
-    meant to restore must never be left with the tables wiped instead.
+    Raises ``FileNotFoundError`` if ``saved_path`` does not exist, and
+    ``ValueError`` (changing nothing) if it holds none of ``tables``: a caller
+    that meant to restore must never be left with the tables wiped instead.
     """
     if saved_path is not None and not saved_path.exists():
         raise FileNotFoundError(saved_path)
@@ -287,6 +288,9 @@ def swap_tables(
                 saved_sql = dict(
                     conn.execute("SELECT name, sql FROM saved.sqlite_master WHERE type='table'").fetchall()
                 )
+                if not any(t in saved_sql for t in tables):
+                    # An empty or truncated copy: restoring it would be a wipe.
+                    raise ValueError(f"{saved_path} holds none of the tables to restore")
                 for table in targets:
                     if table not in saved_sql:
                         continue

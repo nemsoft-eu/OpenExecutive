@@ -10749,7 +10749,8 @@ clients:
       swap as well: `_ensure_schemas` registers the operator's own uploads
       left on disk as pending (`_reregister_surviving_user_knowledge`,
       insert-or-ignore), or a rejected/pending upload would be retrievable
-      during the demo, and it drops the Agent Council override cache.
+      during the demo, and it drops the Agent Council override cache and
+      the people/department registry caches (reset does the same).
     - tests/unit/test_company_tables.py scans the package for every CREATE
       TABLE (resolving f-string constants) and fails on a table in neither
       list; it also runs each path for real against one row in every table.
@@ -10761,14 +10762,22 @@ clients:
     while the live state is the user's own: fixture load, first slot
     activation, create-from-current, and an unload with nothing loaded,
     which would otherwise roll the user back to the copy). Inside the swap
-    the refresh runs immediately before the wipe, with no await between,
-    and a failure aborts the load. "Live is the user's" is inferred from
+    the refresh runs immediately before the wipe, with no await between;
+    a failed refresh raises and aborts the load, activation or create
+    before it changes anything. snapshot_user_state writes state.db last
+    (removing any older copy first), so a failed copy still leaves the YAML
+    artifacts for the legacy path. "Live is the user's" is inferred from
     absent sentinels, which a swap failing half-way also leaves, so
     `_user_backup/.swap_in_progress` (begin_swap/end_swap) blocks every
-    refresh until the swap that wiped live tables completes. With it, load wipes every swapped
+    refresh, snapshot and create-from-current until the swap completes. It
+    is set only once the database step has committed (after swap_tables, or
+    after a first activation's wipe/restore; a client rotation never sets
+    it), so a swap that failed without changing anything does not block.
+    With it, load wipes every swapped
     table and unload restores them from state.db with their own ids
     (`swap_tables`: one transaction, common columns, FK off, creates a table
-    the live DB lacks, raises if the copy vanished) instead of re-seeding YAML — re-seeded people get new ids, which
+    the live DB lacks, raises if the copy vanished or holds none of the
+    tables) instead of re-seeding YAML — re-seeded people get new ids, which
     would orphan every person-keyed table. Without it (a backup from before
     state.db, taken while a fixture is loaded), the path keeps the older
     narrower wipe: seeders, watchlist/external_signals and

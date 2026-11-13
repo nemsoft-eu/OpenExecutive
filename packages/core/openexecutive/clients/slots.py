@@ -47,6 +47,7 @@ from openexecutive.cli.fixture_loader import (
     get_fixture_status,
     refresh_user_state_db,
     snapshot_user_state,
+    swap_in_progress,
 )
 from openexecutive.memory.company_tables import PER_COMPANY_TABLES, wipe_tables
 
@@ -301,9 +302,18 @@ def _replace_dir_copy(src: Path, dst: Path) -> int:
 
 
 async def _restore_slot_state(
-    settings: Any, slot: Path, *, app_state: Any | None = None
+    settings: Any,
+    slot: Path,
+    *,
+    app_state: Any | None = None,
+    mark_swap: bool = False,
 ) -> dict[str, Any]:
-    """Make ``slot`` the live company context. Caller holds the lock."""
+    """Make ``slot`` the live company context. Caller holds the lock.
+
+    ``mark_swap`` (first activation only, while the live state is the user's)
+    records a swap in progress once the database step has replaced it, so a
+    failed activation's retry cannot refresh the user's copy from it.
+    """
     company_dir: Path = settings.company_profile_path.parent
     # "Blank" here means "no state.db yet" — true for both empty blank slots
     # and generated seed slots (which carry YAML/JSON seed files instead).
@@ -317,6 +327,8 @@ async def _restore_slot_state(
         _wipe_per_client_tables()
     else:
         _restore_db_from_file(slot / "state.db")
+    if mark_swap:
+        begin_swap(settings)
     _ensure_schemas()
     _restore_global_tables(preserved)
     seeded: dict[str, Any] = {}
@@ -555,10 +567,15 @@ def _ensure_schemas() -> None:
         _reregister_surviving_user_knowledge(db_path)
     except Exception:
         logger.exception("slot schema init: re-registering user knowledge failed")
-    # The Agent Council's overrides are cached in-process with no expiry.
+    # In-process caches of swapped tables: the Agent Council's overrides (no
+    # expiry) and the people and department registries (a short TTL).
     from openexecutive.agents.overrides import invalidate_cache
+    from openexecutive.departments import registry as departments_registry
+    from openexecutive.people import registry as people_registry
 
     invalidate_cache()
+    people_registry.invalidate()
+    departments_registry.invalidate()
 
 
 def _reseed_blank_defaults() -> None:
@@ -832,6 +849,19 @@ async def create_client_slot(
                 "A client is already active — its live state belongs to that "
                 "slot. Create a blank client and activate it instead."
             )
+        if source == "current":
+            if swap_in_progress(settings):
+                raise ClientSlotConflictError(
+                    "An earlier company switch did not finish, so the live "
+                    "state is not a company to capture. Retry that switch, or "
+                    "unload, first."
+                )
+            # A reused backup: refresh the database copy unload restores. It
+            # raises, so a failed refresh leaves no slot behind.
+            if (
+                settings.company_profile_path.parent / "_user_backup" / "profile.yaml"
+            ).exists():
+                refresh_user_state_db(settings)
 
         # Parse + validate a generated bundle BEFORE creating the slot dir so
         # a rejected draft never leaves an empty husk behind.
@@ -873,9 +903,6 @@ async def create_client_slot(
                     logger.exception(
                         "client-slots: pre-create user snapshot failed"
                     )
-            else:
-                # A reused backup: refresh the database copy unload restores.
-                refresh_user_state_db(settings)
             saved = _save_slot_state(settings, slot)
             _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
             _set_honcho_client_workspace(slug)
@@ -969,14 +996,13 @@ async def activate_client_slot(
             else:
                 # A reused backup: refresh its database copy, which unload
                 # restores every per-company table from, as the fixture
-                # switcher does.
+                # switcher does. Raises, aborting the activation before it
+                # changes anything, rather than leave a stale copy behind.
                 refresh_user_state_db(settings)
-            # The user's own state is about to be replaced: until the client
-            # is recorded as active, a retry must not refresh that copy from
-            # a half-restored database.
-            begin_swap(settings)
 
-        summary = await _restore_slot_state(settings, slot, app_state=app_state)
+        summary = await _restore_slot_state(
+            settings, slot, app_state=app_state, mark_swap=active is None
+        )
         _active_client_sentinel(settings).parent.mkdir(parents=True, exist_ok=True)
         _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
         end_swap(settings)

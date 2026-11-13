@@ -327,7 +327,11 @@ async def _load_from_dir(
         # fixture is already active, current state is NOT the user's company.
         backup_dir = _user_backup_dir(settings)
         auto_snapshot_taken = False
-        if not (backup_dir / "profile.yaml").exists() and not sentinel.exists():
+        if (
+            live_is_users
+            and not (backup_dir / "profile.yaml").exists()
+            and not sentinel.exists()
+        ):
             try:
                 snapshot_user_state(settings)
                 auto_snapshot_taken = True
@@ -500,9 +504,6 @@ async def _apply_state_from_source(
     tables_cleared: dict[str, int] = {}
     restored: dict[str, int] | None = None
     if full_swap:
-        # Until the caller's swap completes, the live state is neither the
-        # user's nor the incoming company's: nothing may refresh the copy.
-        begin_swap(settings)
         # On unload the backup's database restores the user's rows with their
         # own ids, which the YAML seeders below cannot: person- and
         # department-keyed tables would point at re-numbered rows. Its
@@ -515,6 +516,10 @@ async def _apply_state_from_source(
             restore_also=MIGRATION_MARKER_TABLES,
         )
         restored = restored_rows if saved is not None else None
+        # Set only once the swap committed (a rolled-back one changed nothing):
+        # until the caller's swap completes, the live state is neither the
+        # user's nor the incoming company's, so nothing may refresh the copy.
+        begin_swap(settings)
         logger.info("fixture: swapped %d per-company tables", len(tables_cleared))
         from openexecutive.clients.slots import _ensure_schemas
 
@@ -655,8 +660,8 @@ async def _apply_state_from_source(
 
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
     # The skip gate reads the last run's state_hash from audit_log; load/unload
-    # wipes the profile/initiatives/watchlist that feed that fingerprint but
-    # (by design) preserves audit_log. Stale research run-history rows would
+    # wipes the profile/initiatives/watchlist that feed that fingerprint, and
+    # the legacy fallback (a backup without state.db) leaves audit_log. Stale research run-history rows would
     # otherwise make the freshly-seeded watchlist_research_scan skip itself —
     # the "no findings on a seeded run" failure. Surgical delete of just the
     # three research event types; the rest of /audit history is untouched.
@@ -923,10 +928,15 @@ async def reset_all_state(
         if people_store.DB_PATH.exists():
             people_store.initialize_db()
         episodic_cleared = wipe_tables(EPISODIC_DB_PATH)
-        # The Agent Council's overrides are cached in-process with no expiry.
+        # In-process caches of wiped tables: the Agent Council's overrides (no
+        # expiry) and the people and department registries (a short TTL).
         from openexecutive.agents.overrides import invalidate_cache
+        from openexecutive.departments import registry as departments_registry
+        from openexecutive.people import registry as people_registry
 
         invalidate_cache()
+        people_registry.invalidate()
+        departments_registry.invalidate()
         people_cleared = {
             t: n
             for t, n in episodic_cleared.items()
@@ -1251,10 +1261,9 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     backup_dir = _user_backup_dir(settings)
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 0. state.db — every per-company table, for unload (USER_STATE_DB).
-    #       First, so a later step failing never leaves an older copy beside
-    #       newer artifacts.
-    _save_user_state_db(backup_dir)
+    # An older state.db must never sit beside the newer artifacts below; the
+    # fresh copy is written last (step 7).
+    (backup_dir / USER_STATE_DB).unlink(missing_ok=True)
 
     # ── 1. profile.yaml ────────────────────────────────────────────────────
     src_profile = settings.company_profile_path
@@ -1290,6 +1299,11 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
 
     # ── 6. workspace.yaml — so unload restores the user's mode and zone ───
     _dump_workspace(backup_dir / "workspace.yaml")
+
+    # ── 7. state.db — every per-company table, for unload (USER_STATE_DB).
+    #       Last, so if it fails the artifacts above still restore through
+    #       the narrower legacy path.
+    _save_user_state_db(backup_dir)
 
     # Clear active-fixture marker — this state IS the user's company now.
     _fixture_active_sentinel(settings).unlink(missing_ok=True)
@@ -1328,20 +1342,18 @@ def _save_user_state_db(backup_dir: Path) -> None:
 
 
 def refresh_user_state_db(settings: Any) -> None:
-    """Refresh the backup's database copy from the live state. Never raises.
+    """Refresh the backup's database copy from the live state.
 
     For callers about to replace the live state while it is the user's own and
     an earlier backup is being reused (unload keeps ``_user_backup``).
-    A failed refresh removes the stale copy, so unload can never roll the user
-    back to it. Does nothing while a swap is in progress (``begin_swap``).
+    Raises on failure, after removing the stale copy, so the caller aborts
+    before changing anything and unload can never roll the user back to it.
+    Does nothing while a swap is in progress (``begin_swap``).
     """
     backup_dir = _user_backup_dir(settings)
     if not backup_dir.is_dir() or swap_in_progress(settings):
         return
-    try:
-        _save_user_state_db(backup_dir)
-    except Exception:
-        logger.exception("refreshing the backed-up database failed")
+    _save_user_state_db(backup_dir)
 
 
 def _swap_marker(settings: Any) -> Path:

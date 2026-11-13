@@ -194,6 +194,20 @@ def test_swap_tables_refuses_a_missing_copy(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
 
 
+def test_swap_tables_refuses_a_copy_holding_none_of_the_tables(tmp_path: Path) -> None:
+    """An empty or truncated copy would turn the restore into a wipe."""
+    saved, live = tmp_path / "saved.db", tmp_path / "live.db"
+    with sqlite3.connect(saved) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(live) as conn:
+        conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO notes VALUES (1)")
+    with pytest.raises(ValueError):
+        swap_tables(live, ("notes",), saved)
+    with sqlite3.connect(live) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+
+
 # --------------------------------------------------------------------------- #
 # The three swap paths, against a row in every table
 # --------------------------------------------------------------------------- #
@@ -588,3 +602,71 @@ def test_the_users_own_upload_stays_withheld_during_a_demo(
         assert conn.execute(
             "SELECT status FROM review_items WHERE filename = 'my-upload.md'"
         ).fetchall() == [("pending",)]
+
+
+def test_a_swap_that_changed_nothing_leaves_no_marker(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The marker blocks every later refresh and snapshot, so a swap that
+    rolled back must not set it."""
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+
+    def _locked(*_a: object, **_k: object) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("openexecutive.memory.company_tables.swap_tables", _locked)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert not fixture_loader.swap_in_progress(env.settings)
+
+
+def test_create_from_current_refuses_an_unfinished_switch(env: Any) -> None:
+    from openexecutive.clients import slots
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    fixture_loader.begin_swap(env.settings)
+    with pytest.raises(slots.ClientSlotConflictError):
+        asyncio.run(slots.create_client_slot(env.settings, display_name="Mine", slug="mine", source="current"))
+    assert not (env.settings.company_profile_path.parent / "_client_slots" / "mine").exists()
+
+
+def test_a_failed_refresh_aborts_the_first_activation(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a current copy, unload would roll the user back to the old one."""
+    from openexecutive.clients import slots
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    seeded = _seed_every_table(env.db)
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+
+    def _disk_full(_backup_dir: Path) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(fixture_loader, "_save_user_state_db", _disk_full)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    assert slots.get_active_client(env.settings) is None
+    assert set(seeded) & set(PER_COMPANY_TABLES) <= _surviving(env.db, seeded)
+
+
+def test_a_failed_database_copy_still_leaves_the_snapshot(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The YAML artifacts land first, so the legacy path can still restore."""
+
+    def _disk_full(_backup_dir: Path) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(fixture_loader, "_save_user_state_db", _disk_full)
+    with pytest.raises(sqlite3.OperationalError):
+        fixture_loader.snapshot_user_state(env.settings)
+    backup = env.settings.company_profile_path.parent / "_user_backup"
+    assert (backup / "profile.yaml").exists()
+    assert not (backup / fixture_loader.USER_STATE_DB).exists()
+
+
+def test_fixture_load_drops_the_cached_people(env: Any) -> None:
+    from openexecutive.people import registry, store
+
+    store.upsert_person(full_name="Ada Mine", email="ada@mine.example", db_path=env.db)
+    assert [p.full_name for p in registry.list_people()] == ["Ada Mine"]
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert registry.list_people() == []
