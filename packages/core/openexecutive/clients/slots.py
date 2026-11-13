@@ -42,15 +42,13 @@ from typing import Any
 from openexecutive.cli.fixture_loader import (
     _FIXTURE_OP_LOCK,
     _SAFE_NAME_RE,
+    begin_swap,
+    end_swap,
     get_fixture_status,
+    refresh_user_state_db,
     snapshot_user_state,
 )
-from openexecutive.cli.fixture_loader import (
-    PER_CLIENT_CACHE_TABLES as _PER_CLIENT_CACHE_TABLES,
-)
-from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
-from openexecutive.memory.history_schema import TABLES as HISTORY_TABLES
-from openexecutive.orchestrator.take_the_lead import TABLES as TAKE_THE_LEAD_TABLES
+from openexecutive.memory.company_tables import PER_COMPANY_TABLES, wipe_tables
 
 logger = logging.getLogger(__name__)
 
@@ -86,106 +84,14 @@ ENGAGEMENT_META_FIELDS: frozenset[str] = frozenset(
 
 ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
 
-# Per-client tables wiped when activating a *blank* slot (no state.db yet).
-# Ordered children-before-parents for PRAGMA foreign_keys=ON. Existence-guarded
-# at delete time, so stores that haven't initialized on this box are skipped.
-_BLANK_WIPE_TABLES = (
-    # Derived caches first — see PER_CLIENT_CACHE_TABLES for why they must be
-    # wiped by every company-swapping path, not just this one. Neither declares
-    # a foreign key, so head position is free.
-    #
-    # Do not assume person_insights' input_hash makes it self-guarding. The hash
-    # (people.insights.build_insight_input_hash) covers role, is_principal,
-    # status, awaiting_count, awaiting_reply_count, overdue, on_leave_until,
-    # reachable_now, authority_scope, department_slugs, the hour-bucketed
-    # soonest_sla_at / oldest_awaiting_reply_at / next_window_at /
-    # last_contact_at, and the UTC day — every one of them a per-person signal,
-    # and NOT the person's name, the person's id, or the company. The cache key
-    # is person_id, a reused autoincrement PK. So an outgoing principal and a
-    # freshly seeded incoming principal hash identically whenever those signals
-    # coincide: both principals, same role string, no awaiting work, no leave,
-    # same default departments, same UTC day. That is an ordinary steady state
-    # for a seeded slot, not a collision.
-    *_PER_CLIENT_CACHE_TABLES,
-    "chat_messages",
-    "sessions",
-    "decisions",
-    "initiatives",
-    "advice_given",
-    "scheduled_actions",
-    "voice_personas",
-    "alerts",
-    "mute_topics",
-    "user_preferences",
-    # Solo/team mode and the user's time zone (memory.workspace_settings) are
-    # per company, like user_preferences above: a blank client starts on the
-    # defaults (team, no zone) rather than inheriting the previous client's.
-    # Saved slots carry their own row in state.db.
-    "workspace_settings",
-    "workflow_runs",
-    "audit_log",
-    "eval_runs",
-    "external_signals",
-    "watchlist",
-    "page_watch_state",
-    "outbound_context",
-    # An in-progress setup interview: the previous client's unedited
-    # description and answers (financials included).
-    "onboarding_interviews",
-    # Attunement's daily model-call counter (open loops themselves live in
-    # scheduled_actions, and sender/feedback columns in chat_messages).
-    "attunement_usage",
-    "proactive_outcomes",
-    "attunement_profiles",
-    "attunement_profile_history",
-    # Act as me (delegation/): who has it on and each person's "How I write"
-    # — per company like the roster it is keyed on, so a blank client starts
-    # with it off and no profile. (Each person's own-Gmail credential is a
-    # file, not a table, and is re-checked against the roster on every use.)
-    *DELEGATION_TABLES,
-    # Always in the loop (memory/history.py): notes about this company's
-    # people and conversations, and their switches.
-    *HISTORY_TABLES,
-    # Take the lead (orchestrator/take_the_lead.py): its switches, rules and
-    # log, per company.
-    *TAKE_THE_LEAD_TABLES,
-    # Legacy talent / staff-onboarding tables. Both features are gone and
-    # nothing writes these any more, but the rows may still exist on upgraded
-    # installs and they carry candidate PII (names, employers, screening
-    # summaries, offer comp) — keep wiping them so a blank slot never inherits
-    # a previous client's pipeline. Existence-guarded, so a no-op on fresh
-    # installs where the tables were never created.
-    "onboarding_tasks",
-    "onboarding_plans",
-    "onboarding_templates",
-    "offers",
-    "candidates",
-    "engagements",
-    "decision_instances",
-    "decision_class_state",
-    "agent_override_history",
-    "agent_overrides",
-    "review_annotations",
-    "review_items",
-    # Roster requests (people.roster_requests) name who wrote to this
-    # company, and aliases are its people's addresses: children first.
-    "roster_ack_log",
-    "roster_request_messages",
-    "roster_requests",
-    # Telegram chats the bot has seen (integrations.telegram_chats): names
-    # of who wrote to this company's bot, for its People pickers.
-    "telegram_chats",
-    "person_emails",
-    "person_authority_scope",
-    "person_availability",
-    "people",
-    "department_goals",
-    # Each department's own notes (memory.department_notes): decisions,
-    # updates and check-ins of this company.
-    "department_notes",
-    "departments",
-    "departments_meta",
-)
+# Per-client tables wiped when activating a *blank* slot (no state.db yet):
+# every per-company table in the one registry the other swap paths read too
+# (memory.company_tables), so a table added there is wiped here as well. A
+# saved slot needs no list: its state.db replaces the whole database.
+# Existence-guarded at delete time, so stores that haven't initialized on this
+# box are skipped, and ordered children-first from the database's own foreign
+# keys.
+_BLANK_WIPE_TABLES = PER_COMPANY_TABLES
 
 
 class ClientSlotError(ValueError):
@@ -511,21 +417,7 @@ def _wipe_per_client_tables() -> None:
     db_path = _episodic_db_path()
     if not db_path.exists():
         return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        for table in _BLANK_WIPE_TABLES:
-            if table in existing:
-                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed allowlist
-        conn.commit()
-    finally:
-        conn.close()
+    wipe_tables(db_path, _BLANK_WIPE_TABLES)
 
 
 def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:
@@ -653,6 +545,20 @@ def _ensure_schemas() -> None:
         logger.exception("slot schema init: sync_external_registrations failed")
     # Must follow both syncs: it only promotes rows they have flagged.
     ReviewStore.backfill_trusted_defaults(db_path)
+    # The operator's own uploads stay on disk across a swap; one with no review
+    # row (the wipe or an older copy dropped it) would be retrievable un-
+    # reviewed. Register it as pending, as the factory reset does. Insert-or-
+    # ignore, so a row the restored state already has is kept as it is.
+    try:
+        from openexecutive.cli.fixture_loader import _reregister_surviving_user_knowledge
+
+        _reregister_surviving_user_knowledge(db_path)
+    except Exception:
+        logger.exception("slot schema init: re-registering user knowledge failed")
+    # The Agent Council's overrides are cached in-process with no expiry.
+    from openexecutive.agents.overrides import invalidate_cache
+
+    invalidate_cache()
 
 
 def _reseed_blank_defaults() -> None:
@@ -967,6 +873,9 @@ async def create_client_slot(
                     logger.exception(
                         "client-slots: pre-create user snapshot failed"
                     )
+            else:
+                # A reused backup: refresh the database copy unload restores.
+                refresh_user_state_db(settings)
             saved = _save_slot_state(settings, slot)
             _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
             _set_honcho_client_workspace(slug)
@@ -1057,10 +966,20 @@ async def activate_client_slot(
                     logger.exception(
                         "client-slots: pre-activation user snapshot failed"
                     )
+            else:
+                # A reused backup: refresh its database copy, which unload
+                # restores every per-company table from, as the fixture
+                # switcher does.
+                refresh_user_state_db(settings)
+            # The user's own state is about to be replaced: until the client
+            # is recorded as active, a retry must not refresh that copy from
+            # a half-restored database.
+            begin_swap(settings)
 
         summary = await _restore_slot_state(settings, slot, app_state=app_state)
         _active_client_sentinel(settings).parent.mkdir(parents=True, exist_ok=True)
         _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
+        end_swap(settings)
         workspace = _set_honcho_client_workspace(slug)
         if workspace:
             summary["honcho_workspace"] = workspace

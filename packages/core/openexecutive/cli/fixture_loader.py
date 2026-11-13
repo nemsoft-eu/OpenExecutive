@@ -77,10 +77,10 @@ _SAFE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 #
 # Three separate paths swap live company state, and each maintained its own
 # hand-written table list — so this was fixed in one and still live in the other
-# two. They now all consume this constant: `clients.slots._BLANK_WIPE_TABLES`
-# (client switch into a blank/seed slot), `reset_all_state` (factory reset), and
-# `_apply_state_from_source` (fixture load AND unload). Any new per-company
-# cache table goes here, once.
+# two. All three now read one registry, `memory.company_tables`, where these
+# caches are per-company tables like any other. This constant remains only for
+# the fixture path's fallback wipe (`_apply_state_from_source` step 5b, for a
+# user backup that has no state.db yet).
 #
 # The fixture-path wipe belongs in `_apply_state_from_source`, NOT in
 # `_seed_episodic_memory`: that seeder returns early when the fixture has no
@@ -95,6 +95,16 @@ PER_CLIENT_CACHE_TABLES: tuple[str, ...] = (
     "briefing_narrative",
     "person_insights",
 )
+
+# The user's backup (`_user_backup/`) keeps a copy of the whole database here,
+# taken whenever the live state is the user's own and about to be replaced. It
+# lets fixture load and unload swap every per-company table, not just the ones
+# the YAML artifacts carry: unload restores the user's rows from it.
+USER_STATE_DB = "state.db"
+
+# Present in `_user_backup/` while a swap that wiped live tables has not
+# completed (see `swap_in_progress`).
+SWAP_MARKER = ".swap_in_progress"
 
 # Walk up from this file to find the repo root (contains evals/, fixtures/, etc.)
 # Match on ``fixtures/companies`` specifically — NOT a bare ``fixtures`` dir —
@@ -336,12 +346,18 @@ async def _load_from_dir(
             except Exception:
                 logger.exception("fixture load: refreshing the backed-up workspace settings failed")
 
-        summary = await _apply_state_from_source(fixture_dir, settings)
+        # The database copy unload restores every per-company table from is
+        # refreshed inside the swap, just before the wipe (the snapshot above
+        # has just written one).
+        summary = await _apply_state_from_source(
+            fixture_dir, settings, save_user_state=live_is_users and not auto_snapshot_taken
+        )
 
         # Record which fixture is active so the UI can show it and so a
         # subsequent load() knows not to take a fresh snapshot.
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text(fixture_name, encoding="utf-8")
+        end_swap(settings)
 
         # Honcho workspace isolation: switch to a per-fixture workspace
         # so demo turns sync to a sacrificial store rather than polluting
@@ -435,13 +451,19 @@ def list_all_fixtures() -> list[dict[str, Any]]:
     return generated + curated
 
 
-async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str, Any]:
+async def _apply_state_from_source(
+    source_dir: Path, settings: Any, *, save_user_state: bool = False
+) -> dict[str, Any]:
     """Apply profile.yaml + docs/ + memory.json + people.yaml + departments.yaml
     from ``source_dir`` to the live company state.
 
     Shared by ``load_fixture()`` (source = fixture dir) and ``unload_fixture()``
     (source = ``_user_backup/`` dir). Wipes the company-side state before
     writing, so the source dir is fully authoritative.
+
+    ``save_user_state``: the live state is the user's own, so refresh the
+    backup's database copy from it first. The caller ends the swap
+    (``end_swap``) once the incoming state is recorded as active.
     """
     from openexecutive.knowledge.loader import ingest_file
     from openexecutive.knowledge.store import ChromaDBStore
@@ -452,6 +474,54 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     #       logged and skipped, so it cannot abort the load half-way.
     workspace_wanted = _read_workspace_file(source_dir / "workspace.yaml")
     restoring_user_backup = _same_dir(source_dir, _user_backup_dir(settings))
+
+    # ── 0b. Swap every per-company table (memory.company_tables) ───────────
+    # First, before anything awaits, so nothing writes between the backup's
+    # fresh database copy and the wipe. Only when the user's backup holds that
+    # copy: wiping a table the backup does not carry would destroy the user's
+    # own rows on unload. A backup from before state.db existed, taken while a
+    # fixture is loaded, falls back to the narrower wipe of steps 4-5b below
+    # until the next load from the user's own state refreshes it.
+    # Unconditional otherwise: a fixture without people.yaml or memory.json
+    # still swaps the company.
+    from openexecutive.memory.company_tables import (
+        MIGRATION_MARKER_TABLES,
+        PER_COMPANY_TABLES,
+        swap_tables,
+    )
+    from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
+
+    backup_dir = _user_backup_dir(settings)
+    if save_user_state and backup_dir.is_dir() and not swap_in_progress(settings):
+        # Raises, aborting the swap before it changes anything: a load without
+        # a current copy would fall back to the narrow wipe and leak.
+        _save_user_state_db(backup_dir)
+    full_swap = (backup_dir / USER_STATE_DB).exists()
+    tables_cleared: dict[str, int] = {}
+    restored: dict[str, int] | None = None
+    if full_swap:
+        # Until the caller's swap completes, the live state is neither the
+        # user's nor the incoming company's: nothing may refresh the copy.
+        begin_swap(settings)
+        # On unload the backup's database restores the user's rows with their
+        # own ids, which the YAML seeders below cannot: person- and
+        # department-keyed tables would point at re-numbered rows. Its
+        # migration markers come back with them. One transaction.
+        saved = source_dir / USER_STATE_DB if restoring_user_backup else None
+        tables_cleared, restored_rows = swap_tables(
+            EPISODIC_DB_PATH,
+            PER_COMPANY_TABLES,
+            saved,
+            restore_also=MIGRATION_MARKER_TABLES,
+        )
+        restored = restored_rows if saved is not None else None
+        logger.info("fixture: swapped %d per-company tables", len(tables_cleared))
+        from openexecutive.clients.slots import _ensure_schemas
+
+        # Recreate what the wipe emptied that the app expects populated (the
+        # shipped knowledge's review rows, the user's own uploads as pending),
+        # any table an older copy lacks, and the in-process caches.
+        _ensure_schemas()
 
     profile_path = source_dir / "profile.yaml"
     profile = (
@@ -519,9 +589,17 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     # ── 4. Seed people first so episodic seeding can resolve
     #       assigned_to_person on scheduled_actions, and departments seeding
     #       can resolve head_person_id by name.
-    people_seeded = _seed_people(source_dir / "people.yaml")
-    memory_seeded = _seed_episodic_memory(source_dir / "memory.json", settings)
-    departments_seeded = _seed_departments(source_dir / "departments.yaml")
+    if restored is not None:
+        people_seeded = restored.get("people", 0)
+        memory_seeded = {
+            t: restored.get(t, 0)
+            for t in ("decisions", "initiatives", "advice_given", "scheduled_actions", "alerts")
+        }
+        departments_seeded = restored.get("departments", 0)
+    else:
+        people_seeded = _seed_people(source_dir / "people.yaml")
+        memory_seeded = _seed_episodic_memory(source_dir / "memory.json", settings)
+        departments_seeded = _seed_departments(source_dir / "departments.yaml")
 
     # ── 4b. Workspace settings (solo/team mode, the user's time zone) ─────
     # A fixture: back to the defaults, then its workspace.yaml if it has one
@@ -529,16 +607,19 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     # previous company's mode or zone. The user's backup: its workspace.yaml,
     # or — for a backup that predates the file — the settings are left as
     # they are rather than reset. No scheduler side effects either way:
-    # scheduled_actions were just rebuilt from memory.json.
+    # scheduled_actions were just rebuilt from memory.json. A backup restored
+    # from its state.db (3b) already put its own workspace_settings row back,
+    # so it is kept as it is.
     workspace_applied = _apply_workspace(
-        workspace_wanted, keep_when_missing=restoring_user_backup
+        None if restored is not None else workspace_wanted,
+        keep_when_missing=restoring_user_backup,
     )
 
     # ── 5. Wipe the external-monitoring layer ──────────────────────────────
     # The watchlist + external_signals tables are NOT part of memory.json or
-    # the snapshot round-trip — they're regenerated by the executive_research
-    # scan and the external monitor. Without clearing them here the previous
-    # company's monitors (or a prior research scan's AI/competitor entries)
+    # the YAML snapshot round-trip (only of its state.db) — they're
+    # regenerated by the executive_research scan and the external monitor.
+    # Without clearing them here the previous company's monitors (or a prior research scan's AI/competitor entries)
     # leak into every subsequent fixture load AND into the restored user
     # state on unload. Delete external_signals BEFORE watchlist to respect
     # the FK (external_signals.watchlist_id → watchlist.id, enforced under
@@ -546,24 +627,31 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     # schema exists first — load/unload can run against a DB that only has
     # the episodic schema (tests, scripts), and a missing table would raise
     # mid-wipe. initialize_db is idempotent (CREATE TABLE IF NOT EXISTS).
-    from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
-    from openexecutive.monitoring import store as monitoring_store
+    # With a full swap (3b) these tables were already wiped, and on unload
+    # restored: wiping them again here would drop the user's own monitors.
+    if full_swap:
+        monitoring_cleared = {
+            t: tables_cleared.get(t, 0) for t in ("external_signals", "watchlist")
+        }
+    else:
+        from openexecutive.monitoring import store as monitoring_store
 
-    # Guarded on the DB already existing so we never materialise a DB the
-    # caller never created (which would defeat _delete_all_rows' exists()
-    # short circuit). Idempotent CREATE TABLE IF NOT EXISTS otherwise.
-    if EPISODIC_DB_PATH.exists():
-        monitoring_store.initialize_db(EPISODIC_DB_PATH)
-    monitoring_cleared = _delete_all_rows(
-        EPISODIC_DB_PATH, ("external_signals", "watchlist")
-    )
+        # Guarded on the DB already existing so we never materialise a DB the
+        # caller never created (which would defeat _delete_all_rows' exists()
+        # short circuit). Idempotent CREATE TABLE IF NOT EXISTS otherwise.
+        if EPISODIC_DB_PATH.exists():
+            monitoring_store.initialize_db(EPISODIC_DB_PATH)
+        monitoring_cleared = _delete_all_rows(
+            EPISODIC_DB_PATH, ("external_signals", "watchlist")
+        )
 
-    # ── 5b. Wipe the derived per-company caches ────────────────────────────
-    # Same leak class as the watchlist above; see PER_CLIENT_CACHE_TABLES for
-    # why this belongs here rather than in _seed_episodic_memory. Nothing in
-    # this step may become conditional on the fixture's contents.
-    caches_cleared = _wipe_derived_caches(EPISODIC_DB_PATH)
-    logger.info("fixture: cleared derived per-company caches: %s", caches_cleared)
+        # ── 5b. Wipe the derived per-company caches ────────────────────────
+        # Same leak class as the watchlist above; see PER_CLIENT_CACHE_TABLES
+        # for why this belongs here rather than in _seed_episodic_memory.
+        # Nothing in this step may become conditional on the fixture's
+        # contents (only on the full swap above, which covers these tables).
+        caches_cleared = _wipe_derived_caches(EPISODIC_DB_PATH)
+        logger.info("fixture: cleared derived per-company caches: %s", caches_cleared)
 
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
     # The skip gate reads the last run's state_hash from audit_log; load/unload
@@ -614,6 +702,7 @@ async def unload_fixture(settings: Any) -> dict[str, Any]:
         # Unload is also the "exit client mode" path: if a client slot is
         # active (no fixture in play), save its live state back to the slot
         # before the backup restore replaces it.
+        live_is_users = not _fixture_active_sentinel(settings).exists()
         try:
             from openexecutive.clients.slots import park_active_client
 
@@ -621,14 +710,23 @@ async def unload_fixture(settings: Any) -> dict[str, Any]:
         except Exception:
             logger.exception("unload: client save-back failed (continuing)")
             summary_client = None
+            live_is_users = False
+        if summary_client is not None:
+            live_is_users = False
 
-        summary = await _apply_state_from_source(backup, settings)
+        # With nothing loaded over the user's own state, the backup's database
+        # copy may be older than it: refresh it first, or the restore would
+        # roll the user back to that copy.
+        summary = await _apply_state_from_source(
+            backup, settings, save_user_state=live_is_users
+        )
         if summary_client is not None:
             summary["client_saved"] = summary_client
 
         # Clear the active-fixture sentinel — current state is the user's own.
         sentinel = _fixture_active_sentinel(settings)
         sentinel.unlink(missing_ok=True)
+        end_swap(settings)
 
         # Honcho cleanup: delete the per-fixture workspace and clear the
         # override so the operator's env-default workspace takes over
@@ -725,13 +823,10 @@ async def reset_all_state(
     Steps (under the shared destructive-op lock):
       1. Empty live profile.yaml
       2. Delete + recreate company/docs/, clear ChromaDB company collection
-      3. Wipe episodic rows including chat history (chat_messages first,
-         then sessions, then decisions/initiatives/advice_given/
-         scheduled_actions/voice_personas) AND run/audit history
-         (workflow_runs, audit_log, eval_runs) so /jobs and /audit reset
-         too
-      4. DELETE people + child tables (authority scope, availability)
-      5. DELETE departments + Goals (none are re-created)
+      3. Wipe every per-company table (``memory.company_tables``): chat
+         history, episodic memory, run/audit history (so /jobs and /audit
+         reset too), knowledge review state, people and departments (none
+         are re-created), then re-register the shipped knowledge
       5a. Reset the workspace settings to the defaults (team, no zone),
           then re-bootstrap principal briefs, department cadences, and (if
           enabled) the nudge-scan heartbeat — without this Today stays
@@ -803,112 +898,64 @@ async def reset_all_state(
         # built-in is back in effect.
         sync_builtin_skill_index(store)
 
-        # 3. Episodic rows — includes chat history, voice personas, alerts
-        # state (alerts, mutes, preferences), AND the run/audit
-        # history (workflow_runs, audit_log, eval_runs) so a reset truly
-        # returns the box to factory state. Without the run/audit wipe the
-        # /jobs Runs tab and /audit view kept showing the previous fixture's
-        # executions and made reset look broken.
-        # Order matters under PRAGMA foreign_keys=ON: children before parents
-        # (chat_messages → sessions; external_signals → watchlist). The three
-        # run/audit tables have no
-        # FK relationships into the others, so their position is safe; the
-        # external-monitoring tables (watchlist + external_signals) also live
-        # in this DB and must be wiped so a reset starts with a clean
-        # watchlist instead of the previous company's monitors.
+        # 3. Every per-company table (memory.company_tables) — chat history,
+        # episodic memory, alerts state, the run/audit history (workflow_runs,
+        # audit_log, eval_runs: without it the /jobs Runs tab and /audit view
+        # kept showing the previous fixture's executions and made reset look
+        # broken), the external-monitoring tables (so a reset starts with a
+        # clean watchlist instead of the previous company's monitors), the
+        # derived caches, attunement, gated decisions, Act as me, Always in the
+        # loop, Take the lead, department notes, knowledge review state, people
+        # and departments. ``wipe_tables`` skips a table this database does not
+        # have and deletes children before parents under PRAGMA foreign_keys=ON.
+        from openexecutive.memory.company_tables import wipe_tables
         from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
         from openexecutive.monitoring import store as monitoring_store
+        from openexecutive.people import store as people_store
 
-        # Ensure the monitoring schema exists before the DELETE pass — in
-        # production the lifespan inits it, but reset is also called directly
-        # (tests, scripts) against a DB that only has the episodic schema, and
-        # a missing table would raise mid-wipe. Idempotent. Guarded on the DB
+        # The lifespan creates these schemas, but reset is also called directly
+        # (tests, scripts) against a DB that only has the episodic schema; a
+        # reset box keeps them, as it always has. Idempotent. Guarded on the DB
         # already existing so we never *materialise* a DB the caller never
-        # created — that would defeat _delete_all_rows' own exists() short
-        # circuit (and there's nothing to wipe in a DB that isn't there).
+        # created (and there's nothing to wipe in a DB that isn't there).
         if EPISODIC_DB_PATH.exists():
             monitoring_store.initialize_db(EPISODIC_DB_PATH)
-        # Same reasoning for the derived caches in PER_CLIENT_CACHE_TABLES,
-        # which this DELETE pass also covers; the helper is guarded on the
-        # DB existing, exactly like the monitoring init above.
-        _initialize_derived_cache_schemas(EPISODIC_DB_PATH)
-        episodic_cleared = _delete_all_rows(
-            EPISODIC_DB_PATH,
-            (
-                "chat_messages",
-                "sessions",
-                "decisions",
-                "initiatives",
-                "advice_given",
-                "scheduled_actions",
-                "voice_personas",
-                "alerts",
-                "mute_topics",
-                "user_preferences",
-                "workflow_runs",
-                "audit_log",
-                "eval_runs",
-                "external_signals",
-                "watchlist",
-                *PER_CLIENT_CACHE_TABLES,
-            ),
-        )
+        if people_store.DB_PATH.exists():
+            people_store.initialize_db()
+        episodic_cleared = wipe_tables(EPISODIC_DB_PATH)
+        # The Agent Council's overrides are cached in-process with no expiry.
+        from openexecutive.agents.overrides import invalidate_cache
 
-        # Attunement's daily call counter, outcome ledger and working styles. Created by initialize_db, which an
-        # older DB may not have run yet, so guarded per table (the helper
-        # above only guards the file).
-        if EPISODIC_DB_PATH.exists():
-            from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
-            from openexecutive.memory.history_schema import TABLES as HISTORY_TABLES
-            from openexecutive.orchestrator.take_the_lead import TABLES as TAKE_THE_LEAD_TABLES
+        invalidate_cache()
+        people_cleared = {
+            t: n
+            for t, n in episodic_cleared.items()
+            if t == "people" or t.startswith(("person_", "roster_"))
+        }
 
-            with sqlite3.connect(str(EPISODIC_DB_PATH)) as _conn:
-                for _table in ("attunement_usage", "proactive_outcomes",
-                               "attunement_profiles", "attunement_profile_history",
-                               # Gated decisions and each class's mode: a
-                               # reset box has proposed nothing yet.
-                               "decision_instances", "decision_class_state",
-                               # Act as me: every table it keeps.
-                               *DELEGATION_TABLES,
-                               # Always in the loop: notes and switches.
-                               *HISTORY_TABLES,
-                               # Take the lead: switches, rules, its log.
-                               *TAKE_THE_LEAD_TABLES,
-                               # Each department's own notes.
-                               "department_notes"):
-                    if _conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
-                    ).fetchone():
-                        _conn.execute(f"DELETE FROM {_table}")
-
-        # 3c. Knowledge review state (same DB as the episodic rows above). A
+        # 3c. Knowledge review state, wiped with the rest in step 3. A
         # "factory reset" that keeps the previous operator's approvals,
         # rejections and SME annotations is not a factory reset — and a
         # rejection still suppresses retrieval, so a stale one would silently
-        # withhold knowledge on the new box. Wipe both tables (child first for
-        # FK ordering), then re-register the shipped docs so the reset state is
-        # trusted defaults rather than an empty table.
+        # withhold knowledge on the new box. Re-register the shipped docs so
+        # the reset state is trusted defaults rather than an empty table.
         # Resolve the review DB through ``memory.episodic.DB_PATH`` like every
         # other consumer (``api/routes/review._store``,
         # ``retriever._default_review_store``). ``review_store.DB_PATH`` is
-        # bound at import, so using it here could wipe a different file than
+        # bound at import, so using it here could write a different file than
         # the one the app reads under a runtime override.
         from openexecutive.knowledge.review_store import ReviewStore
         from openexecutive.memory.episodic import DB_PATH as _REVIEW_DB_PATH
 
-        # Guarded like the episodic wipe above: never materialise a DB the
-        # caller never created. ``sqlite3.connect`` creates the file, so an
-        # unguarded initialize_db + sync would leave ~81 rows in a stray DB.
+        # Guarded like the wipe above: never materialise a DB the caller never
+        # created. ``sqlite3.connect`` creates the file, so an unguarded
+        # initialize_db + sync would leave ~81 rows in a stray DB.
         if _REVIEW_DB_PATH.exists():
-            # ``_delete_all_rows`` guards a missing FILE but not a missing
-            # TABLE, and nothing guarantees the review schema exists here (a
-            # slot restored before these tables shipped, or a test DB built
-            # table-by-table). ``initialize_db`` is idempotent.
+            # Nothing guarantees the review schema exists here (a slot
+            # restored before these tables shipped, or a test DB built
+            # table-by-table), and the wipe skips a missing table rather than
+            # creating it. ``initialize_db`` is idempotent.
             ReviewStore.initialize_db(_REVIEW_DB_PATH)
-            _delete_all_rows(
-                _REVIEW_DB_PATH,
-                ("review_annotations", "review_items"),
-            )
             try:
                 ReviewStore.sync_builtin_registrations(_REVIEW_DB_PATH)
             except Exception:
@@ -945,33 +992,8 @@ async def reset_all_state(
             except Exception:
                 logger.exception("reset: re-registering user knowledge failed")
 
-        # 4. People (child tables first to satisfy FK ordering)
-        from openexecutive.people import store as people_store
-        from openexecutive.people.roster_requests import TABLES as ROSTER_REQUEST_TABLES
-
-        if people_store.DB_PATH.exists():
-            # So the alias and roster-request tables exist to be wiped on a
-            # DB created before them (idempotent).
-            people_store.initialize_db()
-        people_cleared = _delete_all_rows(
-            people_store.DB_PATH,
-            (
-                *ROSTER_REQUEST_TABLES,
-                "person_emails",
-                "person_authority_scope",
-                "person_availability",
-                "people",
-            ),
-        )
-
-        # 5. Departments + Goals. A reset leaves none, like a new install:
-        # setup (or the Executive's create_goal tool) creates only the ones
-        # the company has.
-        from openexecutive.departments import store as dept_store
-        _delete_all_rows(
-            dept_store.DB_PATH,
-            ("department_goals", "departments", "departments_meta"),
-        )
+        # 4/5. People and departments were wiped in step 3 too; a reset
+        # leaves no departments, like a new install.
         departments_seeded = 0
 
         # 5a. Re-bootstrap the built-in scheduled actions that
@@ -1144,10 +1166,9 @@ def _initialize_derived_cache_schemas(db_path: Path) -> None:
 def _wipe_derived_caches(db_path: Path) -> dict[str, int]:
     """Drop every row of the derived per-company caches; return per-table counts.
 
-    The one place the initialize-then-delete pairing is expressed for callers
-    that wipe only these tables. ``reset_all_state`` folds them into its own
-    single DELETE pass instead (it reports per-table counts for the whole
-    episodic DB), but shares ``_initialize_derived_cache_schemas`` above.
+    Used only by the fixture path's fallback wipe (no state.db in the user's
+    backup). Every other wipe goes through ``memory.company_tables``, which
+    covers these tables and skips a missing one instead of creating it.
     """
     _initialize_derived_cache_schemas(db_path)
     return _delete_all_rows(db_path, PER_CLIENT_CACHE_TABLES)
@@ -1213,8 +1234,27 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
             "fixture data, not your company. Unload first, then snapshot."
         )
 
+    if not force:
+        from openexecutive.clients.slots import get_active_client
+
+        if get_active_client(settings) is not None:
+            raise FixtureActiveError(
+                "Cannot snapshot while a client is active — current state is "
+                "that client's, not your company. Unload first, then snapshot."
+            )
+    if swap_in_progress(settings) and not force:
+        raise FixtureActiveError(
+            "Cannot snapshot while a company switch is unfinished — current "
+            "state may be half-replaced. Retry the switch or unload first."
+        )
+
     backup_dir = _user_backup_dir(settings)
     backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 0. state.db — every per-company table, for unload (USER_STATE_DB).
+    #       First, so a later step failing never leaves an older copy beside
+    #       newer artifacts.
+    _save_user_state_db(backup_dir)
 
     # ── 1. profile.yaml ────────────────────────────────────────────────────
     src_profile = settings.company_profile_path
@@ -1261,6 +1301,74 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
         "people_snapshotted": people_count,
         "departments_snapshotted": departments_count,
     }
+
+
+def _save_user_state_db(backup_dir: Path) -> None:
+    """Copy the live database to ``backup_dir / USER_STATE_DB``.
+
+    ``VACUUM INTO`` gives a transactionally consistent copy while other
+    connections hold the live file open, as a client slot's save does. No copy
+    is left behind on failure, so a half-written or stale one can never be
+    restored: without it the fixture path keeps to its narrower wipe.
+    """
+    from openexecutive.memory.episodic import DB_PATH
+
+    target = backup_dir / USER_STATE_DB
+    target.unlink(missing_ok=True)
+    if not Path(DB_PATH).exists():
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute("VACUUM INTO ?", (str(target),))
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
+
+
+def refresh_user_state_db(settings: Any) -> None:
+    """Refresh the backup's database copy from the live state. Never raises.
+
+    For callers about to replace the live state while it is the user's own and
+    an earlier backup is being reused (unload keeps ``_user_backup``).
+    A failed refresh removes the stale copy, so unload can never roll the user
+    back to it. Does nothing while a swap is in progress (``begin_swap``).
+    """
+    backup_dir = _user_backup_dir(settings)
+    if not backup_dir.is_dir() or swap_in_progress(settings):
+        return
+    try:
+        _save_user_state_db(backup_dir)
+    except Exception:
+        logger.exception("refreshing the backed-up database failed")
+
+
+def _swap_marker(settings: Any) -> Path:
+    return _user_backup_dir(settings) / SWAP_MARKER
+
+
+def swap_in_progress(settings: Any) -> bool:
+    """Whether a company swap started and has not completed.
+
+    "The live state is the user's own" is inferred from the absence of the
+    fixture and client sentinels, which are written only once a swap succeeds.
+    A swap that failed half-way leaves neither, so a retry would otherwise copy
+    the half-wiped database over the backup's only good copy.
+    """
+    return _swap_marker(settings).exists()
+
+
+def begin_swap(settings: Any) -> None:
+    """Mark a swap as started: until ``end_swap``, the backup's copy is kept."""
+    marker = _swap_marker(settings)
+    if marker.parent.is_dir():
+        marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+
+
+def end_swap(settings: Any) -> None:
+    """Mark the swap complete, once the incoming state is recorded as active."""
+    _swap_marker(settings).unlink(missing_ok=True)
 
 
 def _same_dir(a: Path, b: Path) -> bool:
@@ -1380,6 +1488,10 @@ def _dump_episodic_memory(memory_path: Path) -> dict[str, int]:
     the seeder DOES re-populate that table from fixtures (relative
     ``run_at`` sentinels and all), but user-snapshot round-tripping would
     capture stale in-flight actions, so we deliberately drop them here.
+    This file is only read for a backup without ``state.db``: one with it
+    restores ``scheduled_actions`` as they were at the snapshot, like a
+    parked client slot, so actions that fell due during a demo are claimed
+    on the first tick after unload.
     """
     from openexecutive.memory.episodic import (
         list_advice,

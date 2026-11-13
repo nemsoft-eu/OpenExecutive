@@ -10717,33 +10717,69 @@ clients:
     principal and a freshly seeded incoming principal hash identically
     whenever those signals coincide. Ordinary steady state, not a collision.
     THREE paths swap live company state and each kept its own hand-written
-    table list, which is why fixing one left the leak live in the other two.
-    They now all consume `cli.fixture_loader.PER_CLIENT_CACHE_TABLES`:
-    `clients.slots._BLANK_WIPE_TABLES` (switch into a blank/seed slot),
-    `reset_all_state` (factory reset), and `_apply_state_from_source` (fixture
-    load AND unload — the worst surface, since a demo is what gets
-    screen-shared). The fixture-path wipe sits in `_apply_state_from_source`
-    beside the unconditional watchlist wipe, NOT in `_seed_episodic_memory`:
-    that seeder returns early when a fixture has no readable `memory.json`,
-    and `load_fixture` only requires `profile.yaml`, so a wipe inside the
-    seeder is skipped on exactly those loads while the company still swaps.
+    table list, which is why fixing one left the leak live in the other two
+    (the caches first; later department_notes, email_thread_replies and the
+    Act as me tables, all wiped by some paths and not by fixture load).
+    They now all read ONE registry, `memory.company_tables`:
+    `clients.slots._BLANK_WIPE_TABLES` (= PER_COMPANY_TABLES; switch into a
+    blank/seed slot), `reset_all_state` (factory reset), and
+    `_apply_state_from_source` (fixture load AND unload — the worst surface,
+    since a demo is what gets screen-shared).
+    - PER_COMPANY_TABLES: every table holding anything about one company,
+      composed from the modules' own TABLES tuples where they exist
+      (delegation.schema, memory.history_schema, take_the_lead,
+      roster_requests). Order is irrelevant: `wipe_tables` reads PRAGMA
+      foreign_key_list and deletes children first, under foreign_keys=ON,
+      skipping a table the DB lacks and never creating the DB.
+    - COMPANY_INDEPENDENT_TABLES: table -> reason. generated_fixtures and
+      executive_control (operator-level, still preserved across a whole-DB
+      slot restore by _GLOBAL_TABLES), architecture_sections (repo-derived),
+      app_migrations / monitoring_migrations / review_meta (one-shot markers
+      for this DB file), departments_new / department_goals_new (migration
+      scratch).
+    - MIGRATION_MARKER_TABLES (app_migrations, monitoring_migrations,
+      review_meta): company-independent, but they describe the rows of the
+      file, so unload restores them from state.db with the per-company rows;
+      otherwise a sweep that ran on fixture rows would stay marked done over
+      the restored, unswept user rows.
+    - No per-company table is kept by the fixture path. audit_log was, on
+      main, but a kept table crosses companies whenever a client slot is the
+      outgoing state (enter client mode, then unload), so it swaps too; a
+      demo's own audit rows go with the demo on unload. The review tables
+      swap as well: `_ensure_schemas` registers the operator's own uploads
+      left on disk as pending (`_reregister_surviving_user_knowledge`,
+      insert-or-ignore), or a rejected/pending upload would be retrievable
+      during the demo, and it drops the Agent Council override cache.
+    - tests/unit/test_company_tables.py scans the package for every CREATE
+      TABLE (resolving f-string constants) and fails on a table in neither
+      list; it also runs each path for real against one row in every table.
+    The fixture path could not simply wipe more: its YAML snapshot carried
+    only profile/docs/memory.json/people/departments/workspace, so wiping a
+    table on load destroyed the user's own rows on unload. The user backup
+    now also holds `state.db` (VACUUM INTO, written by snapshot_user_state
+    and refreshed by `refresh_user_state_db` whenever a backup is reused
+    while the live state is the user's own: fixture load, first slot
+    activation, create-from-current, and an unload with nothing loaded,
+    which would otherwise roll the user back to the copy). Inside the swap
+    the refresh runs immediately before the wipe, with no await between,
+    and a failure aborts the load. "Live is the user's" is inferred from
+    absent sentinels, which a swap failing half-way also leaves, so
+    `_user_backup/.swap_in_progress` (begin_swap/end_swap) blocks every
+    refresh until the swap that wiped live tables completes. With it, load wipes every swapped
+    table and unload restores them from state.db with their own ids
+    (`swap_tables`: one transaction, common columns, FK off, creates a table
+    the live DB lacks, raises if the copy vanished) instead of re-seeding YAML — re-seeded people get new ids, which
+    would orphan every person-keyed table. Without it (a backup from before
+    state.db, taken while a fixture is loaded), the path keeps the older
+    narrower wipe: seeders, watchlist/external_signals and
+    PER_CLIENT_CACHE_TABLES — the only remaining use of that constant. The
+    fixture-path wipe still runs whatever the fixture holds: a fixture needs
+    only `profile.yaml`, so nothing may hang off `memory.json`.
     Client→client switching into a slot that HAS state.db was already safe:
     the sqlite backup API truncates the destination to an exact copy.
-    Add any new per-company cache table to that constant, once.
-    Graded as NOT wiped: generated_fixtures (operator-level, see
-    _GLOBAL_TABLES) and architecture_sections (repo-derived, keyed by a hash of
-    the facts file). Still UNGRADED, deliberately deferred: dynamic_workflows
-    and eval_scenarios. These ARE client-scoped — the non-blank path already
-    swaps them with the whole DB — and on the blank path the outgoing client's
-    workflow definitions stay registered AND active (`list_definitions(
-    active_only=True)`), runnable against the incoming client's data, with full
-    bodies exposed via /workflows. They are not in the wipe list because they
-    are authored, not derived, and `snapshot_user_state` (the first-activation
-    branch, when no client is active) captures only profile/docs/memory.json/
-    people/departments — so wiping them there would irrecoverably delete the
-    operator's own work. The fix is to capture them in that snapshot FIRST,
-    then wipe. Both tables were observed empty on all known installs as of
-    2026-09 — an observation at a point in time, not an invariant to rely on.
+    dynamic_workflows and eval_scenarios were left unwiped on the blank
+    path because the snapshot did not capture them; with state.db it does,
+    so they are now swapped like every other per-company table.
   invariants:
     - At most one slot is active; the .active_client sentinel records it
       (allowlist-validated on read, same defence as the fixture sentinel).

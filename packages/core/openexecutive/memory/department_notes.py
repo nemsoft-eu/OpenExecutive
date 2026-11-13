@@ -10,9 +10,10 @@ memory is off or has nothing.
 
 Notes are company work, not anyone's private words: anyone whose question
 reaches the department's specialist may see them. Each department keeps its
-newest ``KEEP`` notes, none older than ``MAX_AGE_DAYS``. A factory reset and
-a switch into a blank client slot clear the table. A turn private to the
-principal keeps nothing here. Nothing here raises.
+newest ``KEEP`` notes, none older than ``MAX_AGE_DAYS``. Every company swap
+(factory reset, a switch into a blank client slot, fixture load and unload)
+clears the table, as a per-company table in ``memory.company_tables``. A turn
+private to the principal keeps nothing here. Nothing here raises.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 """Tables for Act as me, in the episodic DB (per company: they swap with a
-client slot — see ``clients.slots._BLANK_WIPE_TABLES``).
+client slot — see ``memory.company_tables``).
 
 Kept free of imports so ``memory.episodic.initialize_db`` can create them
 without an import cycle.

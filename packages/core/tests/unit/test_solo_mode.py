@@ -126,7 +126,13 @@ def test_reset_path_bootstrap_honours_solo(
     """The solo check lives inside bootstrap_cadences, so the reset's own call
     honours it too (here the workspace is held at solo through the reset)."""
     ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo"))
-    monkeypatch.setattr(ws, "reset_workspace_settings", lambda db_path=None: None)
+    # The reset wipes the workspace_settings row with every per-company table,
+    # so hold solo at the step that would otherwise put the defaults back.
+    monkeypatch.setattr(
+        ws,
+        "reset_workspace_settings",
+        lambda db_path=None: ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo")),
+    )
     _run_reset(_reset_harness)
     assert ws.get_workspace().mode == "solo"
     assert _count(_isolated, "dept_cadence") == 0

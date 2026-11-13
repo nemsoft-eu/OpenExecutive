@@ -6,16 +6,17 @@ populate the watchlist with AI/competitor monitors, and those rows then
 leaked into every subsequent fixture load and into the restored user state
 on unload — the "clean" fixture inherited the previous company's monitors.
 
-The fix routes both the shared load/unload path (``_apply_state_from_source``)
+The fix routed the shared load/unload path (``_apply_state_from_source``)
 and ``reset_all_state`` through ``_delete_all_rows`` with the two monitoring
 tables, ``external_signals`` first so the FK
 (``external_signals.watchlist_id`` → ``watchlist.id``) is never violated
-under ``PRAGMA foreign_keys=ON``.
+under ``PRAGMA foreign_keys=ON``. Both now wipe every table in
+``memory.company_tables`` (the fixture path keeps ``_delete_all_rows`` for a
+user backup without state.db); ``test_company_tables.py`` proves each path.
 
-We exercise ``_delete_all_rows`` directly (the same helper both call sites
-delegate to) so the assertion that matters — the deletion works against the
-live schema in the correct FK order — is proven without dragging ChromaDB,
-Honcho, and an ``app.state`` shim into a unit test.
+We exercise ``_delete_all_rows`` directly so the assertion that matters — the
+deletion works against the live schema in the correct FK order — is proven
+without dragging ChromaDB, Honcho, and an ``app.state`` shim into a unit test.
 """
 from __future__ import annotations
 
@@ -29,7 +30,6 @@ import pytest
 from openexecutive.cli.fixture_loader import (
     _apply_state_from_source,
     _delete_all_rows,
-    reset_all_state,
 )
 
 
@@ -95,19 +95,18 @@ def test_delete_clears_watchlist_and_signals_in_fk_order(
         )
 
 
-def test_reset_all_state_wipe_list_includes_monitoring_tables() -> None:
-    """Guard against silently dropping the monitoring tables from reset.
-
-    ``reset_all_state`` is an expensive async function (ChromaDB, Honcho,
-    file I/O), so assert the table names appear in its source — the same
-    cheap guard pattern used for the run/audit tables.
+def test_monitoring_tables_are_swapped_by_every_path() -> None:
+    """Reset, blank-slot switch and fixture load/unload all wipe the
+    registered per-company tables (proven per path, with a row in every
+    table, in ``test_company_tables.py``) — so the monitoring layer must stay
+    registered.
     """
-    src = inspect.getsource(reset_all_state)
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
+
     for table in ("external_signals", "watchlist"):
-        assert f'"{table}"' in src, (
-            f"reset_all_state no longer mentions {table!r} — a reset will "
-            "stop clearing the external-monitoring layer and the previous "
-            "company's watchlist monitors will survive the reset."
+        assert table in PER_COMPANY_TABLES, (
+            f"{table!r} dropped out of memory.company_tables — the previous "
+            "company's watchlist monitors would survive every company swap."
         )
 
 
@@ -226,88 +225,21 @@ def test_delete_clears_derived_caches_on_a_never_briefed_db(
     assert insights_cache.get(1, db_path=_episodic_db) is None
 
 
-def test_fixture_path_cache_wipe_is_unconditional() -> None:
-    """The fixture-path wipe must not sit behind ``memory.json`` — structurally.
+def test_every_swap_path_reads_the_derived_caches_from_the_registry() -> None:
+    """The original bug was three hand-maintained table lists over one DB: the
+    fix landed in one and the leak stayed live in the other two. All three now
+    read ``memory.company_tables``; the caches must stay in it, and in the
+    fixture path's fallback list (a user backup with no state.db yet).
 
-    ``_seed_episodic_memory`` returns early when the fixture has no
-    ``memory.json``, when that file will not parse, and when the DB is
-    missing. ``load_fixture`` only requires ``profile.yaml``, so a fixture
-    with no usable ``memory.json`` still swaps the company — and a wipe
-    placed inside the seeder is skipped on exactly those loads, leaving the
-    outgoing company's narrative to be served under the incoming one.
-
-    A substring search for the constant would not catch a regression here: it
-    passes just as happily when the wipe is present but wrapped in an ``if``.
-    So walk the AST and require the wipe to be a *direct* child of the
-    function body — no enclosing conditional, loop, or try. The sibling test
-    above proves the deletion itself works; this one proves it always runs.
-    """
-    import ast
-    import textwrap
-
-    from openexecutive.cli.fixture_loader import (
-        PER_CLIENT_CACHE_TABLES,
-        _seed_episodic_memory,
-    )
-
-    assert PER_CLIENT_CACHE_TABLES == ("briefing_narrative", "person_insights")
-
-    fn = ast.parse(
-        textwrap.dedent(inspect.getsource(_apply_state_from_source))
-    ).body[0]
-    assert isinstance(fn, ast.AsyncFunctionDef)
-
-    def _wipes(node: ast.AST) -> bool:
-        """True if ``node`` contains a call to the wipe helper."""
-        return any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id == "_wipe_derived_caches"
-            for call in ast.walk(node)
-        )
-
-    # Only leaf statements count. ``ast.walk`` descends, so testing every
-    # member of ``fn.body`` would also accept a wipe nested inside a top-level
-    # ``if``/``for``/``try`` — precisely the regression this pins against. A
-    # wrapping compound statement is none of these three node types, so
-    # nesting the call makes this assertion fail.
-    assert any(
-        _wipes(stmt)
-        for stmt in fn.body
-        if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign))
-    ), (
-        "_apply_state_from_source does not call _wipe_derived_caches as a "
-        "top-level statement — either the wipe is gone, or it is nested in a "
-        "conditional. A fixture load whose memory.json is absent or unparseable "
-        "still swaps the company, so a gated wipe leaves the outgoing company's "
-        "briefing narrative to be served under the incoming one."
-    )
-    assert "PER_CLIENT_CACHE_TABLES" not in inspect.getsource(_seed_episodic_memory), (
-        "the derived-cache wipe moved back into _seed_episodic_memory, which "
-        "returns early on a fixture with no readable memory.json — those loads "
-        "would swap the company and skip the wipe."
-    )
-
-
-def test_reset_and_slot_switch_consume_the_shared_cache_constant() -> None:
-    """The other two company-swapping paths must reference the one constant.
-
-    The original bug was three hand-maintained table lists over one DB: the
-    fix landed in one and the leak stayed live in the other two. Source-grep
-    for the heavy async ``reset_all_state`` (the same cheap guard the
-    monitoring tables use above) and for the shared constant in the slot
-    wipe list.
+    That the fixture-path wipe runs whatever the fixture holds (no
+    ``memory.json``, say) is proven behaviourally, for both the full swap and
+    the fallback, in ``test_company_tables.py``.
     """
     from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES
     from openexecutive.clients.slots import _BLANK_WIPE_TABLES
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 
-    assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(reset_all_state), (
-        "reset_all_state no longer consumes PER_CLIENT_CACHE_TABLES — a factory "
-        "reset will leave the previous company's cached briefing narrative."
-    )
-
+    assert PER_CLIENT_CACHE_TABLES == ("briefing_narrative", "person_insights")
     for table in PER_CLIENT_CACHE_TABLES:
-        assert table in _BLANK_WIPE_TABLES, (
-            f"{table!r} dropped out of the client-slot wipe list — switching "
-            "into a blank/seed slot will leak the previous client's cache."
-        )
+        assert table in PER_COMPANY_TABLES
+        assert table in _BLANK_WIPE_TABLES
