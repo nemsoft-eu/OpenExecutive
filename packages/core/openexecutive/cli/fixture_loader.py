@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -308,9 +309,10 @@ async def _load_from_dir(
         # replaces everything. Without this, loading a demo would silently
         # destroy the active client's unsaved work.
         # Whether the live state is the user's own company right now: not a
-        # loaded fixture, not a client (or one we failed to park).
+        # loaded fixture, not mid-swap, not a client (or one we failed to
+        # park). Parking marks a swap before it drops the client's sentinel.
         sentinel = _fixture_active_sentinel(settings)
-        live_is_users = not sentinel.exists()
+        live_is_users = not sentinel.exists() and not swap_in_progress(settings)
         try:
             from openexecutive.clients.slots import park_active_client
 
@@ -339,22 +341,14 @@ async def _load_from_dir(
                 # Best-effort: do not block the fixture load if snapshot fails
                 # on a truly empty environment. User can call snapshot manually.
                 pass
-        elif live_is_users and backup_dir.is_dir():
-            # An earlier snapshot is being reused (unload keeps _user_backup),
-            # but the workspace settings are the user's own right now and may
-            # have changed since — refresh them, or unload would restore
-            # stale ones (or, from a backup that predates workspace.yaml,
-            # none at all).
-            try:
-                _dump_workspace(backup_dir / "workspace.yaml")
-            except Exception:
-                logger.exception("fixture load: refreshing the backed-up workspace settings failed")
 
-        # The database copy unload restores every per-company table from is
-        # refreshed inside the swap, just before the wipe (the snapshot above
-        # has just written one).
+        # A reused backup (unload keeps _user_backup) gets the live profile,
+        # docs and workspace settings, and the database copy unload restores
+        # every per-company table from is retaken under the swap's own write
+        # lock — even right after the snapshot above, whose copy rows written
+        # since would otherwise miss.
         summary = await _apply_state_from_source(
-            fixture_dir, settings, save_user_state=live_is_users and not auto_snapshot_taken
+            fixture_dir, settings, save_user_state=live_is_users
         )
 
         # Record which fixture is active so the UI can show it and so a
@@ -466,8 +460,10 @@ async def _apply_state_from_source(
     writing, so the source dir is fully authoritative.
 
     ``save_user_state``: the live state is the user's own, so refresh the
-    backup's database copy from it first. The caller ends the swap
-    (``end_swap``) once the incoming state is recorded as active.
+    backup from it first: its profile, docs and workspace settings, then its
+    database copy under the swap's write lock. The swap marker is written
+    before any table changes; the caller ends it (``end_swap``) once the
+    incoming state is recorded as active.
     """
     from openexecutive.knowledge.loader import ingest_file
     from openexecutive.knowledge.store import ChromaDBStore
@@ -480,46 +476,68 @@ async def _apply_state_from_source(
     restoring_user_backup = _same_dir(source_dir, _user_backup_dir(settings))
 
     # ── 0b. Swap every per-company table (memory.company_tables) ───────────
-    # First, before anything awaits, so nothing writes between the backup's
-    # fresh database copy and the wipe. Only when the user's backup holds that
-    # copy: wiping a table the backup does not carry would destroy the user's
-    # own rows on unload. A backup from before state.db existed, taken while a
-    # fixture is loaded, falls back to the narrower wipe of steps 4-5b below
-    # until the next load from the user's own state refreshes it.
-    # Unconditional otherwise: a fixture without people.yaml or memory.json
-    # still swaps the company.
+    # Only when the user's backup holds a database copy: wiping a table the
+    # backup does not carry would destroy the user's own rows on unload. A
+    # backup from before state.db existed, taken while a fixture is loaded,
+    # falls back to the narrower wipe of steps 4-5b below until the next load
+    # from the user's own state refreshes it. Unconditional otherwise: a
+    # fixture without people.yaml or memory.json still swaps the company.
+    # audit_log is not swapped (KEPT_BY_FIXTURE_SWAP).
     from openexecutive.memory.company_tables import (
+        FIXTURE_SWAP_TABLES,
         MIGRATION_MARKER_TABLES,
-        PER_COMPANY_TABLES,
+        SwapRolledBack,
         swap_tables,
     )
     from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
 
     backup_dir = _user_backup_dir(settings)
-    if save_user_state and backup_dir.is_dir() and not swap_in_progress(settings):
-        # Raises, aborting the swap before it changes anything: a load without
-        # a current copy would fall back to the narrow wipe and leak.
-        _save_user_state_db(backup_dir)
-    full_swap = (backup_dir / USER_STATE_DB).exists()
+    state_db = backup_dir / USER_STATE_DB
+    refresh = save_user_state and backup_dir.is_dir() and not swap_in_progress(settings)
+    if refresh:
+        # Raises, aborting the swap before it changes anything; the database
+        # copy is taken below, so the backup's files and copy match.
+        _refresh_user_files(settings, backup_dir)
+        if not EPISODIC_DB_PATH.exists():
+            # Nothing to copy: an older copy would restore rows the user no
+            # longer has.
+            state_db.unlink(missing_ok=True)
+    full_swap = (refresh and EPISODIC_DB_PATH.exists()) or state_db.exists()
     tables_cleared: dict[str, int] = {}
     restored: dict[str, int] | None = None
-    if full_swap:
+    if full_swap and restoring_user_backup and refresh:
+        # An unload with nothing loaded: the live tables already are the
+        # user's own, so only the backup's copy is refreshed (restoring it
+        # would roll the user back to an older copy).
+        _save_user_state_db(backup_dir)
+        restored = {}
+    elif full_swap:
         # On unload the backup's database restores the user's rows with their
         # own ids, which the YAML seeders below cannot: person- and
         # department-keyed tables would point at re-numbered rows. Its
-        # migration markers come back with them. One transaction.
+        # migration markers come back with them. One transaction; on a load
+        # from the user's own state it first retakes the backup's copy under
+        # the same write lock, so no row committed in between is lost.
         saved = source_dir / USER_STATE_DB if restoring_user_backup else None
-        tables_cleared, restored_rows = swap_tables(
-            EPISODIC_DB_PATH,
-            PER_COMPANY_TABLES,
-            saved,
-            restore_also=MIGRATION_MARKER_TABLES,
-        )
-        restored = restored_rows if saved is not None else None
-        # Set only once the swap committed (a rolled-back one changed nothing):
-        # until the caller's swap completes, the live state is neither the
-        # user's nor the incoming company's, so nothing may refresh the copy.
+        # Durably marked before any table changes: from the wipe until the
+        # caller records the incoming state, the live state is not the
+        # user's, and an unmarked crash would let a retry copy it over the
+        # backup. Left set after a failure that may have changed something.
+        marked_here = not swap_in_progress(settings)
         begin_swap(settings)
+        try:
+            tables_cleared, restored_rows = swap_tables(
+                EPISODIC_DB_PATH,
+                FIXTURE_SWAP_TABLES,
+                saved,
+                restore_also=MIGRATION_MARKER_TABLES,
+                save_to=state_db if refresh else None,
+            )
+        except SwapRolledBack:
+            if marked_here:
+                end_swap(settings)
+            raise
+        restored = restored_rows if saved is not None else None
         logger.info("fixture: swapped %d per-company tables", len(tables_cleared))
         from openexecutive.clients.slots import _ensure_schemas
 
@@ -661,7 +679,8 @@ async def _apply_state_from_source(
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
     # The skip gate reads the last run's state_hash from audit_log; load/unload
     # wipes the profile/initiatives/watchlist that feed that fingerprint, and
-    # the legacy fallback (a backup without state.db) leaves audit_log. Stale research run-history rows would
+    # (by design) leaves audit_log on every path (KEPT_BY_FIXTURE_SWAP), so an
+    # unload restores no research rows for this to delete. Stale research run-history rows would
     # otherwise make the freshly-seeded watchlist_research_scan skip itself —
     # the "no findings on a seeded run" failure. Surgical delete of just the
     # three research event types; the rest of /audit history is untouched.
@@ -707,7 +726,7 @@ async def unload_fixture(settings: Any) -> dict[str, Any]:
         # Unload is also the "exit client mode" path: if a client slot is
         # active (no fixture in play), save its live state back to the slot
         # before the backup restore replaces it.
-        live_is_users = not _fixture_active_sentinel(settings).exists()
+        live_is_users = not _fixture_active_sentinel(settings).exists() and not swap_in_progress(settings)
         try:
             from openexecutive.clients.slots import park_active_client
 
@@ -1265,28 +1284,8 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     # fresh copy is written last (step 7).
     (backup_dir / USER_STATE_DB).unlink(missing_ok=True)
 
-    # ── 1. profile.yaml ────────────────────────────────────────────────────
-    src_profile = settings.company_profile_path
-    dst_profile = backup_dir / "profile.yaml"
-    if src_profile.exists():
-        shutil.copy2(src_profile, dst_profile)
-    else:
-        # Write empty profile so restore can detect "no real profile to apply".
-        from openexecutive.memory.company_profile import CompanyProfile
-
-        CompanyProfile().save_to_yaml(dst_profile)
-
-    # ── 2. docs/ ───────────────────────────────────────────────────────────
-    src_docs = src_profile.parent / "docs"
-    dst_docs = backup_dir / "docs"
-    if dst_docs.exists():
-        shutil.rmtree(dst_docs)
-    dst_docs.mkdir(parents=True, exist_ok=True)
-    docs_count = 0
-    if src_docs.exists():
-        for f in src_docs.glob("*.md"):
-            shutil.copy2(f, dst_docs / f.name)
-            docs_count += 1
+    # ── 1-2. profile.yaml and docs/ ───────────────────────────────────────
+    docs_count = _copy_profile_and_docs(settings, backup_dir)
 
     # ── 3. memory.json (episodic) ─────────────────────────────────────────
     memory_count = _dump_episodic_memory(backup_dir / "memory.json")
@@ -1317,6 +1316,42 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     }
 
 
+def _copy_profile_and_docs(settings: Any, backup_dir: Path) -> int:
+    """Copy the live profile.yaml and docs/*.md into ``backup_dir``; return docs copied."""
+    src_profile = settings.company_profile_path
+    dst_profile = backup_dir / "profile.yaml"
+    if src_profile.exists():
+        shutil.copy2(src_profile, dst_profile)
+    else:
+        # Write empty profile so restore can detect "no real profile to apply".
+        from openexecutive.memory.company_profile import CompanyProfile
+
+        CompanyProfile().save_to_yaml(dst_profile)
+
+    src_docs = src_profile.parent / "docs"
+    dst_docs = backup_dir / "docs"
+    if dst_docs.exists():
+        shutil.rmtree(dst_docs)
+    dst_docs.mkdir(parents=True, exist_ok=True)
+    docs_count = 0
+    if src_docs.exists():
+        for f in src_docs.glob("*.md"):
+            shutil.copy2(f, dst_docs / f.name)
+            docs_count += 1
+    return docs_count
+
+
+def _refresh_user_files(settings: Any, backup_dir: Path) -> None:
+    """Bring a reused backup's profile, docs and workspace settings up to date.
+
+    Runs with every refresh of its database copy, so a restore never pairs a
+    fresh copy with an older profile or documents. Raises, like the copy, so
+    the caller aborts before changing anything.
+    """
+    _copy_profile_and_docs(settings, backup_dir)
+    _dump_workspace(backup_dir / "workspace.yaml")
+
+
 def _save_user_state_db(backup_dir: Path) -> None:
     """Copy the live database to ``backup_dir / USER_STATE_DB``.
 
@@ -1342,7 +1377,7 @@ def _save_user_state_db(backup_dir: Path) -> None:
 
 
 def refresh_user_state_db(settings: Any) -> None:
-    """Refresh the backup's database copy from the live state.
+    """Refresh the backup's profile, docs, workspace settings and database copy.
 
     For callers about to replace the live state while it is the user's own and
     an earlier backup is being reused (unload keeps ``_user_backup``).
@@ -1353,6 +1388,7 @@ def refresh_user_state_db(settings: Any) -> None:
     backup_dir = _user_backup_dir(settings)
     if not backup_dir.is_dir() or swap_in_progress(settings):
         return
+    _refresh_user_files(settings, backup_dir)
     _save_user_state_db(backup_dir)
 
 
@@ -1365,17 +1401,34 @@ def swap_in_progress(settings: Any) -> bool:
 
     "The live state is the user's own" is inferred from the absence of the
     fixture and client sentinels, which are written only once a swap succeeds.
-    A swap that failed half-way leaves neither, so a retry would otherwise copy
-    the half-wiped database over the backup's only good copy.
+    A swap that failed half-way, or a client parked for one, leaves neither,
+    so a retry would otherwise copy a database that is not the user's over
+    the backup's only good copy.
     """
     return _swap_marker(settings).exists()
 
 
 def begin_swap(settings: Any) -> None:
-    """Mark a swap as started: until ``end_swap``, the backup's copy is kept."""
+    """Mark a swap as started: until ``end_swap``, the backup's copy is kept.
+
+    Written before the live state stops being the user's (before the wipe,
+    before a parked client's sentinel goes), and flushed to disk with its
+    directory entry, so a crash right after cannot leave the state unmarked.
+    Without a backup directory there is no copy to protect, and nothing is
+    written.
+    """
     marker = _swap_marker(settings)
-    if marker.parent.is_dir():
-        marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+    if not marker.parent.is_dir():
+        return
+    with marker.open("w", encoding="utf-8") as fh:
+        fh.write(datetime.now(UTC).isoformat())
+        fh.flush()
+        os.fsync(fh.fileno())
+    dir_fd = os.open(marker.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def end_swap(settings: Any) -> None:

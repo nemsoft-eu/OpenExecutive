@@ -10742,11 +10742,18 @@ clients:
       file, so unload restores them from state.db with the per-company rows;
       otherwise a sweep that ran on fixture rows would stay marked done over
       the restored, unswept user rows.
-    - No per-company table is kept by the fixture path. audit_log was, on
-      main, but a kept table crosses companies whenever a client slot is the
-      outgoing state (enter client mode, then unload), so it swaps too; a
-      demo's own audit rows go with the demo on unload. The review tables
-      swap as well: `_ensure_schemas` registers the operator's own uploads
+    - KEPT_BY_FIXTURE_SWAP: per-company tables the fixture path leaves in
+      place, with the reason; fixture load/unload swap FIXTURE_SWAP_TABLES
+      (PER_COMPANY_TABLES minus these). Only audit_log, the operator's
+      record of real actions, a demo's included. Each path treats it as on
+      main: the factory reset and a blank slot wipe it, a saved slot carries
+      its own copy in state.db, and fixture load/unload keep the live rows,
+      deleting only the research run rows that gate the periodic scan
+      (`clear_research_run_history`, on every fixture path). So the rows of
+      a client parked by a fixture switch stay in the live audit_log after
+      unload, and entering a blank slot drops the user's audit rows for
+      good (unload does not restore them from state.db). The review tables
+      swap: `_ensure_schemas` registers the operator's own uploads
       left on disk as pending (`_reregister_surviving_user_knowledge`,
       insert-or-ignore), or a rejected/pending upload would be retrievable
       during the demo, and it drops the Agent Council override cache and
@@ -10761,18 +10768,39 @@ clients:
     and refreshed by `refresh_user_state_db` whenever a backup is reused
     while the live state is the user's own: fixture load, first slot
     activation, create-from-current, and an unload with nothing loaded,
-    which would otherwise roll the user back to the copy). Inside the swap
-    the refresh runs immediately before the wipe, with no await between;
-    a failed refresh raises and aborts the load, activation or create
-    before it changes anything. snapshot_user_state writes state.db last
+    which only refreshes the copy and leaves the live tables alone). Every
+    refresh also copies the live profile.yaml, docs/ and workspace.yaml
+    (`_refresh_user_files`), so a restore never pairs a fresh copy with an
+    older profile. On a fixture load the copy is retaken inside
+    `swap_tables(save_to=...)`: VACUUM INTO from a second connection while
+    the swap's own connection holds BEGIN IMMEDIATE, so no writer can commit
+    between the copy and the wipe (the copy cannot be taken on the locked
+    connection itself: SQLite refuses a backup or VACUUM from a connection
+    mid-write). It is written beside state.db and moved over it. The slot
+    paths and an unload still copy outside that lock (`_save_user_state_db`):
+    a first activation restores a saved slot through the backup API, which
+    needs its destination outside any transaction. A failed refresh raises
+    and aborts the load, activation or create before it changes anything.
+    snapshot_user_state writes state.db last
     (removing any older copy first), so a failed copy still leaves the YAML
     artifacts for the legacy path. "Live is the user's" is inferred from
     absent sentinels, which a swap failing half-way also leaves, so
     `_user_backup/.swap_in_progress` (begin_swap/end_swap) blocks every
-    refresh, snapshot and create-from-current until the swap completes. It
-    is set only once the database step has committed (after swap_tables, or
-    after a first activation's wipe/restore; a client rotation never sets
-    it), so a swap that failed without changing anything does not block.
+    refresh, snapshot and create-from-current until the swap completes, and
+    load/unload count it as "not the user's". It is written (fsynced with
+    its directory) BEFORE the live state stops being the user's: before
+    swap_tables, before a first activation's wipe/restore, and in
+    `park_active_client` before the client's sentinel goes (a client
+    rotation never sets it). It is removed only when the swap completed,
+    or when the database step raised `SwapRolledBack` and that same swap
+    wrote the marker (one left by an earlier interrupted swap, or by
+    parking a client, stays): swap_tables raises it only for a failure
+    that provably changed nothing (locked, missing or empty copy, a
+    statement failing before the COMMIT and rolled back, by us or by
+    SQLite itself); any other error, a saved slot's backup-API restore
+    included, leaves the outcome unknown and keeps the marker (CPython's
+    backup retries a busy destination until it is free rather than
+    raising). A blank slot's wipe goes through swap_tables for that reason.
     With it, load wipes every swapped
     table and unload restores them from state.db with their own ids
     (`swap_tables`: one transaction, common columns, FK off, creates a table

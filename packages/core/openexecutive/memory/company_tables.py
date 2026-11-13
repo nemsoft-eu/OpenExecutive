@@ -10,13 +10,16 @@ company's mail threads, Act as me state). They now all read this module.
 Every table the app creates is in exactly one of :data:`PER_COMPANY_TABLES` or
 :data:`COMPANY_INDEPENDENT_TABLES`; ``tests/unit/test_company_tables.py`` scans
 the source for ``CREATE TABLE`` and fails on a table that is in neither. A new
-table therefore needs a decision here, not a guess in each swap path.
+table therefore needs a decision here, not a guess in each swap path. The
+fixture swap reads :data:`FIXTURE_SWAP_TABLES`, which leaves out the
+per-company tables in :data:`KEPT_BY_FIXTURE_SWAP`, each with its reason.
 
 The order of :data:`PER_COMPANY_TABLES` does not matter: :func:`wipe_tables`
 reads the foreign keys from the database and deletes children before parents.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -182,6 +185,20 @@ COMPANY_INDEPENDENT_TABLES: dict[str, str] = {
     "department_goals_new": "scratch table of a goals migration, renamed in the same transaction",
 }
 
+# Per-company tables the fixture swap leaves in place, with the reason. The
+# factory reset and a blank client slot still wipe them (a saved slot carries
+# its own copy in its state.db); only fixture load and unload keep them, as
+# they always have.
+KEPT_BY_FIXTURE_SWAP: dict[str, str] = {
+    "audit_log": (
+        "the operator's record of real actions, including those taken during a demo; "
+        "fixture load/unload only clears the research run rows that gate a scan"
+    ),
+}
+
+# What fixture load and unload swap: every per-company table but those above.
+FIXTURE_SWAP_TABLES: tuple[str, ...] = tuple(t for t in PER_COMPANY_TABLES if t not in KEPT_BY_FIXTURE_SWAP)
+
 # Company-independent tables that record what was done to the rows of this
 # database file (one-shot sweeps and backfills), so they belong with those rows:
 # when a saved copy's per-company rows are restored, its markers come back too,
@@ -241,12 +258,52 @@ def wipe_tables(db_path: Path, tables: tuple[str, ...] = PER_COMPANY_TABLES) -> 
     return counts
 
 
+class SwapRolledBack(RuntimeError):
+    """``swap_tables`` failed and left the database exactly as it was.
+
+    Raised from the original error. Any other exception out of
+    ``swap_tables`` (the rollback itself failing, an interrupt) leaves the
+    outcome unknown, so a caller must treat the tables as changed.
+    """
+
+
+def _copy_database(db_path: Path, target: Path) -> None:
+    """Replace ``target`` with a consistent copy of ``db_path``.
+
+    Reads through its own connection, so it can run while the caller holds
+    the write lock: no other writer can then commit between this copy and the
+    caller's own changes. Written beside ``target`` and moved over it, so a
+    failed copy leaves the previous one whole, and flushed to disk with the
+    move: a swap marker that survives a crash must not guard a copy that did
+    not.
+    """
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("VACUUM INTO ?", (str(tmp),))
+        with tmp.open("rb") as fh:
+            os.fsync(fh.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
+    os.replace(tmp, target)
+    dir_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def swap_tables(
     db_path: Path,
     tables: tuple[str, ...],
     saved_path: Path | None = None,
     *,
     restore_also: tuple[str, ...] = (),
+    save_to: Path | None = None,
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Wipe ``tables``, then restore them (and ``restore_also``) from a saved copy.
 
@@ -254,27 +311,46 @@ def swap_tables(
     leaves them as they were. Returns ``(rows deleted, rows restored)`` per
     table. With ``saved_path`` None this only wipes.
 
+    ``save_to``: first copy the whole database there, holding the write lock
+    from before the copy until the wipe commits, so no row another connection
+    commits can land in between and be lost with the wipe. Not combinable
+    with ``saved_path`` (the transaction would hold that file's lock too).
+
     For a saved copy of this same database: a table the copy lacks is left
     empty; one the live database lacks is created from the copy's own
     definition. Only the columns both have are copied, so a copy from before a
     column was added still restores. Foreign keys are off for the transaction:
     it writes back a consistent snapshot as it was, orphans included, and
     every table that references a swapped one is swapped too (a test checks).
-    Raises ``FileNotFoundError`` if ``saved_path`` does not exist, and
-    ``ValueError`` (changing nothing) if it holds none of ``tables``: a caller
-    that meant to restore must never be left with the tables wiped instead.
+
+    Raises :class:`SwapRolledBack` for any failure that provably changed no
+    table: the database is locked, ``saved_path`` does not exist
+    (``FileNotFoundError`` as its cause), or the copy holds none of ``tables``
+    (``ValueError``) — a caller that meant to restore must never be left with
+    the tables wiped instead.
     """
+    if saved_path is not None and save_to is not None:
+        raise ValueError("swap_tables: save_to cannot be combined with saved_path")
     if saved_path is not None and not saved_path.exists():
-        raise FileNotFoundError(saved_path)
+        raise SwapRolledBack(f"{saved_path} does not exist") from FileNotFoundError(saved_path)
     if not db_path.exists():
         return {}, {}
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
-        conn.execute("PRAGMA foreign_keys = OFF")
-        if saved_path is not None:
-            conn.execute("ATTACH DATABASE ? AS saved", (str(saved_path),))
-        conn.execute("BEGIN IMMEDIATE")
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+    except Exception as exc:
+        raise SwapRolledBack(str(exc)) from exc
+    try:
         try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            if saved_path is not None:
+                conn.execute("ATTACH DATABASE ? AS saved", (str(saved_path),))
+            conn.execute("BEGIN IMMEDIATE")
+        except Exception as exc:
+            raise SwapRolledBack(str(exc)) from exc
+        committing = False
+        try:
+            if save_to is not None:
+                _copy_database(db_path, save_to)
             live = _existing_tables(conn)
             cleared: dict[str, int] = {}
             restored: dict[str, int] = {}
@@ -306,12 +382,22 @@ def swap_tables(
                             f'INSERT INTO main."{table}" ({col_list}) SELECT {col_list} FROM saved."{table}"'  # noqa: S608
                         ).rowcount
                     )
+            committing = True
             conn.execute("COMMIT")
+        except Exception as exc:
+            if not committing and not conn.in_transaction:
+                # SQLite already rolled the transaction back itself (a full
+                # disk, an I/O error mid-statement) before any COMMIT.
+                raise SwapRolledBack(str(exc)) from exc
+            # A ROLLBACK that fails raises its own error, not SwapRolledBack:
+            # the outcome is then unknown.
+            conn.execute("ROLLBACK")
+            raise SwapRolledBack(str(exc)) from exc
         except BaseException:
             conn.execute("ROLLBACK")
             raise
-        if saved_path is not None:
-            conn.execute("DETACH DATABASE saved")
     finally:
+        # Closing detaches the saved copy. Nothing after the COMMIT may raise,
+        # or a committed swap would look like a failed one.
         conn.close()
     return cleared, restored

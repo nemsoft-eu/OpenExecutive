@@ -49,7 +49,7 @@ from openexecutive.cli.fixture_loader import (
     snapshot_user_state,
     swap_in_progress,
 )
-from openexecutive.memory.company_tables import PER_COMPANY_TABLES, wipe_tables
+from openexecutive.memory.company_tables import PER_COMPANY_TABLES, SwapRolledBack, swap_tables
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +90,9 @@ ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
 # (memory.company_tables), so a table added there is wiped here as well. A
 # saved slot needs no list: its state.db replaces the whole database.
 # Existence-guarded at delete time, so stores that haven't initialized on this
-# box are skipped, and ordered children-first from the database's own foreign
-# keys.
+# box are skipped. One transaction with foreign keys off, like the fixture
+# swap: every table that references a per-company table is one itself (a test
+# checks), and a failure must provably change nothing.
 _BLANK_WIPE_TABLES = PER_COMPANY_TABLES
 
 
@@ -311,8 +312,10 @@ async def _restore_slot_state(
     """Make ``slot`` the live company context. Caller holds the lock.
 
     ``mark_swap`` (first activation only, while the live state is the user's)
-    records a swap in progress once the database step has replaced it, so a
-    failed activation's retry cannot refresh the user's copy from it.
+    durably records a swap in progress before the database step changes
+    anything, so a failed or interrupted activation's retry cannot refresh
+    the user's copy from it. The mark is dropped only when that step
+    provably rolled back.
     """
     company_dir: Path = settings.company_profile_path.parent
     # "Blank" here means "no state.db yet" — true for both empty blank slots
@@ -323,12 +326,20 @@ async def _restore_slot_state(
     # 1. SQLite state — whole-DB restore (or factory wipe for blank slots),
     #    with operator-level tables carried across.
     preserved = _dump_global_tables()
-    if is_blank:
-        _wipe_per_client_tables()
-    else:
-        _restore_db_from_file(slot / "state.db")
+    # Only a marker this activation wrote may be dropped: one left by an
+    # earlier interrupted swap still says the live state is not the user's.
+    marked_here = mark_swap and not swap_in_progress(settings)
     if mark_swap:
         begin_swap(settings)
+    try:
+        if is_blank:
+            _wipe_per_client_tables()
+        else:
+            _restore_db_from_file(slot / "state.db")
+    except SwapRolledBack:
+        if marked_here:
+            end_swap(settings)
+        raise
     _ensure_schemas()
     _restore_global_tables(preserved)
     seeded: dict[str, Any] = {}
@@ -425,11 +436,15 @@ def _restore_db_from_file(state_src: Path) -> None:
 
 
 def _wipe_per_client_tables() -> None:
-    """Factory-wipe per-client tables (blank-slot activation). Existence-guarded."""
+    """Factory-wipe per-client tables (blank-slot activation). Existence-guarded.
+
+    One transaction (``swap_tables`` with no copy), so a failure that changed
+    nothing raises ``SwapRolledBack``.
+    """
     db_path = _episodic_db_path()
     if not db_path.exists():
         return
-    wipe_tables(db_path, _BLANK_WIPE_TABLES)
+    swap_tables(db_path, _BLANK_WIPE_TABLES)
 
 
 def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:
@@ -772,6 +787,10 @@ def park_active_client(settings: Any) -> str | None:
     if active is None:
         return None
     slot = _slot_dir(settings, active)
+    # The live state stays the client's until the caller's swap completes:
+    # mark it before the sentinel that says so goes, or a failed swap's retry
+    # would take it for the user's and copy it over their backup.
+    begin_swap(settings)
     if slot.is_dir():
         _save_slot_state(settings, slot)
     _active_client_sentinel(settings).unlink(missing_ok=True)

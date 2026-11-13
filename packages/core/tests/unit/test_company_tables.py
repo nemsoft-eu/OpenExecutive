@@ -29,8 +29,11 @@ import openexecutive
 from openexecutive.cli import fixture_loader
 from openexecutive.memory.company_tables import (
     COMPANY_INDEPENDENT_TABLES,
+    FIXTURE_SWAP_TABLES,
+    KEPT_BY_FIXTURE_SWAP,
     MIGRATION_MARKER_TABLES,
     PER_COMPANY_TABLES,
+    SwapRolledBack,
     swap_tables,
     wipe_tables,
 )
@@ -107,6 +110,11 @@ def test_the_registry_has_no_overlap_duplicates_or_stale_names() -> None:
     # tables kept on purpose.
     assert set(PER_COMPANY_TABLES) - created == _LEGACY_TABLES
     assert set(COMPANY_INDEPENDENT_TABLES) <= created
+    # A table the fixture swap keeps is still per-company (reset and a blank
+    # slot wipe it), each with its reason.
+    assert set(KEPT_BY_FIXTURE_SWAP) <= set(PER_COMPANY_TABLES)
+    assert all(reason.strip() for reason in KEPT_BY_FIXTURE_SWAP.values())
+    assert set(FIXTURE_SWAP_TABLES) == set(PER_COMPANY_TABLES) - set(KEPT_BY_FIXTURE_SWAP)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,8 +185,9 @@ def test_swap_tables_is_all_or_nothing(tmp_path: Path) -> None:
     with sqlite3.connect(live) as conn:
         conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
         conn.execute("INSERT INTO notes VALUES (1, 'live')")
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(SwapRolledBack) as raised:
         swap_tables(live, ("notes",), saved)
+    assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
     with sqlite3.connect(live) as conn:
         assert conn.execute("SELECT * FROM notes").fetchall() == [(1, "live")]
 
@@ -188,8 +197,9 @@ def test_swap_tables_refuses_a_missing_copy(tmp_path: Path) -> None:
     with sqlite3.connect(live) as conn:
         conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO notes VALUES (1)")
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(SwapRolledBack) as raised:
         swap_tables(live, ("notes",), tmp_path / "absent.db")
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
     with sqlite3.connect(live) as conn:
         assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
 
@@ -202,10 +212,45 @@ def test_swap_tables_refuses_a_copy_holding_none_of_the_tables(tmp_path: Path) -
     with sqlite3.connect(live) as conn:
         conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO notes VALUES (1)")
-    with pytest.raises(ValueError):
+    with pytest.raises(SwapRolledBack) as raised:
         swap_tables(live, ("notes",), saved)
+    assert isinstance(raised.value.__cause__, ValueError)
     with sqlite3.connect(live) as conn:
         assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+
+
+def test_swap_tables_holds_the_write_lock_from_the_copy_to_the_wipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row another connection commits between the copy and the wipe would be
+    in neither: wiped from the live database and missing from the copy."""
+    from openexecutive.memory import company_tables
+
+    live, copy = tmp_path / "live.db", tmp_path / "copy.db"
+    with sqlite3.connect(live) as conn:
+        conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.execute("INSERT INTO notes (body) VALUES ('mine')")
+    real_copy = company_tables._copy_database
+    late_write: list[str] = []
+
+    def _copy_then_write(db: Path, target: Path) -> None:
+        real_copy(db, target)
+        other = sqlite3.connect(live, timeout=0.1)
+        try:
+            other.execute("INSERT INTO notes (body) VALUES ('late')")
+            other.commit()
+            late_write.append("committed")
+        except sqlite3.OperationalError as exc:
+            late_write.append(str(exc))
+        finally:
+            other.close()
+
+    monkeypatch.setattr(company_tables, "_copy_database", _copy_then_write)
+    assert swap_tables(live, ("notes",), save_to=copy) == ({"notes": 1}, {})
+    assert late_write == ["database is locked"]
+    with sqlite3.connect(copy) as conn:
+        assert conn.execute("SELECT body FROM notes").fetchall() == [("mine",)]
+    assert not (tmp_path / "copy.db.tmp").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -448,8 +493,8 @@ def test_factory_reset_empties_every_per_company_table(env: Any) -> None:
 
 def test_fixture_load_swaps_every_table_and_unload_restores_it(env: Any) -> None:
     seeded = _seed_every_table(env.db)
-    swapped = set(seeded) & set(PER_COMPANY_TABLES)
-    kept = set(seeded) & set(COMPANY_INDEPENDENT_TABLES)
+    swapped = set(seeded) & set(FIXTURE_SWAP_TABLES)
+    kept = set(seeded) & (set(COMPANY_INDEPENDENT_TABLES) | set(KEPT_BY_FIXTURE_SWAP))
 
     summary = asyncio.run(fixture_loader.load_fixture("demo", env.settings))
     assert summary["auto_snapshot_taken"] is True
@@ -512,16 +557,18 @@ def test_unload_with_nothing_loaded_keeps_the_users_newer_rows(env: Any) -> None
 
 
 def test_no_table_outside_the_registry_references_a_per_company_table(env: Any) -> None:
-    """The fixture swap runs with foreign keys off, so a reference from a
-    table it does not swap would be left dangling rather than cascade."""
+    """The fixture swap and the blank-slot wipe run with foreign keys off, so a
+    reference from a table they do not swap would be left dangling rather than
+    cascade."""
     with sqlite3.connect(env.db) as conn:
         tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
         crossing = {
             (table, ref[2])
+            for swapped in (set(PER_COMPANY_TABLES), set(FIXTURE_SWAP_TABLES))
             for table in tables
-            if table not in PER_COMPANY_TABLES
+            if table not in swapped
             for ref in conn.execute(f'PRAGMA foreign_key_list("{table}")')
-            if ref[2] in PER_COMPANY_TABLES
+            if ref[2] in swapped
         }
     assert crossing == set()
 
@@ -575,7 +622,299 @@ def test_a_failed_first_slot_activation_retried_keeps_the_users_copy(
     monkeypatch.setattr(slots, "_rebuild_vector_state", _no_vector)
     asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
     asyncio.run(fixture_loader.unload_fixture(env.settings))
-    assert set(seeded) & set(PER_COMPANY_TABLES) <= _surviving(env.db, seeded)
+    # audit_log is not here: entering a blank slot wipes it and unload keeps
+    # the live one, as on main (KEPT_BY_FIXTURE_SWAP).
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(env.db, seeded)
+
+
+def _note(db: Path, body: str) -> None:
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO department_notes (department_slug, kind, body, created_at) "
+            "VALUES ('finance', 'note', ?, '2026-11-13')",
+            (body,),
+        )
+
+
+def _notes(db: Path) -> set[str]:
+    with sqlite3.connect(db) as conn:
+        return {r[0] for r in conn.execute("SELECT body FROM department_notes")}
+
+
+def _user_backup_db(env: Any) -> Path:
+    return env.settings.company_profile_path.parent / "_user_backup" / fixture_loader.USER_STATE_DB
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [sqlite3.OperationalError("database is locked"), SwapRolledBack("database is locked")],
+    ids=["unknown-outcome", "rolled-back"],
+)
+def test_a_failed_swap_after_parking_a_client_keeps_the_users_copy(
+    env: Any, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """Parking drops the client's sentinel. If the swap then fails, the live
+    state is still the client's, and the retry must not copy it over the
+    user's backup, even when the swap provably changed nothing."""
+    from openexecutive.clients import slots
+    from openexecutive.memory import company_tables
+
+    seeded = _seed_every_table(env.db)
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+    # The first activation snapshots the user's state into _user_backup.
+    asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    _note(env.db, "the client's")
+
+    real = company_tables.swap_tables
+    calls: list[int] = []
+
+    def _locked_once(*a: Any, **k: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise failure
+        return real(*a, **k)
+
+    monkeypatch.setattr(company_tables, "swap_tables", _locked_once)
+    with pytest.raises(type(failure)):
+        asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert slots.get_active_client(env.settings) is None
+    assert fixture_loader.swap_in_progress(env.settings)
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert "the client's" not in _notes(_user_backup_db(env))
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(_user_backup_db(env), seeded)
+
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert "the client's" not in _notes(env.db)
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(env.db, seeded)
+
+
+def test_a_crash_right_after_the_swap_commits_keeps_the_users_copy(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tables are wiped once the swap commits; a process dying right then
+    must still leave the swap marked, or the retried load would copy the
+    wiped database over the user's only good copy."""
+    from openexecutive.memory import company_tables
+
+    seeded = _seed_every_table(env.db)
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    real = company_tables.swap_tables
+
+    def _commit_then_die(*a: Any, **k: Any) -> Any:
+        real(*a, **k)
+        raise RuntimeError("process killed")
+
+    monkeypatch.setattr(company_tables, "swap_tables", _commit_then_die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    monkeypatch.setattr(company_tables, "swap_tables", real)
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(_user_backup_db(env), seeded)
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(env.db, seeded)
+
+
+def test_a_failure_to_mark_the_swap_keeps_the_users_copy(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writing the marker failing once (a full disk, say) must not leave
+    wiped tables behind an absent marker."""
+    seeded = _seed_every_table(env.db)
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    real = fixture_loader.begin_swap
+    calls: list[int] = []
+
+    def _fail_once(settings: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("No space left on device")
+        real(settings)
+
+    monkeypatch.setattr(fixture_loader, "begin_swap", _fail_once)
+    with pytest.raises(OSError):
+        asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(env.db, seeded)
+
+
+def test_a_crash_right_after_a_first_activations_wipe_keeps_the_users_copy(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.clients import slots
+
+    seeded = _seed_every_table(env.db)
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+    real = slots._wipe_per_client_tables
+
+    def _wipe_then_die() -> None:
+        real()
+        raise RuntimeError("process killed")
+
+    monkeypatch.setattr(slots, "_wipe_per_client_tables", _wipe_then_die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    monkeypatch.setattr(slots, "_wipe_per_client_tables", real)
+
+    asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert set(seeded) & set(FIXTURE_SWAP_TABLES) <= _surviving(env.db, seeded)
+
+
+def test_a_rolled_back_first_activation_leaves_no_marker(env: Any) -> None:
+    from openexecutive.clients import slots
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+    holder = sqlite3.connect(env.db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(SwapRolledBack):
+            asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert not fixture_loader.swap_in_progress(env.settings)
+
+
+def test_a_rolled_back_first_activation_keeps_an_earlier_swaps_marker(env: Any) -> None:
+    """A load that died after its wipe left the marker over demo rows. A first
+    activation that then rolls back must not drop it, or the next load would
+    copy the demo rows over the user's backup."""
+    from openexecutive.clients import slots
+
+    _note(env.db, "the user's")
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+    # The interrupted load: tables wiped, marker set, no fixture sentinel.
+    fixture_loader.begin_swap(env.settings)
+    with sqlite3.connect(env.db) as conn:
+        conn.execute("DELETE FROM department_notes")
+    _note(env.db, "demo row")
+
+    holder = sqlite3.connect(env.db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(SwapRolledBack):
+            asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert fixture_loader.swap_in_progress(env.settings)
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert _notes(_user_backup_db(env)) == {"the user's"}
+
+
+def test_a_reused_backup_restores_the_users_current_profile_and_docs(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backup's database copy is refreshed on every load from the user's
+    own state; its profile and docs must be too, or unload pairs fresh rows
+    with an older profile."""
+
+    async def _ingest(**_k: Any) -> int:
+        return 1
+
+    monkeypatch.setattr("openexecutive.knowledge.loader.ingest_file", _ingest)
+    company = env.settings.company_profile_path.parent
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    env.settings.company_profile_path.write_text("name: My Co Renamed\n")
+    (company / "docs" / "plan.md").write_text("# the new plan\n")
+    _note(env.db, "new")
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert "My Co Renamed" in env.settings.company_profile_path.read_text()
+    assert (company / "docs" / "plan.md").read_text() == "# the new plan\n"
+    assert "new" in _notes(env.db)
+
+
+def test_a_first_activation_from_a_reused_backup_refreshes_its_profile(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.clients import slots
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    env.settings.company_profile_path.write_text("name: My Co Renamed\n")
+    asyncio.run(slots.create_client_slot(env.settings, display_name="Fresh", slug="fresh", source="blank"))
+    asyncio.run(slots.activate_client_slot(env.settings, "fresh"))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert "My Co Renamed" in env.settings.company_profile_path.read_text()
+
+
+def test_fixture_load_and_unload_keep_the_audit_log(env: Any) -> None:
+    """The operator's record of real actions, a demo's included, as on main.
+    Only the research run rows that would make a seeded scan skip go."""
+    from openexecutive.monitoring.research.scheduler import EVENT_RAN
+
+    def _audit(event_type: str, summary: str) -> None:
+        with sqlite3.connect(env.db) as conn:
+            conn.execute(
+                "INSERT INTO audit_log (ts, event_type, summary) VALUES ('2026-11-13T09:00:00', ?, ?)",
+                (event_type, summary),
+            )
+
+    def _rows() -> set[tuple[str, str]]:
+        with sqlite3.connect(env.db) as conn:
+            return set(conn.execute("SELECT event_type, summary FROM audit_log").fetchall())
+
+    _audit("tool_call", "before the demo")
+    _audit(EVENT_RAN, "the user's last scan")
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    assert ("tool_call", "before the demo") in _rows()
+    _audit("tool_call", "during the demo")
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    rows = _rows()
+    assert {("tool_call", "before the demo"), ("tool_call", "during the demo")} <= rows
+    assert not any(event == EVENT_RAN for event, _ in rows)
+
+
+def test_a_row_written_while_the_load_copies_the_users_state_is_not_lost(
+    env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another thread or process committing between the backup's copy and the
+    wipe: its row must either wait for the swap or end up in the copy."""
+    from openexecutive.memory import company_tables
+
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    outcomes: list[str] = []
+
+    def _then_write(copy: Any) -> Any:
+        def wrapped(*a: Any, **k: Any) -> None:
+            copy(*a, **k)
+            other = sqlite3.connect(env.db, timeout=0.1)
+            try:
+                other.execute(
+                    "INSERT INTO department_notes (department_slug, kind, body, created_at) "
+                    "VALUES ('finance', 'note', 'written meanwhile', '2026-11-13')"
+                )
+                other.commit()
+                outcomes.append("committed")
+            except sqlite3.OperationalError:
+                outcomes.append("waited")
+            finally:
+                other.close()
+
+        return wrapped
+
+    monkeypatch.setattr(fixture_loader, "_save_user_state_db", _then_write(fixture_loader._save_user_state_db))
+    monkeypatch.setattr(company_tables, "_copy_database", _then_write(company_tables._copy_database))
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    # The reused backup's copy is taken under the swap's lock: the writer waits.
+    assert outcomes == ["waited"]
 
 
 def test_fixture_load_drops_the_cached_council_overrides(env: Any) -> None:
@@ -604,19 +943,36 @@ def test_the_users_own_upload_stays_withheld_during_a_demo(
         ).fetchall() == [("pending",)]
 
 
-def test_a_swap_that_changed_nothing_leaves_no_marker(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_swap_that_changed_nothing_leaves_no_marker(env: Any, tmp_path: Path) -> None:
     """The marker blocks every later refresh and snapshot, so a swap that
-    rolled back must not set it."""
+    provably rolled back (here: the database is locked) must not leave it."""
     asyncio.run(fixture_loader.load_fixture("demo", env.settings))
     asyncio.run(fixture_loader.unload_fixture(env.settings))
 
-    def _locked(*_a: object, **_k: object) -> Any:
-        raise sqlite3.OperationalError("database is locked")
+    holder = sqlite3.connect(env.db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(SwapRolledBack):
+            asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert not fixture_loader.swap_in_progress(env.settings)
 
-    monkeypatch.setattr("openexecutive.memory.company_tables.swap_tables", _locked)
+
+def test_a_swap_with_an_unknown_outcome_keeps_the_marker(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any other failure may have changed the tables, so the marker stays and
+    the user's copy is kept."""
+    asyncio.run(fixture_loader.load_fixture("demo", env.settings))
+    asyncio.run(fixture_loader.unload_fixture(env.settings))
+
+    def _unknown(*_a: object, **_k: object) -> Any:
+        raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+
+    monkeypatch.setattr("openexecutive.memory.company_tables.swap_tables", _unknown)
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(fixture_loader.load_fixture("demo", env.settings))
-    assert not fixture_loader.swap_in_progress(env.settings)
+    assert fixture_loader.swap_in_progress(env.settings)
 
 
 def test_create_from_current_refuses_an_unfinished_switch(env: Any) -> None:
