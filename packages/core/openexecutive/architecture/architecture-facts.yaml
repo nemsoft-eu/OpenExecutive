@@ -10725,12 +10725,61 @@ integrations:
     rev (docker/Dockerfile) that nothing in this repo tests: a url server's
     tools are fetched once at boot (client_manager), so a revoked key or a
     Linear outage mid-process leaves block 0 and server_names still claiming
-    Linear is connected; and the reason `load_mcp_server` cannot re-point
-    `linear` at the write endpoint is that extensible-mcp resolves a token by
-    SERVER NAME and refuses to connect a name already in use — a bump that
-    changed either would reopen that door with every test here still green.
-    Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a counting
-    answer over a large team can under-report.
+    Linear is connected; and extensible-mcp resolves a url server's bearer
+    token by SERVER NAME, but refuses a runtime `load_mcp_server` name only
+    while that name is connected. A url server whose boot `list_tools` fails
+    is logged and skipped, so after a failed boot connect extensible-mcp alone
+    would let `load_mcp_server({"name": "linear", "url": <anything>})` connect
+    and send the `linear=` token to that URL. OE closes that in its own code:
+    `MCPGateway.load_mcp_server` refuses a name whose `_normalize_tool_name`
+    form is in `_RESERVED_SERVER_NAMES` (`linear`, `regradar`), audited with
+    address `<reserved-server>`, before it reaches extensible-mcp and whatever
+    the connection state. A bump that changed token-by-name resolution (for
+    example, resolving by URL or falling back to a default token) would reopen
+    the door for any name not reserved there, with every test here still
+    green. Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a
+    counting answer over a large team can under-report.
+
+    RegRadar (read-only, enforced in code): Nemsoft's internal regulatory
+    horizon scanner, a separate service on the same host. Its MCP server is
+    not built yet (nemsoft-eu/regradar#44), so the LIVE WIRING IS PENDING: the
+    code-side gate ships first and is inert until a `regradar` entry exists.
+    Deploy-side facts the repo cannot see: a url entry in
+    company/mcp_servers.json, `"regradar": {"url":
+    "http://host.containers.internal:<port>/mcp"}`, and a `regradar=` line in
+    the tokens file (docs/regradar_setup.md). INVARIANT:
+    `mcp_gateway._REGRADAR_READ_TOOLS` is a fail-closed frozenset of exactly
+    `search_findings`, `get_finding` and `latest_digest`, the contract pinned
+    in regradar#44, so a rename is a cross-repo change. A `regradar__` name
+    whose bare form is not in it is refused by `call_tool`
+    (`_is_blocked_regradar_tool`, which shares the prefix/normalise/membership
+    helper with `_is_blocked_linear_tool`) with a "Do not retry" reason,
+    audited as `integration_outbound_blocked` with address `<regradar-write>`
+    and a summary naming RegRadar, and dropped from `search_tools` output by
+    `_always_refused_tool`. The same `_refuse` flattening and truncation
+    applies, because everything after `regradar__` is caller-chosen. Like
+    Linear, it is reachable on ordinary chat turns only: private, hosted,
+    MCP-client and delegated scheduled turns pass `PRIVATE_TURN_MCP_TOOLS` /
+    `MCP_CLIENT_MCP_TOOLS`, which name no `regradar__` tool.
+    LIMIT OF THE GUARANTEE: the gate authorises tool NAMES, not behaviour. A
+    server that implemented `search_findings` as a write would pass. That the
+    three are genuine reads with no caller-chosen fetch target rests on
+    RegRadar's implementation and on enumerating the live server's tools and
+    schemas before the entry is enabled; a mismatch means changing
+    `_REGRADAR_READ_TOOLS` deliberately, with its tests, never widening it to
+    make a call work. It is also keyed to the entry name `regradar`, exactly
+    as Linear's is to `linear`, with no look-alike-name warning.
+    The `unconfirmed_secondary` caution (a finding backed only by interpretive
+    sources must not be stated as a settled obligation) is REQUESTED of
+    RegRadar's tool descriptions and of an inline field on each such result
+    row, not added by OE: the data source owns its status vocabulary, and the
+    caution then travels with the data into a saved workflow or a later turn.
+    A gateway-side annotation stays the fallback if the live check shows the
+    model ignoring it. No entry in mcp_servers.json.example: every deployment
+    that copied it would log a connect failure for a server that exists only
+    on Nemsoft's host, and that file is shared with upstream.
+    test_regradar_readonly pins the exact set, the refusal and its audit row,
+    the search filter and the reserved runtime names.
   own_gmail: |
     Act as me (delegation) connects a second, separate Gmail — the
     principal's own — read and drafted into by delegation.gmail.DelegateGmail
