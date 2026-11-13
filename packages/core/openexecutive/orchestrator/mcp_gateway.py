@@ -223,13 +223,17 @@ _REGRADAR_READ_TOOLS: frozenset[str] = frozenset({
     "search_findings",
 })
 
-# Server names a runtime `load_mcp_server` may not use: the configured servers
-# whose tools are gated by prefix above. extensible-mcp skips a url server
-# whose boot `list_tools` fails, refuses a runtime name only while a server of
-# that name is connected, and picks the bearer token by server name. So after
-# a failed boot connect, a runtime load under `regradar` or `linear` would
-# send that entry's token to a URL the model chose. Refusing the name here
-# closes that whatever the connection state.
+# Server names a runtime `load_mcp_server` may not use. extensible-mcp skips a
+# url server whose boot `list_tools` fails, refuses a runtime name only while a
+# server of that name is connected, and picks the bearer token by server name.
+# So after a failed boot connect, a runtime load under a configured server's
+# name would send that entry's token to a URL the model chose.
+# `load_mcp_server` therefore refuses every name the config file defines
+# (`MCPGateway.server_names`, read from the file, so a failed connect is still
+# covered), plus this pair: the prefix-gated servers, reserved even when that
+# list is empty. Not covered: a tokens-file line with no config entry (one
+# left behind, or added for a planned runtime load), since closing that would
+# mean reading the tokens file here.
 _RESERVED_SERVER_NAMES: frozenset[str] = frozenset({
     _LINEAR_PREFIX.removesuffix("__"),
     _REGRADAR_PREFIX.removesuffix("__"),
@@ -782,9 +786,8 @@ def _refuse(tool: str, field: str, shown: str, *, reason: str, system: str = "Go
     refuse by prefix rather than by exact name (Linear's and RegRadar's
     allow-lists, the non-object `arguments` refusal) put a caller-chosen
     suffix in it, and the reserved-name refusal puts a caller-chosen server
-    name there: a
-    newline would forge a second line in the audit summary and the log, and
-    an arbitrarily long name would bloat the audit row."""
+    name there: a newline would forge a second line in the audit summary and
+    the log, and an arbitrarily long name would bloat the audit row."""
     from openexecutive.audit import log_event as audit_log
 
     field = _one_line(field)
@@ -4522,12 +4525,14 @@ class MCPGateway:
 
         if (refused := outside_reach_refusal("load_mcp_server")) is not None:
             return refused
-        # A configured, prefix-gated server's name would pick up its bearer
-        # token for a URL the model chose (`_RESERVED_SERVER_NAMES`).
+        # a configured server's name would pick up its bearer token for a URL
+        # the model chose (see `_RESERVED_SERVER_NAMES`); the audit label names
+        # the tool rather than a product, since no outside system is involved.
         name = tool_input.get("name")
-        if isinstance(name, str) and _normalize_tool_name(name) in _RESERVED_SERVER_NAMES:
+        reserved = _RESERVED_SERVER_NAMES | {_normalize_tool_name(n) for n in self.server_names}
+        if isinstance(name, str) and _normalize_tool_name(name) in reserved:
             return _refuse(
-                name, "name", "<reserved-server>", system="MCP gateway",
+                name, "name", "<reserved-server>", system="load_mcp_server",
                 reason=(
                     f"{_one_line(name, 120)} is a configured server's name, and a "
                     "server cannot be loaded at runtime under it. Do not retry "

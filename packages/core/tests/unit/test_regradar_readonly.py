@@ -244,8 +244,37 @@ def test_search_results_without_a_blocked_regradar_tool_come_back_byte_identical
 # --- load_mcp_server --------------------------------------------------------
 
 
-def test_the_reserved_names_are_the_prefix_gated_servers() -> None:
-    assert {"linear", "regradar"} == _RESERVED_SERVER_NAMES
+def test_every_prefix_gated_server_is_reserved() -> None:
+    """A tripwire, not a proof: it finds gates named `_X_PREFIX` +
+    `_X_READ_TOOLS`, so a new read-gated server following that convention
+    fails the equality until someone reviews whether its name is reserved."""
+    names = vars(gw_module)
+    gated = {
+        value.removesuffix("__")
+        for key, value in names.items()
+        if key.endswith("_PREFIX") and key.removesuffix("_PREFIX") + "_READ_TOOLS" in names
+    }
+    assert gated == {"linear", "regradar"}
+    assert gated <= _RESERVED_SERVER_NAMES
+
+
+@pytest.mark.parametrize("name", ["atlassian", "Atlassian", "google-workspace"])
+def test_a_runtime_load_under_any_configured_server_name_is_refused(name: str) -> None:
+    """Any url server with a tokens line has the same token-by-name hazard,
+    so every name the config file defines is refused, not only the pair."""
+    gateway, session_call = _make_gateway()
+    gateway.server_names = ("atlassian", "google_workspace")
+    result = _load(gateway, name)
+    assert _blocked(result)
+    assert session_call.await_count == 0
+
+
+def test_an_unconfigured_name_still_loads_when_servers_are_configured() -> None:
+    """Negative control: a non-empty configured list refuses only its own names."""
+    gateway, session_call = _make_gateway()
+    gateway.server_names = ("atlassian", "google_workspace")
+    assert _load(gateway, "vendor_docs") == '{"ok": true}'
+    session_call.assert_awaited_once()
 
 
 @pytest.mark.parametrize("name", ["regradar", "RegRadar", "linear", "Linear", " linear "])

@@ -10732,9 +10732,14 @@ integrations:
     would let `load_mcp_server({"name": "linear", "url": <anything>})` connect
     and send the `linear=` token to that URL. OE closes that in its own code:
     `MCPGateway.load_mcp_server` refuses a name whose `_normalize_tool_name`
-    form is in `_RESERVED_SERVER_NAMES` (`linear`, `regradar`), audited with
-    address `<reserved-server>`, before it reaches extensible-mcp and whatever
-    the connection state. A bump that changed token-by-name resolution (for
+    form is in `_RESERVED_SERVER_NAMES` (`linear`, `regradar`) or among the
+    names the config file defines (`MCPGateway.server_names`, read from the
+    file, so a server whose boot connect failed is still covered), audited
+    with address `<reserved-server>`, before it reaches extensible-mcp and
+    whatever the connection state. NOT covered: a tokens-file line with no
+    config entry (one left behind after an entry was removed, or added for a
+    planned runtime load) — closing that would mean reading the tokens file in
+    OE. A bump that changed token-by-name resolution (for
     example, resolving by URL or falling back to a default token) would reopen
     the door for any name not reserved there, with every test here still
     green. Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a

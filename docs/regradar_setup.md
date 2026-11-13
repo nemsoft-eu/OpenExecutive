@@ -75,17 +75,27 @@ regradar=<token>
 Edit the file in an editor and keep it at mode `0600`. Never put the token on
 a command line, where process listings and shell history can show it.
 
-Optionally, deny the name for runtime loads as a second line of defence, by
-adding this key to the existing `filters.load_control` block of the same
-file:
+The Executive refuses a runtime `load_mcp_server` under the name of any server
+the config file defines, and always under `regradar` and `linear`. The match
+ignores case, surrounding spaces, and hyphens versus underscores, so the model
+cannot load a server under `regradar` (or `RegRadar`) and send that entry's
+token to a URL it chose.
+
+Optionally, add a coarser deny in the deployment config itself by adding this
+key to the existing `filters.load_control` block of `mcp_servers.json` (the
+pinned extensible-mcp reads `deny_name_patterns` there, beside
+`deny_url_patterns`):
 
 ```json
 "deny_name_patterns": ["regradar*"]
 ```
 
-The Executive already refuses a runtime `load_mcp_server` named `regradar` or
-`linear`, in any spelling, so a model-chosen URL can never receive that
-entry's token. The filter repeats that refusal in the deployment config.
+It is not the same check: the pattern is case-sensitive (it does not match
+`RegRadar`, which is harmless because the token lookup is exact too), and it
+also refuses names such as `regradar_two`, which the Executive allows.
+
+Not covered by either: a line in the tokens file with no matching entry in
+`mcp_servers.json`. Remove a server's tokens line when you remove its entry.
 
 ---
 
