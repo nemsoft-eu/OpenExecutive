@@ -351,10 +351,12 @@ def _tool_lists_for_turn(final_msgs: list[object], during_round=None) -> list[li
     return captured
 
 
-def test_a_private_turn_is_never_offered_web_fetch() -> None:
+def test_a_private_turn_is_offered_web_fetch_and_the_one_check_holds_it() -> None:
     """A turn that carries a contact's mail must not open a URL its text
-    names; the client fetch is in PRIVATE_TURN_WITHHELD_TOOLS beside the
-    server search, which stays."""
+    names on its own. Every tool is offered (one stable list); the client
+    fetch is in PRIVATE_TURN_WITHHELD_TOOLS, so the one check
+    (orchestrator.levels) holds a call at dispatch, which
+    test_private_turns pins. The server search stays last."""
     _reset_settings_cache()
     os.environ["ENABLE_WEB_SEARCH"] = "true"
     try:
@@ -368,7 +370,7 @@ def test_a_private_turn_is_never_offered_web_fetch() -> None:
             tools = _tool_lists_for_turn([done])[0]
         names = [t.get("name") for t in tools]
         assert names[-1] == "web_search"
-        assert "web_fetch" not in names
+        assert "web_fetch" in names
     finally:
         _reset_settings_cache()
 

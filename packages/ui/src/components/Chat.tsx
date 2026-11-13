@@ -12,6 +12,7 @@ import MicButton from "./MicButton";
 import InfoTip from "./InfoTip";
 import OverflowMenu from "./ui/OverflowMenu";
 import { SharePanel } from "./sessions/ChatHistory";
+import { MemoryUpdatedChip } from "./memories/MemoryChanges";
 import {
   MAX_FILES_PER_TURN,
   mergePickedFiles,
@@ -32,7 +33,6 @@ import {
   sendTyping,
   setMessageFeedback,
   streamChat,
-  handOverChat,
   type ChatPeople,
   type LiveChatEvent,
 } from "@/lib/api";
@@ -53,7 +53,15 @@ import { confirmRedoText, dropLastTurn, lastTurn } from "@/lib/chatTurns";
 import { answerSourcesFrom, type AnswerSources } from "@/lib/answerSources";
 import { matchingMessages } from "@/lib/chatSearch";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
-import { WRITING_FROM_CHARS, addStep, applyPlan, planRows, showSteps, type TurnPlan } from "@/lib/turnSteps";
+import {
+  WRITING_FROM_CHARS,
+  addReads,
+  addStep,
+  applyProgress,
+  showSteps,
+  type ReadCounts,
+  type TurnProgress,
+} from "@/lib/turnSteps";
 import {
   composerText,
   markTaken,
@@ -61,6 +69,8 @@ import {
   type QueuedMessage,
 } from "@/lib/queuedMessages";
 import { newClientTurnId } from "@/lib/turn-id";
+import RepeatOfferCard from "@/components/jobs/RepeatOfferCard";
+import type { RepeatOffer } from "@/lib/api";
 import { turnStatus } from "@/lib/turnStatus";
 import { isNearBottom, lastUserIndex, pinScrollTop, pinSpacerHeight } from "@/lib/chatPin";
 
@@ -95,6 +105,10 @@ interface ChatProps {
   member?: { sharedBy: string; onLeft?: () => void };
   // Bumped by the parent to open the Share panel (its ⋯ menu's Share).
   shareRequest?: number;
+  // Opened from a working row's Watch on Home: the chat may have a turn
+  // running on the server with no page of its own (an approved card's turn),
+  // which saves nothing until it ends, so follow it live meanwhile.
+  watch?: boolean;
 }
 
 // The browser's own highlight for found words, where it has one
@@ -124,13 +138,19 @@ function endsOnReply(messages: ChatMessage[] | undefined): boolean {
 const FALLBACK_SUBTITLE =
   "Pick up where we left off — decisions to revisit, drafts to push forward, people to pull in.";
 
-export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind, member, shareRequest }: ChatProps) {
+export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind, member, shareRequest, watch }: ChatProps) {
   const { data: session } = useSession();
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
   const executiveName = useExecutiveName();
 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages ?? []);
   const [input, setInput] = useState(initialInput ?? "");
+  // While the mic listens: what the box held when it started (the heard
+  // words go after it), and the browser's guess at the latest words, drawn
+  // tinted after the box's text until they settle.
+  const dictationBaseRef = useRef<string | null>(null);
+  const [dictating, setDictating] = useState(false);
+  const [heardPending, setHeardPending] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const { isStopping, beginTurn, stop: handleStop, serverAcknowledgedStop, endTurn } =
     useStoppableTurn();
@@ -139,6 +159,21 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Inline action chips that arrived for the in-flight assistant message.
   // Reset on every turn; frozen onto the message at `done` event time.
   const [streamingActions, setStreamingActions] = useState<ActionTaken[]>([]);
+  // An offer to do what they keep asking for on a schedule, under the reply
+  // to the repeated ask (workflows/repeat_asks.py). Gone once answered or
+  // when they send the next message; it stays on Workflows until answered.
+  const [repeatOffer, setRepeatOffer] = useState<{ offer: RepeatOffer; sessionId?: string } | null>(null);
+  // Replies this browser saw finish, by row id: the window the "Memory
+  // updated" chip under each looks in; `memorySeen` keeps a change on one
+  // chip only.
+  const [memoryWatch, setMemoryWatch] = useState<Record<number, { sessionId: string; since: string }>>({});
+  const memorySeen = useMemo(() => new Set<string>(), []);
+  // Replies whose Memory updated chip has rows: only those drop their own
+  // remember_fact chip, so a saved fact always shows one or the other.
+  const [memoryShown, setMemoryShown] = useState<Set<number>>(() => new Set());
+  const markMemoryShown = useCallback((id: number) => {
+    setMemoryShown((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+  }, []);
   const [isConsulting, setIsConsulting] = useState(false);
   // The reply whose held steps the person put off with Not now (its index).
   const [heldDismissed, setHeldDismissed] = useState<number | null>(null);
@@ -146,9 +181,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // The running turn's steps (lib/turnSteps.ts), and whether the person
   // pressed I'll finish it and the turn is writing up what it has.
   const [turnSteps, setTurnSteps] = useState<string[]>([]);
-  // The plan the turn showed up front, if it sent one, and whether the reply
-  // itself is being written (answer text since the last tool round).
-  const [turnPlan, setTurnPlan] = useState<TurnPlan | null>(null);
+  // What the turn shows while it works, if it sent any (task, live line,
+  // used, found), the reads counted from its rounds, the card's live line,
+  // and whether the reply itself is being written (answer text since the
+  // last tool round).
+  const [turnProgress, setTurnProgress] = useState<TurnProgress | null>(null);
+  const [turnReads, setTurnReads] = useState<ReadCounts>({});
+  const [liveLine, setLiveLine] = useState<string | null>(null);
   const [writingReply, setWritingReply] = useState(false);
   const [handingOver, setHandingOver] = useState(false);
   const [committeeEnabled, setCommitteeEnabled] = useState(false);
@@ -345,6 +384,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setSettling(null);
   }, []);
 
+  // Watch (see the prop): follow the server's turn live while the chat it
+  // opened has nothing saved, until that turn ends.
+  const [watchDone, setWatchDone] = useState<string | null>(null);
+  const watching = Boolean(watch) && Boolean(sessionId) && sessionId === initialSessionId
+    && watchDone !== sessionId && messages.length === 0 && !isLoading && !streamingContent;
+
   const onLiveEvent = (event: LiveChatEvent) => {
     const before = liveRef.current;
     const step = applyLiveEvent(before, event, {
@@ -358,9 +403,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     if (step.state.typing.length) setClock(Date.now());
     if (step.reload) void reloadMessages();
     if (step.people) setPeopleVersion((v) => v + 1);
-    if (step.closed) setClosed(step.closed);
+    // A watched chat that isn't shared has no one to close it: a "removed"
+    // there means the turn hasn't started or left nothing saved, so stop
+    // following instead of showing the chat as closed.
+    if (watching && (event.type === "turn_ended" || step.closed)) setWatchDone(sessionId ?? null);
+    else if (step.closed) setClosed(step.closed);
   };
-  useLiveChat(sessionId, shared && !closed, onLiveEvent);
+  useLiveChat(sessionId, (shared || watching || live.turn !== null) && !closed, onLiveEvent);
 
   // "Is typing" fades on its own: tick while anyone is.
   useEffect(() => {
@@ -552,12 +601,18 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setIsLoading(true);
     isLoadingRef.current = true;
     turnClock.start();
+    // Back a little, so a clock a few seconds ahead of the server's still
+    // catches what this turn keeps.
+    const turnSince = new Date(Date.now() - 30_000).toISOString();
     setStreamingContent("");
     setStreamingActions([]);
+    setRepeatOffer(null);
     setIsConsulting(false);
     setActivityLabel(null);
     setTurnSteps([]);
-    setTurnPlan(null);
+    setTurnProgress(null);
+    setTurnReads({});
+    setLiveLine(null);
     setWritingReply(false);
     setHandingOver(false);
     setCommitteePhase(null);
@@ -576,6 +631,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     let accumulated = "";
     // Answer text since the last tool round (WRITING_FROM_CHARS).
     let roundText = 0;
+    // Whether this round's show_progress already set the live line.
+    let progressThisRound = false;
     // Local mirror of streamingActions so the closure builds the final
     // message without depending on the async setState applying first.
     const turnActions: ActionTaken[] = [];
@@ -632,10 +689,20 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           // running, and clearing there would flicker the line off and on.
           setActivityLabel(item.label);
           setTurnSteps((prev) => addStep(prev, item.label));
+          setTurnReads((prev) => addReads(prev, item.reads));
+          // The turn's own words for this round, when it sent them just
+          // before (show_progress comes ahead of the round's activity), say
+          // more than the generic label.
+          if (!progressThisRound) setLiveLine(item.label);
+          progressThisRound = false;
           roundText = 0;
           setWritingReply(false);
-        } else if (item.type === "plan") {
-          setTurnPlan((prev) => applyPlan(prev, item.steps, item.current));
+        } else if (item.type === "progress") {
+          setTurnProgress((prev) => applyProgress(prev, item));
+          if (item.now?.trim()) {
+            setLiveLine(item.now.trim());
+            progressThisRound = true;
+          }
         } else if (item.type === "handing_over") {
           setHandingOver(true);
         } else if (item.type === "thinking") {
@@ -651,6 +718,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         } else if (item.type === "action_taken") {
           turnActions.push(item);
           setStreamingActions([...turnActions]);
+        } else if (item.type === "repeat_offer") {
+          setRepeatOffer({ offer: item.offer, sessionId: item.session_id });
         } else if (item.type === "sources") {
           turnSources = answerSourcesFrom(item);
         } else if (item.type === "held_steps") {
@@ -722,6 +791,11 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         // Only a complete, persisted reply gets a follow-up: a stopped one
         // is half an answer, and without an id there is nothing to key on.
         if (!wasStopped && replyId && doneSessionId) loadFollowup(doneSessionId);
+        if (replyId && doneSessionId) {
+          const watched = { sessionId: doneSessionId, since: turnSince };
+          const id = replyId;
+          setMemoryWatch((prev) => ({ ...prev, [id]: watched }));
+        }
       }
       setStreamingContent("");
       setStreamingActions([]);
@@ -778,7 +852,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       setIsConsulting(false);
       setActivityLabel(null);
       setTurnSteps([]);
-      setTurnPlan(null);
+      setTurnProgress(null);
+      setTurnReads({});
+      setLiveLine(null);
       setWritingReply(false);
       setHandingOver(false);
       setCommitteePhase(null);
@@ -888,6 +964,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Enter and the Send button: an edit replaces the last turn.
   function submit() {
     if (redoing) return;
+    // The mic is still listening or writing it out: stop it first.
+    if (dictating) return;
     // One turn at a time in a shared chat: wait for someone else's to end.
     if (!editing && !isLoading && liveRef.current.turn) return;
     if (editing) void sendEdit();
@@ -907,16 +985,16 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     fallbackLabel: FALLBACK_ACTIVITY_LABEL,
   });
 
-  // I'll finish it: the turn stops working and writes up what it has. The
-  // button stays off once pressed; if the turn won't take it (it already
-  // finished or was stopped) the reply that arrives is its own.
-  async function handleHandOver() {
-    const id = turnIdRef.current;
-    if (!id || handingOver) return;
-    setHandingOver(true);
-    if (!(await handOverChat(id))) setHandingOver(false);
-  }
-  const stepsShown = isLoading && (turnPlan !== null || showSteps(turnSteps)) && !committeePhase;
+  const stepsShown = isLoading && (turnProgress !== null || showSteps(turnSteps)) && !committeePhase;
+  const turnStepsLine = (
+    <TurnSteps
+      progress={turnProgress}
+      reads={turnReads}
+      liveLine={writingReply ? "Writing the answer" : liveLine}
+      elapsed={status.elapsed}
+      handingOver={handingOver}
+    />
+  );
 
   // Fill the composer with the suggestion without sending it, so the user
   // can edit first. The suggestion is kept: clearing the box shows it again.
@@ -933,7 +1011,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     });
   }
 
-  const showFollowup = Boolean(followup) && !input && !isLoading && !live.turn;
+  const showFollowup = Boolean(followup) && !input && !isLoading && !live.turn && !dictating;
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // Tab / → take the suggestion only while the box is empty; otherwise
@@ -1199,7 +1277,14 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 <Message
                   role={msg.role}
                   content={msg.content}
-                  actions={msg.role === "assistant" ? msg.actions : undefined}
+                  actions={
+                    msg.role !== "assistant"
+                      ? undefined
+                      : msg.id && memoryShown.has(msg.id)
+                        ? // The Memory updated chip below says it, with an Undo.
+                          msg.actions?.filter((a) => a.tool !== "remember_fact")
+                        : msg.actions
+                  }
                   stopped={msg.role === "assistant" ? msg.stopped : undefined}
                   sources={msg.role === "assistant" ? msg.sources : undefined}
                   feedback={msg.role === "assistant" && !member ? msg.feedback : undefined}
@@ -1215,6 +1300,15 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   }
                   onRetry={canRedo && i === turn.replyIndex ? () => void handleRetry() : undefined}
                   onEdit={canRedo && !editing && i === turn.userIndex ? startEdit : undefined}
+                  memory={
+                    msg.role === "assistant" && msg.id && memoryWatch[msg.id] ? (
+                      <MemoryUpdatedChip
+                        {...memoryWatch[msg.id]}
+                        seen={memorySeen}
+                        onShown={() => markMemoryShown(msg.id as number)}
+                      />
+                    ) : undefined
+                  }
                 />
                 {!member &&
                   msg.role === "assistant" &&
@@ -1244,20 +1338,20 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 </div>
               ))}
 
-              {stepsShown && (
-                <div className="pl-12">
-                  <TurnSteps
-                    steps={turnSteps}
-                    plan={turnPlan ? planRows(turnPlan, { writing: writingReply, handingOver }) : null}
-                    liveLabel={writingReply ? null : activityLabel}
-                    elapsed={status.elapsed}
-                    handingOver={handingOver}
-                    stopping={isStopping}
-                    onStop={() => void handleStop()}
-                    onHandOver={() => void handleHandOver()}
-                  />
-                </div>
-              )}
+              {stepsShown &&
+                (streamingContent ? (
+                  <div className="pl-12">{turnStepsLine}</div>
+                ) : (
+                  <div className="flex gap-4">
+                    <div className="flex-shrink-0 mt-1">
+                      <BrandMark size="md" consulting />
+                    </div>
+                    <div className="flex-1 pt-1.5">
+                      <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
+                      {turnStepsLine}
+                    </div>
+                  </div>
+                ))}
 
               {streamingContent && (
                 <Message
@@ -1316,6 +1410,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 </>
               )}
             </>
+          )}
+          {repeatOffer && !isLoading && (!repeatOffer.sessionId || repeatOffer.sessionId === sessionId) && (
+            <RepeatOfferCard
+              offer={repeatOffer.offer}
+              onDone={() => setRepeatOffer(null)}
+              className="mb-8 sm:ml-12"
+            />
           )}
           <div ref={bottomRef} />
         </div>
@@ -1456,13 +1557,27 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   {followup}
                 </div>
               )}
+              {dictating && heardPending && (
+                <div
+                  aria-hidden
+                  className="col-start-1 row-start-1 pointer-events-none text-sm sm:text-base leading-relaxed whitespace-pre-wrap break-words max-h-40 overflow-hidden"
+                >
+                  <span className="text-transparent">{input ? `${input} ` : ""}</span>
+                  <span className="text-fg-muted bg-accent/15 rounded">{heardPending}</span>
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 value={input}
                 onChange={handleTextareaChange}
                 onKeyDown={handleKeyDown}
+                readOnly={dictating}
                 placeholder={
-                  isLoading
+                  dictating
+                    ? heardPending
+                      ? ""
+                      : "Listening… start talking"
+                    : isLoading
                     ? WORKING_PLACEHOLDER
                     : blockedBy
                       ? `The Executive is answering ${blockedBy}…`
@@ -1481,8 +1596,19 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             {!isLoading && (
               <MicButton
                 disabled={Boolean(blockedBy)}
+                onLive={(settled, pending) => {
+                  if (dictationBaseRef.current === null) dictationBaseRef.current = input;
+                  setDictating(true);
+                  setInput(joinDictation(dictationBaseRef.current, settled));
+                  setHeardPending(pending);
+                }}
                 onText={(text) => {
-                  setInput((prev) => joinDictation(prev, text));
+                  // The written-out words replace the live ones.
+                  const base = dictationBaseRef.current;
+                  dictationBaseRef.current = null;
+                  setDictating(false);
+                  setHeardPending("");
+                  setInput((prev) => joinDictation(base ?? prev, text));
                   setFileError(null);
                   textareaRef.current?.focus();
                 }}
@@ -1508,8 +1634,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 onClick={submit}
                 disabled={
                   editing
-                    ? !input.trim() || redoing
-                    : Boolean(blockedBy) || (!input.trim() && pendingFiles.length === 0)
+                    ? dictating || !input.trim() || redoing
+                    : dictating || Boolean(blockedBy) || (!input.trim() && pendingFiles.length === 0)
                 }
                 aria-label={isLoading ? "Add to what it's working on" : editing ? "Send edited message" : "Send message"}
                 className="flex-shrink-0 w-11 h-11 rounded-xl bg-accent-strong hover:bg-accent-strong/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"

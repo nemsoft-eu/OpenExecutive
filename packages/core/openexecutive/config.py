@@ -168,6 +168,15 @@ class Settings(BaseSettings):
         None, ge=0.0, le=2.0, alias="KNOWLEDGE_BUILTIN_DISTANCE_THRESHOLD"
     )
     knowledge_builtin_n_results: int = Field(5, alias="KNOWLEDGE_BUILTIN_N_RESULTS")
+    # Whether the Executive's own chat turns (web chat, chat apps, email) get
+    # built-in playbook excerpts matched to the message. Off by
+    # default: on real turns most matches were unrelated (a procurement
+    # playbook for a pricing question, a board-meeting one for "when is the
+    # next daily meeting?"), and the good and bad matches score alike, so a
+    # stricter gate can't separate them. Company documents still come with
+    # every turn, and a specialist the Executive consults still reads its own
+    # domain's playbooks.
+    knowledge_chat_builtin: bool = Field(False, alias="KNOWLEDGE_CHAT_BUILTIN")
     knowledge_company_n_results: int = Field(3, alias="KNOWLEDGE_COMPANY_N_RESULTS")
     # Total characters of knowledge excerpts a chat turn carries (web chat,
     # Telegram, Discord, Google Chat). The closest matches are kept first.
@@ -520,11 +529,12 @@ class Settings(BaseSettings):
     # Whole-turn wall-clock ceiling for a streaming chat turn. Raised from 120s
     # because deep multi-specialist turns were being cut off mid-answer. A
     # ceiling this high is only tolerable because the user can end a turn
-    # themselves — see POST /chat/stop in api/routes/chat.py.
-    chat_stream_timeout_s: float = Field(300.0, alias="CHAT_STREAM_TIMEOUT_S")
+    # themselves — see POST /chat/stop in api/routes/chat.py. Raised again to
+    # 600s: filing two emails' worth of attachments to Drive ran past 300s.
+    chat_stream_timeout_s: float = Field(600.0, alias="CHAT_STREAM_TIMEOUT_S")
 
     # Extra wall-clock allowance added to chat_stream_timeout_s when a request
-    # opts in to Committee review (so 360s in total at the defaults). Committee
+    # opts in to Committee review (so 660s in total at the defaults). Committee
     # adds three reviewer calls + one full-pass revision on top of the draft,
     # typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
@@ -1290,8 +1300,12 @@ class Settings(BaseSettings):
     # ROUTING_MODEL.
     chat_review_enabled: bool = Field(True, alias="CHAT_REVIEW_ENABLED")
     chat_review_quiet_minutes: int = Field(30, ge=1, alias="CHAT_REVIEW_QUIET_MINUTES")
-    chat_review_max_per_day: int = Field(10, ge=0, alias="CHAT_REVIEW_MAX_PER_DAY")
+    chat_review_max_per_day: int = Field(50, ge=0, alias="CHAT_REVIEW_MAX_PER_DAY")
     chat_review_model: str = Field("", alias="CHAT_REVIEW_MODEL")
+    # What it worked out (memory.worked_out): figures the Executive worked
+    # out, kept with their source for that person's later turns.
+    worked_out_enabled: bool = Field(True, alias="WORKED_OUT_ENABLED")
+    worked_out_max_per_day: int = Field(40, ge=0, alias="WORKED_OUT_MAX_PER_DAY")
     # Replay of the misses (memory.replay): nightly, the turns the review
     # graded a miss run again with today's lessons and facts, in a dry run,
     # and a judge says whether they would now go right. At most MAX_CASES a
@@ -1382,7 +1396,7 @@ class Settings(BaseSettings):
         20, alias="DELEGATION_WORKFLOW_MAX_SENDS_PER_DAY", ge=1, le=500
     )
     # Whether the owner may let team members use Act as me for themselves
-    # (Delegate → Act as me → "Let team members use it", off until they turn
+    # (Delegate → Advanced → "Let team members use it", off until they turn
     # it on). Off: the owner alone, as before (delegation.settings).
     delegation_team_members: bool = Field(False, alias="DELEGATION_TEAM_MEMBERS")
 

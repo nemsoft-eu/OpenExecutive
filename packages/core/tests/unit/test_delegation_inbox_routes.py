@@ -204,7 +204,7 @@ def test_local_login_sends_with_no_caller_header(
     assert mailbox.sent == ["d1"]
 
 
-def test_send_and_allow_through_decisions(
+def test_send_and_keep_the_example_through_decisions(
     client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from openexecutive.delegation import training
@@ -212,20 +212,13 @@ def test_send_and_allow_through_decisions(
     mailbox, card_id = _card(ids["principal"], monkeypatch)
     monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    # Not in training: refused, nothing sent.
-    resp = client.post(f"/decisions/{card_id}/approve", json={"edits": {"allow": True}}, headers=OWNER)
-    assert resp.status_code == 422 and resp.json()["detail"]["code"] == "cant_allow"
-    assert mailbox.sent == []
-    training.set_(ids["principal"], {training.REPLIES: True, training.DRAFTS: True}, updated_by="t")
-    assert client.get("/delegation/replies", headers=OWNER).json()["cards"][0]["can_allow"] is True
+    training.set_(ids["principal"], {training.DRAFTS: True}, updated_by="t")
+    assert client.get("/delegation/replies", headers=OWNER).json()["cards"][0]["learns_style"] is True
     mailbox.edit("d1")
     mailbox.drafts["d1"].message.text = "Dana, Friday is great."
-    resp = client.post(
-        f"/decisions/{card_id}/approve", json={"edits": {"allow": True, "example": True}}, headers=OWNER,
-    )
+    resp = client.post(f"/decisions/{card_id}/approve", json={"edits": {"example": True}}, headers=OWNER)
     assert resp.status_code == 200 and mailbox.sent == ["d1"]
     assert training.example_for(ids["principal"], "dana@northpeak.example") == "Dana, Friday is great."
-    assert training.allowed_sender(ids["principal"], "dana@northpeak.example") is not None
 
 
 def test_keeping_replies_in_the_mailbox_is_the_callers_own_choice_and_off_by_default(
@@ -322,3 +315,40 @@ def test_reply_from_home_makes_a_card(client: TestClient, ids: dict[str, int], m
     set_enabled(ids["principal"], False, updated_by="t")
     off = client.post("/delegation/mail/reply", json={"thread_id": "t1", "message_id": "m1"}, headers=OWNER)
     assert off.status_code == 409 and off.json()["detail"]["code"] == "act_as_me_off"
+
+
+def test_work_typed_on_a_card_goes_to_the_executive(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import answers, card_work
+
+    _mailbox, card_id = _card(ids["principal"], monkeypatch)
+
+    async def needs_work(*_a: Any, **_k: Any) -> Any:
+        raise answers.NeedsWork("make the spreadsheet")
+
+    monkeypatch.setattr(answers, "change", needs_work)
+    started: list[tuple[int, str]] = []
+
+    def start(person: Any, decision_id: int, *, ask: str = "", **_k: Any) -> bool:
+        started.append((decision_id, ask))
+        card_work._RUNNING.add(decision_id)
+        return card_work._set_work(decision_id, card_work.WORKING)
+
+    monkeypatch.setattr(card_work, "start", start)
+    url = f"/delegation/replies/{card_id}/change"
+    try:
+        resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
+        assert resp.status_code == 200
+        assert resp.json()["working"] is True and resp.json()["changed_sentences"] == []
+        assert started == [(card_id, "Make the spreadsheet")]
+        # Again while it runs: busy.
+        monkeypatch.setattr(card_work, "start", lambda *_a, **_k: False)
+        resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
+        assert resp.status_code == 409 and resp.json()["detail"]["code"] == "busy"
+        # Not running and it can't start (no longer waiting): gone.
+        card_work._RUNNING.discard(card_id)
+        resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
+        assert resp.status_code == 404
+    finally:
+        card_work._RUNNING.discard(card_id)

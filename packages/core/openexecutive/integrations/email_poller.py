@@ -66,6 +66,8 @@ _failed_attempts: dict[str, int] = {}
 _MAX_ATTEMPTS = 3
 # What a settings stub without `email_turn_timeout_s` gets (config's default).
 _DEFAULT_TURN_TIMEOUT_S = 300.0
+# The wait before the sender check is tried a second time (_prove).
+_PROVE_RETRY_S = 2.0
 
 _SKIP_SENDERS = ("noreply", "no-reply", "mailer-daemon", "postmaster", "do-not-reply")
 
@@ -147,6 +149,8 @@ _REPLY_SUBJECT_RE = re.compile(
     r"^(\[[^\]]{0,40}\]\s*)*(re|fwd?|fw|aw|wg|sv|antw|r)(\[\d{1,3}\])?\s*:",
     re.IGNORECASE,
 )
+# A reply's subject (not a forward's), for _retrieval_query.
+_ANSWER_SUBJECT_RE = re.compile(r"^\s*(\[[^\]]{0,40}\]\s*)*(re|aw|sv|antw|r)(\[\d{1,3}\])?\s*:", re.IGNORECASE)
 # An attachment line is `N. <filename> (<mime>, <size> KB)`, optionally
 # followed by ` [in attached message]`. Parsed by splitting from the right
 # rather than one regex: the filename is free text an email sender controls,
@@ -299,6 +303,29 @@ def _attribution_end(body: list[str], i: int) -> tuple[int, bool] | None:
     return None
 
 
+def _retrieval_query(raw_email: str) -> str:
+    """What to search Knowledge for on an email turn: its subject and what
+    the sender wrote, not the raw mail (whose first lines are headers), cut
+    to 500 characters. The raw start when the mail has no text of its own."""
+    header, body_lines, _attachments = _split_gmail_content(raw_email)
+    subject = next(
+        (line.split(":", 1)[1] for line in header if line.strip().lower().startswith("subject:")), "",
+    )
+    new_lines, _forwarded = _new_text_lines(body_lines)
+    # A reply's subject is the old topic ("Re: last week's question"), and it
+    # drowned out what was asked, so a reply searches only the new lines;
+    # "Re:"/"Fwd:" never reach the search.
+    topic = subject.strip()
+    for _ in range(5):
+        stripped = _REPLY_SUBJECT_RE.sub("", topic, count=1).strip()
+        if stripped == topic:
+            break
+        topic = stripped
+    is_reply = _ANSWER_SUBJECT_RE.match(subject) is not None and any(line.strip() for line in new_lines)
+    words = "\n".join(line for line in ("" if is_reply else topic, *new_lines) if line.strip()).strip()
+    return (words or topic or raw_email)[:500]
+
+
 def _new_text_lines(body: list[str]) -> tuple[list[str], bool]:
     """The sender's own lines, without quoted replies, stopping where an
     older message is appended below. Returns (lines, whether a forwarded
@@ -435,6 +462,28 @@ async def _handle_email(
         )
 
 
+# A raw read that is a message: it carries mail headers. An error the tool
+# printed instead ("Error: ...") does not.
+_MIME_HEADER_RE = re.compile(r"(?mi)^(?:received|authentication-results|message-id|from|date):")
+
+
+async def _prove_sender(gateway: Any, message_id: str, from_addr: str) -> bool:
+    """Whether the mail provider authenticated the sender of ``message_id``.
+    A raw read that failed reads as "not authenticated", and a
+    contact's real mail was then treated as possibly forged. When the read
+    gives nothing back, or gives back an error instead of a message, the
+    check is tried once more after a short wait. A message that was read and
+    didn't pass is final, so forged mail costs no wait."""
+    from openexecutive.integrations import fact_confirmation
+
+    if await fact_confirmation.sender_authenticated(gateway, message_id, from_addr):
+        return True
+    if _MIME_HEADER_RE.search(await fact_confirmation.read_raw(gateway, message_id)):
+        return False
+    await asyncio.sleep(_PROVE_RETRY_S)
+    return await fact_confirmation.sender_authenticated(gateway, message_id, from_addr)
+
+
 async def _handle_one_email(
     gateway: MCPGateway,
     message_id: str,
@@ -456,9 +505,7 @@ async def _handle_one_email(
     from_addr = msg.from_addr
 
     async def _prove() -> bool:
-        from openexecutive.integrations.fact_confirmation import sender_authenticated
-
-        return await sender_authenticated(gateway, message_id, from_addr)
+        return await _prove_sender(gateway, message_id, from_addr)
 
     async def _no_send(_to: str, _body: str, _in_thread: bool) -> str | None:
         return "the mailbox's answer is sent with its reply tool"
@@ -552,7 +599,18 @@ async def _handle_mail(
     if any(p in sender_blob for p in _SKIP_SENDERS):
         logger.debug("skipping automated sender for message=%s", message_id)
         return _SKIPPED
-    if mailbox is None and not from_addr:
+    if not message_id.strip("0"):
+        # No real message behind it: a fetch of id "0" returns an error text,
+        # not mail. Nothing to mark read, and never a turn.
+        logger.warning("skipping message=%r: not a real message id", message_id)
+        return _SKIPPED
+    if not from_addr:
+        # No sender to answer. Mailbox mail is marked read so it can't fill
+        # the capped unread listing and starve newer mail; the principal still
+        # finds it in the inbox. A source's mail is left to the source.
+        logger.warning("skipping message=%s with no sender", message_id)
+        if mailbox is not None and done is not None:
+            await done()
         return _SKIPPED
 
     if mailbox is not None and gateway is not None:
@@ -1093,7 +1151,7 @@ async def _run_executive(
     with its send tool (``reply_block``); mail from a mail source
     (``source``) is answered by mailing the turn's answer through the source,
     which this returns the outcome of."""
-    from openexecutive.knowledge.retriever import retrieve
+    from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
     from openexecutive.memory.episodic import format_for_prompt
     from openexecutive.onboarding.profile_builder import load_or_create_profile
     from openexecutive.orchestrator.executive import Executive
@@ -1365,6 +1423,22 @@ async def _run_executive(
         )
     if attachment_text:
         base_message += f"\n\n--- ATTACHMENT TEXT ---\n{attachment_text}"
+    # What this turn's answers already mailed the sender on this thread
+    # (integrations.email_replies), since the quoted chain may be trimmed.
+    if source is not None and answer_to == from_addr.strip().lower():
+        from openexecutive.integrations import email_replies
+
+        # Their other addresses too (People entry), so a reply on one thread
+        # is known on the next. Other threads only when the mail proved its
+        # sender: a forged From must not read back what went to the real one.
+        proven = session.email_authenticated is True or session.email_sender_authenticated is True
+        their = [getattr(person, "email", "") or "", *(getattr(person, "email_aliases", None) or [])]
+        earlier = email_replies.block(
+            session_id or session.session_id, answer_to,
+            also=[a for a in their if isinstance(a, str)], elsewhere=proven,
+        )
+        if earlier:
+            base_message += f"\n\n{earlier}"
     if reply_block:
         base_message += f"\n\n{reply_block}"
     if source is not None:
@@ -1375,7 +1449,14 @@ async def _run_executive(
             "above and the images you could see are with this message; any other attachment is "
             "listed by name only, so ask for what you need in the body if it matters.\n"
         )
-    if from_addr:
+    # What went to a principal (a brief or digest, scheduler.runner
+    # _remember_for_email_reply, can carry what is private to them) is read
+    # back only by mail the mailbox proved is theirs: a forged From in a
+    # principal's name must not pull it into a turn its own text steers.
+    principal_unproven = getattr(person, "is_principal", False) is True and not (
+        session.email_authenticated or other_principal_proven
+    )
+    if from_addr and not principal_unproven:
         from openexecutive.integrations.inbound_hydration import (
             hydrate_user_message,
         )
@@ -1412,7 +1493,9 @@ async def _run_executive(
             response = await executive.chat(
                 user_message=base_message,
                 session=session,
-                retrieved_context=retrieve(query=raw_email[:500]),
+                retrieved_context=await asyncio.to_thread(
+                    retrieve, query=_retrieval_query(raw_email), n_builtin=chat_builtin_results()
+                ),
                 episodic_context=format_for_prompt(),
                 person_id=person_id,
                 co_present_person_ids=co_present_person_ids or None,
@@ -1506,6 +1589,12 @@ async def _send_answer(source: InboundMail, response: Any, to: str, session_id: 
         session_id=session_id,
         details={"channel": "email", "provider": source.source, "to": to, "error": error},
     )
+    # Only an answer in the thread to the sender is the thread's; one
+    # redirected to the principal belongs to their own conversation.
+    if error is None and session_id and in_thread:
+        from openexecutive.integrations import email_replies
+
+        email_replies.record(session_id, to, answer)
     return "answered" if error is None else f"answer not sent: {error}"
 
 

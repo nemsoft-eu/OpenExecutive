@@ -43,16 +43,17 @@ logger = logging.getLogger(__name__)
 
 MODES = ("enforce", "report", "off")
 
-# Both point at the "Left out of your brief" block on Home, which lists the
-# held-back lines (``recent_held_back`` below, served by GET /today).
+# Both point at the "Left out of your brief" block in Memory, What it does,
+# which lists the held-back lines (``recent_held_back`` below, served by
+# GET /today/held-back).
 HELD_BACK_NOTE = (
     "_I left out {n} line{s} that named people or figures I couldn't match to "
-    "your data. They're under Left out of your brief on Home._"
+    "your data. They're under Left out of your brief in Memory, What it does._"
 )
 HELD_BACK_ALL = (
     "Everything I drafted for this brief named people or figures I couldn't "
     "match to your data, so I've held it back. The lines are under Left out "
-    "of your brief on Home."
+    "of your brief in Memory, What it does."
 )
 # The briefs whose held-back lines Home lists (``surface`` on the audit row).
 BRIEF_SURFACES = ("morning brief", "end-of-day digest")
@@ -186,9 +187,12 @@ _ALWAYS_MASK = re.compile(
     r"|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
     re.IGNORECASE,
 )
-# Masked in prose only: things that look like figures but never are.
+# Masked in prose only: things that look like figures but never are. A card
+# number ("card 220") is an id, not a figure: checked, it held the line back
+# when the context didn't print it, and cited, it got a "[1]" of its own.
 _PROSE_MASK = re.compile(
     r"\[\d{1,2}\]"
+    r"|\b(?:cards?|alerts?)(?:\s*_?id)?(?:\s*[=:#]\s*|\s+)#?\d+\b"
     r"|^\s*\d+[.)]\s"
     r"|\b\d{1,2}\s?[ap]\.?m\b\.?"
     rf"|\b{_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?\b"

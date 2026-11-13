@@ -60,6 +60,16 @@ def _no_ai_disclosure(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_inbox_work(monkeypatch: pytest.MonkeyPatch):
+    """The inbox's work turn on a reply card (delegation.card_work) runs a
+    whole Executive turn: never in a test that only makes cards.
+    test_delegation_card_work.py starts it with its own Executive."""
+    from openexecutive.delegation import card_work
+
+    monkeypatch.setattr(card_work, "start", lambda *_a, **_k: False)
+
+
+@pytest.fixture(autouse=True)
 def _outside_content_asks(monkeypatch: pytest.MonkeyPatch):
     """Hold every outside read, as "Ask every time" does
     (orchestrator.outside_mode), whatever the test database stores, so the
@@ -68,6 +78,24 @@ def _outside_content_asks(monkeypatch: pytest.MonkeyPatch):
     from openexecutive.orchestrator import outside_mode
 
     monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.ASK)
+
+
+@pytest.fixture
+def stored_department_levels(monkeypatch: pytest.MonkeyPatch):
+    """Run each department at the level its test stored on it
+    (``authority_level``), instead of the company's Approvals level
+    (``departments.authority.department_level``), so routing tests can set
+    one department per level. No department, or an unknown one, is
+    Balanced's."""
+    from openexecutive.departments import authority
+    from openexecutive.departments import registry as dept_registry
+    from openexecutive.departments.models import AuthorityLevel
+
+    def stored(slug: str) -> AuthorityLevel:
+        state = dept_registry.get_state(slug) if slug else None
+        return state.config.authority_level if state is not None else AuthorityLevel.PROPOSE_ONLY
+
+    monkeypatch.setattr(authority, "department_level", stored)
 
 
 @pytest.fixture(autouse=True)
@@ -88,6 +116,16 @@ def _content_scan_unchecked(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(content_scan, "scan", unchecked)
     monkeypatch.setattr(content_scan, "scan_list", list_unchecked)
     content_scan.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_sign_in_notice(monkeypatch: pytest.MonkeyPatch):
+    """A mailbox status check in a test never records a break in the default
+    database or sends a notice; tests/unit/test_sign_in_notice.py calls
+    ``note`` itself."""
+    from openexecutive.delegation import sign_in_notice
+
+    monkeypatch.setattr(sign_in_notice, "record", lambda email, status: None)
 
 
 @pytest.fixture(autouse=True)
@@ -207,3 +245,24 @@ def _chat_topics_title_only(monkeypatch: pytest.MonkeyPatch):
         return await session_title.generate_session_title(user_msg, assistant_msg), None
 
     monkeypatch.setattr(chat_topics, "_title_and_topic", _title_only)
+
+
+@pytest.fixture(autouse=True)
+def _no_sender_check_wait(monkeypatch: pytest.MonkeyPatch):
+    """The email poller tries a failed sender check again after a short wait
+    (``email_poller._PROVE_RETRY_S``); tests don't wait for it."""
+    from openexecutive.integrations import email_poller
+
+    monkeypatch.setattr(email_poller, "_PROVE_RETRY_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _email_replies_in_tmp(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """The replies the email poller mails are kept per thread
+    (integrations.email_replies). Keep them in this test's own file, so one
+    test's thread never shows up in another's turn, and nothing is written
+    to ./episodic_memory.db."""
+    monkeypatch.setattr(
+        "openexecutive.integrations.email_replies.DB_PATH_OVERRIDE", tmp_path / "email_replies.db"
+    )
+    yield

@@ -457,15 +457,21 @@ def test_only_the_send_path_sends_and_only_its_four_doors_reach_it() -> None:
     assert _uses("send_for_workflow") == {"delegation/workflow_email.py"}
     assert _uses("send_chat_draft") == {"api/routes/delegation.py"}
     assert _uses("handle_send_email_as_me") == {"workflows/tool_catalog.py"}
-    # card_drafts, answers and the edit routes use its refusals and caller check only.
+    # card_drafts, answers, the chat draft card, the edit routes and the
+    # inbox's work on a card (card_work, update_reply_card) use its refusals
+    # and caller check only.
     assert _importers("openexecutive.delegation.reply_send") == {
         "api/routes/decisions.py", "api/routes/delegation.py", "delegation/inbox.py", "delegation/card_drafts.py",
-        "delegation/answers.py", "delegation/workflow_email.py",
+        "delegation/answers.py", "delegation/workflow_email.py", "delegation/chat_draft_card.py",
+        "delegation/card_work.py", "orchestrator/reply_card_tools.py",
     }
     assert _importers("openexecutive.delegation.reply_send.SendRefused") >= {"delegation/answers.py"}
-    assert not ({"send_draft", "send_approved_reply", "send_on_its_own", "send_for_workflow", "send_chat_draft"} & {
-        n for n, files in _index()[0].items() if "delegation/answers.py" in files
-    })
+    for only_refuses in (
+        "delegation/answers.py", "delegation/chat_draft_card.py", "orchestrator/reply_card_tools.py",
+    ):
+        assert not ({"send_draft", "send_approved_reply", "send_on_its_own", "send_for_workflow", "send_chat_draft"} & {
+            n for n, files in _index()[0].items() if only_refuses in files
+        })
 
 
 def test_only_dismiss_deletes_a_draft() -> None:
@@ -474,10 +480,12 @@ def test_only_dismiss_deletes_a_draft() -> None:
     too), or an unedited follow-up nobody needs once the thread is answered,
     and a reply kept on its card takes back the draft it made for a send that
     was refused before anything went. A chat draft that a redraft or the
-    Executive's own send replaced goes too, when unedited (redrafts)."""
+    Executive's own send replaced goes too, when unedited (redrafts), and so
+    does an unedited chat draft its person deletes on its card
+    (chat_draft_card.discard, from DELETE /delegation/drafts/{row} only)."""
     assert _uses("delete_draft") == {
         "delegation/replies.py", "delegation/inbox.py", "delegation/follow_ups.py", "delegation/card_drafts.py",
-        "delegation/redrafts.py",
+        "delegation/redrafts.py", "delegation/chat_draft_card.py",
     }
     assert _importers("openexecutive.delegation.replies") == {"api/routes/decisions.py", "api/routes/delegation.py"}
 
@@ -528,10 +536,13 @@ def _noted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return calls
 
 
-def test_a_sent_reply_is_not_noted_unless_they_turned_it_on(
+def test_a_sent_reply_is_not_noted_once_they_turned_it_off(
     owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from openexecutive.memory.history import set_person_settings
+
     calls = _noted(monkeypatch)
+    set_person_settings(owner.id, by="test", reply_notes=False)
     mailbox, card = _card(owner)
     _send(card, mailbox, owner)
     assert calls == []
@@ -562,3 +573,50 @@ def test_a_failure_to_start_noting_never_touches_the_send(
     monkeypatch.setattr(history, "person_settings", broken)
     mailbox, card = _card(owner)
     assert _send(card, mailbox, owner) == "sent-d1"
+
+
+# ── "Send to them on its own next time" (In training) ────────────────────────
+
+
+def test_send_with_allow_lets_that_sender_go_on_its_own(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import training
+
+    training.set_(owner.id, {training.TRAINING: True}, updated_by="test")
+    mailbox, card = _card(owner)
+    asyncio.run(send_approved_reply(
+        card, caller=LOCAL, resolver=owner.id, allow=True, gmail=mailbox, now=NOW + timedelta(minutes=30),
+    ))
+    assert mailbox.sent == ["d1"] and _status(card) != ledger.STATUS_PROPOSED
+    allowed = training.allowed_person(owner.id, DANA)
+    assert allowed is not None and allowed.person_id == owner.id
+    assert [training.setting_of(a.key) for a in training.learned(owner.id)] == [training.TRAINING]
+
+
+def test_allow_learns_only_who_it_really_went_to(owner: Any, models: dict[str, Any]) -> None:
+    # They swapped Dana for Sam in their mailbox and confirmed: Dana, who got
+    # nothing, is not allowed, and Sam, never on the card, stays in training.
+    from openexecutive.delegation import training
+
+    sam = "sam@northpeak.example"
+    training.set_(owner.id, {training.TRAINING: True}, updated_by="test")
+    mailbox, card = _card(owner)
+    mailbox.edit("d1", to=[sam])
+    asyncio.run(send_approved_reply(
+        card, caller=LOCAL, resolver=owner.id, allow=True, confirm={"recipients": [sam]}, gmail=mailbox,
+        now=NOW + timedelta(minutes=30),
+    ))
+    assert mailbox.sent == ["d1"]
+    assert training.allowed_person(owner.id, DANA) is None
+    assert training.allowed_person(owner.id, sam) is None
+
+
+def test_allow_is_refused_out_of_training_before_anything_is_sent(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import training
+
+    mailbox, card = _card(owner)
+    with pytest.raises(SendRefused) as err:
+        asyncio.run(send_approved_reply(
+            card, caller=LOCAL, resolver=owner.id, allow=True, gmail=mailbox, now=NOW + timedelta(minutes=30),
+        ))
+    assert err.value.code == "cant_allow" and mailbox.sent == []
+    assert training.allowed_person(owner.id, DANA) is None and _status(card) == ledger.STATUS_PROPOSED

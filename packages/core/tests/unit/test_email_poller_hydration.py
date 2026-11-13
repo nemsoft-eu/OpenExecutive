@@ -52,7 +52,7 @@ def _settings() -> Any:
     return SimpleNamespace(exec_email_address="exec@example.com", email_poll_interval_seconds=60)
 
 
-def _capture_user_message(from_addr: str, raw_email_body: str) -> str:
+def _capture_user_message(from_addr: str, raw_email_body: str, *, proven: bool | None = None) -> str:
     captured: dict[str, Any] = {}
 
     class _StubExecutive:
@@ -83,6 +83,7 @@ def _capture_user_message(from_addr: str, raw_email_body: str) -> str:
                 thread_id="t1",
                 from_addr=from_addr,
                 session_id=f"email:{from_addr}",
+                **({} if proven is None else {"prove_sender": AsyncMock(return_value=proven)}),
             )
         )
     return captured.get("user_message", "")
@@ -134,4 +135,25 @@ def test_reply_without_linkage_passes_through(isolated_episodic_db: Path) -> Non
     people_store.upsert_person(full_name="Alice", email="alice@example.com")
     user_message = _capture_user_message("alice@example.com", _raw_email("alice@example.com"))
     assert "<outbound_reply_context>" not in user_message
+    assert "Looks good to me." in user_message
+
+
+@pytest.mark.parametrize("proven", [True, False])
+def test_a_principals_brief_is_read_back_only_by_their_proven_mail(
+    isolated_episodic_db: Path, proven: bool
+) -> None:
+    """A brief emailed to the principal can carry what is private to them; a
+    reply in their name whose From the mailbox did not prove gets none of it."""
+    people_store.upsert_person(full_name="Founder", email="founder@example.com", is_principal=True)
+    insert_outbound_context(
+        channel="email",
+        channel_ref="founder@example.com",
+        outbound_text="Morning brief: the Acme term sheet is in your inbox.",
+        originating_session_id=None,
+        db_path=isolated_episodic_db,
+    )
+    user_message = _capture_user_message(
+        "founder@example.com", _raw_email("founder@example.com"), proven=proven
+    )
+    assert ("Acme term sheet" in user_message) is proven
     assert "Looks good to me." in user_message

@@ -108,6 +108,8 @@ def test_a_scheduled_run_sends_its_message_not_its_report(
     monkeypatch.setattr("openexecutive.workflows.get_workflow", lambda name: _Run())
     monkeypatch.setattr("openexecutive.delegation.workflow_reads.owns_runs", lambda name: None)
     monkeypatch.setattr(persistence, "create_run", lambda *a, **k: None)
+    # No row was written, so run_control.watch's read of it finds none.
+    monkeypatch.setattr(persistence, "get_run", lambda *a, **k: None)
     stored: list[str] = []
     monkeypatch.setattr(persistence, "complete_run", lambda rid, art: stored.append(art))
     monkeypatch.setattr("openexecutive.knowledge.store.ChromaDBStore", lambda **k: None)

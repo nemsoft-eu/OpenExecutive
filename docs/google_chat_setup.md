@@ -155,6 +155,10 @@ The webhook endpoint is now active at `POST /webhook/google-chat`. Google Chat w
 
 Files sent in a message (PDFs, Word, spreadsheets, text, images; up to 5 per message, 20 MB each) are read into the turn, and scanned PDFs are converted to text. They download with the same service account and `chat.bot` scope the replies use, so no extra setup is needed. Because the webhook authenticates Google rather than the sender, files are read only from people on the **People** roster, matched by their Google account email; anyone else's files are named to the Executive but never downloaded. A Google Drive file shared into a message is left to the Google Workspace (Drive) tools.
 
+Someone on **People** (matched by the Google account email on Google's signed event) is treated as signed in, as in Slack: the Executive knows it's them, and your Approvals level decides what runs. In a direct message between them and the app alone they also get what is private to them, as in the web chat (Act as me, Apps, their open items). A space, or a two-person DM the app was added to, never gets those, because others can read it, and there the Executive treats the conversation as shared: owner-only tools stay off, and under your Approvals level its actions wait for approval. Anyone not on People is still answered, but as an unknown sender: anything they ask the Executive to send or change waits for approval.
+
+In that direct message, what the Executive leaves for approval (a meeting to book, a card of actions, a change to a workflow) comes as a message with **Approve** and **Skip** buttons under its reply. A tap goes to the same webhook URL, so the app needs no extra setup beyond its interactive features being on. The card shows "Working on it…" and then the outcome. In a space the cards stay on Today.
+
 ---
 
 ## Troubleshooting

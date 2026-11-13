@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 
 from openexecutive.briefing.value_summary import ValueSummary
 from openexecutive.clients.cockpit import ClientCockpitCard, format_practice_for_today
+from openexecutive.departments import authority as dept_authority
 
 if TYPE_CHECKING:
     from openexecutive.alerts.models import Alert
@@ -88,6 +89,9 @@ class DepartmentBriefItem(BaseModel):
     at_risk_count: int
     off_track_count: int
     awaiting_count: int
+    # Goals still on their "on track" default that no review has looked at:
+    # the UI says "not checked yet" for them instead of "on track". Additive.
+    unchecked_count: int = 0
     # The off-track/at-risk goals themselves (worst first), capped, so the card
     # is insightful at rest. Empty for healthy/inactive departments. Additive —
     # defaults to empty so older clients and test mocks keep working.
@@ -231,11 +235,29 @@ class ProposalItem(BaseModel):
     superseded_count: int = 0
     # Registry workflow the review suggested as the next step ('' = none).
     suggested_workflow: str = ""
+    # What the card needs from its reader (Alert.needs): an answer or a pick
+    # (answered at POST /alerts/{id}/answer), an OK, or nothing. '' keeps the
+    # card's own buttons.
+    needs: str = ""
+    question: str = ""
+    choices: list[str] = Field(default_factory=list)
     # Drafted artifacts only (source='artifact'): the format, so the card can
     # badge it and link to /artifacts, and the link target for 'link' ones.
     # `body` already carries a Markdown rendering for every format.
     artifact_format: str | None = None
     artifact_url: str | None = None
+    # Approvals one request held together (the same chat turn asking for the
+    # same kind of step, e.g. saving four files): every card of the request
+    # carries the same opaque key, so Needs you shows them as one card with a
+    # box per item. None on a card that stands alone.
+    group_key: str | None = None
+    # Why an Approve card waited for the reader, in their words, when the
+    # card's own text doesn't say it (a gated booking, as recorded when it
+    # was held): '' otherwise.
+    waiting_because: str = ""
+    # Who else is waiting on this card: the teammate whose ask was held for
+    # the reader's OK. Home puts these first. '' when nobody else waits.
+    waiting_on: str = ""
 
 
 def _proposal_body(alert: Alert) -> str:
@@ -385,6 +407,94 @@ def _watch_trust_by_slug(alerts: list[Any]) -> dict[str, float]:
     except Exception:
         logger.debug("today: watch trust lookup failed", exc_info=True)
         return {}
+
+
+def _group_requests(items: list[ProposalItem]) -> None:
+    """Give the approvals one request held together the same ``group_key``:
+    open decision-backed cards from the same conversation for the same kind
+    of step (the tool, or the decision class), waiting on the same person. A key only two or more cards
+    share is set; the rest stay None. Never raises."""
+    import hashlib
+
+    from openexecutive.memory.decision_ledger import STATUS_PROPOSED, get_decision_instances
+    from openexecutive.orchestrator.take_the_lead import TRAINING_TAG
+
+    # A Take the lead training card is answered on its own (it asks whether
+    # to do it alone next time), so it never joins a group.
+    ids = [
+        p.decision_instance_id for p in items
+        if p.decision_instance_id is not None and TRAINING_TAG not in p.topic_tags
+    ]
+    if len(ids) < 2:
+        return
+    try:
+        instances = get_decision_instances(ids)
+    except Exception:
+        logger.debug("today: grouping approvals failed", exc_info=True)
+        return
+    keys: dict[int, str] = {}
+    for p in items:
+        inst = instances.get(p.decision_instance_id or 0)
+        if inst is None or TRAINING_TAG in p.topic_tags or inst.status != STATUS_PROPOSED or not inst.originating_session_id:
+            continue
+        try:
+            payload = json.loads(inst.proposed_payload_json or "{}")
+        except ValueError:
+            payload = {}
+        step = str(payload.get("tool") or "") if isinstance(payload, dict) else ""
+        raw = "|".join((
+            inst.originating_session_id, inst.decision_class, step, str(p.routed_to_person_id),
+        ))
+        keys[p.alert_id] = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    counts: dict[str, int] = {}
+    for key in keys.values():
+        counts[key] = counts.get(key, 0) + 1
+    for p in items:
+        shared = keys.get(p.alert_id)
+        if shared is not None and counts[shared] > 1:
+            p.group_key = shared
+
+
+def _mark_waiting(items: list[ProposalItem]) -> None:
+    """Fill ``waiting_because`` on a gated booking's card (the reason
+    calendar_tools recorded when it held it; its text doesn't say why) and
+    ``waiting_on`` on a teammate's held ask. Reads a decision only from its
+    own card: its class and approver match. Never raises: a card without
+    them still shows."""
+    from openexecutive.memory.decision_ledger import get_decision_instances
+    from openexecutive.orchestrator import department_gate
+
+    booking_tag = "decision_class:meeting_scheduling"
+    held_tag = f"decision_class:{department_gate.DECISION_CLASS}"
+    cards = [
+        p for p in items
+        if p.decision_instance_id is not None and (booking_tag in p.topic_tags or held_tag in p.topic_tags)
+    ]
+    if not cards:
+        return
+    try:
+        instances = get_decision_instances([i for p in cards if (i := p.decision_instance_id) is not None])
+    except Exception:
+        logger.debug("today: reading held cards failed", exc_info=True)
+        return
+    for p in cards:
+        inst = instances.get(p.decision_instance_id or 0)
+        if inst is None or inst.approver_person_id != p.routed_to_person_id:
+            continue
+        try:
+            payload = json.loads(inst.proposed_payload_json or "{}")
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if inst.decision_class == "meeting_scheduling" and booking_tag in p.topic_tags:
+            p.waiting_because = str(payload.get("waiting_because") or "").strip()
+        elif inst.decision_class == department_gate.DECISION_CLASS and held_tag in p.topic_tags:
+            asker = payload.get("requested_by_person_id")
+            name = str(payload.get("requested_by") or "").strip()
+            # The reader's own ask held for their own OK: nobody else waits.
+            if isinstance(asker, int) and asker != p.routed_to_person_id and name:
+                p.waiting_on = name
 
 
 def _parse_decision_instance_id(topic_tags: list[str]) -> int | None:
@@ -538,6 +648,22 @@ def _point_source(raw: dict[str, Any] | None) -> PointSource | None:
         return None
 
 
+class RightNowRow(BaseModel):
+    """One row of Home's Right now list (``briefing.right_now_list``): what
+    it is (``mail``, ``draft``, ``chat``), who it is from or to, its
+    subject, the newest activity on it (ISO-8601 UTC), a short note on why
+    it is listed, and what Home can open from it. ``key`` is what
+    ``POST /today/right-now/dismiss`` takes."""
+
+    key: str
+    kind: Literal["mail", "draft", "chat"]
+    who: str
+    subject: str
+    at: str
+    note: str = ""
+    source: PointSource | None = None
+
+
 class NarrativeProgress(BaseModel):
     """What a Right now being written is doing, for the page to show in its
     place: ``reading`` what moved (mail, calendar, Needs you), ``writing``
@@ -564,6 +690,56 @@ class CalendarNextItem(BaseModel):
     title: str
     start: str | None = None
     all_day: bool = False
+
+
+class DoneRow(BaseModel):
+    """One thing in Home's Done for you. ``key`` names it (``approval:<card
+    id>`` for a card the viewer approved, else the activity row), and its
+    ``status`` changes in place: ``working`` while it runs, then ``done`` or
+    ``failed``. ``session_id`` is the chat that shows the work, when it ran
+    as one; ``alert_id`` lets a failed approval be tried again."""
+
+    key: str
+    kind: str
+    title: str
+    detail: str = ""
+    status: Literal["working", "done", "failed"] = "done"
+    at: str
+    session_id: str | None = None
+    alert_id: int | None = None
+    approval_id: int | None = None
+    artifact_id: str | None = None
+
+
+class WatchingItem(BaseModel):
+    """One line of Home's Watching next: something the Executive is keeping
+    an eye on and when it acts on it next. ``key`` is ``action:<id>`` (a
+    follow-up or nudge it will send) or ``job:<id>`` (a standing job);
+    ``POST /today/watching/stop`` ends that one thing. ``detail`` says what
+    it does next ("I follow up with Priya Nair"), ``at`` when (ISO), which
+    the page writes as "tomorrow at 9:00 AM"."""
+
+    key: str
+    kind: Literal["follow_up", "standing_job"]
+    title: str
+    detail: str = ""
+    at: str | None = None
+
+
+class WaitingElsewhereItem(BaseModel):
+    """Something waiting on the reader that lives on another page (watch
+    suggestions on the Watch list, say): one row in Home's Needs you that
+    opens that page, so Home never calls the day quiet while it waits."""
+
+    key: str
+    title: str
+    detail: str = ""
+    count: int
+    href: str
+    # The row's button: "Review", "Look".
+    action: str
+    # The newest thing in it (ISO), for the row's age.
+    at: str = ""
 
 
 class TodayResponse(BaseModel):
@@ -602,6 +778,15 @@ class TodayResponse(BaseModel):
     # never a point. Additive; empty / 0 for anyone else.
     inbox_also: list[str] = Field(default_factory=list)
     inbox_also_total: int = 0
+    # The principal's own: Home's Right now list, one row per thing waiting
+    # on them that Needs you doesn't show (``briefing.right_now_list``).
+    # Built from the records on every load, never written by a model.
+    # Additive; empty for anyone else.
+    right_now: list[RightNowRow] = Field(default_factory=list)
+    # Done for you: what the Executive did, or is doing, for the viewer in
+    # the last day, one row per thing (``_done_for_you``). Home's only place
+    # for it, so nothing in Needs you repeats it.
+    done_for_you: list[DoneRow] = Field(default_factory=list)
     # The principal's own: today's delivered morning brief and the meetings
     # still ahead today. Additive; None / empty for anyone else.
     morning_brief: MorningBriefItem | None = None
@@ -633,6 +818,13 @@ class TodayResponse(BaseModel):
     # Home shows the first-week card instead of calling the day quiet.
     first_week: bool = False
     first_week_card: FirstWeekCardModel | None = None
+    # Watching next (``_watching``): what it is keeping an eye on for the
+    # reader, with when it acts next. The owner sees the company's; anyone
+    # else only what they asked it to do.
+    watching: list[WatchingItem] = Field(default_factory=list)
+    # What waits on the reader on other pages (``_waiting_elsewhere``):
+    # Needs you shows one row each and the day isn't quiet while any wait.
+    waiting_elsewhere: list[WaitingElsewhereItem] = Field(default_factory=list)
 
 
 class ActivityItem(BaseModel):
@@ -654,6 +846,14 @@ class ActivityItem(BaseModel):
     # and the artifact id of its write-up when it kept one (`run:<id>`).
     detail: str | None = None
     artifact_id: str | None = None
+    # An email it sent on its own, for Home's Done for you only
+    # (owner-only there): its subject and the addresses it went to. Never
+    # served, since this feed is the whole team's ("named, never quoted").
+    mail_subject: str = Field(default="", exclude=True)
+    mail_to: str = Field(default="", exclude=True)
+    # What As me did, for Done for you only: how, what made it look, and
+    # what came of it (``_lead_line``). Never served, like the mail fields.
+    lead_line: str = Field(default="", exclude=True)
 
 
 class ActivityResponse(BaseModel):
@@ -831,10 +1031,13 @@ def _build_today(
             slug=slug,
             title=title,
             authority_level=authority_level,
-            goal_count=len(goals),
+            goal_count=sum(1 for g in goals if g.status != "done"),
             at_risk_count=sum(1 for g in goals if g.status == "at_risk"),
             off_track_count=sum(1 for g in goals if g.status == "off_track"),
             awaiting_count=dept_awaiting.get(slug, 0) if slug else 0,
+            unchecked_count=sum(
+                1 for g in goals if g.status == "on_track" and not g.last_reviewed_at
+            ),
             attention_goals=[
                 GoalBrief(
                     key_result=g.key_result,
@@ -849,7 +1052,7 @@ def _build_today(
         )
 
     dept_items = [
-        _brief_row(ds.config.slug, ds.config.title, ds.config.authority_level.value, ds.goals)
+        _brief_row(ds.config.slug, ds.config.title, dept_authority.department_level(ds.config.slug).value, ds.goals)
         for ds in depts
     ]
     unassigned = [v.goal for v in views if not v.goal.department_slug]
@@ -1016,6 +1219,9 @@ def _build_today(
             due_at=alert.due_at,
             superseded_count=superseded_counts.get(alert.id or -1, 0),
             suggested_workflow=alert.suggested_workflow,
+            needs=alert.needs,
+            question=alert.question,
+            choices=alert.choices,
             artifact_format=alert.artifact_format if alert.source == "artifact" else None,
             artifact_url=alert.artifact_url if alert.source == "artifact" else None,
         ))
@@ -1028,6 +1234,8 @@ def _build_today(
     # team" and collapses the monitoring tail.
     proposal_items.sort(key=lambda p: p.created_at, reverse=True)
     proposal_items.sort(key=lambda p: (0 if p.category == "action" else 1, -p.score))
+    _group_requests(proposal_items)
+    _mark_waiting(proposal_items)
 
     response = TodayResponse(
         departments=dept_items,
@@ -1176,7 +1384,7 @@ _DECISION_STATUS_LABEL = {
     "rejected": "Rejected",
     "auto_no_response": "Expired (no response)",
     "reversed": "Reversed",
-    "executed": "Executed",
+    "executed": "Done",
     "failed": "Failed",
     "closed_externally": "Closed",
 }
@@ -1343,7 +1551,7 @@ def _build_activity(
     propose_only_depts = {
         d.config.slug
         for d in dept_store.list_departments()
-        if d.config.authority_level == "propose_only"
+        if dept_authority.department_level(d.config.slug) == "propose_only"
     }
 
     from openexecutive.alerts.models import is_private_alert, visible_alert
@@ -1475,18 +1683,35 @@ def _build_activity(
     try:
         led = take_the_lead.done([take_the_lead.SCOPE_EXECUTIVE], days=30, limit=pool)
     except Exception:
-        logger.warning("activity: couldn't read Take the lead's rows", exc_info=True)
+        logger.warning("activity: couldn't read As me's rows", exc_info=True)
         led = []
+    jobs = take_the_lead.jobs_by_id() if led else {}
+    answers = _answers([(r.to_person_id, r.at) for r in led if r.to_person_id is not None])
     for row in led:
         if row.status not in ("done", "approved"):
             continue
+        if "__" in row.tool and not take_the_lead.mcp_tool_acts(row.tool):
+            # A connected-app read logged before reads stopped being gated
+            # ("Get gmail messages content batch") did nothing for anyone.
+            continue
+        # An email names who it went to ("Emailed Riley Park"),
+        # never the raw tool ("Send gmail message").
+        # The feed is the whole team's: it names teammates only, and an
+        # email to anyone else (a contact, an outside address) is "Sent an
+        # email". Done for you, the owner's own, names them all.
+        team = _mail_names(row.mail_to, team_only=True)
+        mailed = bool(row.mail_to) or take_the_lead.is_mail_send(row.tool)
+        summary = f"Emailed {team}" if team else "Sent an email" if mailed else row.summary
         items.append(ActivityItem(
             kind="took_the_lead",
-            summary=row.summary if row.status == "done" else f"{row.summary} (after a yes)",
+            summary=summary if row.status == "done" else f"{summary} (after a yes)",
             actor="Executive",
-            target=None,
+            target=team or None,
             department=None,
             at=row.at,
+            mail_subject=row.mail_subject,
+            mail_to=row.mail_to,
+            lead_line=_lead_line(row, jobs, answers),
         ))
 
     # Operational alerts the Executive raised. For the rail, all statuses are
@@ -2279,6 +2504,8 @@ async def _regen_briefing_narrative_locked(
                     rendered_context=context,
                     mode=mode,
                     reader=reader,
+                    # The principal's own header only, never the company one.
+                    owner_lessons=expected_scope == narrative_cache.DEFAULT_SCOPE,
                 ),
                 # 25 s for the draft, plus the rewrite's own budget.
                 timeout=25.0 + REWRITE_TIMEOUT_S,
@@ -2439,7 +2666,505 @@ async def get_today(request: Request, background_tasks: BackgroundTasks) -> Toda
         response.first_week = response.first_week_card is not None
         response.morning_brief = _morning_brief_today()
         response.calendar_next = _calendar_next(datetime.now(UTC))
+        response.right_now = _right_now_rows()
+        response.waiting_elsewhere = _waiting_elsewhere()
+    response.done_for_you = _done_for_you(request, caller, datetime.now(UTC))
+    response.watching = _watching(request, caller)
     return response
+
+
+# How far back Home's Done for you looks, and how many rows it sends.
+_DONE_WINDOW = timedelta(hours=24)
+_DONE_MAX = 8
+# Activity rows that are not something done for the reader: a card raised
+# (that is Needs you's), advice and decisions noted from their own chats,
+# a project started, and the contacts tally.
+_DONE_SKIP_KINDS = frozenset({
+    "alert_raised", "advice_given", "decision_logged", "initiative_started", "contacts_kept",
+})
+
+
+def _reader_name(caller: int | None) -> str:
+    """The reader's name as the activity rows name whom a message went to
+    (``_build_channel_lookup``), folded for matching, or "" when there is
+    no one to match."""
+    if caller is None:
+        return ""
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(caller)
+    except Exception:
+        return ""
+    return " ".join((person.full_name or "").split()).casefold() if person is not None else ""
+
+
+def _done_for_you(request: Request, caller: int | None, now: datetime) -> list[DoneRow]:
+    """What the Executive did or is doing for the viewer in the last day:
+    the cards they approved (one row per card, its newest try) and what it
+    did on its own. Running ones first, then newest. Never raises."""
+    from openexecutive.alerts import approvals as alert_approvals
+    from openexecutive.alerts.store import get_alert
+    from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
+
+    since = now - _DONE_WINDOW
+    rows: list[DoneRow] = []
+    # On an install with no principal yet anyone may approve (unsigned, so
+    # the approval has no person) and is the owner here: they see every
+    # approval and the shared feed, as the approve route lets them act.
+    try:
+        owner = _caller_is_principal_or_unclaimed(request)
+    except Exception:
+        owner = False
+    unclaimed = caller is None and owner
+    if caller is not None or unclaimed:
+        try:
+            for a in alert_approvals.recent(since.isoformat(), approved_by_person_id=caller):
+                alert = get_alert(a.alert_id)
+                status: Literal["working", "done", "failed"] = (
+                    "working" if a.status == alert_approvals.STATUS_RUNNING
+                    else "failed" if a.status == alert_approvals.STATUS_FAILED else "done"
+                )
+                rows.append(DoneRow(
+                    key=f"approval:{a.alert_id}",
+                    kind="approval",
+                    title=alert.headline if alert is not None else "A card you approved",
+                    detail=a.outcome,
+                    status=status,
+                    at=a.finished_at or a.approved_at,
+                    session_id=a.session_id,
+                    alert_id=a.alert_id,
+                    approval_id=a.id,
+                ))
+        except Exception:
+            logger.warning("today: reading approvals for Done for you failed", exc_info=True)
+    try:
+        # The shared feed is what the Executive did for the company, so it
+        # is "done for you" only to the principal; anyone else gets their
+        # own approvals and what was sent as them.
+        shared = (
+            _build_activity(
+                20, since, include_alert_raised=False, exclude_workflows=RHYTHM_WORKFLOWS,
+            ).items
+            if owner else []
+        )
+        activity = [*shared, *_sent_as_caller(request)]
+    except Exception:
+        logger.warning("today: reading activity for Done for you failed", exc_info=True)
+        activity = []
+    # A message it sent to the reader (a reminder, a Right now note) is
+    # something they already got, not something it did for them.
+    reader = _reader_name(caller)
+    reader_emails = _reader_emails(caller)
+    seen: set[str] = set()
+    for item in activity:
+        at = _parse_aware(item.at)
+        if item.kind in _DONE_SKIP_KINDS or at is None or at < since:
+            continue
+        if reader and " ".join((item.target or "").split()).casefold() == reader:
+            continue
+        mailed = {a for a in item.mail_to.split(",") if a}
+        if mailed and reader_emails and mailed <= reader_emails:
+            continue
+        key = f"{item.kind}:{item.at}:{item.summary}"
+        if key in seen:
+            continue
+        seen.add(key)
+        title = item.summary or item.kind
+        if item.mail_to:
+            # Done for you is the owner's own, so it says who and what.
+            who = _mail_names(item.mail_to)
+            title = f"Emailed {who}" + (" (after a yes)" if title.endswith("(after a yes)") else "")
+            if item.mail_subject:
+                title = f"{title}: {item.mail_subject}"
+        rows.append(DoneRow(
+            key=key, kind=item.kind, title=title[:240],
+            detail=item.lead_line or item.detail or "", at=item.at, artifact_id=item.artifact_id,
+        ))
+    rows.sort(key=lambda r: _parse_aware(r.at) or datetime.min.replace(tzinfo=UTC), reverse=True)
+    rows.sort(key=lambda r: 0 if r.status == "working" else 1)
+    return rows[:_DONE_MAX]
+
+
+def _lead_line(row: Any, jobs: dict[int, Any], answers: dict[tuple[int, str], str]) -> str:
+    """Done for you's second line for something As me did: how it did it,
+    what made it look (or the standing job it was for) and what came of it.
+    "By email, as me · When new mail came in · Riley Park answered at
+    9:40 AM". Never raises."""
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        how = take_the_lead.how_line(row.tool, to_person_id=row.to_person_id)
+        parts = [f"{how}, as me" if how else "As me"]
+        job = jobs.get(row.job_id) if row.job_id is not None else None
+        if job is not None:
+            parts.append(f"For your standing job: {job.text}")
+        elif row.prompted_by:
+            parts.append(row.prompted_by)
+        answered = answers.get((row.to_person_id, row.at), "") if row.to_person_id is not None else ""
+        if answered:
+            parts.append(answered)
+        elif row.outcome:
+            parts.append(row.outcome)
+        return " · ".join(parts)
+    except Exception:
+        logger.warning("today: couldn't write As me's line", exc_info=True)
+        return ""
+
+
+def _answers(sent: list[tuple[int, str]]) -> dict[tuple[int, str], str]:
+    """"Riley answered at 9:40 AM" for each (person, sent at) whose message
+    was replied to (``outbound_context`` recorded beside the send, then
+    consumed). One query for the whole feed; a message with no answer is
+    left out, and one that can't be named doesn't cost the others. Never
+    raises."""
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+    from openexecutive.memory.workspace_settings import get_user_timezone
+    from openexecutive.people.store import get_person
+
+    out: dict[tuple[int, str], str] = {}
+    window = timedelta(minutes=2)
+    when = {(pid, at): _parse_aware(at) for pid, at in sent}
+    times = [t for t in when.values() if t is not None]
+    if not times:
+        return out
+    try:
+        path = _resolve_db_path(None)
+        if not path.exists():
+            return out
+        people = sorted({pid for pid, _ in when})
+        with _get_conn(path) as conn:
+            rows = conn.execute(
+                "SELECT recipient_person_id, created_at, consumed_at FROM outbound_context "
+                f"WHERE recipient_person_id IN ({','.join('?' * len(people))}) "
+                "AND created_at >= ? AND created_at <= ? AND consumed_at IS NOT NULL "
+                "ORDER BY created_at",
+                (*people, (min(times) - window).isoformat(), (max(times) + window).isoformat()),
+            ).fetchall()
+        zone = get_user_timezone()
+    except Exception:
+        logger.warning("today: couldn't read who answered", exc_info=True)
+        return out
+    replies = [(r["recipient_person_id"], _parse_aware(r["created_at"]), _parse_aware(r["consumed_at"]))
+               for r in rows]
+    # The message As me sent is recorded beside its log row, so each reply
+    # belongs to the send nearest it (within the window), and to one only:
+    # two messages to Riley a minute apart, one answered, give one line.
+    matched: dict[tuple[int, str], datetime] = {}
+    for p, made, consumed in replies:
+        if made is None or consumed is None:
+            continue
+        near = [(abs(made - t), key) for key, t in when.items()
+                if key[0] == p and t is not None and abs(made - t) <= window and key not in matched]
+        if near:
+            matched[min(near)[1]] = consumed
+    names: dict[int, str] = {}
+    for (pid, at), replied in matched.items():
+        try:
+            if pid not in names:
+                person = get_person(pid)
+                names[pid] = (person.full_name or "").split()[0] if person is not None and person.full_name else "They"
+            out[(pid, at)] = f"{names[pid]} answered at {replied.astimezone(zone).strftime('%I:%M %p').lstrip('0')}"
+        except Exception:
+            logger.warning("today: couldn't name who answered", exc_info=True)
+    return out
+
+
+# Home's Watching next: the follow-ups and nudges it will send, then the
+# standing jobs, at most this many lines.
+_WATCHING_MAX = 6
+_WATCHING_KINDS = frozenset({"ad_hoc", "proactive_nudge"})
+
+
+def _next_look() -> str | None:
+    """When As me looks next (its daily look, or a wake already waiting),
+    ISO; None when none is scheduled. Never raises."""
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+    from openexecutive.scheduler.runner import TAKE_THE_LEAD_WAKE_KIND
+
+    try:
+        path = _resolve_db_path(None)
+        if not path.exists():
+            return None
+        with _get_conn(path) as conn:
+            row = conn.execute(
+                "SELECT run_at FROM scheduled_actions WHERE status = 'pending' AND kind IN (?, ?) "
+                "ORDER BY run_at LIMIT 1",
+                ("executive_reflection", TAKE_THE_LEAD_WAKE_KIND),
+            ).fetchone()
+        return str(row["run_at"]) if row is not None else None
+    except Exception:
+        return None
+
+
+def _watching(request: Request, caller: int | None) -> list[WatchingItem]:
+    """Watching next for this reader: the follow-ups and nudges it will
+    send (the owner sees all of them, anyone else the ones they asked for),
+    soonest first, then, for the owner while As me is on, the standing
+    jobs with when it looks next. Never raises."""
+    from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
+    from openexecutive.api.routes.people import caller_is_principal
+    from openexecutive.memory.episodic import list_pending_scheduled_actions
+    from openexecutive.orchestrator import take_the_lead
+    from openexecutive.people.store import list_people
+
+    try:
+        owner = _caller_is_principal_or_unclaimed(request)
+        # Standing jobs are the owner's alone, as on the As me tab.
+        principal = caller_is_principal(request)
+    except Exception:
+        owner = principal = False
+    if not owner and caller is None:
+        return []
+    items: list[WatchingItem] = []
+    try:
+        names = {p.id: p.full_name for p in list_people(include_archived=True) if p.id is not None}
+        lookup = _build_channel_lookup()
+        mine = None if owner else caller
+        for action in list_pending_scheduled_actions(
+            limit=_WATCHING_MAX, kinds=_WATCHING_KINDS, created_by_person_id=mine,
+        ):
+            if action.id is None:
+                continue
+            target = names.get(action.assigned_to_person_id) if action.assigned_to_person_id else None
+            target = target or _resolve_channel_target(lookup, action.channel, action.channel_ref or "")
+            verb = "I nudge" if action.kind == "proactive_nudge" else "I follow up with"
+            items.append(WatchingItem(
+                key=f"action:{action.id}",
+                kind="follow_up",
+                title=" ".join(action.intent_text.split())[:200],
+                detail=f"{verb} {target}" if target else "I follow up",
+                at=action.run_at,
+            ))
+    except Exception:
+        logger.warning("today: reading follow-ups for Watching next failed", exc_info=True)
+    items = items[:_WATCHING_MAX]
+    if principal:
+        try:
+            if take_the_lead.executive_on():
+                look = _next_look()
+                for job in take_the_lead.list_jobs():
+                    items.append(WatchingItem(
+                        key=f"job:{job.id}",
+                        kind="standing_job",
+                        title=job.text,
+                        detail="Standing job · I look again" if look else "Standing job",
+                        at=look,
+                    ))
+        except Exception:
+            logger.warning("today: reading standing jobs for Watching next failed", exc_info=True)
+    return items[: _WATCHING_MAX + take_the_lead.JOBS_MAX]
+
+
+def _mail_names(mail_to: str, *, team_only: bool = False) -> str:
+    """"Riley Park", "Riley Park and sam@example.com", "Riley Park and 2
+    others": who an email went to, by their People name where there is
+    one (contacts included), else the address. ``team_only`` (the shared
+    feed): teammates' names, and "" when anyone else got it. "" when there's
+    no address. Never raises."""
+    from openexecutive.people.store import find_person_by_email
+
+    addresses = [a.strip() for a in (mail_to or "").split(",") if a.strip()]
+    if not addresses:
+        return ""
+    names: list[str] = []
+    for index, address in enumerate(addresses):
+        try:
+            person = find_person_by_email(address, include_contacts=not team_only)
+        except Exception:
+            person = None
+        name = " ".join((person.full_name or "").split()) if person is not None and person.full_name else ""
+        if team_only and not name:
+            return ""
+        if index < 2:
+            names.append(name or address)
+    if len(addresses) == 1:
+        return names[0]
+    if len(addresses) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{names[0]} and {len(addresses) - 1} others"
+
+
+def _reader_emails(caller: int | None) -> set[str]:
+    """The viewer's addresses, lowercased: an email it sent them is
+    something they already got. Empty when unknown. Never raises."""
+    if caller is None:
+        return set()
+    from openexecutive.people.store import get_person
+
+    try:
+        person = get_person(caller)
+    except Exception:
+        return set()
+    if person is None:
+        return set()
+    return {e.strip().lower() for e in [person.email or "", *person.email_aliases] if e and e.strip()}
+
+
+def _right_now_rows(now: datetime | None = None) -> list[RightNowRow]:
+    """The principal's Right now list as the API shows it. Never raises."""
+    from openexecutive.briefing import right_now_list
+
+    try:
+        found = right_now_list.rows(now)
+    except Exception:
+        logger.exception("today: building the Right now list failed")
+        return []
+    return [
+        RightNowRow(
+            key=r.key, kind=r.kind,  # type: ignore[arg-type]
+            who=r.who, subject=r.subject, at=r.at, note=r.note,
+            source=_point_source(r.source),
+        )
+        for r in found
+    ]
+
+
+# How many watch suggestions Home's row names before "and N more".
+_ELSEWHERE_NAMED = 2
+
+
+def _watch_label(target: str) -> str:
+    """A suggestion's short name: a URL's host, or the target itself."""
+    from urllib.parse import urlsplit
+
+    text = " ".join(str(target or "").split())
+    try:
+        host = urlsplit(text).hostname if "://" in text else None
+    except ValueError:  # a malformed bracketed host
+        host = None
+    if host:
+        return host.removeprefix("www.")
+    return text if len(text) <= 40 else text[:39].rstrip() + "…"
+
+
+def _named(labels: list[str]) -> str:
+    """ "a, b and 3 more" from the first few labels."""
+    seen: list[str] = []
+    for label in labels:
+        if label and label not in seen:
+            seen.append(label)
+    if not seen:
+        return ""
+    shown = seen[:_ELSEWHERE_NAMED]
+    rest = len(seen) - len(shown)
+    if rest > 0:
+        return f"{', '.join(shown)} and {rest} more"
+    return " and ".join(shown) if len(shown) == 2 else shown[0]
+
+
+def _waiting_elsewhere() -> list[WaitingElsewhereItem]:
+    """The principal's things waiting on other pages: the Watch list's
+    suggestions waiting for a yes or no. Never raises."""
+    from openexecutive.monitoring import store as monitoring_store
+
+    items: list[WaitingElsewhereItem] = []
+    try:
+        # A suggestion routed to a department head is that head's to answer
+        # (watch_policy._nudge_if_piled_up); the rest are the principal's.
+        suggestions = [
+            w for w in monitoring_store.list_pending_suggestions() if w.route_to_person_id is None
+        ]
+    except Exception:
+        logger.exception("today: reading watch suggestions failed")
+        suggestions = []
+    if suggestions:
+        n = len(suggestions)
+        items.append(
+            WaitingElsewhereItem(
+                key="watch-suggestions",
+                title=f"{n} {'thing' if n == 1 else 'things'} I'd like to watch",
+                detail=_named([_watch_label(w.target) for w in suggestions]),
+                count=n,
+                href="/watchlist",
+                action="Look",
+                at=max((w.created_at or "" for w in suggestions), default=""),
+            )
+        )
+    return items
+
+
+class DismissRowRequest(BaseModel):
+    """A Right now row to clear, by the ``key`` ``GET /today`` served it with."""
+
+    key: str = Field(min_length=1, max_length=200)
+
+
+class StopWatchingRequest(BaseModel):
+    """A Watching next line to stop, by the ``key`` ``GET /today`` served."""
+
+    key: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/today/watching/stop", tags=["today"])
+async def stop_watching(body: StopWatchingRequest, request: Request) -> dict[str, bool]:
+    """Stop one line of Watching next: cancel that follow-up, or stop that
+    standing job. Nothing else changes. The owner may stop any line; anyone
+    else only a follow-up they asked for. 404 when it isn't there (or isn't
+    theirs), 409 when it already ran."""
+    from openexecutive.api.routes.chat import (
+        _caller_is_principal_or_unclaimed,
+        _resolve_caller_person_id,
+    )
+    from openexecutive.api.routes.people import caller_is_principal
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.memory.episodic import cancel_scheduled_action, get_scheduled_action
+    from openexecutive.orchestrator import take_the_lead
+
+    kind, _, raw = body.key.partition(":")
+    try:
+        item_id = int(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="That isn't there any more.") from exc
+    caller = _resolve_caller_person_id(request)
+    owner = _caller_is_principal_or_unclaimed(request)
+    if kind == "job":
+        # The owner's alone, the same check as DELETE /take-the-lead/jobs.
+        job = take_the_lead.stop_job(item_id) if caller_is_principal(request) else None
+        if job is None:
+            raise HTTPException(status_code=404, detail="That isn't there any more.")
+        if job.stopped_at is None:
+            audit_log("take_the_lead_changed", "Standing job stopped from Home", actor="user",
+                      details={"job_id": item_id})
+        return {"stopped": True}
+    if kind != "action":
+        raise HTTPException(status_code=404, detail="That isn't there any more.")
+    action = get_scheduled_action(item_id)
+    if (
+        action is None or action.kind not in _WATCHING_KINDS or action.channel == "__internal__"
+        or (not owner and (caller is None or action.created_by_person_id != caller))
+    ):
+        raise HTTPException(status_code=404, detail="That isn't there any more.")
+    result = cancel_scheduled_action(item_id)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="That isn't there any more.")
+    if result != "cancelled":
+        # Stopped already (another tab) is a stop that worked; anything else
+        # ran or is running.
+        current = get_scheduled_action(item_id)
+        if current is not None and current.status == "cancelled":
+            return {"stopped": True}
+        raise HTTPException(status_code=409, detail="It already went out.")
+    audit_log(
+        "scheduled_action_cancelled",
+        f"Stopped from Watching next: {action.kind} #{item_id}",
+        actor="user",
+        details={"action_id": item_id, "kind": action.kind, "via": "watching_next"},
+    )
+    return {"stopped": True}
+
+
+@router.post("/today/right-now/dismiss", tags=["today"])
+async def dismiss_right_now_row(body: DismissRowRequest, request: Request) -> dict[str, bool]:
+    """The principal dismissed a row of their Right now list: ``GET /today``
+    leaves it out until something newer lands on it (a later email in the
+    thread, a later ask). Anyone else has no list, so nothing to dismiss."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.briefing import right_now_list
+
+    if not _is_principal(_resolve_caller_person_id(request)):
+        return {"dismissed": False}
+    return {"dismissed": right_now_list.dismiss(body.key)}
 
 
 @router.post("/today/seen", tags=["today"])
@@ -2574,6 +3299,18 @@ def _held_back(now: datetime) -> list[HeldBackItem]:
         HeldBackItem(event_id=h.event_id, surface=h.surface, at=h.at, lines=h.lines)
         for h in recent_held_back(since=since)
     ]
+
+
+@router.get("/today/held-back", response_model=list[HeldBackItem], tags=["today"])
+def get_held_back(request: Request) -> list[HeldBackItem]:
+    """The lines grounding left out of the principal's briefs in the last
+    day, for Memory's What it does. The principal's alone: anyone else gets
+    an empty list."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    if not _is_principal(_resolve_caller_person_id(request)):
+        return []
+    return _held_back(datetime.now(UTC))
 
 
 @router.get("/today/activity", response_model=ActivityResponse, tags=["today"])

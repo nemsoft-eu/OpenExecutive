@@ -8,7 +8,8 @@ import AnswerSourcesFooter from "@/components/AnswerSourcesFooter";
 import BrandMark from "@/components/BrandMark";
 import type { AnswerSources } from "@/lib/answerSources";
 import type { ActionTaken } from "@/lib/api";
-import { groupActions, opensDetails, type ChipGroup } from "@/lib/actionChips";
+import { dropReplaced, groupActions, opensDetails, type ChipGroup } from "@/lib/actionChips";
+import { linkCardMentions } from "@/lib/cardMentions";
 import { loadsInline } from "@/lib/markdownImages";
 import { isMailboxLink } from "@/lib/replyCards";
 import { hostOf } from "@/lib/url";
@@ -48,6 +49,8 @@ interface MessageProps {
   // A shared chat's messages from people: who wrote it. Someone else's sits
   // on the left under their name; the viewer's own stays on the right.
   author?: { name: string; mine: boolean };
+  // Under a finished reply, after its action chips: the "Memory updated" chip.
+  memory?: ReactNode;
 }
 
 // The small text buttons under a message (Copy, Try again, Edit).
@@ -271,6 +274,7 @@ export default function Message({
   onRetry,
   onEdit,
   author,
+  memory,
 }: MessageProps) {
   const executiveName = useExecutiveName();
   // Approval cards this reply left, shown under it (ActionCards).
@@ -283,7 +287,7 @@ export default function Message({
   );
   // Emails written as you (Act as me), shown under it with Send.
   const chatDrafts = useMemo(
-    () => (actions ?? []).flatMap((a) => (a.draft && typeof a.draft.row === "number" ? [a.draft] : [])),
+    () => dropReplaced(actions ?? []).flatMap((a) => (a.draft && typeof a.draft.row === "number" ? [a.draft] : [])),
     [actions],
   );
   if (role === "user" && author && !author.mine) {
@@ -356,7 +360,7 @@ export default function Message({
                 ) : null,
             }}
           >
-            {content}
+            {linkCardMentions(content)}
           </ReactMarkdown>
           {isStreaming && (
             <span className="inline-block w-0.5 h-4 bg-accent cursor-blink ml-0.5 align-text-bottom rounded-full" />
@@ -365,7 +369,9 @@ export default function Message({
 
         {status && <div className="mt-3">{status}</div>}
 
-        {actions && actions.length > 0 && <ActionChips actions={actions} />}
+        {actions && actions.length > 0 && <ActionChips actions={dropReplaced(actions)} />}
+
+        {memory}
 
         {cardIds.length > 0 && <ChatActionCards ids={cardIds} />}
 

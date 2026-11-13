@@ -873,11 +873,20 @@ async def reset_all_state(
                                # Always in the loop: notes and switches.
                                *HISTORY_TABLES,
                                # Take the lead: switches, rules, its log.
-                               *TAKE_THE_LEAD_TABLES):
+                               *TAKE_THE_LEAD_TABLES,
+                               # Each department's own notes.
+                               "department_notes",
+                               # What the Executive mailed back
+                               # (integrations.email_replies).
+                               "email_thread_replies"):
                     if _conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
                     ).fetchone():
                         _conn.execute(f"DELETE FROM {_table}")
+                # Decisions live in facts now; "decisions" above is the old table.
+                from openexecutive.memory.facts import drop_decisions
+
+                drop_decisions(_conn)
 
         # 3c. Knowledge review state (same DB as the episodic rows above). A
         # "factory reset" that keeps the previous operator's approvals,
@@ -1562,6 +1571,11 @@ def _seed_episodic_memory(memory_path: Path, settings: Any) -> dict[str, int]:
                 ),
             )
         counts["decisions"] = len(decisions)
+        # Decisions are standing facts now: drop the decision facts and the
+        # copied-once marker, so the next facts read copies these rows in.
+        from openexecutive.memory.facts import drop_decisions
+
+        drop_decisions(conn)
 
         initiatives = data.get("initiatives", [])
         for row in initiatives:

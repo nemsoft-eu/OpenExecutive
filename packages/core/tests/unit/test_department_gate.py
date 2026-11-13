@@ -17,6 +17,7 @@ from openexecutive.alerts import store as alerts_store
 from openexecutive.api.routes import decisions as decisions_route
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
+from openexecutive.departments.authority import department_level as _company_level  # noqa: E402
 from openexecutive.departments.models import AuthorityLevel
 from openexecutive.memory import decision_ledger as ledger
 from openexecutive.memory import episodic
@@ -26,6 +27,8 @@ from openexecutive.orchestrator.session import Session
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.people.models import AuthorityScope, Person
+
+pytestmark = pytest.mark.usefixtures("stored_department_levels")
 
 SAM = "sam@co.example"
 RIA = "ria@co.example"
@@ -128,11 +131,11 @@ def test_the_owner_on_a_chat_channel_is_not_gated(team: dict[str, Person], chann
 
 
 def test_google_chat_gates_its_sender_by_their_people_entry(team: dict[str, Person]) -> None:
-    """Google Chat names its sender for the gate alone: the owner goes, a
-    teammate gets their own department's authority."""
+    """Google Chat names a sender on People as the turn's caller, as Slack
+    does: the owner goes, a teammate gets their own department's authority."""
     owner, sam = team["owner"], team["sam"]
-    assert gate.speaker(Session(origin_channel="google_chat", gate_sender_person_id=owner.id)) is None
-    teammate = gate.speaker(Session(origin_channel="google_chat", gate_sender_person_id=sam.id))
+    assert gate.speaker(Session(origin_channel="google_chat", caller_person_id=owner.id)) is None
+    teammate = gate.speaker(Session(origin_channel="google_chat", caller_person_id=sam.id))
     assert teammate is not None and teammate.id == sam.id
 
 
@@ -163,29 +166,66 @@ def test_propose_only_holds_it_for_an_approver(team: dict[str, Person]) -> None:
     assert verdict.level == "propose_only"
 
 
-def test_propose_only_lets_someone_who_could_approve_it_send(team: dict[str, Person]) -> None:
+def test_balanced_lets_someone_who_approves_everything_send(team: dict[str, Person]) -> None:
     _level("marketing", AuthorityLevel.PROPOSE_ONLY)
-    people_store.set_authority_scope(team["sam"].id, [AuthorityScope.SPEND_LT_10K])  # type: ignore[arg-type]
+    people_store.set_authority_scope(team["sam"].id, [AuthorityScope.WILDCARD])  # type: ignore[arg-type]
     sam = _reload(team["sam"])
-    # A spend within Sam's range: theirs to approve, so it goes.
     assert gate.decide(sam, "send_slack_dm", _send("The invoice is $1,500"), mcp=False).run is True
-    # Anything else still needs someone holding its range (here, the owner).
-    assert gate.decide(sam, "send_slack_dm", _send(), mcp=False).run is False
 
 
-def test_a_small_amount_doesnt_cover_the_rest_of_it(team: dict[str, Person]) -> None:
-    """Every kind of approval the action touches must be held: a petty-cash
-    range doesn't approve a termination letter that mentions $12."""
+def test_words_in_a_message_need_no_approval_range(team: dict[str, Person]) -> None:
+    """Money, contract or hiring words no longer pick an approval range:
+    the level alone decides."""
+    _level("marketing", AuthorityLevel.AUTO_EXECUTE)
+    sam = _reload(team["sam"])
+    letter = _send("Send Bob the termination letter, effective today. Also expense the $12 lunch.")
+    assert gate.decide(sam, "send_slack_dm", letter, mcp=False).run is True
     _level("marketing", AuthorityLevel.PROPOSE_ONLY)
     people_store.set_authority_scope(team["sam"].id, [AuthorityScope.SPEND_LT_2K])  # type: ignore[arg-type]
     sam = _reload(team["sam"])
-    letter = _send("Send Bob the termination letter, effective today. Also expense the $12 lunch.")
-    assert gate.approval_ranges("send_slack_dm", letter) == [
-        [AuthorityScope.SPEND_LT_2K, AuthorityScope.SPEND_LT_10K, AuthorityScope.SPEND_GT_10K],
-        [AuthorityScope.HIRING_SIGNOFF],
-    ]
-    assert gate.decide(sam, "send_slack_dm", letter, mcp=False).run is False
-    assert gate.decide(sam, "send_slack_dm", _send("Expense the $12 lunch"), mcp=False).run is True
+    assert gate.decide(sam, "send_slack_dm", _send("Expense the $12 lunch"), mcp=False).run is False
+
+
+def test_the_company_level_decides_without_a_stored_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Outside the routing tests, a department runs at the company's
+    Approvals level, whatever "How it acts" once stored."""
+    from openexecutive.orchestrator import outside_mode
+
+    for mode, level in (
+        (outside_mode.TRUST, AuthorityLevel.AUTO_EXECUTE),
+        (outside_mode.OUTSIDERS, AuthorityLevel.PROPOSE_ONLY),
+        (outside_mode.ASK, AuthorityLevel.ESCALATE),
+    ):
+        monkeypatch.setattr(outside_mode, "get_mode", lambda m=mode, **_: m)
+        assert _company_level("marketing") is level
+
+
+def test_an_unreadable_level_escalates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the Approvals level can't be read, or isn't one it knows, a
+    department's work waits for an approver, as on Careful."""
+    from openexecutive.orchestrator import outside_mode
+
+    def broken(**_: object) -> str:
+        raise RuntimeError("no settings")
+
+    monkeypatch.setattr(outside_mode, "get_mode", broken)
+    assert _company_level("marketing") is AuthorityLevel.ESCALATE
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: "unknown")
+    assert _company_level("marketing") is AuthorityLevel.ESCALATE
+
+
+def test_on_hands_off_someone_on_no_people_entry_still_waits(
+    team: dict[str, Person], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unmatched chat sender or a signed-in web caller on nobody's entry:
+    Hands-off is the owner's trust in their own team, not in them."""
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    unmatched = gate.speaker(Session(origin_channel="slack", caller_person_id=None))
+    assert unmatched is not None and unmatched.id is None
+    verdict = gate.decide(unmatched, "send_slack_dm", _send(), mcp=False)
+    assert verdict.run is False and verdict.approver_person_id == team["owner"].id
 
 
 def test_escalate_always_waits_for_someone_else(team: dict[str, Person]) -> None:
@@ -258,9 +298,9 @@ def test_a_held_send_becomes_a_card_and_does_nothing(
     assert instance.originating_session_id == "s-1"
     payload = json.loads(instance.proposed_payload_json)
     assert payload["tool"] == "send_slack_dm" and payload["requested_by_person_id"] == team["sam"].id
-    # The whole call, for the card to show before it can be approved.
+    # The whole call in plain words, for the card to show before it can be approved.
     assert payload["details"] == [
-        {"field": "user_id", "value": "U_RIA"}, {"field": "text", "value": _send()["text"]},
+        {"field": "User id", "value": "U_RIA"}, {"field": "Message", "value": _send()["text"]},
     ]
 
     [card] = alerts_store.list_alerts(limit=10)
@@ -394,11 +434,18 @@ def test_declining_is_recorded(
 # ── wired into a chat turn ────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("hands_off", [False, True])
 @pytest.mark.parametrize("who", ["sam", "owner"])
 def test_a_teammates_chat_turn_goes_through_the_gate(
-    team: dict[str, Person], monkeypatch: pytest.MonkeyPatch, who: str,
+    team: dict[str, Person], monkeypatch: pytest.MonkeyPatch, who: str, hands_off: bool,
 ) -> None:
-    """A team member's send waits; the owner's own goes, as before."""
+    """A team member's send waits; the owner's own goes, as before. Hands-off
+    is the owner's trust in their own Executive: it doesn't waive the range
+    they set for their people."""
+    if hands_off:
+        from openexecutive.orchestrator import outside_mode
+
+        monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
     from unittest.mock import patch
 
     from openexecutive.orchestrator.executive import Executive
@@ -457,3 +504,105 @@ def test_a_teammates_chat_turn_goes_through_the_gate(
     assert json.loads(results["tu-slack"])["status"] == "waiting_for_approval"
     assert "waiting_for_approval" in results["tu-mail"]
     assert len(alerts_store.list_alerts(limit=10)) == 2
+
+
+# ── several calls held together ───────────────────────────────────────────────
+
+
+def _rename(n: int) -> dict[str, Any]:
+    return {"file_id": f"f{n}", "name": f"2026 Tax - Lot {n}.pdf"}
+
+
+def test_calls_held_together_are_one_card(team: dict[str, Person]) -> None:
+    """Fourteen renames in one round: one card that lists them all."""
+    from openexecutive.orchestrator.department_gate import Verdict
+
+    verdict = Verdict(run=False, approver_person_id=team["owner"].id, reason="it read your own mail first")
+    steps = [_rename(n) for n in range(1, 4)]
+    decision_id = gate.hold(
+        team["owner"], "google_workspace__update_drive_file", steps[0], verdict,
+        mcp=True, held=True, more=steps[1:],
+    )
+    instance = ledger.get_decision_instance(decision_id)
+    assert instance is not None
+    payload = json.loads(instance.proposed_payload_json)
+    assert payload["steps"] == steps and payload["input"] == steps[0]
+    assert payload["fields"] == [] and "2 more like it" in payload["summary"]
+    [card] = alerts_store.list_alerts(limit=10)
+    assert all(f"Lot {n}" in card.body for n in range(1, 4))
+    # The same calls still waiting are that card, not a new one.
+    assert gate.hold(
+        team["owner"], "google_workspace__update_drive_file", steps[0], verdict,
+        mcp=True, held=True, more=steps[1:],
+    ) == decision_id
+
+
+
+def test_a_card_for_several_calls_shows_every_one(team: dict[str, Person]) -> None:
+    """The web card and the chat-app card show each call Approve runs, not
+    only the first."""
+    from openexecutive.api.routes.decisions import _served
+    from openexecutive.integrations.channel_cards import card_text
+    from openexecutive.orchestrator.department_gate import Verdict
+
+    verdict = Verdict(run=False, approver_person_id=team["owner"].id, reason="it read your own mail first")
+    steps = [_rename(n) for n in range(1, 4)]
+    decision_id = gate.hold(
+        team["owner"], "google_workspace__update_drive_file", steps[0], verdict,
+        mcp=True, held=True, more=steps[1:],
+    )
+    instance = ledger.get_decision_instance(decision_id)
+    assert instance is not None
+    served = json.loads(_served(instance).proposed_payload_json)
+    shown = " ".join(d["value"] for d in served["details"])
+    assert all(f"Lot {n}" in shown for n in range(1, 4))
+    assert {d["field"].split(".")[0] for d in served["details"]} == {"1", "2", "3"}
+    text = card_text(decision_id)
+    assert text is not None and all(f"Lot {n}" in text for n in range(1, 4))
+
+
+def test_one_tap_carries_out_each_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import mcp_gateway
+
+    calls: list[dict[str, Any]] = []
+
+    class Gateway:
+        async def call_tool(self, tool_input: dict[str, Any]) -> str:
+            calls.append(tool_input)
+            if tool_input["arguments"]["file_id"] == "f3":
+                return json.dumps({"error": "no such file"})
+            return "Renamed."
+
+    monkeypatch.setattr(mcp_gateway, "get_active_gateway", lambda: Gateway())
+    steps = [_rename(n) for n in range(1, 3)]
+    payload = {"tool": "google_workspace__update_drive_file", "input": steps[0], "mcp": True,
+               "held": True, "steps": steps}
+    done = json.loads(asyncio.run(ttl.carry_out(payload, by_principal=True)))
+    assert done["done"] == 2 and [c["arguments"] for c in calls] == steps
+    # It stops at the first that fails: nothing after it runs.
+    calls.clear()
+    failed = asyncio.run(ttl.carry_out({**payload, "steps": [*steps, _rename(3), _rename(4)]}, by_principal=True))
+    assert ttl.result_failed(failed)
+    error = json.loads(failed)
+    assert error["done"] == 2 and "step 3 didn't" in error["error"] and "rest didn't run" in error["error"]
+    assert [c["arguments"]["file_id"] for c in calls] == ["f1", "f2", "f3"]
+
+
+def test_a_step_that_raises_stops_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import mcp_gateway
+
+    calls: list[str] = []
+
+    class Gateway:
+        async def call_tool(self, tool_input: dict[str, Any]) -> str:
+            calls.append(tool_input["arguments"]["file_id"])
+            if tool_input["arguments"]["file_id"] == "f2":
+                raise TimeoutError("timed out")
+            return "Renamed."
+
+    monkeypatch.setattr(mcp_gateway, "get_active_gateway", lambda: Gateway())
+    steps = [_rename(n) for n in range(1, 4)]
+    payload = {"tool": "google_workspace__update_drive_file", "input": steps[0], "mcp": True,
+               "held": True, "steps": steps}
+    out = json.loads(asyncio.run(ttl.carry_out(payload, by_principal=True)))
+    assert out["done"] == 1 and "timed out" in out["error"] and calls == ["f1", "f2"]

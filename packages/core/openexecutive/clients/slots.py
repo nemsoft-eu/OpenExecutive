@@ -129,6 +129,10 @@ _BLANK_WIPE_TABLES = (
     "watchlist",
     "page_watch_state",
     "outbound_context",
+    # What the Executive mailed back (integrations.email_replies), found by
+    # the recipient's address: an advisor who writes for two clients would
+    # otherwise be shown the previous client's replies.
+    "email_thread_replies",
     # An in-progress setup interview: the previous client's unedited
     # description and answers (financials included).
     "onboarding_interviews",
@@ -180,6 +184,9 @@ _BLANK_WIPE_TABLES = (
     "person_availability",
     "people",
     "department_goals",
+    # Each department's own notes (memory.department_notes): decisions,
+    # updates and check-ins of this company.
+    "department_notes",
     "departments",
     "departments_meta",
 )
@@ -520,6 +527,10 @@ def _wipe_per_client_tables() -> None:
         for table in _BLANK_WIPE_TABLES:
             if table in existing:
                 conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed allowlist
+        # Decisions live in facts now ("decisions" above is the old table).
+        from openexecutive.memory.facts import drop_decisions
+
+        drop_decisions(conn)
         conn.commit()
     finally:
         conn.close()

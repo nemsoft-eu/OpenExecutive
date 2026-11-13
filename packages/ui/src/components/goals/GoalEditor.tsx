@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import TimeframePicker, { TimeframeChips, suggestPeriodValue } from "@/components/TimeframePicker";
 import Button from "@/components/ui/Button";
@@ -16,6 +16,7 @@ import {
   type GoalPatch,
   type PeriodType,
 } from "@/lib/api";
+import { shownStatus } from "@/lib/goalGroups";
 import { formatRelativeTime } from "@/lib/relativeTime";
 
 // Goal rows (view / edit / delete) and the add-goal form, shared by a
@@ -38,18 +39,22 @@ function isStaleReview(lastReviewedAt: string): boolean {
   return Date.now() - ts > STALE_REVIEW_MS;
 }
 
-export const GOAL_STATUS_OPTS = ["on_track", "at_risk", "off_track"] as const;
+export const GOAL_STATUS_OPTS = ["on_track", "at_risk", "off_track", "done"] as const;
 export type GoalStatus = (typeof GOAL_STATUS_OPTS)[number];
 
 // A goal's status as a dot and a word, the one status pill the goal screens
 // share (a goal row, an area's summary on /goals, a department card).
+// "not_checked" is a goal no review has looked at yet (lib/goalGroups.ts).
 const GOAL_STATUS_DOT: Record<string, string> = {
   on_track: "bg-emerald-500",
   at_risk: "bg-amber-500",
   off_track: "bg-rose-500",
+  not_checked: "bg-fg-subtle",
+  done: "bg-sky-500",
 };
 
 export function goalStatusLabel(status: string): string {
+  if (status === "not_checked") return "not checked yet";
   return status.replace("_", " ");
 }
 
@@ -125,6 +130,8 @@ interface GoalRowProps {
   // server snapshot replacing `goals` while a user is mid-edit would
   // flicker the view label and discard the form state.
   onEditingChange?: (editing: boolean) => void;
+  /** Shown under the goal's status line (on /goals: what was done for it). */
+  footer?: ReactNode;
 }
 
 export function formatGoalPeriod(g: Goal): string {
@@ -149,6 +156,7 @@ export function GoalRow({
   onSaved,
   onDeleted,
   onEditingChange,
+  footer,
 }: GoalRowProps) {
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -193,6 +201,7 @@ export function GoalRow({
   }, []);
 
   const stale = isStaleReview(goal.last_reviewed_at);
+  const shown = shownStatus(goal);
 
   if (!editing) {
     const progress = formatGoalProgress(goal);
@@ -221,17 +230,27 @@ export function GoalRow({
           {progress && <div className="text-[15px] text-fg-muted mt-1">{progress}</div>}
           {meta && <div className="text-sm text-fg-muted mt-1">{meta}</div>}
           <div className="text-sm text-fg-subtle mt-2 flex items-center gap-x-2 gap-y-1.5 flex-wrap">
-            <GoalStatusPill status={goal.status} />
+            <GoalStatusPill status={shown} />
             <span>{formatGoalPeriod(goal)}</span>
-            <span aria-hidden="true">·</span>
             {goal.last_reviewed_at ? (
-              <span className={cls(stale && "text-amber-400")}>
-                Last reviewed {formatRelativeTime(goal.last_reviewed_at)}
-              </span>
+              <>
+                <span aria-hidden="true">·</span>
+                <span className={cls(stale && "text-amber-400")}>
+                  Last reviewed {formatRelativeTime(goal.last_reviewed_at)}
+                </span>
+              </>
             ) : (
-              <span className="italic">Never reviewed</span>
+              // The pill already says "not checked yet" for a goal left on
+              // its default; a status someone set still notes it was never checked.
+              shown !== "not_checked" && shown !== "done" && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="italic">Never reviewed</span>
+                </>
+              )
             )}
           </div>
+          {footer}
         </div>
         <div className="flex flex-col items-end gap-1 flex-shrink-0 -mr-2 -mt-1.5">
           <OverflowMenu

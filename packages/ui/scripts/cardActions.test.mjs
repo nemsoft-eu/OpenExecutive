@@ -20,10 +20,10 @@ const CALLS = JSON.parse(readFileSync(new URL("../src/lib/host-list.json", impor
 const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 
 // Approvals that are no card: a suggested watch going live (on the host
-// list), knowledge review items and clearing a Right now point (a change
+// list), knowledge review items and clearing a Right now row (a change
 // like any other).
 const NOT_CARDS = new Set([
-  "/watchlist/12/approve", "/watchlist/12/decline", "/review/bulk-approve", "/today/dismiss",
+  "/watchlist/12/approve", "/watchlist/12/decline", "/review/bulk-approve", "/today/right-now/dismiss",
 ]);
 
 test("every approve, reject, cancel or decide call in lib/api.ts is a card action or named as none", () => {
@@ -68,7 +68,7 @@ test("in a frame, any change off the host list asks; reads and host-list calls d
     assert.match(action.what, new RegExp(`${method} /`));
   }
   // The ones a lured click would most like say what they do.
-  assert.match(frameActionFor("PUT", "/api/backend/delegation/handle-it", "{}", CALLS).what, /^Change Handle it for me/);
+  assert.match(frameActionFor("PUT", "/api/backend/delegation/reach", "{}", CALLS).what, /^Change what the Executive may do as you/);
   assert.match(frameActionFor("POST", "/api/backend/people/3/archive", "{}", CALLS).what, /^Change People/);
   assert.equal(frameActionFor("POST", "/api/backend/decisions/7/approve", undefined, CALLS).card, true);
   // A chat message is on the host list, but sent from this app's page in a

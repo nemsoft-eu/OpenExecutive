@@ -158,6 +158,12 @@ function youTabs(isOnboarded: boolean, roleKind: RoleKind | null): NavItem[] {
 
 const WORK_TABS: NavItem[] = [
   {
+    href: "/tasks",
+    label: "Tasks",
+    icon: "check-circle",
+    description: "What you and your team owe, with who, when and where it came from.",
+  },
+  {
     href: "/jobs",
     label: "Workflows",
     icon: "doc",
@@ -177,33 +183,15 @@ const WORK_TABS: NavItem[] = [
   },
 ];
 
-// The Delegate hub's tabs: what the Executive does as you (Act as me,
-// Handle it for me) and on its own (Take the lead). Each is a named feature,
-// so its tab shows the brand label. What it does for you sits beside each
-// tab (DelegatePage).
-const DELEGATE_TABS: NavItem[] = [
-  {
-    href: "/delegate/act-as-me",
-    label: "Act as me",
-    icon: "mail",
-    feature: "act_as_me",
-    description: "Your mailbox, drafts written as you, and how you write.",
-  },
-  {
-    href: "/delegate/handle-it",
-    label: "Handle it for me",
-    icon: "check-circle",
-    feature: "handle_it",
-    description: "Replies and follow-ups it sends as you on its own.",
-  },
-  {
-    href: "/delegate/take-the-lead",
-    label: "Take the lead",
-    icon: "bolt",
-    feature: "take_the_lead",
-    description: "What it does in its own name without waiting to be asked.",
-  },
-];
+// Delegate: one page (app/delegate/page.tsx) in three blocks: As you (Act
+// as me), As me (Take the lead) and Approvals.
+// The older tabs' addresses land on their block.
+export const DELEGATE_NAV_ITEM: NavItem = {
+  href: "/delegate",
+  label: "Delegate",
+  icon: "check-circle",
+  description: "What your Executive does as you and in its own name, and what waits for your yes.",
+};
 
 /**
  * A hub: one menu entry that holds several pages, shown as a row of tabs at
@@ -211,7 +199,7 @@ const DELEGATE_TABS: NavItem[] = [
  * the first tab.
  */
 export interface Hub {
-  key: "work" | "company" | "you" | "delegate";
+  key: "work" | "company" | "you";
   label: string;
   icon: IconName;
   description: string;
@@ -228,7 +216,7 @@ export function buildHubs({
     key: "work",
     label: "Work",
     icon: "briefcase",
-    description: "Workflows, finished documents and the watch list.",
+    description: "Tasks, workflows, finished documents and the watch list.",
     tabs: WORK_TABS,
   };
   const people: Hub =
@@ -247,14 +235,7 @@ export function buildHubs({
           description: "People, goals, departments and the company profile.",
           tabs: companyTabs(isOnboarded, hasDepartments),
         };
-  const delegate: Hub = {
-    key: "delegate",
-    label: "Delegate",
-    icon: "check-circle",
-    description: "What your Executive does as you, and on its own: Act as me, Handle it for me, Take the lead.",
-    tabs: DELEGATE_TABS,
-  };
-  return [work, people, delegate];
+  return [work, people];
 }
 
 // The hub a page belongs to, or null for a page that isn't in one.
@@ -269,10 +250,10 @@ export function hubForPath(pathname: string, opts: BuildOpts = {}): Hub | null {
 
 export const PULSE_NAV_ITEM: NavItem = {
   href: "/memories",
-  label: "Pulse",
+  label: "Memory",
   icon: "activity",
   description:
-    "The Executive's memory and heartbeat — what it knows and the rhythm it runs on.",
+    "What the Executive knows and where it came from, and what it does on its own.",
 };
 
 /** A main-menu entry. A hub's entry is active on any of its tabs. */
@@ -311,6 +292,7 @@ export function buildDestinations({
       description: "Every conversation, searchable — including Slack, Telegram and Discord.",
     },
     ...hubs.map(hubEntry),
+    { key: "delegate", ...DELEGATE_NAV_ITEM },
     {
       key: "knowledge",
       href: "/knowledge",
@@ -391,7 +373,7 @@ export const ADVANCED_ITEMS: AdvancedItem[] = [
     icon: "doc-search",
     group: "diagnose",
     description:
-      "A searchable record of everything the Executive did: each chat, each question it passed to an expert, each tool it used and each scheduled job.",
+      "A searchable record of everything the Executive did: each chat, each question it passed to an expert, each tool it used and each thing it did on a schedule.",
   },
   {
     href: "/audit/usage",
@@ -418,11 +400,11 @@ export const ADVANCED_ITEMS: AdvancedItem[] = [
   },
   {
     href: "/settings/tools",
-    label: "Custom tools",
+    label: "Tools I built",
     icon: "bolt",
     group: "configure",
     description:
-      "Tools the Executive built when it didn't have the one it needed: turn each on or off, see its runs, or go back a version.",
+      "Tools I built when I didn't have the one I needed: turn each on or off, see its runs, or go back a version.",
   },
   {
     href: "/demo",
@@ -519,7 +501,7 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
     label: "About you",
     href: "/settings/memory",
     icon: "user",
-    description: "What the Executive has learned about you, and the private notes it keeps.",
+    description: "Whether it keeps notes of what you say, what you share with the team, and how long notes last.",
     hashes: ["memory"],
   },
   {
@@ -578,8 +560,8 @@ export function settingsPageForHash(hash: string): SettingsPageDef | null {
 }
 
 // Old Settings anchors for pages that moved out of Settings, and where they
-// went: Act as me is a tab of Delegate now.
-const MOVED_HASHES: Record<string, string> = { "act-as-me": "/delegate/act-as-me" };
+// went: Act as me is the As you block of Delegate now.
+const MOVED_HASHES: Record<string, string> = { "act-as-me": "/delegate#as-you" };
 
 // Where an old `/settings#<hash>` link should go: its Settings page, or the
 // page it moved to, or null.

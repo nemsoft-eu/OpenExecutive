@@ -174,6 +174,25 @@ def _viewer(entry: str) -> str:
     return who[:80]
 
 
+_OUTSIDE_OWNER = "That folder belongs to someone outside the team"
+
+
+class FolderNeedsOK(Exception):
+    """Below Hands-off, a folder outside the company (or open to anyone)
+    waits on the owner's Approve card; ``detail`` says why."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _place_relaxed() -> bool:
+    """Hands-off, or a save the owner approved (``orchestrator.levels``)."""
+    from openexecutive.orchestrator import levels
+
+    return levels.relaxed()
+
+
 def folder_check(info: str, folder: str, account: str, team: set[str]) -> tuple[str | None, list[str]]:
     """Why a Google Drive folder, by ``get_drive_file_permissions``'s answer,
     is not one to save into (or None), and who outside the team can open it.
@@ -198,7 +217,7 @@ def folder_check(info: str, folder: str, account: str, team: set[str]) -> tuple[
     allowed = {account} | team
     owner_emails = {e.lower() for e in _EMAIL_IN_RE.findall(owners)}
     if not owner_emails <= allowed:
-        return "That folder belongs to someone outside the team, so I don't save into it", []
+        return _OUTSIDE_OWNER + ", so I don't save into it", []
     tail = lines[marks[0] + 4:]
     try:
         start = next(i for i, line in enumerate(tail) if line.strip() == "Sharing Status:")
@@ -259,13 +278,22 @@ async def _google(
         if _failed(info):
             raise SaveFailed(f"Couldn't open that folder: {_why(info)}")
         refused, outside = folder_check(info, folder, account, _team_emails())
-        if refused is not None:
+        if refused is not None and refused.startswith(_OUTSIDE_OWNER):
+            # A held turn (_turn_held: mail lock or outside read) never saves
+            # into a folder someone outside the company owns, whatever the
+            # level: what it read may have named that folder.
+            if held:
+                raise SaveFailed(refused + ".")
+            # Where the file goes follows the owner's level (orchestrator.levels):
+            # Hands-off saves it; below, it's their Approve card.
+            if not _place_relaxed():
+                raise FolderNeedsOK(refused + ".")
+        elif refused is not None:
             raise SaveFailed(refused + ".")
         public = [who for who in outside if who == ANYONE_WITH_LINK or who.startswith(WHOLE_DOMAIN)]
-        if public:
-            raise SaveFailed(
-                f"That folder is open to {public[0].lower() if public[0].startswith('Anyone') else public[0]}, "
-                "so I don't save into it. Pick a folder shared with named people, or change its sharing."
+        if public and not _place_relaxed():
+            raise FolderNeedsOK(
+                f"That folder is open to {public[0].lower() if public[0].startswith('Anyone') else public[0]}."
             )
         if (held or tapped) and _NO_PERMISSIONS_LISTED in info:
             raise SaveFailed(HELD_UNSEEN)
@@ -421,17 +449,27 @@ async def handle_save_file(tool_input: dict[str, Any]) -> str:
             ),
         })
     try:
-        async with save._lock():
-            if provider == DOCUMENTS:
-                saved = await _documents(item, name)
-            elif provider == save.GOOGLE:
+        if provider == save.GOOGLE:
+            # Up to save.GOOGLE_PARALLEL_SAVES at once: a folder id is given
+            # and Drive allows two files of one name, so nothing races.
+            async with save._google_slot():
                 saved = await _google(gateway, item, folder, name, held=held)
-            elif held:
-                raise save.SaveFailed(HELD_ONEDRIVE)
-            else:
-                saved = await _microsoft(gateway, item, folder, name)
+        elif held:
+            raise save.SaveFailed(HELD_ONEDRIVE)
+        else:
+            # Documents and OneDrive pick a free name first, so one at a time.
+            async with save._lock():
+                if provider == DOCUMENTS:
+                    saved = await _documents(item, name)
+                else:
+                    saved = await _microsoft(gateway, item, folder, name)
     except save.NoStorage:
         return json.dumps({"status": "no_storage", "detail": "Your OneDrive couldn't be reached."})
+    except FolderNeedsOK as exc:
+        from openexecutive.orchestrator import levels
+
+        blocked = json.dumps({"status": "failed", "detail": f"Couldn't save {name}. {exc.detail}"})
+        return levels.card_or(blocked, SAVE_FILE, dict(tool_input), reason=levels.FILE_PLACE, mcp=False)
     except save.SaveFailed as exc:
         return json.dumps({"status": "failed", "detail": f"Couldn't save {name}. {exc.detail}"})
     try:

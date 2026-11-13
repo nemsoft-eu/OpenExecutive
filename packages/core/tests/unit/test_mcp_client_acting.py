@@ -17,7 +17,7 @@ import pytest
 from openexecutive.audit import logger as audit_logger
 from openexecutive.audit import unscoped_audit_rows, via_app
 from openexecutive.audit.logger import log_event
-from openexecutive.delegation import action_cards, handle_it, training
+from openexecutive.delegation import action_cards, handle_it, inbox
 from openexecutive.delegation.settings import pin_turn_delegation, set_enabled
 from openexecutive.mcp_server import server as mcp_server
 from openexecutive.memory.decision_ledger import get_decision_instance
@@ -43,7 +43,7 @@ from .test_action_cards import _invite, _message
 
 # The autouse temp DB and fresh turn pin of Act as me's tests.
 from .test_delegation_tools import OWNER, TEAM, db, fresh_turn_state  # noqa: F401
-from .test_mcp_client_turns import _gateway, _real_gateway, _results, _run_loop
+from .test_mcp_client_turns import _gateway, _held, _real_gateway, _results, _run_loop
 
 OUTWARD = (
     "message_person", "send_slack_dm", "send_discord_dm", "send_telegram_message",
@@ -100,8 +100,9 @@ def test_the_acting_set_is_the_read_only_set_minus_the_changes_it_may_make() -> 
         "ack_alert", "add_watchlist_entry", "assign_open_loop",
         "cancel_followup", "close_open_loop", "create_alert", "create_goal", "forget_fact",
         "leave_out_of_brief", "move_followup", "record_decision_outcome", "remember_fact",
-        "remove_watchlist_entry", "schedule_followup",
+        "remove_watchlist_entry", "reopen_open_loop", "schedule_followup",
         "tune_watchlist_entry", "update_company_profile", "update_department_goal",
+        "update_open_loop",
     }
     assert runs == MCP_CLIENT_RUNS_WHEN_ACTING
     # The roster stays out of reach: someone added on one call would be
@@ -154,7 +155,8 @@ def test_only_a_turn_that_may_act_is_a_verified_surface(roster: SimpleNamespace)
 def test_an_acting_turn_is_offered_its_own_stable_list(roster: SimpleNamespace) -> None:
     offered = _run_loop(_acting(roster.principal), [], _gateway()).offered[0]
     assert offered == sorted(offered)
-    assert not MCP_CLIENT_ACTING_WITHHELD_TOOLS & set(offered)
+    # Nothing is hidden: the one check decides at dispatch (orchestrator.levels).
+    assert MCP_CLIENT_ACTING_WITHHELD_TOOLS & set(offered)
     assert {"remember_fact", "close_open_loop", "schedule_followup", act.PROPOSE_ACTIONS} <= set(offered)
     assert "ghostwrite_email" not in offered and "recall_history" not in offered
     assert _run_loop(_acting(roster.principal), [], _gateway()).offered[0] == offered
@@ -168,7 +170,7 @@ def test_an_acting_turn_is_offered_its_own_stable_list(roster: SimpleNamespace) 
     ["message_person", "create_calendar_event", "run_workflow", "save_workflow",
      "upsert_person", "archive_person", "set_department_head"],
 )
-def test_an_acting_turn_refuses_what_it_is_not_offered(roster: SimpleNamespace, tool: str) -> None:
+def test_an_acting_turn_puts_a_withheld_step_on_a_card(roster: SimpleNamespace, tool: str) -> None:
     from openexecutive.orchestrator import executive as executive_module
 
     handler = AsyncMock(return_value=json.dumps({"status": "sent"}))
@@ -176,7 +178,7 @@ def test_an_acting_turn_refuses_what_it_is_not_offered(roster: SimpleNamespace, 
     with patch.dict(executive_module._ALL_SKILL_HANDLERS, {tool: handler}):
         provider = _run_loop(_acting(roster.principal), [tool_use])
     handler.assert_not_awaited()
-    assert MCP_CLIENT_ACTING_REFUSAL in json.loads(_results(provider)["tu-1"])["error"]
+    assert _held(_results(provider)["tu-1"])
 
 
 def test_an_acting_turn_runs_a_change_inside_open_executive(roster: SimpleNamespace) -> None:
@@ -197,7 +199,7 @@ def test_the_gateway_still_refuses_a_send_on_an_acting_turn(roster: SimpleNamesp
         with set_session(_acting(roster.principal)):
             return str(await gateway.call_tool({
                 "name": "google_workspace__send_gmail_message",
-                "arguments": {"to": "olivia@co.example", "subject": "s", "body": "b"},
+                "arguments": {"to": "ben@co.example", "subject": "s", "body": "b"},
             }))
 
     assert MCP_CLIENT_ACTING_REFUSAL in json.loads(asyncio.run(_go()))["error"]
@@ -223,8 +225,12 @@ def _settle(*person_ids: int, days: int = 30) -> None:
 
 @pytest.fixture
 def act_as_me(roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Act as me on, Approvals on Balanced."""
+    from openexecutive.orchestrator import outside_mode
+
     set_enabled(roster.principal, True, updated_by="t")
     monkeypatch.setattr(handle_it, "signing_ok", lambda: True)
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.OUTSIDERS)
     _settle(roster.principal, roster.teammate)
     return roster
 
@@ -240,28 +246,17 @@ def _ai_propose(person_id: int, tool_input: dict[str, Any], app: str | None = "C
     return json.loads(asyncio.run(go()))
 
 
-def test_suggested_actions_on_leaves_an_ai_app_card_to_handle_it(
-    act_as_me: SimpleNamespace, sends: list[Any]
-) -> None:
-    """On is for cards from their mail: another AI app's still follows Handle it for me."""
-    from openexecutive.delegation import training
-
-    training.set_(act_as_me.principal, {training.ACTIONS_ON: True}, updated_by="t")
-    result = _ai_propose(act_as_me.principal, {"why": "x", "actions": [_message(act_as_me.teammate)]})
-    assert result["status"] == "waiting_for_approval" and sends == []
-
-
 def test_a_card_waits_when_handle_it_is_off(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
     result = _ai_propose(act_as_me.principal, {"why": "x", "actions": [_message(act_as_me.teammate)]})
     assert result["status"] == "waiting_for_approval" and sends == []
     card = get_decision_instance(result["decision_id"])
     assert card is not None and card.status == "proposed"
     payload = json.loads(card.proposed_payload_json)
-    assert payload["via"] == "Claude Desktop" and payload["follow_handle_it"] is True
+    assert payload["via"] == "Claude Desktop"
 
 
 def test_a_card_goes_on_its_own_under_handle_it(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
-    handle_it.set_(act_as_me.principal, enabled=True, mode=handle_it.MODE_BALANCED, updated_by="t")
+    inbox.set_watch(act_as_me.principal, True, updated_by="test")
     result = _ai_propose(act_as_me.principal, {"why": "x", "actions": [
         _message(act_as_me.teammate), _invite(act_as_me.principal, act_as_me.teammate),
     ]})
@@ -276,61 +271,34 @@ def test_a_card_goes_on_its_own_under_handle_it(act_as_me: SimpleNamespace, send
     assert handled and handled[0].details["via"] == "Claude Desktop"
 
 
-@pytest.mark.parametrize(("action", "reason"), [
-    ("contact", "new_contact"),
-    ("sensitive", "sensitive"),
-    ("link", "link"),
-    ("long", "long"),
-])
-def test_what_still_waits_under_handle_it(
-    act_as_me: SimpleNamespace, sends: list[Any], action: str, reason: str
-) -> None:
+def test_a_new_contact_still_waits_under_handle_it(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
     roster = act_as_me
-    handle_it.set_(roster.principal, enabled=True, mode=handle_it.MODE_CAREFUL, updated_by="t")
-    proposed = {
-        "contact": {"kind": "add_contact", "full_name": "Sam Lee", "email": "sam@northpeak.example"},
-        "sensitive": _message(roster.teammate, "Can you check the contract terms?"),
-        "link": _message(roster.teammate, "See https://files.example.com/x"),
-        # Careful sends only short replies on its own.
-        "long": _message(roster.teammate, "Could you look at the pilot schedule? " * 15),
-    }[action]
+    inbox.set_watch(roster.principal, True, updated_by="test")
+    proposed = {"kind": "add_contact", "full_name": "Sam Lee", "email": "sam@northpeak.example"}
     person = people_store.get_person(roster.principal)
     checked = action_cards.check([proposed], person, now=datetime.now(UTC))
     assert not isinstance(checked, str)
-    assert action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC), follow_handle_it=True) == reason
-    # The same card on an ordinary turn needs training, as before.
-    assert action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC)) == "training_off"
+    assert action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC)) == "new_contact"
     result = _ai_propose(roster.principal, {"why": "y", "actions": [proposed]})
     assert result["status"] == "waiting_for_approval" and sends == []
 
 
-def test_in_training_the_training_rule_applies(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
-    roster = act_as_me
-    handle_it.set_(roster.principal, enabled=True, updated_by="t")
-    training.set_(roster.principal, {training.ACTIONS: True}, updated_by="t")
-    person = people_store.get_person(roster.principal)
-    checked = action_cards.check([_message(roster.teammate)], person, now=datetime.now(UTC))
-    assert not isinstance(checked, str)
-    assert action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC), follow_handle_it=True) == "not_allowed"
-    assert _ai_propose(roster.principal, {"why": "y", "actions": [_message(roster.teammate)]})["status"] == "waiting_for_approval"
-
-
 def test_the_last_check_uses_the_cards_own_rule(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
     roster = act_as_me
-    handle_it.set_(roster.principal, enabled=True, updated_by="t")
+    inbox.set_watch(roster.principal, True, updated_by="test")
     person = people_store.get_person(roster.principal)
     checked = action_cards.check([_message(roster.teammate)], person, now=datetime.now(UTC))
     assert not isinstance(checked, str)
-    decision_id = action_cards.propose(person, checked, "y", session_id=None, on_its_own=True, follow_handle_it=True)
+    decision_id = action_cards.propose(person, checked, "y", session_id=None, on_its_own=True)
     # Turned off in between: held, waiting on a tap.
-    handle_it.set_(roster.principal, enabled=False, updated_by="t")
+    inbox.set_watch(roster.principal, False, updated_by="test")
     assert asyncio.run(action_cards.run_on_its_own(decision_id, person)) is None
     card = get_decision_instance(decision_id)
     assert card is not None and card.status == "proposed" and sends == []
 
 
 def test_no_card_without_act_as_me_or_a_speaker(roster: SimpleNamespace, sends: list[Any]) -> None:
-    assert "Act as me" in _ai_propose(roster.principal, {"why": "x", "actions": [_message(roster.teammate)]})["error"]
+    assert "As you" in _ai_propose(roster.principal, {"why": "x", "actions": [_message(roster.teammate)]})["error"]
     session = _acting(None)
     pin_turn_delegation(session, "x")
 
@@ -437,10 +405,22 @@ def test_ask_executive_plumbs_may_act_and_the_app(
 def test_a_turn_that_read_outside_text_waits(act_as_me: SimpleNamespace, sends: list[Any]) -> None:
     from openexecutive.orchestrator import outside_content
 
-    handle_it.set_(act_as_me.principal, enabled=True, updated_by="t")
+    inbox.set_watch(act_as_me.principal, True, updated_by="test")
     with patch.object(outside_content, "read_outside", return_value=True):
         result = _ai_propose(act_as_me.principal, {"why": "x", "actions": [_message(act_as_me.teammate)]})
     assert result["status"] == "waiting_for_approval" and sends == []
+
+
+def test_on_hands_off_a_turn_that_read_outside_text_goes(
+    act_as_me: SimpleNamespace, sends: list[Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.orchestrator import outside_content, outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    inbox.set_watch(act_as_me.principal, True, updated_by="test")
+    with patch.object(outside_content, "read_outside", return_value=True):
+        result = _ai_propose(act_as_me.principal, {"why": "x", "actions": [_message(act_as_me.teammate)]})
+    assert result["status"] == "done_on_its_own" and len(sends) == 1
 
 
 @pytest.mark.parametrize(("days", "expected"), [(1, "new_person"), (6, "new_person"), (8, None)])
@@ -448,16 +428,14 @@ def test_no_one_added_lately_is_reached_on_its_own(
     act_as_me: SimpleNamespace, sends: list[Any], days: int, expected: str | None
 ) -> None:
     roster = act_as_me
-    handle_it.set_(roster.principal, enabled=True, updated_by="t")
+    inbox.set_watch(roster.principal, True, updated_by="test")
     newcomer = people_store.upsert_person(full_name="Nia New", email="nia@co.example")
     _settle(newcomer, days=days)
     person = people_store.get_person(roster.principal)
     for proposed in (_message(newcomer), _invite(roster.principal, newcomer)):
         checked = action_cards.check([proposed], person, now=datetime.now(UTC))
         assert not isinstance(checked, str)
-        assert action_cards.on_its_own_refusal(
-            person, checked, now=datetime.now(UTC), follow_handle_it=True,
-        ) == expected
+        assert action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC)) == expected
 
 
 def test_planting_someone_then_messaging_them_never_sends_on_its_own(
@@ -468,7 +446,7 @@ def test_planting_someone_then_messaging_them_never_sends_on_its_own(
     from openexecutive.orchestrator import executive as executive_module
 
     roster = act_as_me
-    handle_it.set_(roster.principal, enabled=True, updated_by="t")
+    inbox.set_watch(roster.principal, True, updated_by="test")
     upsert = AsyncMock(return_value=json.dumps({"status": "saved"}))
     tool_use = SimpleNamespace(
         type="tool_use", id="tu-1", name="upsert_person",
@@ -477,7 +455,7 @@ def test_planting_someone_then_messaging_them_never_sends_on_its_own(
     with patch.dict(executive_module._ALL_SKILL_HANDLERS, {"upsert_person": upsert}):
         provider = _run_loop(_acting(roster.principal), [tool_use])
     upsert.assert_not_awaited()
-    assert MCP_CLIENT_ACTING_REFUSAL in json.loads(_results(provider)["tu-1"])["error"]
+    assert _held(_results(provider)["tu-1"])
     assert people_store.find_person_by_email("eve@attacker.example", include_contacts=True) is None
     planted = people_store.upsert_person(full_name="Eve Planted", email="eve@attacker.example")
     result = _ai_propose(roster.principal, {"why": "x", "actions": [_message(planted)]})

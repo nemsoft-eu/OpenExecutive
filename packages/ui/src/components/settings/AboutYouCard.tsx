@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { formatDate } from "@/components/memories/shared";
 import SettingsCard from "@/components/settings/SettingsCard";
 import {
+  forgetPersonConclusion,
   listPeopleMemory,
   listPersonConclusions,
   type PeopleMemory,
@@ -12,12 +13,13 @@ import {
   type PersonMemory,
 } from "@/lib/api";
 import { cardEntry, noteAboutYou } from "@/lib/aboutYou";
+import { PageSpinner, Spinner } from "@/components/ui/Spinner";
 
-// Settings → About you: what peer memory has learned about the signed-in
+// Memory → About you: what peer memory has learned about the signed-in
 // person, derived server-side from their conversations. GET /memories/people
 // returns only the caller's own entry (the principal's included), so this is
-// one person's profile and notes. Read-only: it is not the Executive's own
-// record to edit. Renders nothing when peer memory is off.
+// one person's profile and notes. Each note can be removed (yours only).
+// Renders nothing when peer memory is off.
 
 const NOTHING_YET =
   "Nothing learned about you yet. It fills in as you talk with the Executive.";
@@ -28,7 +30,18 @@ const CARD_PREVIEW_LINES = 4;
 // of its bottom.
 const NOTES_SCROLL_SLACK_PX = 48;
 
-export default function AboutYouCard() {
+export default function AboutYouCard({
+  title = "Your profile",
+  description = "Learned from your chats and replies. Only you see this.",
+  footer,
+}: {
+  title?: string;
+  description?: string;
+  /** Shown in the same card, under what it learned: the Memory page puts
+   * "What you said" there. With a footer the card stays even when there is
+   * no profile to show. */
+  footer?: ReactNode;
+} = {}) {
   const [data, setData] = useState<PeopleMemory | null>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -52,18 +65,24 @@ export default function AboutYouCard() {
     };
   }, []);
 
-  if (data?.status === "disabled") return null;
+  if (data?.status === "disabled") {
+    return footer ? (
+      <SettingsCard title={title} description={description}>
+        {footer}
+      </SettingsCard>
+    ) : null;
+  }
 
   const me = data?.status === "ok" ? data.people[0] : undefined;
   const learned = me?.last_observed_at ? `Last learned ${formatDate(me.last_observed_at)}.` : null;
 
   return (
     <SettingsCard
-      title="Your profile"
-      description={["Learned from your chats and replies. Only you see this.", learned].filter(Boolean).join(" ")}
+      title={title}
+      description={[description, learned].filter(Boolean).join(" ")}
     >
       {loading ? (
-        <p className="text-[15px] text-fg-muted">Loading…</p>
+        <PageSpinner />
       ) : failed || !data || data.status === "error" || me?.error ? (
         <p className="text-[15px] text-fg-muted">Couldn&apos;t load what it knows about you right now.</p>
       ) : !me || (me.card.length === 0 && me.conclusion_count === 0) ? (
@@ -74,6 +93,7 @@ export default function AboutYouCard() {
           {me.recent.length > 0 && <Notes item={me} />}
         </div>
       )}
+      {footer && <div className="mt-5">{footer}</div>}
     </SettingsCard>
   );
 }
@@ -119,8 +139,20 @@ function Notes({ item }: { item: PersonMemory }) {
   const [hasMore, setHasMore] = useState(item.conclusion_count > item.recent.length);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [removed, setRemoved] = useState(0);
+  const [removeFailed, setRemoveFailed] = useState(false);
   const loadingRef = useRef(false);
   const paneRef = useRef<HTMLDivElement>(null);
+  const remove = async (id: string) => {
+    setRemoveFailed(false);
+    try {
+      await forgetPersonConclusion(item.person_id, id);
+      setNotes((prev) => prev.filter((c) => c.id !== id));
+      setRemoved((n) => n + 1);
+    } catch {
+      setRemoveFailed(true);
+    }
+  };
   const load = useCallback(
     async (page: number) => {
       if (loadingRef.current) return;
@@ -162,13 +194,17 @@ function Notes({ item }: { item: PersonMemory }) {
     if (el.scrollHeight <= el.clientHeight) void load(nextPage);
   }, [notes, nextPage, hasMore, loading, failed, load]);
 
-  const remaining = Math.max(item.conclusion_count - notes.length, 0);
+  const total = Math.max(item.conclusion_count - removed, 0);
+  const remaining = Math.max(total - notes.length, 0);
   return (
     <div>
       <h3 className="text-[13px] font-semibold uppercase tracking-wide text-fg-subtle mb-2">
         Notes · {nextPage !== null ? `${notes.length} of ` : ""}
-        {Math.max(item.conclusion_count, notes.length)}
+        {Math.max(total, notes.length)}
       </h3>
+      {removeFailed && (
+        <p className="mb-2 text-sm text-fg-muted">Couldn&apos;t remove that note. Try again.</p>
+      )}
       <div
         ref={paneRef}
         onScroll={onScroll}
@@ -176,25 +212,37 @@ function Notes({ item }: { item: PersonMemory }) {
       >
         <ul className="divide-y divide-line/60">
           {notes.map((c, i) => (
-            <li key={`${c.created_at}-${i}`} className="grid grid-cols-1 gap-0.5 px-3 py-2.5 sm:grid-cols-[5.5rem_1fr] sm:gap-3">
-              <span className="text-[11px] text-fg-subtle tabular-nums pt-0.5">{formatDate(c.created_at)}</span>
-              <span className="text-[15px] text-fg leading-relaxed break-words">
+            <li
+              key={`${c.created_at}-${i}`}
+              className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5 px-3 py-2.5 sm:grid-cols-[5.5rem_1fr_auto]"
+            >
+              <span className="text-[11px] text-fg-subtle tabular-nums pt-0.5 sm:row-auto">{formatDate(c.created_at)}</span>
+              <span className="col-span-2 row-start-2 text-[15px] text-fg leading-relaxed break-words sm:col-span-1 sm:row-start-auto">
                 {noteAboutYou(c.content, item.person_id, item.full_name)}
               </span>
+              {c.id ? (
+                <button
+                  onClick={() => void remove(c.id as string)}
+                  className="col-start-2 row-start-1 min-h-touch self-start text-sm text-fg-muted hover:text-fg sm:col-start-3"
+                  aria-label="Remove this note"
+                >
+                  Remove
+                </button>
+              ) : null}
             </li>
           ))}
         </ul>
         {(loading || failed || (hasMore && nextPage === null)) && (
           <div className="px-3 py-2 text-sm text-fg-muted border-t border-line/60">
             {loading ? (
-              "Loading…"
+              <Spinner />
             ) : failed ? (
               <button onClick={() => void load(nextPage ?? 1)} className="min-h-touch hover:text-fg">
                 Couldn&apos;t load more — retry
               </button>
             ) : (
               <button onClick={() => void load(1)} className="min-h-touch font-medium text-accent hover:underline">
-                Show all {item.conclusion_count} notes ({remaining} more)
+                Show all {total} notes ({remaining} more)
               </button>
             )}
           </div>

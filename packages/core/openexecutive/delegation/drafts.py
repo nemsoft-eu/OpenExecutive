@@ -54,6 +54,10 @@ class WaitingDraft:
     created_at: str
     to: tuple[str, ...] = ()
     subject: str = ""
+    # Its row in the drafts table, and the thread it answers ("" for a new
+    # email): what Home's Right now keys and opens it by.
+    row_id: int = 0
+    thread_id: str = ""
 
 
 # (person id, row id) -> (to, subject) as the last ``settle_waiting`` read them from the
@@ -155,6 +159,7 @@ class DraftRow:
     sent_message_id: str
     created_at: str
     gone_at: str
+    replaced_by: int | None = None
 
 
 def get_row(row_id: int, *, db_path: Path | None = None) -> DraftRow | None:
@@ -163,7 +168,7 @@ def get_row(row_id: int, *, db_path: Path | None = None) -> DraftRow | None:
     try:
         row = conn.execute(
             "SELECT id, person_id, source, thread_id, draft_id, message_id, sent_message_id, "
-            f"created_at, gone_at FROM {DRAFTS_TABLE} WHERE id = ?",  # noqa: S608 — constant table name
+            f"created_at, gone_at, replaced_by FROM {DRAFTS_TABLE} WHERE id = ?",  # noqa: S608 — constant table name
             (row_id,),
         ).fetchone()
     finally:
@@ -174,6 +179,7 @@ def get_row(row_id: int, *, db_path: Path | None = None) -> DraftRow | None:
         id=int(row[0]), person_id=int(row[1]), source=str(row[2] or ""), thread_id=str(row[3] or ""),
         draft_id=str(row[4] or ""), message_id=str(row[5] or ""), sent_message_id=str(row[6] or ""),
         created_at=str(row[7] or ""), gone_at=str(row[8] or ""),
+        replaced_by=int(row[9]) if row[9] is not None else None,
     )
 
 
@@ -208,6 +214,39 @@ def open_chat_drafts(
         f"WHERE source = ? AND ({' OR '.join(which)}) "
         "AND sent_message_id IS NULL AND gone_at IS NULL"
     )
+    if before_id is not None:
+        sql += " AND id < ?"
+        params.append(before_id)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(_SETTLE_MAX)
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [
+        DraftRow(
+            id=int(r[0]), person_id=int(r[1]), source=str(r[2] or ""), thread_id=str(r[3] or ""),
+            draft_id=str(r[4] or ""), message_id=str(r[5] or ""), sent_message_id=str(r[6] or ""),
+            created_at=str(r[7] or ""), gone_at=str(r[8] or ""),
+        )
+        for r in rows
+    ]
+
+
+def open_chat_drafts_of(
+    person_id: int, *, since: datetime, before_id: int | None = None, db_path: Path | None = None,
+) -> list[DraftRow]:
+    """``person_id``'s chat drafts written since ``since`` in any
+    conversation, not yet sent or gone, newest first (at most
+    ``_SETTLE_MAX``)."""
+    sql = (
+        "SELECT id, person_id, source, thread_id, draft_id, message_id, sent_message_id, "
+        f"created_at, gone_at FROM {DRAFTS_TABLE} "  # noqa: S608 — constant table name
+        "WHERE source = ? AND person_id = ? AND created_at >= ? "
+        "AND sent_message_id IS NULL AND gone_at IS NULL"
+    )
+    params: list[object] = [SOURCE_CHAT, person_id, since.isoformat()]
     if before_id is not None:
         sql += " AND id < ?"
         params.append(before_id)
@@ -370,9 +409,11 @@ def waiting_drafts(
     newest first, each with who it goes to and its subject when a settle
     pass has read them (empty until one has)."""
     out = []
-    for row_id, _, created_at, _ in _waiting_rows(person_id, since, db_path):
+    for row_id, _, created_at, thread_id in _waiting_rows(person_id, since, db_path):
         to, subject = _seen.get((person_id, row_id), ((), ""))
-        out.append(WaitingDraft(created_at=created_at, to=to, subject=subject))
+        out.append(WaitingDraft(
+            created_at=created_at, to=to, subject=subject, row_id=row_id, thread_id=thread_id,
+        ))
     return out
 
 
@@ -381,6 +422,38 @@ def latest_waiting(person_id: int, since: datetime, *, db_path: Path | None = No
     counted as waiting, or None."""
     waiting = _waiting(person_id, since, db_path)
     return waiting[0][0] if waiting else None
+
+
+def set_version(row_id: int, old: str, new: str, *, db_path: Path | None = None) -> bool:
+    """The chat draft ``row_id`` was rewritten from its card on the person's
+    tap: it is now the version ``new`` (Gmail's message id for the edited
+    draft, or Outlook's change key), so Send under the chat sends it. Only
+    while it is still ``old`` and waiting (compare-and-set); False otherwise."""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            f"UPDATE {DRAFTS_TABLE} SET message_id = ? "  # noqa: S608 — constant table name
+            "WHERE id = ? AND message_id = ? AND gone_at IS NULL AND sent_message_id IS NULL",
+            (new, row_id, old),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def mark_replaced(row_id: int, by: int, *, db_path: Path | None = None) -> None:
+    """The chat draft ``row_id`` was retired for the newer one ``by``: its
+    card folds to "replaced". Set once; a later redraft never moves it."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            f"UPDATE {DRAFTS_TABLE} SET replaced_by = ? WHERE id = ? AND replaced_by IS NULL",  # noqa: S608
+            (by, row_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def mark_gone(row_id: int, now: datetime, *, db_path: Path | None = None) -> None:

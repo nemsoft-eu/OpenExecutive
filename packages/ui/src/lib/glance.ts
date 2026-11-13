@@ -18,14 +18,16 @@ export function realDepartments(departments: DepartmentBriefItem[]): DepartmentB
 }
 
 // Every goal on the briefing, with or without a department.
-export function goalTotals(departments: DepartmentBriefItem[]): { goals: number; atRisk: number } {
+export function goalTotals(departments: DepartmentBriefItem[]): { goals: number; atRisk: number; unchecked: number } {
   let goals = 0;
   let atRisk = 0;
+  let unchecked = 0;
   for (const d of departments) {
     goals += d.goal_count;
     atRisk += d.at_risk_count + d.off_track_count;
+    unchecked += d.unchecked_count ?? 0;
   }
-  return { goals, atRisk };
+  return { goals, atRisk, unchecked };
 }
 
 // What Act as me sent or accepted for you in the last seven days.
@@ -54,4 +56,54 @@ export function scheduledWorkflows(
 export function watching(items: WatchlistItem[], now: Date): { watched: number; firedThisWeek: number } {
   const on = items.filter((i) => i.enabled);
   return { watched: on.length, firedThisWeek: on.filter((i) => withinWeek(i.last_fired_at, now)).length };
+}
+
+// The words on Home's bottom line. Each item reads on its own ("5 goals,
+// 1 at risk"), since the line has no headings.
+export function counted(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+// Your tasks: those due this week, or else how many are due later.
+export function tasksText(dueThisWeek: number, overdue: number, later: number): string {
+  if (dueThisWeek > 0) {
+    const due = `${counted(dueThisWeek, "task", "tasks")} due this week`;
+    return overdue > 0 ? `${due}, ${overdue} overdue` : due;
+  }
+  return `${counted(later, "task", "tasks")} due later`;
+}
+
+// A goal nothing has checked yet is not called on track.
+export function goalsText(goals: number, atRisk: number, unchecked = 0): string {
+  const g = counted(goals, "goal", "goals");
+  if (atRisk > 0) return `${g}, ${atRisk} at risk`;
+  if (unchecked > 0) return `${g}, ${unchecked} not checked yet`;
+  return `${g} on track`;
+}
+
+// Departments: the ones that need you, or else all of them on track. Those
+// with goals nothing has checked yet (`unchecked`) aren't called on track.
+export function departmentsText(active: number, needAttention: number, atRisk: boolean, unchecked = 0): string {
+  if (needAttention > 0)
+    return `${counted(needAttention, "department", "departments")} ${
+      atRisk ? "at risk" : needAttention === 1 ? "needs attention" : "need attention"
+    }`;
+  const d = counted(active, "department", "departments");
+  return unchecked > 0 ? `${d}, ${unchecked} not checked yet` : `${d} on track`;
+}
+
+// People: those to follow up with, or else everyone, all clear.
+export function peopleText(total: number, toFollowUp: number): string {
+  if (toFollowUp > 0) return `${counted(toFollowUp, "person", "people")} to follow up`;
+  return `${counted(total, "person", "people")}, all clear`;
+}
+
+// The watchlist, with the new signals when there are any.
+export function watchingText(watched: number, signals: number): string {
+  const sig = counted(signals, "new signal", "new signals");
+  if (watched > 0) {
+    const w = `Watching ${counted(watched, "thing", "things")}`;
+    return signals > 0 ? `${w}, ${sig}` : w;
+  }
+  return sig;
 }

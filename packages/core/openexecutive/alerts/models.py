@@ -81,6 +81,16 @@ class AlertChannel(StrEnum):
     COMPANY_BROADCAST = "company_broadcast"
 
 
+# What a card can need from its reader (``Alert.needs``).
+NEEDS_ANSWER = "answer"
+NEEDS_CHOICE = "choice"
+NEEDS_OK = "ok"
+NEEDS_FYI = "fyi"
+CARD_NEEDS: frozenset[str] = frozenset({NEEDS_ANSWER, NEEDS_CHOICE, NEEDS_OK, NEEDS_FYI})
+# A pick offers this many choices, each this long at most.
+MIN_CHOICES, MAX_CHOICES, MAX_CHOICE_CHARS = 2, 4, 60
+
+
 class AlertEvent(BaseModel):
     """An external event that may or may not become an alert."""
 
@@ -97,6 +107,11 @@ class AlertEvent(BaseModel):
     # Producer-supplied dedup key that overrides the triage model's own
     # (monitoring sets ``watch:<slug>`` so one watch = one open alert).
     dedup_hint: str = ""
+    # With ``dedup_hint``: a later event folds into the open card by adding
+    # its words under the earlier ones ("Then: ..."), not replacing them, so
+    # a follow-up never erases what was first asked (one card per sender's
+    # mail, see ``orchestrator.alert_tools``).
+    follow_up: bool = False
     # Person the alert should be routed to (assigned_to_person_id from the
     # Executive's create_alert tool). Lands on the row so the "principal
     # owns unrouted" rule stops sweeping every triage-born alert to them.
@@ -116,6 +131,10 @@ class AlertEvent(BaseModel):
     # turn asked, and never goes out as a company-wide broadcast — a person
     # or department only (alerts/pipeline.py).
     raised_by: str = ""
+    # What the card needs from its reader (``Alert.needs``).
+    needs: str = ""
+    question: str = ""
+    choices: list[str] = Field(default_factory=list)
 
 
 # The source of every alert a team member raises from chat (see
@@ -207,6 +226,14 @@ class Alert(BaseModel):
     # Whose document a drafted artifact is (orchestrator/artifact_records.py);
     # NULL on a draft = the principal's. Unused on every other source.
     owner_person_id: int | None = None
+    # What the card needs from its reader (CARD_NEEDS): an answer
+    # typed on the card, a pick of ``choices``, an OK to do one exact thing,
+    # or nothing (for them to know). '' on rows written before, and on cards
+    # that keep their own buttons. ``question`` is what an answer or pick is
+    # to; the reply goes back into the work (POST /alerts/{id}/answer).
+    needs: str = ""
+    question: str = ""
+    choices: list[str] = Field(default_factory=list)
 
 
 class UserPreferences(BaseModel):

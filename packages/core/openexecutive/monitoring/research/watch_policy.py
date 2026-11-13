@@ -10,8 +10,7 @@ in itself.
 
 Two tiers:
 
-- **direct** — added live, quietly (daily cadence, medium floor, keyword
-  trigger). Requires the grounding entity to be *in company data* (a named
+- **direct** — added live, quietly (daily cadence, keyword trigger). Requires the grounding entity to be *in company data* (a named
   competitor / vendor / ticker / initiative / priority / the company itself,
   or an entity a department lists under its watched entities) plus enough
   corroboration (see :func:`classify`). This is the "high likelihood, worth
@@ -48,8 +47,10 @@ from openexecutive.audit import log_event as audit_log
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
     DECLINE_KIND_EXPIRED,
+    DECLINE_KIND_EXPLICIT,
     DECLINE_REASON_EXPIRED,
     DECLINE_REASON_NOT_RELEVANT,
+    DECLINE_REASON_WRONG_SOURCE,
     MODE_ACTIVE,
     MODE_DRY_RUN,
     ORIGIN_RESEARCH,
@@ -64,7 +65,7 @@ from openexecutive.monitoring.models import (
 )
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.sources._http import validate_target_url
-from openexecutive.monitoring.sources.base import collapse_whitespace
+from openexecutive.monitoring.target_validation import page_watch_target_problem
 from openexecutive.monitoring.validation import normalize_target, registrable_domain
 
 logger = logging.getLogger(__name__)
@@ -160,14 +161,20 @@ _STOPWORDS: frozenset[str] = frozenset({
 _MIN_PARTIAL_TOKEN = 4
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-# Auto-add defaults per source kind: (cadence, severity_floor).
+# Auto-add defaults per source kind: (cadence, severity_floor). The floor
+# is low everywhere: it is no longer a filter (a medium floor here once held
+# back every feed post and page change a research watch noticed). What keeps
+# a research watch quiet is its trigger: the stock threshold and the
+# keywords below, which the watch's "Tells you when" line says out loud.
 _QUIET_DEFAULTS: dict[str, tuple[str, AlertSeverity]] = {
-    SOURCE_KIND_STOCK: ("daily", AlertSeverity.MEDIUM),
-    SOURCE_KIND_EDGAR: ("daily", AlertSeverity.MEDIUM),
-    SOURCE_KIND_RSS: ("daily", AlertSeverity.MEDIUM),
-    SOURCE_KIND_VENDOR_STATUS: ("hourly", AlertSeverity.MEDIUM),
-    SOURCE_KIND_PAGE_WATCH: ("weekly", AlertSeverity.MEDIUM),
-    SOURCE_KIND_QUERY: ("weekly", AlertSeverity.MEDIUM),
+    SOURCE_KIND_STOCK: ("daily", AlertSeverity.LOW),
+    SOURCE_KIND_EDGAR: ("daily", AlertSeverity.LOW),
+    SOURCE_KIND_RSS: ("daily", AlertSeverity.LOW),
+    SOURCE_KIND_VENDOR_STATUS: ("hourly", AlertSeverity.LOW),
+    # Daily, not weekly: a news page changes most days, and the digest keeps
+    # it to one alert a day whatever the poll rate.
+    SOURCE_KIND_PAGE_WATCH: ("daily", AlertSeverity.LOW),
+    SOURCE_KIND_QUERY: ("weekly", AlertSeverity.LOW),
 }
 _STOCK_DEFAULT_PCT = 5
 
@@ -211,6 +218,9 @@ class WatchProposal:
     trigger: dict[str, Any] = field(default_factory=dict)
     route_to_specialist: str = ""
     display_label: str = ""
+    # One plain line for the approval card ("GitHub status: outages could
+    # break our deploys."), written by the model as it proposes the watch.
+    card_line: str = ""
 
 
 @dataclass
@@ -978,7 +988,7 @@ def quiet_defaults(
 
     The model's cadence/floor are ignored: a research watch must be quiet
     by construction and the principal can loosen it on /watchlist."""
-    cadence, floor = _QUIET_DEFAULTS.get(proposal.signal_type, ("daily", AlertSeverity.MEDIUM))
+    cadence, floor = _QUIET_DEFAULTS.get(proposal.signal_type, ("daily", AlertSeverity.LOW))
     trigger: dict[str, Any] = dict(proposal.trigger or {})
     if proposal.signal_type == SOURCE_KIND_STOCK:
         if not isinstance(trigger.get("abs_change_pct_gte"), (int, float)):
@@ -1085,6 +1095,22 @@ def auto_link_finding(
         if best is None or key > best[0]:
             best = (key, index)
     return best[1] if best else None
+
+
+def _goal_for(decision: Decision, db_path: Path | None = None) -> int | None:
+    """The goal a watch is for, when the term that grounded it is a goal's
+    own wording. None for any other grounding, or when goals can't be read."""
+    if decision.grounding_kind != KIND_DEPARTMENT_SCOPE or not decision.entity:
+        return None
+    try:
+        from openexecutive.departments.store import list_all_goals
+
+        for goal in list_all_goals(db_path):
+            if goal.id is not None and _norm(goal.key_result) == decision.entity:
+                return goal.id
+    except Exception:
+        logger.debug("watch_policy: goals unavailable", exc_info=True)
+    return None
 
 
 def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
@@ -1212,6 +1238,8 @@ def apply_proposals(
         cadence, floor, trigger = quiet_defaults(proposal, ctx.priority_terms)
         config = dict(proposal.config)
         config["_policy"] = _policy_stamp(decision, proposal, finding, supported)
+        if proposal.card_line:
+            config[CARD_LINE_KEY] = proposal.card_line
         is_direct = decision.tier == TIER_DIRECT
         # A department-grounded watch is the department's: its alerts go to
         # the head (as of now — the head at insert time; a later head change
@@ -1233,6 +1261,7 @@ def apply_proposals(
                 mode=MODE_ACTIVE if is_direct else MODE_DRY_RUN,
                 notes=proposal.rationale[:500],
                 origin=ORIGIN_RESEARCH if is_direct else ORIGIN_RESEARCH_PROPOSED,
+                goal_id=_goal_for(decision, db_path),
                 db_path=db_path,
             )
         except Exception:
@@ -1308,14 +1337,13 @@ def _notify_department_heads(
                 logger.debug("watch_policy: principal lookup failed", exc_info=True)
         if person_id is None:
             continue
-        lines = [
-            f"- {i.slug} ({i.signal_type}) — {collapse_whitespace(i.notes or i.target)}"[:200]
-            for i in items[:DEPARTMENT_CARD_MAX_LINES]
-        ]
+        # Same plain lines as the principal's card (``nudge_body``).
+        lines = [f"• {card_line(i)}" for i in items[:DEPARTMENT_CARD_MAX_LINES]]
+        if (more := len(items) - DEPARTMENT_CARD_MAX_LINES) > 0:
+            lines.append(f"• and {more} more on the Watch list")
         body = (
-            f"The Executive suggested these sources for {ref.title} to monitor and "
-            "is not sure enough to add them on its own. Approve or decline them "
-            "on the Watch list page.\n\n" + "\n".join(lines)
+            f"I'd like to keep an eye on these for {ref.title}. Approve or decline "
+            "them on the Watch list page.\n" + "\n".join(lines)
         )
         try:
             alert_id = propose_via_alert(
@@ -1342,6 +1370,8 @@ def _summary(proposal: WatchProposal, outcome: str, detail: str) -> dict[str, An
         "ok": outcome != "rejected",
         "outcome": outcome,
         "slug": proposal.slug,
+        # What the research write-up shows: the watch in words, not its slug.
+        "label": (proposal.display_label or proposal.target)[:160],
     }
 
 
@@ -1410,6 +1440,13 @@ def _auto_disable_reason(item: WatchlistItem) -> str:
         return f"dismissed {item.dismiss_count} of {item.fired_count} alerts (trust {item.trust_score:.2f})"
     if _consecutive_poll_failures(item.slug) >= _POLL_FAILURES_TO_DISABLE:
         return f"{_POLL_FAILURES_TO_DISABLE} consecutive poll failures"
+    if item.signal_type == SOURCE_KIND_PAGE_WATCH:
+        # A watch added before research was held to index pages: one
+        # article, a document or a sign-in wall polls forever and never
+        # changes, so it is retired like a dead source.
+        problem = page_watch_target_problem(item.target)
+        if problem:
+            return problem
     return ""
 
 
@@ -1493,6 +1530,144 @@ def _auto_disable(now: datetime, db_path: Path | None) -> int:
     return n
 
 
+# The approval card names each suggestion the way a person would say it, one
+# short line each, never its slug, its signal type or the research notes cut
+# off mid-word (a 2026-11 card read "vendor-status-github (vendor_status) —
+# Repeated October Actions/Pages/webhook and REST latency incid...").
+CARD_LINE_KEY = "_card_line"
+MAX_CARD_LINE = 120
+NUDGE_SHOWN = 10
+
+
+# No count in the headline: an open card is refreshed in place
+# (``coalesce_alert`` updates its body only), so a count there goes stale.
+NUDGE_HEADLINE = "Watch suggestions waiting for your OK"
+
+
+def nudge_headline() -> str:
+    return NUDGE_HEADLINE
+
+
+def _plain(text: str) -> str:
+    """One line with no link or markup syntax: card text comes from model
+    words and labels shaped by web content, so a chat app must never render
+    it as a link, and a newline must never forge a bullet."""
+    return " ".join(re.sub(r"[<>\[\]|`@*~]", " ", text).split())
+
+
+def card_line(item: WatchlistItem) -> str:
+    """One plain line for ``item`` on the card: the line the model wrote for
+    it, else what it watches in words (``describe.watching_line``)."""
+    from openexecutive.monitoring.describe import watching_line
+
+    config = item.config_json if isinstance(item.config_json, dict) else {}
+    written = _plain(str(config.get(CARD_LINE_KEY) or ""))
+    if written and len(written) <= MAX_CARD_LINE:
+        # The model's words name no source on their own: the site it
+        # watches (else its ticker or query) always follows them, so an
+        # approval is of the real target.
+        source = registrable_domain(item.target) or _plain(item.target)[:60]
+        return f"{written} ({source})" if source else written
+    label = next(
+        (str(config[k]) for k in ("vendor_label", "feed_label", "display_name", "label") if config.get(k)), "",
+    )
+    line = _plain(watching_line(item.signal_type, item.target, label))
+    return line if len(line) <= MAX_CARD_LINE * 2 else line[: MAX_CARD_LINE * 2 - 1].rstrip() + "…"
+
+
+def nudge_body(pending: list[WatchlistItem]) -> str:
+    lines = [f"• {card_line(i)}" for i in pending[:NUDGE_SHOWN]]
+    more = len(pending) - NUDGE_SHOWN
+    if more > 0:
+        lines.append(f"• and {more} more on the Watch list")
+    return "I'd like to keep an eye on these:\n" + "\n".join(lines)
+
+
+def decline_suggestion(
+    item: WatchlistItem, reason: str, *, actor: str = "principal", db_path: Path | None = None,
+) -> bool:
+    """Remove a pending suggestion and remember the no, so the research
+    pass never proposes that source again under a new slug. False when it
+    was approved, declined or removed meanwhile."""
+    if item.id is None or not ms.delete_pending_suggestion(item.id, db_path=db_path):
+        return False
+    try:
+        ms.insert_decline(
+            normalized_target=normalize_target(item.signal_type, item.target),
+            kind=DECLINE_KIND_EXPLICIT,
+            reason=reason,
+            entity=str(policy_stamp_of(item).get("entity", "")),
+            signal_type=item.signal_type,
+            slug=item.slug,
+            db_path=db_path,
+        )
+        record_outcome_for(item, OUTCOME_DECLINED, db_path=db_path)
+    except Exception:
+        logger.exception("watch_policy: decline record failed slug=%s", item.slug)
+    try:
+        audit_log(
+            EVENT_SUGGESTION_DECLINED,
+            f"Declined watching {item.slug} ({reason}) — removed",
+            actor=actor,
+            details={"slug": item.slug, "watchlist_id": item.id, "target": item.target,
+                     "signal_type": item.signal_type, "reason": reason, "result": "removed"},
+        )
+    except Exception:
+        logger.exception("watch_policy: decline audit failed slug=%s", item.slug)
+    return True
+
+
+def suggestions_on_card(alert: Any, *, db_path: Path | None = None) -> list[WatchlistItem] | None:
+    """The pending suggestions a Needs you card names, or None when it isn't
+    a watch suggestions card: the principal's pile (``_nudge_if_piled_up``)
+    or a department head's (``Watch suggestions for <Department>``)."""
+    from openexecutive.departments.authority import PROPOSAL_ALERT_SOURCE
+
+    tags = list(getattr(alert, "topic_tags", None) or [])
+    source = getattr(alert, "source", "")
+    if source == NUDGE_ALERT_SOURCE:
+        pile = [i for i in ms.list_pending_suggestions(db_path=db_path) if i.route_to_person_id is None]
+    elif source == PROPOSAL_ALERT_SOURCE and "watchlist" in tags:
+        slugs = {t.split(":", 1)[1] for t in tags if t.startswith("department:")}
+        if not slugs:
+            return None
+        pile = [i for i in ms.list_pending_suggestions(db_path=db_path) if i.route_to_department in slugs]
+    else:
+        return None
+    # Only what the card shows by name: a suggestion filed after its body
+    # was last written (even one whose line reads the same), or folded into
+    # "and N more", was never in front of them.
+    shown = {line.strip() for line in str(getattr(alert, "body", "") or "").splitlines()}
+    written = _parse(getattr(alert, "last_seen_at", None)) or _parse(getattr(alert, "created_at", None))
+
+    def _on_card(item: WatchlistItem) -> bool:
+        filed = _parse(item.created_at)
+        if written is not None and filed is not None and filed > written:
+            return False
+        return f"• {card_line(item)}" in shown
+
+    return [i for i in pile if _on_card(i)]
+
+
+def decline_card_suggestions(alert: Any, *, db_path: Path | None = None) -> int:
+    """A no to a watch suggestions card is a no to what it lists: each
+    pending suggestion on it is declined (that source only), so the Watch
+    list stops asking. Other cards: nothing. Never raises."""
+    try:
+        items = suggestions_on_card(alert, db_path=db_path) or []
+    except Exception:
+        logger.exception("watch_policy: reading the card's suggestions failed")
+        return 0
+    declined = 0
+    for i in items:
+        # One failure never leaves the rest of the card asking.
+        try:
+            declined += decline_suggestion(i, DECLINE_REASON_WRONG_SOURCE, actor="executive", db_path=db_path)
+        except Exception:
+            logger.exception("watch_policy: declining %s failed", i.slug)
+    return declined
+
+
 def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
     # Suggestions routed to a department HEAD were put in front of that head
     # when they were filed; everything else (the principal's own, and rows
@@ -1514,12 +1689,7 @@ def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
     dedup_key = f"{NUDGE_ALERT_SOURCE}:pending"
     year, week, _ = now.isocalendar()
     external_id = f"{dedup_key}:{year}-W{week:02d}"
-    lines = [f"- {i.slug} ({i.signal_type}) — {i.notes or i.target}"[:200] for i in pending[:10]]
-    body = (
-        "The Executive suggested these sources to monitor and is not sure "
-        "enough to add them on its own. Approve or decline them on the "
-        "Watch list page.\n\n" + "\n".join(lines)
-    )
+    body = nudge_body(pending)
     if coalesce_alert(
         source=NUDGE_ALERT_SOURCE, dedup_key=dedup_key, severity="medium", body=body, db_path=db_path,
     ):
@@ -1528,7 +1698,7 @@ def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
         source=NUDGE_ALERT_SOURCE,
         external_id=external_id,
         severity="medium",
-        headline=f"{len(pending)} watch suggestions are waiting for you",
+        headline=nudge_headline(),
         body=body,
         suggested_action="Review the suggestions on /watchlist",
         topic_tags=["watchlist"],

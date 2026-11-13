@@ -383,6 +383,30 @@ def _count_distinct_humans(
     return len(humans)
 
 
+def _thread_root_context(
+    thread_replies: list[dict] | None, event: dict, bot_user_id: str | None
+) -> str:
+    """The message a reply in a Slack thread was written under: the thread's
+    first message (``integrations.reply_context``). "" when the reply isn't
+    in a thread, or Slack didn't hand the thread back."""
+    from openexecutive.integrations import reply_context
+
+    if not thread_replies:
+        return ""
+    root = thread_replies[0]
+    if not isinstance(root, dict) or str(root.get("ts") or "") == str(event.get("ts") or ""):
+        return ""
+    # Only a post by this bot's own user is the Executive's: another app's
+    # post (a bot id with no user) is just "an earlier message".
+    author = str(root.get("user") or "")
+    by_executive = bool(bot_user_id) and author == bot_user_id
+    writer = reply_context.whose(
+        by_executive=by_executive,
+        by_sender=bool(author) and author == str(event.get("user") or ""),
+    )
+    return reply_context.quote(writer, str(root.get("text") or ""))
+
+
 def _replies_to_gate_history(
     messages: list[dict], bot_user_id: str | None
 ) -> list[dict]:
@@ -480,12 +504,13 @@ async def _read_shared_files(
 # card's id and choice in the button's value.
 _CARD_ACTION_APPROVE = "oe_card_approve"
 _CARD_ACTION_SKIP = "oe_card_skip"
-_CARD_ACTION_RE = re.compile(rf"^({_CARD_ACTION_APPROVE}|{_CARD_ACTION_SKIP})$")
+_CARD_ACTION_ALLOW = "oe_card_allow"
+_CARD_ACTION_RE = re.compile(rf"^({_CARD_ACTION_APPROVE}|{_CARD_ACTION_SKIP}|{_CARD_ACTION_ALLOW})$")
 _MAX_CARD_TEXT = 2900
 
 
 def _card_blocks(
-    text: str, decision_id: int | None = None, labels: tuple[str, str] = ("Approve", "Skip"),
+    text: str, decision_id: int | None = None, labels: tuple[str, ...] = ("Approve", "Skip"),
 ) -> list[dict[str, Any]]:
     """A card as Slack blocks: its text as plain text (it may quote what
     someone else wrote, so never mrkdwn), with the two buttons while it waits."""
@@ -502,6 +527,9 @@ def _card_blocks(
             {"type": "button", "action_id": _CARD_ACTION_SKIP,
              "text": {"type": "plain_text", "text": labels[1]},
              "value": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
+            *([{"type": "button", "action_id": _CARD_ACTION_ALLOW,
+                "text": {"type": "plain_text", "text": labels[2]},
+                "value": channel_cards.callback_data(decision_id, channel_cards.ALLOW)}] if len(labels) > 2 else []),
         ]})
     return blocks
 
@@ -525,7 +553,7 @@ async def _send_cards(client: Any, channel: str, cards: list[int]) -> None:
             logger.exception("Slack: couldn't send card %d", decision_id)
 
 
-async def send_dm_card(slack_user_id: str, decision_id: int, text: str, labels: tuple[str, str]) -> None:
+async def send_dm_card(slack_user_id: str, decision_id: int, text: str, labels: tuple[str, ...]) -> None:
     """Post a card waiting outside any chat to ``slack_user_id``'s DM with the
     bot (``channel_cards.push_waiting``). Raises when it couldn't."""
     from slack_sdk.web.async_client import AsyncWebClient
@@ -637,6 +665,7 @@ async def handle_card_tap(body: dict[str, Any], client: Any) -> None:
     ts = str((body.get("container") or {}).get("message_ts") or message.get("ts") or "")
     actions = body.get("actions") or []
     parsed = channel_cards.parse_callback(actions[0].get("value") if actions else None)
+    allow = channel_cards.tapped_allow(actions[0].get("value") if actions else None)
     person = await asyncio.to_thread(find_person_by_slack_id, user_id) if user_id else None
     if parsed is None or person is None or not await _is_own_dm(client, user_id, channel_id):
         logger.warning("Slack: ignored a card tap that isn't from its own DM")
@@ -648,8 +677,8 @@ async def handle_card_tap(body: dict[str, Any], client: Any) -> None:
                 logger.warning("Slack: couldn't answer an ignored card tap", exc_info=True)
         return
     decision_id, approve = parsed
-    line = await channel_cards.resolve(decision_id, person, approve=approve)
-    choice = "approve" if approve else "skip"
+    line = await channel_cards.resolve(decision_id, person, approve=approve, allow=allow)
+    choice = "allow" if allow else "approve" if approve else "skip"
     await asyncio.to_thread(
         audit_log,
         "integration_inbound",
@@ -1110,7 +1139,7 @@ async def create_slack_app():
                 attach_briefing_context,
                 build_channel_context_block,
             )
-            from openexecutive.knowledge.retriever import retrieve
+            from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
             from openexecutive.memory.episodic import format_for_prompt
             from openexecutive.memory.session_store import load_messages
             from openexecutive.onboarding.profile_builder import load_or_create_profile
@@ -1175,7 +1204,7 @@ async def create_slack_app():
                 from openexecutive.mcp_server.server import get_store
 
                 retrieved_context, episodic_context = await asyncio.gather(
-                    asyncio.to_thread(retrieve, query=cleaned, store=get_store()),
+                    asyncio.to_thread(retrieve, query=cleaned, store=get_store(), n_builtin=chat_builtin_results()),
                     # session_id-scoped, matching discord_bot: an unscoped
                     # call mixes every other conversation's episodes into
                     # this turn.
@@ -1217,6 +1246,28 @@ async def create_slack_app():
                     # Before the words, as Discord and Telegram inline it.
                     chat_user_message = f"{att_text}\n\n{chat_user_message}"
 
+                # A reply under a message in a thread says which message it
+                # answers. A DM is one conversation, so the thread's first
+                # message may be any earlier one; a channel thread's own
+                # history already holds its start, unless it's new to us.
+                reply_quote = ""
+                if is_threaded_reply and (mode == "dm" or not history):
+                    reply_quote = _thread_root_context(thread_replies, event, _bot_user_id)
+                    # A channel thread can be started by anyone: quote its
+                    # start only from the team, the Executive or the sender.
+                    root_author = str((thread_replies or [{}])[0].get("user") or "")
+                    if (
+                        reply_quote
+                        and mode != "dm"
+                        and root_author not in (_bot_user_id, event.get("user"))
+                        and not await asyncio.to_thread(_find_slack_sender, root_author)
+                    ):
+                        reply_quote = ""
+                if reply_quote:
+                    from openexecutive.integrations.reply_context import with_context
+
+                    chat_user_message = with_context(reply_quote, chat_user_message)
+
                 from openexecutive.integrations.channel_cards import shows_cards
 
                 # A DM shows the reply's cards with Approve and Skip buttons
@@ -1237,8 +1288,9 @@ async def create_slack_app():
                     co_present_person_ids=co_present_person_ids or None,
                     attachment_blocks=att_image_blocks or None,
                     # Peer memory records what the sender wrote and the files'
-                    # names, never a document's text or a DM's hydrated
-                    # backstory as their words; web_fetch opens only URLs in it.
+                    # names, never a document's text, a DM's hydrated
+                    # backstory or the quoted thread root as their words;
+                    # web_fetch opens only URLs in it.
                     memory_text=own_words,
                     fetch_own_urls=True,  # past the roster gate above
                 )
@@ -1288,7 +1340,9 @@ async def create_slack_app():
                     title=_session_title(sender_person, mode),
                     created_at=session.created_at.isoformat(),
                     owner_person_id=person_id,
-                    user_text=_format_user_content(own_words, speaker),
+                    user_text=_format_user_content(
+                        f"{reply_quote}\n\n{own_words}" if reply_quote else own_words, speaker
+                    ),
                     assistant_text=response,
                     also_session_id=also_session_id,
                     sender_person_id=sender_person.id,

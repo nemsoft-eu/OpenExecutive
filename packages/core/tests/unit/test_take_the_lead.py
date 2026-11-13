@@ -24,7 +24,7 @@ from openexecutive.people import store as people_store
 from openexecutive.people.models import AuthorityScope
 
 from . import test_delegation_inbox as _inbox_tests
-from .test_delegation_inbox import DANA, NOW, OWNER, _msg
+from .test_delegation_inbox import DANA, NOW, OWNER
 
 db = _inbox_tests.db
 owner = _inbox_tests.owner
@@ -54,10 +54,16 @@ def _lead(**ask_first: bool) -> ttl.Lead:
 # ── the switches and rules ────────────────────────────────────────────────────
 
 
-def test_off_until_turned_on_and_everything_asks_first() -> None:
+def _hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+
+
+def test_the_executive_always_leads_and_approvals_decides() -> None:
     lead = ttl.get(ttl.SCOPE_EXECUTIVE)
-    assert lead.enabled is False and all(lead.asks_first(k) for k in ttl.KINDS)
-    assert ttl.executive_on() is False and ttl.as_you_on(1) is False
+    assert all(lead.asks_first(k) for k in ttl.KINDS)
+    assert ttl.executive_on() is True
 
 
 def test_every_kind_has_a_label_and_a_hint() -> None:
@@ -227,7 +233,7 @@ def test_a_held_action_waits_on_today_for_the_principal(owner: Any) -> None:
     [decision] = ledger.list_instances(ttl.DECISION_CLASS)
     assert decision.approver_person_id == owner.id and decision.status == ledger.STATUS_PROPOSED
     payload = json.loads(decision.proposed_payload_json)
-    assert payload["tool"] == "message_person" and payload["kind"] == "money"
+    assert payload["tool"] == "message_person" and payload["kind"] == "level"
     [alert] = alerts_store.list_alerts(limit=10)
     assert alert.routed_to_person_id == owner.id and "private:principal" in alert.topic_tags
     assert ttl.done([ttl.SCOPE_EXECUTIVE])[0].status == "waiting"
@@ -398,6 +404,80 @@ def test_only_a_direct_message_to_the_principal_skips_the_gate(owner: Any, monke
     assert not ttl._only_to_principal("message_person", {"person_id": owner.id, "text": "Sign the NDA"})
 
 
+def test_mail_with_no_principal_or_unreadable_roster_waits(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.people import store
+
+    send = "google_workspace__send_gmail_message"
+    monkeypatch.setattr(store, "find_principal_person", lambda: None)
+    assert not ttl._mail_only_to_principal(send, {"to": OWNER, "body": "Hi"})
+
+    def broken() -> None:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(store, "find_principal_person", broken)
+    assert not ttl._mail_only_to_principal(send, {"to": OWNER, "body": "Hi"})
+
+
+def test_mail_only_to_the_principal_skips_the_gate(owner: Any) -> None:
+    # A correction to the owner once waited as "someone new"
+    # because its body named an outside contact.
+    seen: list[str] = []
+
+    async def call_tool(tool_input: dict[str, Any]) -> str:
+        seen.append(tool_input["arguments"]["to"])
+        return "Email sent!"
+
+    gated = ttl.gated_call_tool(call_tool, source="scheduled")
+    body = "A check on the figure I sent x@far.example earlier: it was off."
+    sent = asyncio.run(gated({"name": "google_workspace__send_gmail_message",
+                              "arguments": {"to": OWNER.upper(), "subject": "Check", "body": body}}))
+    assert sent == "Email sent!" and seen == [OWNER.upper()]
+    # Anyone else on it, even in bcc, and it waits as before.
+    acting = asyncio.run(gated({"name": "google_workspace__send_gmail_message", "arguments": {
+        "to": OWNER, "body": body, "user_google_email": "exec@co.example", "in_reply_to": "<a1@mail.example>",
+    }}))
+    assert acting == "Email sent!"
+    for extra in ({"cc": "x@far.example"}, {"bcc": "x@far.example"}, {"Cc": "x@far.example"},
+                  {"extra_recipients": ["x@far.example"]}):
+        held = asyncio.run(gated({"name": "google_workspace__send_gmail_message",
+                                  "arguments": {"to": OWNER, "body": body, **extra}}))
+        assert json.loads(held)["status"] == "waiting_for_approval"
+    send = "google_workspace__send_gmail_message"
+    assert ttl._mail_only_to_principal(send, {"to": f"Olivia <{OWNER}>", "body": body})
+    assert ttl._mail_only_to_principal("microsoft_365__send-mail", {"to": [OWNER], "body": body})
+    # An alias on their People entry counts as theirs.
+    people_store.add_person_email(owner.id, "olivia@home.example")
+    people_registry.invalidate()
+    assert ttl._mail_only_to_principal(send, {"to": [OWNER, "olivia@home.example"], "body": body})
+    # An outsider anywhere outside the text: nested, or under any key.
+    assert not ttl._mail_only_to_principal(send, {"to": OWNER, "headers": {"x": ["x@far.example"]}})
+    for key in ("bcc", "BCC", "reply_to"):
+        assert not ttl._mail_only_to_principal(send, {"to": OWNER, key: "x@far.example"})
+    # Only the excluded keys may name someone else.
+    for key in sorted(ttl._NOT_RECIPIENT_KEYS):
+        assert ttl._mail_only_to_principal(send, {"to": OWNER, key: "x@far.example"}), key
+    assert not ttl._mail_only_to_principal(send, {"body": body})
+    assert not ttl._mail_only_to_principal("google_workspace__create_doc", {"to": OWNER})
+    # A display name that looks like the owner's address hides no one.
+    assert not ttl._mail_only_to_principal(send, {"to": f'"{OWNER}" <x@far.example>', "body": body})
+    # Outlook nests the message, recipients included, under "body".
+    outlook = "microsoft_365__send_mail"
+
+    def graph(*addresses: str) -> dict[str, Any]:
+        return {"message": {
+            "subject": "Check",
+            "toRecipients": [{"emailAddress": {"address": a}} for a in addresses],
+            "body": {"contentType": "Text", "content": body},
+        }}
+
+    assert ttl._mail_only_to_principal(outlook, {"body": graph(OWNER)})
+    assert not ttl._mail_only_to_principal(outlook, {"body": graph("x@far.example")})
+    assert not ttl._mail_only_to_principal(outlook, {"to": OWNER, "body": graph("x@far.example")})
+    cc = graph(OWNER)
+    cc["message"]["bccRecipients"] = [{"emailAddress": {"address": "x@far.example"}}]
+    assert not ttl._mail_only_to_principal(outlook, {"body": cc})
+
+
 def test_mcp_reads_pass_and_sends_are_gated(owner: Any) -> None:
     seen: list[str] = []
 
@@ -430,6 +510,11 @@ def test_mcp_reads_pass_and_sends_are_gated(owner: Any) -> None:
     ("mail__unsubscribe_from_list", True),
     ("drive.searchFiles", False),
     ("ms365__read_mail_message", False),
+    ("google_workspace__get_gmail_messages_content_batch", False),
+    ("google_workspace__get_gmail_threads_content_batch", False),
+    ("crm__getRecordsBatch", False),
+    ("google_workspace__batch_modify_gmail_message_labels", True),
+    ("google_workspace__get_and_modify_batch", True),
 ])
 def test_connected_tools_fail_closed(name: str, acts: bool) -> None:
     assert ttl.mcp_tool_acts(name) is acts
@@ -504,15 +589,6 @@ def test_an_amount_rule_holds_a_wire_written_in_words() -> None:
 
 def _tools(*names: str) -> list[dict[str, Any]]:
     return [{"name": n} for n in names]
-
-
-def test_off_solo_passes_keep_their_limits(owner: Any) -> None:
-    calls: list[Any] = []
-    tools, handlers = schedule_tools.unattended_toolkit(
-        _tools("create_calendar_event", "message_person", "list_people"),
-        {**_handlers(calls), "create_calendar_event": _handlers(calls)["message_person"]}, "solo",
-    )
-    assert [t["name"] for t in tools] == ["message_person", "list_people"]
 
 
 def test_on_solo_passes_can_book_and_everything_is_gated(owner: Any) -> None:
@@ -662,53 +738,6 @@ def test_sent_as_you_rows_are_the_callers_own(owner: Any, monkeypatch: pytest.Mo
     assert today._sent_as_caller(object()) == []  # type: ignore[arg-type]
 
 
-# ── as you ────────────────────────────────────────────────────────────────────
-
-
-def _check(owner: Any, *, relation: str = "stranger", body: str | None = None) -> str | None:
-    from openexecutive.delegation.gmail import MailThread
-
-    from .test_delegation_handle_it import _reply, _verdict
-
-    message = _msg("m1", "t1")
-    reply = _reply(body=body) if body is not None else _reply()
-    return handle_it.refusal(
-        owner.id, message, MailThread(id="t1", messages=[message]), reply, _verdict(confidence=0.6),
-        relation=relation, own={OWNER}, exec_address="exec@co.example", now=NOW,
-    )
-
-
-def test_as_you_lifts_the_setting(owner: Any) -> None:
-    handle_it.set_(owner.id, enabled=True, mode="careful", updated_by="t")
-    assert _check(owner) == "level"
-    ttl.set_(ttl.person_scope(owner.id), enabled=True, updated_by="t")
-    assert _check(owner) is None
-    # Confidence (0.6 here) and amounts give way; a link still waits on a tap.
-    assert _check(owner, body="Hi Dana, the total is $300.") is None
-    assert _check(owner, body="Hi Dana, the deck is at https://x.example/d") == "link"
-
-
-def test_as_you_keeps_what_always_waits_and_adds_the_rules(owner: Any) -> None:
-    handle_it.set_(owner.id, enabled=True, updated_by="t")
-    ttl.set_(ttl.person_scope(owner.id), enabled=True, updated_by="t")
-    assert _check(owner, body="Hi Dana, I'll send the contract over.") == "sensitive"
-    ttl.add_rule(ttl.person_scope(owner.id), "words", "Thursday", created_by="t")
-    assert _check(owner, body="Hi Dana, Thursday works.") == "lead_rule"
-
-
-def test_as_you_does_nothing_while_handle_it_is_off(owner: Any) -> None:
-    ttl.set_(ttl.person_scope(owner.id), enabled=True, updated_by="t")
-    assert _check(owner) == "level"
-
-
-def test_turning_handle_it_off_turns_the_lead_as_you_off(owner: Any) -> None:
-    from openexecutive.api.routes import delegation as delegation_route
-
-    ttl.set_(ttl.person_scope(owner.id), enabled=True, updated_by="t")
-    delegation_route._set_handle_it(owner.id, enabled=False, mode=None)
-    assert not ttl.as_you_on(owner.id)
-
-
 # ── waking on what comes in ───────────────────────────────────────────────────
 
 
@@ -728,15 +757,19 @@ def _wakes() -> list[Any]:
         ).fetchall()
 
 
-def test_off_nothing_wakes(no_last_wake: None) -> None:
-    assert ttl.wake("a message on slack", now=NOW) is None
-    assert _wakes() == []
+def test_below_hands_off_new_messages_wake_it_too(no_last_wake: None) -> None:
+    # Each step waits on a card there, but the card comes the same hour.
+    assert ttl.wake("a message on slack", now=NOW) is not None
+    [row] = _wakes()
+    assert row["run_at"] == (NOW + ttl.WAKE_AFTER).isoformat()
 
 
-def test_on_new_messages_wake_the_reflection_once_in_a_while(no_last_wake: None) -> None:
+def test_hands_off_new_messages_wake_the_reflection_once_in_a_while(
+    monkeypatch: pytest.MonkeyPatch, no_last_wake: None,
+) -> None:
     from datetime import timedelta
 
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, updated_by="t")
+    _hands_off(monkeypatch)
     first = ttl.wake("a message on email", now=NOW)
     assert first is not None
     assert ttl.wake("a message on slack", now=NOW + timedelta(minutes=1)) is None  # batched
@@ -749,7 +782,7 @@ def test_on_new_messages_wake_the_reflection_once_in_a_while(no_last_wake: None)
 def test_a_failed_wake_doesnt_hold_off_the_next(monkeypatch: pytest.MonkeyPatch, no_last_wake: None) -> None:
     from openexecutive.memory import episodic
 
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, updated_by="t")
+    _hands_off(monkeypatch)
     real = episodic.insert_scheduled_action
     locked = [True]
 
@@ -775,25 +808,24 @@ def test_only_a_json_error_counts_as_failed(text: str, failed: bool) -> None:
     assert ttl.result_failed(text) is failed
 
 
-@pytest.mark.parametrize("on", [True, False])
-def test_a_wake_runs_the_reflection_only_while_on(monkeypatch: pytest.MonkeyPatch, no_last_wake: None, on: bool) -> None:
+def test_a_wake_runs_the_reflection(monkeypatch: pytest.MonkeyPatch, no_last_wake: None) -> None:
     from openexecutive.memory.episodic import get_scheduled_action
     from openexecutive.scheduler import runner
 
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, updated_by="t")
-    action_id = ttl.wake("a message on email", now=NOW)
+    _hands_off(monkeypatch)
+    action_id = ttl.wake("new mail came in", now=NOW)
     assert action_id is not None
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=on, updated_by="t")
-    ran: list[str] = []
+    ran: list[tuple[str, str]] = []
 
-    async def reflect(now: Any, *, kind: str) -> None:
-        ran.append(kind)
+    async def reflect(now: Any, *, kind: str, prompted_by: str = "") -> None:
+        ran.append((kind, prompted_by))
 
     monkeypatch.setattr(runner, "_reflect", reflect)
     action = get_scheduled_action(action_id)
     assert action is not None
     asyncio.run(runner._run_take_the_lead_wake(action, NOW))
-    assert ran == (["take_the_lead_wake"] if on else [])
+    # The run is told why it looks, in Done for you's words.
+    assert ran == [("take_the_lead_wake", "When new mail came in")]
     done = get_scheduled_action(action_id)
     assert done is not None and done.status == "done"
 
@@ -822,27 +854,25 @@ def _lead_tools(monkeypatch: pytest.MonkeyPatch, gateway: Any) -> tuple[list[str
     return [t["name"] for t in tools], handlers, leading
 
 
-def test_the_pass_gets_no_gateway_tools_while_off(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    names, handlers, leading = _lead_tools(monkeypatch, _Gateway())
-    assert names == ["message_person"] and handlers == {} and not leading
-
-
 def test_the_leading_pass_can_discover_and_use_connected_tools(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, updated_by="test")
     gateway = _Gateway()
     names, handlers, leading = _lead_tools(monkeypatch, gateway)
     assert leading and names == ["call_tool", "message_person", "search_tools"]
     assert "load_mcp_server" not in handlers  # no new connections unattended
     found = asyncio.run(handlers["search_tools"]({"query": "spreadsheet"}))
     assert "create_spreadsheet" in found
+    # Below Hands-off an acting call is held for a yes.
+    held = asyncio.run(handlers["call_tool"]({"name": "google_workspace__create_spreadsheet",
+                                              "arguments": {"title": "Project tracker"}}))
+    assert json.loads(held)["status"] == "waiting_for_approval"
+    assert gateway.called == []
+    # Under Hands-off it runs, sharing included.
+    _hands_off(monkeypatch)
     asyncio.run(handlers["call_tool"]({"name": "google_workspace__create_spreadsheet",
                                        "arguments": {"title": "Project tracker"}}))
-    assert gateway.called == ["google_workspace__create_spreadsheet"]
-    # Sharing it is held for a yes, like any delete or share.
-    held = asyncio.run(handlers["call_tool"]({"name": "google_workspace__share_drive_file",
-                                              "arguments": {"file_id": "f1"}}))
-    assert json.loads(held)["status"] == "waiting_for_approval"
-    assert gateway.called == ["google_workspace__create_spreadsheet"]
+    asyncio.run(handlers["call_tool"]({"name": "google_workspace__share_drive_file",
+                                       "arguments": {"file_id": "f1"}}))
+    assert gateway.called == ["google_workspace__create_spreadsheet", "google_workspace__share_drive_file"]
 
 
 def test_the_leading_pass_without_a_gateway_still_leads(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -877,65 +907,21 @@ def test_connected_tools_are_named_by_file_not_content(
     assert ttl.summarize(tool, arguments, mcp=True, quote=quote) == expected
 
 
-# ── in training ───────────────────────────────────────────────────────────────
+# ── Approvals decides ─────────────────────────────────────────────────────────
 
 
 def _training() -> None:
     ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, training=True, updated_by="t")
 
 
-def test_in_training_a_clean_action_waits_for_the_principal(owner: Any) -> None:
-    _training()
-    sam = _teammate()
+def test_under_hands_off_it_goes(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _hands_off(monkeypatch)
     calls: list[Any] = []
     gated = ttl.gated_handlers(_handlers(calls), source="reflection")
-    result = json.loads(asyncio.run(gated["message_person"]({"person_id": sam, "text": "Are we on for Thursday?"})))
-    assert result["status"] == "waiting_for_approval" and calls == []
-    [decision] = ledger.list_instances(ttl.DECISION_CLASS)
-    payload = json.loads(decision.proposed_payload_json)
-    assert payload["kind"] == ttl.TRAINING and decision.approver_person_id == owner.id
-    assert payload["allow"] == {"key": f"take_the_lead|message|person:{sam}", "label": "Message Sam Teammate"}
-    assert payload["fields"] == [
-        {"field": "text", "label": "Message", "long": True, "value": "Are we on for Thursday?"},
-    ]
-    [alert] = alerts_store.list_alerts(limit=10)
-    assert ttl.TRAINING_TAG in alert.topic_tags and "private:principal" in alert.topic_tags
-
-
-def test_in_training_an_allowed_action_goes_and_is_counted(owner: Any) -> None:
-    _training()
-    sam = _teammate()
-    key, label = ttl.allowance("message_person", {"person_id": sam, "text": "x"})  # type: ignore[misc]
-    ttl.allow(key, label, created_by="t")
-    calls: list[Any] = []
-    gated = ttl.gated_handlers(_handlers(calls), source="reflection")
-    asyncio.run(gated["message_person"]({"person_id": sam, "text": "Are we on for Thursday?"}))
+    asyncio.run(gated["message_person"]({"person_id": _teammate(), "text": "Pay the invoice"}))
     assert len(calls) == 1
     [line] = ttl.done([ttl.SCOPE_EXECUTIVE])
-    assert line.status == "done" and "You allowed this: Message Sam Teammate." in line.why
-    [learned] = ttl.list_allowed()
-    assert learned.uses == 1 and learned.feature == "take_the_lead"
-
-
-def test_allowing_never_lets_the_six_kinds_or_rules_through(owner: Any) -> None:
-    _training()
-    sam = _teammate()
-    key, label = ttl.allowance("message_person", {"person_id": sam, "text": "x"})  # type: ignore[misc]
-    ttl.allow(key, label, created_by="t")
-    calls: list[Any] = []
-    gated = ttl.gated_handlers(_handlers(calls), source="reflection")
-    result = json.loads(asyncio.run(gated["message_person"]({"person_id": sam, "text": "Pay the invoice"})))
-    assert result["status"] == "waiting_for_approval" and calls == []
-    payload = json.loads(ledger.list_instances(ttl.DECISION_CLASS)[0].proposed_payload_json)
-    assert payload["kind"] == "money" and "allow" not in payload
-
-
-def test_on_without_training_nothing_extra_waits(owner: Any) -> None:
-    ttl.set_(ttl.SCOPE_EXECUTIVE, enabled=True, training=False, updated_by="t")
-    calls: list[Any] = []
-    gated = ttl.gated_handlers(_handlers(calls), source="reflection")
-    asyncio.run(gated["message_person"]({"person_id": _teammate(), "text": "Are we on for Thursday?"}))
-    assert len(calls) == 1
+    assert line.status == "done"
 
 
 def test_what_one_allow_covers(owner: Any) -> None:
@@ -1063,9 +1049,13 @@ def test_the_three_positions(client: TestClient, owner: Any, monkeypatch: pytest
     assert client.put("/take-the-lead", json={"training": True}).status_code == 200
 
 
-def test_learned_note_is_empty_while_off() -> None:
+def test_learned_note_quotes_examples_without_a_switch() -> None:
+    # There is no switch any more: the owner's examples always count.
     ttl.allow("take_the_lead|workflow|x", "Start the x workflow", example={"text": "y"}, created_by="t")
-    assert ttl.learned_note() == ""
+    assert "Start the x workflow" in ttl.learned_note()
+    assert "in training" not in ttl.learned_note()
+    ttl.set_(ttl.SCOPE_EXECUTIVE, training=True, updated_by="t")
+    assert "in training" in ttl.learned_note()
 
 
 def test_an_older_switch_table_gains_training(db: Path) -> None:
@@ -1109,6 +1099,24 @@ def test_only_the_principal_edits_a_card(client: TestClient, owner: Any, monkeyp
     monkeypatch.setattr(decisions_route, "_resolver", lambda instance, request: owner.id)
     response = client.post(f"/decisions/{decision_id}/approve", json={"edits": {"input": {"text": "Pay it elsewhere"}}})
     assert response.status_code == 403 and done == []
+
+
+def test_a_card_for_several_calls_is_not_changed_before_approving(
+    client: TestClient, owner: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    done: list[dict[str, Any]] = []
+    _carry_out_into(done, monkeypatch)
+    decision_id = _held(owner)
+    parse = decisions_route._parse_payload
+
+    def with_steps(instance: Any) -> dict[str, Any]:
+        payload = parse(instance)
+        return {**payload, "steps": [payload["input"], {**payload["input"], "text": "And the other one"}]}
+
+    monkeypatch.setattr(decisions_route, "_parse_payload", with_steps)
+    monkeypatch.setattr(decisions_route, "_approver_is_principal", lambda request: True)
+    response = client.post(f"/decisions/{decision_id}/approve", json={"edits": {"input": {"text": "Pay it elsewhere"}}})
+    assert response.status_code == 422 and done == []
 
 
 def test_a_full_list_refuses_the_allow_before_acting(
@@ -1191,16 +1199,17 @@ def test_a_removed_one_isnt_suggested_straight_back(
 def test_the_owners_act_as_me_ones_share_the_list_and_nobody_elses(client: TestClient, owner: Any) -> None:
     from openexecutive.delegation import training
 
-    mine = training.allow_sender(owner.id, "dana@northpeak.example", "Dana Park", decision_id=None)
-    training.allow_sender(owner.id + 50, "sam@northpeak.example", "Sam Lee", decision_id=None)
+    mine = training.keep_style(owner.id, "dana@northpeak.example", "Dana Park", "Hi Dana", decision_id=None)
+    training.keep_style(owner.id + 50, "sam@northpeak.example", "Sam Lee", "Hi Sam", decision_id=None)
+    assert mine is not None
     learned = client.get("/take-the-lead").json()["learned"]
     assert [(x["label"], x["feature"]) for x in learned] == [
-        ("Reply to Dana Park (dana@northpeak.example)", "act_as_me"),
+        ("Writing to Dana Park (dana@northpeak.example)", "act_as_me"),
     ]
     others = training.learned(owner.id + 50)[0]
     assert client.delete(f"/take-the-lead/learned/{others.id}").status_code == 404
     assert client.delete(f"/take-the-lead/learned/{mine.id}").status_code == 200
-    assert training.allowed_sender(owner.id, "dana@northpeak.example") is None
+    assert training.example_for(owner.id, "dana@northpeak.example") is None
 
 
 def test_a_calendar_delete_by_action_counts_as_deleting(owner: Any) -> None:
@@ -1208,3 +1217,597 @@ def test_a_calendar_delete_by_action_counts_as_deleting(owner: Any) -> None:
     assert hit is not None and hit.kind == ttl.DELETE_SHARE
     hit = ttl.check("google_workspace__manage_event", {"action": "update", "event_id": "e1"}, lead=_lead(), rules=[], mcp=True)
     assert hit is None or hit.kind != ttl.DELETE_SHARE
+
+
+def test_mail_sends_are_known_without_their_addresses() -> None:
+    assert ttl.is_mail_send("google_workspace__send_gmail_message")
+    assert ttl.is_mail_send("microsoft_365__send-mail")
+    assert not ttl.is_mail_send("google_workspace__create_spreadsheet")
+
+
+# ── In training sits above Approvals ─────────────────────────────────────────
+
+
+def _balanced(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.OUTSIDERS)
+
+
+def _gated_message(sam: int, text: str) -> tuple[dict[str, Any], list[Any]]:
+    calls: list[Any] = []
+    gated = ttl.gated_handlers(_handlers(calls), source="reflection")
+    result = json.loads(asyncio.run(gated["message_person"]({"person_id": sam, "text": text})))
+    return result, calls
+
+
+@pytest.mark.parametrize("level", ["balanced", "hands_off"])
+def test_in_training_nothing_goes_on_any_level(owner: Any, monkeypatch: pytest.MonkeyPatch, level: str) -> None:
+    (_balanced if level == "balanced" else _hands_off)(monkeypatch)
+    _training()
+    result, calls = _gated_message(_teammate(), "Are we on for Thursday?")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    [decision] = ledger.list_instances(ttl.DECISION_CLASS)
+    payload = json.loads(decision.proposed_payload_json)
+    assert payload["kind"] == ttl.TRAINING and payload["allow"]["label"] == "Message Sam Teammate"
+
+
+def test_a_training_card_says_who_where_and_the_whole_message(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _training()
+    text = "Sam, " + "the Q3 numbers are in and look solid. " * 10
+    result, calls = _gated_message(_teammate(), text)
+    assert result["status"] == "waiting_for_approval" and calls == []
+    payload = json.loads(ledger.list_instances(ttl.DECISION_CLASS)[0].proposed_payload_json)
+    assert payload["headline"] == "Message Sam Teammate"
+    # No chat app set up for Sam: it would land on their Needs you.
+    assert payload["where"].startswith("In Open Executive")
+    assert payload["fields"][0]["value"] == text  # the whole message, not the first 120 characters
+
+
+@pytest.mark.parametrize("tool_input", [{}, {"person_id": "SAM"}, {"text": "Hi"}, {"person_id": "SAM", "text": "  "}])
+def test_a_call_missing_who_or_what_is_never_a_card(owner: Any, tool_input: dict[str, Any]) -> None:
+    _training()
+    sam = _teammate()
+    tool_input = {k: sam if v == "SAM" else v for k, v in tool_input.items()}
+    calls: list[Any] = []
+    gated = ttl.gated_handlers(_handlers(calls), source="research")
+    result = json.loads(asyncio.run(gated["message_person"](tool_input)))
+    assert "error" in result and "needs" in result["error"] and calls == []
+    assert ledger.list_instances(ttl.DECISION_CLASS) == []
+
+
+def test_every_needed_argument_is_one_its_tool_requires() -> None:
+    from openexecutive.orchestrator import (
+        broadcast_tools,
+        calendar_tools,
+        open_loop_tools,
+        people_tools,
+        workflow_run_tools,
+    )
+
+    defs = [
+        v for mod in (schedule_tools, broadcast_tools, calendar_tools, open_loop_tools, people_tools, workflow_run_tools)
+        for v in vars(mod).values() if isinstance(v, dict) and v.get("name") in ttl.ACTING_TOOLS and "input_schema" in v
+    ]
+    required = {d["name"]: set(d["input_schema"].get("required", [])) for d in defs}
+    assert set(ttl._NEEDS) == set(ttl.ACTING_TOOLS) == set(required)
+    for tool, needs in ttl._NEEDS.items():
+        assert set(needs) <= required[tool], tool
+
+
+def test_where_a_message_goes() -> None:
+    assert ttl.where("send_slack_dm", {"user_id": "U1", "text": "x"}) == "On Slack"
+    assert ttl.where("send_company_broadcast", {"integration": "discord", "text": "x"}) == "On Discord"
+    assert ttl.where("create_calendar_event", {"title": "Sync"}) == ""
+
+
+@pytest.mark.parametrize(("channel", "ref", "usable"), [
+    ("discord", "123456789", True), ("discord", "@sam", False),
+    ("telegram", "-100123", True), ("telegram", "--1", False), ("slack", "U123", True), ("slack", None, False),
+])
+def test_where_skips_an_id_message_person_would_skip(channel: str, ref: str | None, usable: bool) -> None:
+    assert schedule_tools.usable_chat_ref(channel, ref) is usable
+
+
+def test_a_connected_email_card_shows_the_email() -> None:
+    details = ttl.card_details(
+        "google_workspace__send_gmail_message",
+        {"to": "lee@far.example", "subject": "Renewal", "body": "Lee, the renewal is attached."}, mcp=True,
+    )
+    assert [(d["label"], d["value"]) for d in details] == [
+        ("To", "lee@far.example"), ("Subject", "Renewal"), ("Message", "Lee, the renewal is attached."),
+    ]
+    assert ttl.card_details("message_person", {"person_id": 1, "text": "x"}) == []
+
+
+def test_once_allowed_it_goes_where_approvals_lets_it(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _training()
+    sam = _teammate()
+    key, label = ttl.allowance("message_person", {"person_id": sam})  # type: ignore[misc]
+    ttl.allow(key, label, created_by="t")
+    # Careful still holds everything, allowed or not.
+    result, calls = _gated_message(sam, "Are we on for Thursday?")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    assert json.loads(ledger.list_instances(ttl.DECISION_CLASS)[0].proposed_payload_json)["kind"] == "level"
+    _balanced(monkeypatch)
+    result, calls = _gated_message(sam, "Are we on for Friday?")
+    assert result["status"] == "sent" and len(calls) == 1
+    # Someone not allowed yet still gets a card.
+    pat = people_store.upsert_person(full_name="Pat Other", email="pat@co.example")
+    people_registry.invalidate()
+    result, calls = _gated_message(pat, "Hello")
+    assert result["status"] == "waiting_for_approval" and calls == []
+
+
+def test_out_of_training_balanced_holds_the_kinds_and_hands_off_runs(
+    owner: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _balanced(monkeypatch)
+    sam = _teammate()
+    result, calls = _gated_message(sam, "Are we on for Thursday?")
+    assert result["status"] == "sent" and len(calls) == 1
+    result, calls = _gated_message(sam, "Pay the invoice, $4,000.")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    [decision] = ledger.list_instances(ttl.DECISION_CLASS)
+    assert json.loads(decision.proposed_payload_json)["kind"] == "money"
+    _hands_off(monkeypatch)
+    result, calls = _gated_message(sam, "Pay the invoice, $4,000.")
+    assert result["status"] == "sent" and len(calls) == 1
+
+
+def test_the_owners_rules_hold_even_on_hands_off(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _hands_off(monkeypatch)
+    rule = ttl.add_rule(ttl.SCOPE_COMPANY, "words", "acquisition", created_by="t")
+    result, calls = _gated_message(_teammate(), "The acquisition closes Friday.")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    [decision] = ledger.list_instances(ttl.DECISION_CLASS)
+    assert json.loads(decision.proposed_payload_json)["rule_id"] == rule.id
+
+
+# ── Goes rules ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def balanced(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.OUTSIDERS)
+
+
+def _go(kind: str, value: str) -> ttl.Rule:
+    return ttl.add_rule(ttl.SCOPE_COMPANY, kind, value, created_by="t", effect=ttl.EFFECT_GO)
+
+
+def _run(owner: Any, text: str, person_id: int | None = None) -> tuple[dict[str, Any], list[Any]]:
+    calls: list[Any] = []
+    gated = ttl.gated_handlers(_handlers(calls), source="reflection")
+    result = json.loads(asyncio.run(gated["message_person"]({"person_id": person_id or _teammate(), "text": text})))
+    return result, calls
+
+
+def test_an_amount_rule_takes_a_rupee_sign() -> None:
+    assert ttl.add_rule(ttl.SCOPE_COMPANY, "amount", "₹500", created_by="t").value == "500"
+
+
+def test_rules_keep_their_effect() -> None:
+    assert ttl.add_rule(ttl.SCOPE_COMPANY, "words", "acquisition", created_by="t").effect == ttl.EFFECT_WAIT
+    _go("amount", "500")
+    assert [r.effect for r in ttl.list_rules([ttl.SCOPE_COMPANY])] == [ttl.EFFECT_WAIT, ttl.EFFECT_GO]
+    with pytest.raises(ttl.RuleError):
+        ttl.add_rule(ttl.SCOPE_COMPANY, "words", "x", created_by="t", effect="maybe")
+
+
+def test_an_amount_goes_rule_needs_every_amount_under_it() -> None:
+    rules = [_go("amount", "500")]
+    assert ttl.rule_goes(rules, "Approve Priya's $180 software request", []) is not None
+    assert ttl.rule_goes(rules, "Pay $180 now and $900 later", []) is None
+    assert ttl.rule_goes(rules, "Pay the invoice", []) is None  # no amount: not covered
+
+
+def test_a_domain_goes_rule_needs_every_recipient_on_it() -> None:
+    rules = [_go("domain", "co.example")]
+    assert ttl.rule_goes(rules, "", ["dana@co.example"]) is not None
+    assert ttl.rule_goes(rules, "", ["dana@co.example", "x@far.example"]) is None
+
+
+def test_on_balanced_a_goes_rule_lets_small_money_go(owner: Any, balanced: None) -> None:
+    result, calls = _run(owner, "Approve the $180 software request")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    _go("amount", "500")
+    result, calls = _run(owner, "Approve the $180 software request")
+    assert result["status"] == "sent" and len(calls) == 1
+    done = [d for d in ttl.done([ttl.SCOPE_EXECUTIVE]) if d.status == "done"]
+    assert "Your rule: amounts under $500." in done[0].why
+    result, calls = _run(owner, "Approve the $1,240 invoice")
+    assert result["status"] == "waiting_for_approval" and calls == []
+
+
+def test_a_waits_rule_beats_a_goes_rule(owner: Any, balanced: None) -> None:
+    _go("amount", "500")
+    ttl.add_rule(ttl.SCOPE_COMPANY, "words", "software", created_by="t")
+    result, calls = _run(owner, "Approve the $180 software request")
+    assert result["status"] == "waiting_for_approval" and calls == []
+
+
+def test_careful_and_in_training_still_hold_a_goes_rule(
+    owner: Any, balanced: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    _go("amount", "500")
+    ttl.set_(ttl.SCOPE_EXECUTIVE, training=True, updated_by="t")
+    result, calls = _run(owner, "Approve the $180 software request")
+    assert result["status"] == "waiting_for_approval" and calls == []
+    assert json.loads(ledger.list_instances(ttl.DECISION_CLASS)[0].proposed_payload_json)["kind"] == ttl.TRAINING
+    ttl.set_(ttl.SCOPE_EXECUTIVE, training=False, updated_by="t")
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.ASK)
+    result, calls = _run(owner, "Approve the $180 software request")
+    assert result["status"] == "waiting_for_approval" and calls == []
+
+
+def test_the_route_adds_a_goes_rule_for_a_provable_owner(
+    client: TestClient, owner: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = client.post("/take-the-lead/rules", json={"kind": "amount", "value": "500", "effect": "go"}).json()
+    assert [(r["kind"], r["value"], r["effect"]) for r in body["rules"]] == [("amount", "500", "go")]
+    assert client.post("/take-the-lead/rules", json={"kind": "amount", "value": "5", "effect": "bogus"}).status_code == 422
+    monkeypatch.delenv("OE_LOCAL_LOGIN", raising=False)
+    assert client.post("/take-the-lead/rules", json={"kind": "amount", "value": "9", "effect": "go"}).status_code == 409
+    assert client.post("/take-the-lead/rules", json={"kind": "amount", "value": "9"}).status_code == 200
+
+
+def test_a_goes_rule_never_lets_a_delete_go(owner: Any, balanced: None) -> None:
+    _go("amount", "500")
+    hit, _ = ttl._hit("cancel_calendar_event", {"event_id": "e1", "title": "$100 standup"}, mcp=False)
+    assert hit is not None and hit.kind == "delete_share"
+
+
+def test_a_goes_rule_lets_go_only_what_it_covers(owner: Any, balanced: None) -> None:
+    """A words rule only waits, and an amount rule lets only the money go:
+    a contract under the limit still waits."""
+    with pytest.raises(ttl.RuleError):
+        _go("words", "thanks")
+    _go("amount", "500")
+    result, calls = _run(owner, "Sign the $300 contract renewal")
+    assert result["status"] == "waiting_for_approval" and calls == []
+
+
+def test_a_person_goes_rule_needs_one_person_by_that_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import openexecutive.people.store as store
+
+    def sams(**_: Any) -> list[Any]:
+        return [
+            SimpleNamespace(full_name="Sam Lee", email="sam@co.example", email_aliases=[]),
+            SimpleNamespace(full_name="Sam Lee", email="sam@far.example", email_aliases=[]),
+        ]
+
+    rules = [_go("person", "Sam Lee")]
+    monkeypatch.setattr(store, "list_people", sams)
+    assert ttl.rule_goes(rules, "", ["sam@co.example"]) is None
+    monkeypatch.setattr(store, "list_people", lambda **_: sams()[:1])
+    assert ttl.rule_goes(rules, "", ["sam@co.example"]) is not None
+    assert ttl.rule_goes(rules, "Sam Lee", []) is None  # a name in the text isn't a recipient
+
+
+def test_an_amount_goes_rule_fails_closed_on_an_amount_it_cant_read() -> None:
+    rules = [_go("amount", "500")]
+    assert ttl.rule_goes(rules, "I can do $100 now, and ₹9,000,000 next quarter", []) is None
+    assert ttl.rule_goes(rules, "I can do $100 now and a 40% discount", []) is None
+    for text in [
+        "Pay $5 trillion today",
+        "Pay ₹3 crore today",
+        "Pay €1.200,50 today",
+        "Pay €1.000.000 today",
+        "The fee is $100, plus a ten thousand dollar deposit",
+        "The fee is $100, plus a few dollars",
+        "Fee is $20; please wire 50000 to the new account",
+    ]:
+        assert ttl.rule_goes(rules, text, []) is None, text
+    for text in ["I can do $100 now.", "Pay $1,200.50 and $2k", "That's 300 dollars"]:
+        assert (ttl.rule_goes([_go("amount", "5000")], text, []) is not None), text
+    assert ttl.rule_goes(rules, "I can do $100 now", []) is not None
+
+
+def test_a_goes_company_rule_is_that_domain_only() -> None:
+    rules = [_go("domain", "co.example")]
+    assert ttl.rule_goes(rules, "", ["x@eu.co.example"]) is None
+    waits = [ttl.add_rule(ttl.SCOPE_COMPANY, "domain", "co.example", created_by="t")]
+    assert ttl.rule_waits(waits, "", ["x@eu.co.example"]) is not None
+
+
+def test_a_goes_person_rule_reads_only_the_main_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import openexecutive.people.store as store
+
+    sam = SimpleNamespace(full_name="Sam Lee", email="sam@co.example", email_aliases=["s@far.example"])
+    monkeypatch.setattr(store, "list_people", lambda **_: [sam])
+    rules = [_go("person", "Sam Lee")]
+    assert ttl.rule_goes(rules, "", ["sam@co.example"]) is not None
+    assert ttl.rule_goes(rules, "", ["s@far.example"]) is None
+
+
+def test_an_address_in_the_body_doesnt_satisfy_a_goes_rule(owner: Any, balanced: None) -> None:
+    """A person or company Goes rule counts only who it actually reaches."""
+    _go("person", "alice@acme.example")
+    hit, allowed = ttl._hit("post_to_channel", {"channel": "#all", "text": "Signed the contract, cc alice@acme.example"},
+                            mcp=False)
+    assert allowed is None
+
+
+# ── standing jobs, what made it look, more times it looks ─────────────────────
+
+
+def test_standing_jobs_on_the_as_me_tab(client: TestClient, owner: Any) -> None:
+    """The owner gives it standing jobs and stops them; the tab says what it
+    did for each this week and how much it did and left today."""
+    body = client.post("/take-the-lead/jobs", json={"text": "  Keep the dealer   onboarding moving "}).json()
+    [job] = body["jobs"]
+    assert job["text"] == "Keep the dealer onboarding moving" and job["this_week"] == ""
+    assert client.post("/take-the-lead/jobs", json={"text": "keep the dealer onboarding moving"}).status_code == 400
+    assert client.post("/take-the-lead/jobs", json={"text": "x"}).status_code == 400
+    with ttl.looking(ttl.DAILY_LOOK):
+        ttl.focus_job(job["id"])
+        ttl.record(scope=ttl.SCOPE_EXECUTIVE, source="reflection", tool="message_person", summary="Messaged Dana",
+                   status="done")
+        ttl.record(scope=ttl.SCOPE_EXECUTIVE, source="reflection", tool="create_calendar_event",
+                   summary="Booked the dealer call", status="done")
+        ttl.focus_job(0)
+        ttl.record(scope=ttl.SCOPE_EXECUTIVE, source="reflection", tool="message_person", summary="Messaged Sam",
+                   status="waiting")
+    body = client.get("/take-the-lead").json()
+    assert body["jobs"][0]["this_week"] == "1 follow-up, 1 meeting booked"
+    assert (body["done_today"], body["left_today"]) == (2, 1)
+    assert client.delete(f"/take-the-lead/jobs/{job['id']}").json()["jobs"] == []
+    # A second stop (another tab) still succeeds; a job that never was doesn't.
+    assert client.delete(f"/take-the-lead/jobs/{job['id']}").status_code == 200
+    assert client.delete("/take-the-lead/jobs/9999").status_code == 404
+
+
+def test_a_teammate_cant_give_it_standing_jobs(client: TestClient, owner: Any) -> None:
+    people_store.upsert_person(full_name="Sam", email=SAM)
+    people_registry.invalidate()
+    response = client.post("/take-the-lead/jobs", json={"text": "Chase overdue tasks"}, headers={"x-caller-email": SAM})
+    assert response.status_code == 403
+    assert ttl.list_jobs() == []
+
+
+def test_the_look_is_told_the_standing_jobs_and_a_job_is_picked_by_number() -> None:
+    assert ttl.jobs_note() == ""
+    job = ttl.add_job("Chase overdue tasks every morning", created_by="t")
+    note = ttl.jobs_note()
+    assert f"[{job.id}] Chase overdue tasks every morning" in note and "for_standing_job" in note
+    assert "error" in ttl.focus_job(job.id)  # no look running
+    with ttl.looking(ttl.DAILY_LOOK) as look:
+        assert "error" in asyncio.run(ttl.handle_focus_job({"job_id": 999}))
+        assert json.loads(asyncio.run(ttl.handle_focus_job({"job_id": job.id})))["standing_job"] == job.text
+        assert look.job_id == job.id
+    assert ttl.current_look() is None
+
+
+def test_wake_reasons_read_as_done_for_you_words() -> None:
+    assert ttl.arrival_reason("email") == "new mail came in"
+    assert ttl.arrival_reason("slack") == "a message came in on Slack"
+    assert ttl.prompted_line("") == ttl.DAILY_LOOK
+    assert ttl.wake_reason("As me: look over what's new (a task went overdue).") == "a task went overdue"
+    assert ttl.wake_reason("Something else") == ""
+
+
+def test_what_came_of_a_step() -> None:
+    assert ttl.outcome_of("google_workspace__send_gmail_message", {}, "{}", mcp=True) == "Sent"
+    assert ttl.outcome_of("create_calendar_event", {"attendees": ["a@x.example"]}, "{}") == "Invites sent"
+    assert ttl.outcome_of("run_workflow", {}, "{}") == "Started"
+    assert ttl.outcome_of("update_department_goal", {}, '{"message": "Goal updated"}') == "Goal updated"
+    assert ttl.outcome_of("update_department_goal", {}, "not json") == ""
+    # A connected app's own words never show: they can be someone else's text.
+    assert ttl.outcome_of("notion__update_page", {}, '{"message": "Q3 plan: cut 20%"}', mcp=True) == ""
+    assert ttl.how_line("google_workspace__send_gmail_message") == "By email"
+    assert ttl.how_line("create_calendar_event") == "On the calendar"
+
+
+@pytest.fixture
+def watched() -> Iterator[None]:
+    ttl._WATCHED.at = None
+    ttl._WATCHED.goals = {}
+    ttl._WATCHED.pending = []
+    ttl._LAST_WAKE.clear()
+    yield
+    ttl._WATCHED.at = None
+    ttl._WATCHED.goals = {}
+    ttl._WATCHED.pending = []
+    ttl._LAST_WAKE.clear()
+
+
+def test_a_slipping_goal_failed_workflow_overdue_task_or_ended_meeting_wakes_it(
+    monkeypatch: pytest.MonkeyPatch, watched: None, owner: Any, db: Path,
+) -> None:
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from openexecutive.attunement import open_loops
+    from openexecutive.briefing import live_signals
+    from openexecutive.departments import store as dept_store
+    from openexecutive.workflows import persistence
+
+    monkeypatch.setattr(dept_store, "DB_PATH", db)
+    dept_store.initialize_db(db)
+    goal = dept_store.insert_goal(None, period_value="Q4 2026", key_result="Ramp gate", target="1")
+    assert ttl.watch(NOW) is None  # the first check only takes stock
+    assert ttl.watch(NOW + timedelta(seconds=10)) is None  # throttled
+    dept_store.update_goal(goal, status="at_risk")
+    later = NOW + timedelta(minutes=2)
+    assert ttl.watch(later) == "a goal slipped"
+    [wake] = _wakes()
+    row = get_scheduled(wake["id"])
+    assert ttl.wake_reason(row.intent_text) == "a goal slipped"
+    assert "Ramp gate" not in row.intent_text  # the row names the kind of event only
+
+    ttl._LAST_WAKE.clear()
+    from openexecutive.memory.episodic import mark_action_done
+
+    mark_action_done(wake["id"])  # that look has run
+    persistence.create_run("r1", "board_prep", "Board prep", {})
+    persistence.fail_run("r1", "boom")
+    # A teammate's own run is theirs alone: it doesn't wake the company's look.
+    persistence.create_run("r2", "board_prep", "Dana's prep", {}, owner_person_id=7)
+    persistence.fail_run("r2", "boom")
+    monkeypatch.setattr(open_loops, "list_open_loops", lambda **_: [
+        SimpleNamespace(description="Send the deck", due_at=(later + timedelta(minutes=1)).isoformat()),
+    ])
+    monkeypatch.setattr(live_signals, "cached_calendar", lambda now, tz: [
+        SimpleNamespace(title="Supplier sync", all_day=False, start=later, end=later + timedelta(minutes=2)),
+    ])
+    reason = ttl.watch(later + timedelta(minutes=3))
+    assert reason is not None
+    assert reason == "a workflow failed (and 2 more)"
+    assert "Supplier sync" not in str([get_scheduled(w["id"]).intent_text for w in _wakes()])
+
+
+def test_standing_jobs_are_wiped_with_the_rest() -> None:
+    assert ttl.JOBS_TABLE in ttl.TABLES
+
+
+def test_two_adds_at_once_make_one_standing_job(tmp_path: Path) -> None:
+    """A double tap, or chat and the page together: one job, not two."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    db = tmp_path / "jobs.db"
+    ttl.list_jobs(db_path=db)
+
+    def add() -> str:
+        try:
+            ttl.add_job("Chase late invoices", created_by=OWNER, db_path=db)
+            return "added"
+        except ValueError:
+            return "refused"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: add(), range(8)))
+    assert results.count("added") == 1
+    assert [j.text for j in ttl.list_jobs(db_path=db)] == ["Chase late invoices"]
+
+    [job] = ttl.list_jobs(db_path=db)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        stopped = list(pool.map(lambda _: ttl.stop_job(job.id, db_path=db), range(8)))
+    # Every stop succeeds; only one of them stopped it.
+    assert all(s is not None for s in stopped)
+    assert sum(s is not None and s.stopped_at is None for s in stopped) == 1
+    again = ttl.stop_job(job.id, db_path=db)
+    assert again is not None and again.stopped_at is not None
+    assert ttl.stop_job(9999, db_path=db) is None
+
+
+def test_it_only_watches_while_as_me_is_on(monkeypatch: pytest.MonkeyPatch, watched: None) -> None:
+    monkeypatch.setattr(ttl, "executive_on", lambda **_: False)
+    assert ttl.watch(NOW) is None
+    assert ttl._WATCHED.at is None
+
+
+def get_scheduled(action_id: int) -> Any:
+    from openexecutive.memory.episodic import get_scheduled_action
+
+    return get_scheduled_action(action_id)
+
+
+def test_a_standing_job_from_chat_waits_for_a_tap() -> None:
+    """A job is replayed into every look, so adding one from chat is a card."""
+    from openexecutive.orchestrator import app_control, app_control_catalog  # noqa: F401
+
+    action = app_control.CATALOG.actions["add_standing_job"]
+    assert action.confirm and action.card is not None
+    assert not app_control.CATALOG.actions["stop_standing_job"].confirm
+
+
+def test_a_failed_check_is_looked_at_again(monkeypatch: pytest.MonkeyPatch, watched: None) -> None:
+    """A check that raises leaves the watermark, so nothing it missed is lost."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(ttl, "executive_on", lambda **_: True)
+    monkeypatch.setattr(ttl, "_goal_statuses", lambda: {})
+    monkeypatch.setattr(ttl, "_overdue_tasks", lambda since, now: [])
+    monkeypatch.setattr(ttl, "_ended_meetings", lambda since, now: [])
+    monkeypatch.setattr(ttl, "_failed_runs", lambda since: [])
+    assert ttl.watch(NOW) is None
+    stocked = ttl._WATCHED.marks["runs"]
+
+    def boom(since: Any) -> list[str]:
+        raise RuntimeError("locked")
+
+    monkeypatch.setattr(ttl, "_failed_runs", boom)
+    later = NOW + timedelta(minutes=2)
+    assert ttl.watch(later) is None
+    # Only the check that failed keeps its mark; the others move on.
+    assert ttl._WATCHED.marks["runs"] == stocked
+    assert ttl._WATCHED.marks["meetings"] == later
+
+
+def test_what_one_check_saw_doesnt_wake_it_again_while_another_fails(
+    monkeypatch: pytest.MonkeyPatch, watched: None,
+) -> None:
+    from datetime import timedelta
+
+    monkeypatch.setattr(ttl, "executive_on", lambda **_: True)
+    monkeypatch.setattr(ttl, "_goal_statuses", lambda: {})
+    monkeypatch.setattr(ttl, "_overdue_tasks", lambda since, now: [])
+    monkeypatch.setattr(ttl, "_look_waiting", lambda: False)
+
+    def meetings(since: Any, now: Any) -> list[str]:
+        raise RuntimeError("cache unreadable")
+
+    monkeypatch.setattr(ttl, "_ended_meetings", meetings)
+    failed_at = NOW + timedelta(seconds=30)
+    monkeypatch.setattr(ttl, "_failed_runs", lambda since: ["Board prep"] if since < failed_at else [])
+    woken: list[str] = []
+    monkeypatch.setattr(ttl, "wake", lambda reason, now=None: woken.append(reason) or 1)
+    ttl.watch(NOW)
+    ttl.watch(NOW + timedelta(minutes=2))
+    ttl.watch(NOW + timedelta(minutes=4))
+    assert woken == ["a workflow failed"]
+
+
+def test_what_it_sees_inside_the_gap_wakes_it_once_the_gap_is_over(
+    monkeypatch: pytest.MonkeyPatch, watched: None,
+) -> None:
+    """A slip seen while the last look is under WAKE_GAP old is kept, not dropped."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(ttl, "executive_on", lambda **_: True)
+    monkeypatch.setattr(ttl, "_overdue_tasks", lambda since, now: [])
+    monkeypatch.setattr(ttl, "_ended_meetings", lambda since, now: [])
+    monkeypatch.setattr(ttl, "_failed_runs", lambda since: [])
+    monkeypatch.setattr(ttl, "_look_waiting", lambda: False)
+    statuses = {1: ("on_track", "Ramp gate")}
+    monkeypatch.setattr(ttl, "_goal_statuses", lambda: dict(statuses))
+    scheduled: list[str] = []
+    gap_over = NOW + ttl.WAKE_GAP
+
+    def fake_wake(reason: str, *, now: Any = None) -> int | None:
+        if now is not None and now < gap_over:
+            return None
+        scheduled.append(reason)
+        return 1
+
+    monkeypatch.setattr(ttl, "wake", fake_wake)
+    assert ttl.watch(NOW) is None
+    statuses[1] = ("at_risk", "Ramp gate")
+    assert ttl.watch(NOW + timedelta(minutes=2)) is None  # inside the gap: kept
+    assert ttl._WATCHED.pending == ["a goal slipped"]
+    assert ttl.watch(gap_over + timedelta(minutes=1)) == "a goal slipped"
+    assert scheduled == ["a goal slipped"] and ttl._WATCHED.pending == []
+
+
+def test_today_is_the_owners_day(monkeypatch: pytest.MonkeyPatch, db: Path) -> None:
+    """Done today counts from midnight where the owner is, not UTC midnight."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from openexecutive.memory import workspace_settings
+
+    monkeypatch.setattr(workspace_settings, "get_user_timezone", lambda: ZoneInfo("America/Los_Angeles"))
+    ttl.record(scope=ttl.SCOPE_EXECUTIVE, source="reflection", tool="message_person",
+               summary="Messaged Dana", status="done")
+    # Late evening in Los Angeles is the next UTC day: still today there.
+    afternoon = datetime.now(UTC).astimezone(ZoneInfo("America/Los_Angeles")).replace(hour=23, minute=59)
+    assert ttl.done_today(now=afternoon.astimezone(UTC))[0] == 1

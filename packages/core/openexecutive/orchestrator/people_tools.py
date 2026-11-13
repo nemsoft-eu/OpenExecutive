@@ -16,7 +16,7 @@ import inspect
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from datetime import date
 from types import SimpleNamespace
 from typing import Any, ParamSpec
@@ -351,11 +351,13 @@ def _audit(tool: str, kind: str, ok: bool, summary: str, details: dict[str, Any]
 # Surfaces that verify who sent every message: the web chat (the signed-in
 # Google account, stamped by the UI proxy), and Slack / Discord (the platform's
 # own user id, over an authenticated connection). Email (an unauthenticated
-# From header), Google Chat (its sender is matched by email for the department gate only), the CLI, the MCP server
-# (unless the turn may act: `Session.mcp_client_may_act`) and unattended runs (scheduler, workflows, alert review) don't. Telegram only
-# sometimes — see `_is_verified_speaker_surface`. A channel adapter this module
-# doesn't know counts when it verified the sender itself
-# (`Session.speaker_verified`, with the `caller_person_id` it resolved).
+# From header), the CLI, the MCP server (unless the turn may act:
+# `Session.mcp_client_may_act`) and unattended runs (scheduler, workflows,
+# alert review) don't. Telegram only sometimes — see
+# `_is_verified_speaker_surface`. A channel adapter this module doesn't know
+# counts when it verified the sender itself (`Session.speaker_verified`, with
+# the `caller_person_id` it resolved), as Google Chat does for a sender on
+# People (by the Google account email on Google's signed event).
 _VERIFIED_SPEAKER_CHANNELS = frozenset({"slack", "discord"})
 
 
@@ -394,6 +396,13 @@ def _is_verified_speaker_surface(session: Any) -> bool:
     channel = str(getattr(session, "origin_channel", "") or "")
     if channel in _VERIFIED_SPEAKER_CHANNELS:
         return True
+    # The principal's own mail, which their mail service authenticated as
+    # coming from their address (``Session.email_authenticated``, set by the
+    # email poller): they are signed in there as on any other channel, so
+    # their Approvals level decides what runs. Anyone else's mail, or a From
+    # header nothing proved, still isn't.
+    if channel == "email":
+        return getattr(session, "email_authenticated", False) is True
     if channel != "telegram":
         return False
     # Telegram identifies the chat, not the sender, and its webhook is exempt
@@ -498,6 +507,18 @@ def turn_is_private_to_principal() -> bool:
     from openexecutive.orchestrator.schedule_tools import current_session
 
     return getattr(current_session.get(), "private_to_principal", False) is True
+
+
+def private_turn_holds() -> bool:
+    """Whether a private turn (``turn_is_private_to_principal``) keeps a send
+    to the principal alone right now: not under Hands-off, nor for a step the
+    owner approved on a card (``orchestrator.levels.relaxed``). Below
+    Hands-off the dispatch guard already put such a step on a card."""
+    if not turn_is_private_to_principal():
+        return False
+    from openexecutive.orchestrator import levels
+
+    return not levels.relaxed()
 
 
 PRIVATE_TURN_REFUSAL = (
@@ -954,7 +975,37 @@ async def handle_list_people(tool_input: dict[str, Any]) -> str:
         f"list_people returned {team_count}",
         {"count": team_count, "include_archived": include_archived},
     )
+    shared = _shared_first_names(p for p in people if not p.archived)
+    if shared:
+        return json.dumps({
+            "people": out, "count": len(out),
+            "shared_first_names": shared, "note": SHARED_NAME_NOTE,
+        })
     return json.dumps({"people": out, "count": len(out)})
+
+
+SHARED_NAME_NOTE = (
+    "Some people share a first name (shared_first_names). When the principal "
+    "names one of them, ask which one unless the conversation makes it clear, "
+    "and whatever you send or say was sent, name the person by full name and "
+    "email address."
+)
+
+
+def _shared_first_names(people: Iterable[Any]) -> list[str]:
+    """First names that more than one listed person has, as written."""
+    seen: dict[str, str] = {}
+    shared: dict[str, str] = {}
+    for p in people:
+        first = ((p.full_name or "").split() or [""])[0]
+        key = first.casefold()
+        if not key:
+            continue
+        if key in seen:
+            shared[key] = seen[key]
+        else:
+            seen[key] = first
+    return sorted(shared.values())
 
 
 def _hold_until_next_turn(person_id: int) -> None:
@@ -985,6 +1036,18 @@ def _new_way_to_reach(existing: Any, tool_input: dict[str, Any], aliases: list[s
         known.add(norm(getattr(existing, "email", None)))
         return any(norm(a) not in known for a in aliases)
     return False
+
+
+
+def _is_store_refusal(exc: BaseException) -> bool:
+    """True for a rule the people store refuses a write with: a plain
+    ``ValueError`` or one of its named refusals. Other ``ValueError``
+    subclasses (a pydantic or JSON error, say) are faults, not refusals."""
+    from openexecutive.people import store as people_store
+
+    return type(exc) is ValueError or isinstance(
+        exc, (people_store.AddressInUseError, people_store.PrincipalContactError)
+    )
 
 
 async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
@@ -1154,7 +1217,14 @@ async def handle_upsert_person(tool_input: dict[str, Any]) -> str:
         if details is not None:
             people_store.set_person_details(new_id, details, source="chat_tool")
     except Exception as exc:
-        logger.exception("upsert_person: failed")
+        if _is_store_refusal(exc):
+            # A rule the store explains (address already on someone, bad
+            # alias, too many addresses): the reason goes back to the model
+            # and the person, so it is not a fault worth an error report. The
+            # traceback stays in the log in case it ever is one.
+            logger.warning("upsert_person: refused (%s)", type(exc).__name__, exc_info=True)
+        else:
+            logger.exception("upsert_person: failed")
         # Always invalidate — a partial write (e.g. row inserted but scopes
         # failed) must not leave the registry serving stale data.
         people_registry.invalidate()
@@ -1443,7 +1513,9 @@ def _contact_note_answer(person_id: int, target_person_id: int | None) -> str | 
 
 
 async def handle_ask_about_person(input: dict[str, Any]) -> str:
-    """Query Honcho's per-person memory via the directional_chat wrapper.
+    """Query Honcho's per-person memory via the directional_chat wrapper,
+    falling back to our own stores (``memory.person_recall``) when it has
+    nothing: off, or nothing known yet.
 
     Lives here (vs. honcho_client) because it's the Anthropic tool
     *handler*: parameter coercion, error JSON shape, and clamping the
@@ -1509,6 +1581,11 @@ async def handle_ask_about_person(input: dict[str, Any]) -> str:
             target_person_id=None,
             reasoning_level=reasoning_level,
         )
+        if not answer:
+            # Peer memory off or empty: how they work, from our own stores.
+            from openexecutive.memory.person_recall import work_style
+
+            answer = work_style(person_id)
         if guard_contacts and answer and _names_a_contact((answer,)):
             return json.dumps(
                 {"person_id": person_id, "target_person_id": None,
@@ -1526,6 +1603,12 @@ async def handle_ask_about_person(input: dict[str, Any]) -> str:
         target_person_id=target_person_id,
         reasoning_level=reasoning_level,
     )
+    if not answer and target_person_id is None:
+        # Peer memory off or empty: their own notes and how they like
+        # replies, from our own stores.
+        from openexecutive.memory.person_recall import own_memory
+
+        answer = own_memory(person_id, question)
     # Empty answer is a normal outcome (Honcho disabled, no data, error
     # swallowed by the wrapper) — surface `found: false` rather than a
     # raw "" so the model knows it's an empty result, not a tool failure.

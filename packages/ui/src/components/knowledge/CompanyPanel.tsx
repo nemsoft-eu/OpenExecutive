@@ -9,6 +9,8 @@ import {
   getDocument,
   getSyncedDocument,
   listDocuments,
+  listUnansweredQuestions,
+  markQuestionDocumented,
   listSyncSources,
   listSyncedDocuments,
   syncSourceNow,
@@ -17,13 +19,18 @@ import {
   type SyncedDoc,
   type SyncedSourceId,
   type CompanyDoc,
+  type UnansweredQuestion,
 } from "@/lib/api";
 import {
   SOURCE_LABELS,
+  acceptsDrop,
+  dragLeavesPanel,
+  dropLandsOnPanel,
   filterDocs,
   formatInterval,
   formatSize,
   mergeDocs,
+  showEmptyDropBox,
   type DocRow,
   type DocSource,
 } from "@/lib/companyDocs";
@@ -32,6 +39,8 @@ import Icon from "@/components/Icon";
 import Button, { buttonClass } from "@/components/ui/Button";
 import OverflowMenu, { type OverflowItem } from "@/components/ui/OverflowMenu";
 import SidePanel from "@/components/ui/SidePanel";
+import { Spinner } from "@/components/ui/Spinner";
+import UnansweredQuestions from "./UnansweredQuestions";
 
 interface CompanyPanelProps {
   /** Reports how many documents are listed, for the tab's count. */
@@ -77,6 +86,13 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
   const [viewLoading, setViewLoading] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<Partial<Record<SyncedSourceId, string>>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Set before the first await, so two drops in one frame can't both start.
+  const uploadingRef = useRef(false);
+  // Questions it could not answer, and the one whose document is being
+  // added through the file picker (it leaves the list once the upload works).
+  const [questions, setQuestions] = useState<UnansweredQuestion[]>([]);
+  const [addingFor, setAddingFor] = useState<number | null>(null);
+  const addingForRef = useRef<number | null>(null);
 
   const loadSynced = useCallback(async (ids: SyncedSourceId[]) => {
     const lists = await Promise.all(
@@ -107,6 +123,17 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    listUnansweredQuestions()
+      .then((page) => setQuestions(page.questions))
+      .catch(() => {});
+  }, []);
+
+  function addDocumentFor(id: number) {
+    addingForRef.current = id;
+    fileInputRef.current?.click();
+  }
 
   const rows = useMemo(
     () => mergeDocs(uploads, synced.drive, synced.notion, synced.onedrive),
@@ -140,9 +167,14 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
   }, [syncingKey, loadSynced]);
 
   async function handleFiles(files: File[]) {
-    if (!files.length) return;
+    // One batch at a time, from a drop or from Add documents.
+    if (!acceptsDrop(uploadingRef.current, files.length)) return;
+    uploadingRef.current = true;
     setError(null);
     const failed: string[] = [];
+    const forQuestion = addingForRef.current;
+    addingForRef.current = null;
+    setAddingFor(forQuestion);
     for (const [i, file] of files.entries()) {
       setUploadProgress(
         files.length > 1 ? `Adding ${i + 1} of ${files.length}: ${file.name}…` : `Adding ${file.name}…`
@@ -154,8 +186,17 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
       }
     }
     setUploadProgress(null);
+    uploadingRef.current = false;
     if (fileInputRef.current) fileInputRef.current.value = "";
     if (failed.length) setError(failed.join(" · "));
+    if (forQuestion !== null && failed.length < files.length) {
+      try {
+        setQuestions((await markQuestionDocumented(forQuestion)).questions);
+      } catch {
+        // The document is in; the question stays listed and can be dismissed.
+      }
+    }
+    setAddingFor(null);
     try {
       setUploads(await listDocuments());
     } catch {
@@ -209,31 +250,89 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
     ...(["upload", "drive", "onedrive", "notion"] as DocSource[]).filter((s) => usedSources.has(s)),
   ];
 
+  const empty = loaded && rows.length === 0;
+  const dropHandlers = {
+        onDragOver: (e: React.DragEvent) => {
+          if (!dropLandsOnPanel(e.currentTarget, e.target)) return;
+          if (!e.dataTransfer.types.includes("Files")) return;
+          // Always claim a file drag, so the browser never opens the file in
+          // place of the page; while a batch is still being added, refuse it.
+          e.preventDefault();
+          if (uploadingRef.current) {
+            e.dataTransfer.dropEffect = "none";
+            return;
+          }
+          setDragOver(true);
+        },
+        onDragLeave: (e: React.DragEvent) => {
+          // Only when the pointer leaves the panel, not when it crosses a child.
+          if (dragLeavesPanel(e.currentTarget, e.relatedTarget)) setDragOver(false);
+        },
+        onDrop: (e: React.DragEvent) => {
+          if (!dropLandsOnPanel(e.currentTarget, e.target)) return;
+          e.preventDefault();
+          setDragOver(false);
+          addingForRef.current = null;
+          handleFiles(Array.from(e.dataTransfer.files));
+        },
+      };
+
+  // The side panels sit outside the drop area, so a file dropped on one
+  // isn't uploaded.
   return (
-    <div className="space-y-6 max-w-4xl">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <p className="text-[15px] text-fg-muted max-w-xl">
-          Your own files, plus anything synced from a connected source.
-        </p>
-        <label
-          className={buttonClass(
-            "primary",
-            "md",
-            "self-start sm:self-auto flex-shrink-0 cursor-pointer focus-within:ring-2 focus-within:ring-accent/60"
+    <>
+    <UnansweredQuestions
+      questions={questions}
+      onChange={(page) => setQuestions(page.questions)}
+      onAddDocument={addDocumentFor}
+      addingFor={addingFor}
+    />
+    <div
+      {...dropHandlers}
+      className={`space-y-4 max-w-5xl rounded-2xl transition-shadow ${
+        dragOver && !empty ? "ring-2 ring-accent ring-offset-8 ring-offset-surface" : ""
+      }`}
+    >
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+        <h2 className="text-lg font-semibold text-fg flex-1">
+          Documents
+          {rows.length > 0 && (
+            <span className="ml-2 font-medium text-fg-subtle tabular-nums">{rows.length}</span>
           )}
-        >
-          <Icon name="plus" size="w-5 h-5" />
-          Add documents
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="sr-only"
-            accept={ACCEPT}
-            onChange={(e) => handleFiles(Array.from(e.target.files ?? []))}
-          />
-        </label>
+        </h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <label
+              // Adding documents from here is not for a listed question.
+              // (A click forwarded to the input bubbles here too: keep that one.)
+              onClick={(e) => {
+                if (e.target !== fileInputRef.current) addingForRef.current = null;
+              }}
+              className={buttonClass(
+                "primary",
+                "md",
+                "flex-shrink-0 cursor-pointer focus-within:ring-2 focus-within:ring-accent/60"
+              )}
+            >
+              <Icon name="plus" size="w-5 h-5" />
+              Add documents
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="sr-only"
+                accept={ACCEPT}
+                onChange={(e) => handleFiles(Array.from(e.target.files ?? []))}
+              />
+            </label>
+        </div>
       </div>
+
+      <SourcesLine
+        connected={connected}
+        anyKnown={sources.length > 0}
+        messages={syncMessage}
+        onSyncNow={handleSyncNow}
+      />
 
       {error && (
         <p className="text-sm text-red-500 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
@@ -241,41 +340,24 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
         </p>
       )}
 
-      <SourcesStrip
-        connected={connected}
-        anyKnown={sources.length > 0}
-        messages={syncMessage}
-        onSyncNow={handleSyncNow}
-      />
+      {uploadProgress && <p className="text-[15px] text-accent animate-pulse">{uploadProgress}</p>}
 
-      <div
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragOver(true);
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragOver(false);
-          handleFiles(Array.from(e.dataTransfer.files));
-        }}
-        className={`rounded-2xl border-2 border-dashed transition-colors text-center ${
-          rows.length === 0 && loaded ? "p-10" : "px-4 py-5"
-        } ${dragOver ? "border-accent bg-accent/5" : "border-line-strong/70"}`}
-      >
-        {uploadProgress ? (
-          <p className="text-[15px] text-accent animate-pulse">{uploadProgress}</p>
-        ) : (
-          <p className="text-[15px] text-fg-muted">
-            {rows.length === 0 && loaded
-              ? "No documents yet. Drop files here to add your first ones."
-              : "Drop files here to add them"}
-            <span className="block text-sm text-fg-subtle mt-1">
-              PDF, Word, Excel, CSV, Markdown or text, up to 50 MB each
-            </span>
+      {showEmptyDropBox({ loaded, count: rows.length, uploading: uploadProgress !== null }) && (
+        <div
+          className={`rounded-2xl border-2 border-dashed transition-colors text-center px-6 py-14 ${
+            dragOver ? "border-accent bg-accent/5" : "border-line-strong/70"
+          }`}
+        >
+          <span className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-surface-overlay text-fg-muted">
+            <Icon name="doc" size="w-6 h-6" />
+          </span>
+          <p className="text-[17px] font-semibold text-fg">Add your first documents</p>
+          <p className="text-sm text-fg-muted mt-1">
+            Drop files here, or press Add documents. PDF, Word, Excel, CSV, Markdown or text, up to 50 MB
+            each.
           </p>
-        )}
-      </div>
+        </div>
+      )}
 
       {rows.length > 0 && (
         <div className="space-y-3">
@@ -324,15 +406,23 @@ export default function CompanyPanel({ onCountChange }: CompanyPanelProps) {
               </li>
             )}
           </ul>
+
+          <p className={`text-sm text-center ${dragOver ? "text-accent" : "text-fg-subtle"}`}>
+            Drop files anywhere here to add them · PDF, Word, Excel, CSV, Markdown or text, up to 50 MB
+            each
+          </p>
         </div>
       )}
 
-      <Viewer doc={viewing} onClose={() => setViewing(null)} />
     </div>
+      <Viewer doc={viewing} onClose={() => setViewing(null)} />
+    </>
   );
 }
 
-function SourcesStrip({
+// One line under the heading: each connected source with when it last
+// synced, or how to connect one.
+function SourcesLine({
   connected,
   anyKnown,
   messages,
@@ -341,71 +431,71 @@ function SourcesStrip({
   connected: SyncSourceStatus[];
   anyKnown: boolean;
   messages: Partial<Record<SyncedSourceId, string>>;
-  onSyncNow: (id: SyncedSourceId) => void;
+  onSyncNow?: (id: SyncedSourceId) => void;
 }) {
   if (!anyKnown) return null;
   if (connected.length === 0) {
     return (
-      <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-2xl border border-line bg-surface-overlay/50 px-5 py-4">
-        <p className="flex-1 text-[15px] text-fg-muted">
-          Connect Google Drive, OneDrive or Notion to bring documents in automatically.
-        </p>
+      <p className="text-sm text-fg-muted">
+        Connect Google Drive, OneDrive or Notion to bring documents in automatically.{" "}
         {/* Sources are connected with environment settings; the guide says how. */}
-        <Link
-          href="/guide#knowledge"
-          className={buttonClass("secondary", "md", "self-start sm:self-auto")}
-        >
+        <Link href="/guide#knowledge" className="font-medium text-accent hover:underline">
           How to connect
         </Link>
-      </div>
+      </p>
     );
   }
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      {connected.map((s) => {
-        const dot = s.syncing
-          ? "bg-accent animate-pulse"
-          : s.last_error
-            ? "bg-red-500"
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-sm text-fg-muted">
+        {connected.map((s) => {
+          const dot = s.syncing
+            ? "bg-accent animate-pulse"
+            : s.last_error
+              ? "bg-red-500"
+              : s.last_run
+                ? "bg-emerald-500"
+                : "bg-fg-subtle";
+          const when = s.syncing
+            ? "syncing…"
             : s.last_run
-              ? "bg-emerald-500"
-              : "bg-fg-subtle";
+              ? `synced ${formatRelativeTime(s.last_run)} · ${s.file_count} ${s.file_count === 1 ? "file" : "files"}`
+              : "not synced yet";
+          return (
+            <span
+              key={s.id}
+              className="inline-flex items-center gap-2"
+              title={`Syncs ${formatInterval(s.interval_minutes)}`}
+            >
+              <span className={`h-2 w-2 rounded-full flex-shrink-0 ${dot}`} aria-hidden />
+              <span>
+                <span className="text-fg">{s.label}</span> · {when}
+              </span>
+              {onSyncNow && !s.syncing && (
+                <button
+                  type="button"
+                  onClick={() => onSyncNow(s.id)}
+                  className="font-medium text-accent hover:underline"
+                >
+                  Sync now
+                </button>
+              )}
+            </span>
+          );
+        })}
+      </div>
+      {connected.map((s) => {
         const message = messages[s.id];
+        if (!s.last_error && !message) return null;
         return (
-          <div key={s.id} className="rounded-2xl border border-line bg-surface-elevated px-4 py-3.5">
-            <div className="flex items-center gap-2.5">
-              <span className={`h-2.5 w-2.5 rounded-full flex-shrink-0 ${dot}`} aria-hidden />
-              <span className="text-base font-semibold text-fg truncate">{s.label}</span>
-              <Button
-                size="sm"
-                className="ml-auto !h-10"
-                onClick={() => onSyncNow(s.id)}
-                disabled={s.syncing}
-              >
-                {s.syncing ? "Syncing…" : "Sync now"}
-              </Button>
-            </div>
-            <p className="text-sm text-fg-muted mt-1.5">
-              {s.syncing
-                ? "Checking for new and changed files…"
-                : s.last_run
-                  ? `Last synced ${formatRelativeTime(s.last_run)} · ${s.file_count} ${
-                      s.file_count === 1 ? "file" : "files"
-                    }`
-                  : "Not synced yet"}
-              <span className="text-fg-subtle"> · syncs {formatInterval(s.interval_minutes)}</span>
-            </p>
-            {(s.last_error || message) && (
-              <p className="text-sm text-red-500 mt-1.5">
-                {message ?? s.last_error}{" "}
-                {!message && (
-                  <Link href="/guide#knowledge" className="underline">
-                    How to fix
-                  </Link>
-                )}
-              </p>
+          <p key={s.id} className="text-sm text-red-500">
+            {s.label}: {message ?? s.last_error}{" "}
+            {!message && (
+              <Link href="/guide#knowledge" className="underline">
+                How to fix
+              </Link>
             )}
-          </div>
+          </p>
         );
       })}
     </div>
@@ -470,7 +560,10 @@ function DocListRow({
       <div className="flex items-center gap-1 flex-shrink-0">
         {row.indexed && (
           <Button size="sm" className="!h-10" onClick={onView} disabled={loading}>
-            {loading ? "Loading…" : "View"}
+            <span className="inline-flex items-center gap-2">
+              {loading && <Spinner />}
+              View
+            </span>
           </Button>
         )}
         <OverflowMenu items={menu} label={`More actions for ${row.name}`} />

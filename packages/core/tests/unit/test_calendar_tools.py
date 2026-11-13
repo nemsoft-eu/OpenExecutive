@@ -303,6 +303,13 @@ def test_happy_path_propose(tmp_path: Path) -> None:
     })
     assert result["status"] == "proposed"
     assert "decision_instance_id" in result
+    # Someone on the team asked (the principal asking books it), so its card
+    # on Home says that.
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    held = get_decision_instance(result["decision_instance_id"])
+    assert held is not None
+    assert json.loads(held.proposed_payload_json)["waiting_because"].startswith("Someone on your team asked")
 
 
 def test_propose_does_not_call_mcp() -> None:
@@ -988,7 +995,10 @@ def test_team_auto_execute_from_an_email_is_proposed_to_an_approver(monkeypatch:
         }))
     assert json.loads(raw)["status"] == "proposed"
     gw.call_tool.assert_not_awaited()
-    assert list_instances("meeting_scheduling")[0].approver_person_id == boss
+    held = list_instances("meeting_scheduling")[0]
+    assert held.approver_person_id == boss
+    # Its card on Home says why it waited: nobody on the team asked.
+    assert json.loads(held.proposed_payload_json)["waiting_because"].startswith("Nobody on your team asked")
 
 
 # The gate itself, unpatched: who counts as someone on the team asking directly.
@@ -1090,8 +1100,10 @@ def _new_york(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(calendar_tools, "_local_tz", lambda: ZoneInfo("America/New_York"))
 
 
-def _weekday(days_out: int = 3) -> datetime:
-    day = datetime.now(UTC) + timedelta(days=days_out)
+def _weekday(days_out: int = 3, tz: Any = UTC) -> datetime:
+    # A weekday on ``tz``'s calendar: just after midnight UTC on a Monday is
+    # still Sunday in New York.
+    day = (datetime.now(UTC) + timedelta(days=days_out)).astimezone(tz)
     while day.weekday() >= 5:
         day += timedelta(days=1)
     return day
@@ -1103,7 +1115,7 @@ def test_business_hours_are_read_on_the_company_clock(monkeypatch: pytest.Monkey
 
     _new_york(monkeypatch)
     _add_person("Alice", "alice@example.com")
-    day = _weekday().astimezone(ZoneInfo("America/New_York"))
+    day = _weekday(tz=ZoneInfo("America/New_York"))
     start = day.replace(hour=14, minute=0, second=0, microsecond=0)
     result = _call({
         "title": "Sync", "start": _iso(start), "end": _iso(start + timedelta(minutes=30)),
@@ -1125,7 +1137,7 @@ def test_early_morning_in_new_york_is_still_outside_hours(monkeypatch: pytest.Mo
 
     _new_york(monkeypatch)
     _add_person("Alice", "alice@example.com")
-    start = _weekday().astimezone(ZoneInfo("America/New_York")).replace(hour=7, minute=0, second=0, microsecond=0)
+    start = _weekday(tz=ZoneInfo("America/New_York")).replace(hour=7, minute=0, second=0, microsecond=0)
     result = _call({
         "title": "Sync", "start": _iso(start), "end": _iso(start + timedelta(minutes=30)),
         "attendee_person_ids": [1], "confidence": 0.9,
@@ -1180,3 +1192,51 @@ def test_a_raw_booking_with_people_goes_through_the_card_tool() -> None:
     with patch("openexecutive.config.get_settings", return_value=_settings(calendar_booking_enabled=False)):
         assert asyncio.run(typed_booking_only(True, call_tool)(create)) == "ok"
     assert calls == [alone, delete, create, create]
+
+
+# ---------------------------------------------------------------------------
+# Approvals decides: no meeting setting of its own
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("workspace", ["solo", "team"])
+def test_the_owner_asking_books_it_with_no_meeting_setting(workspace: str) -> None:
+    from openexecutive.memory import workspace_settings
+
+    workspace_settings.set_workspace_mode(workspace)
+    pid = _add_person("Alice", "alice@example.com")
+    gw = _fake_gateway("evt-owner")
+    with patch(
+        "openexecutive.orchestrator.people_tools.is_principal_on_verified_surface", return_value=True,
+    ):
+        result = _call({
+            "title": "Sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+            "attendee_person_ids": [pid], "confidence": 0.9,
+        }, gateway=gw)
+    assert result["status"] == "created"
+    gw.call_tool.assert_awaited_once()
+
+
+@pytest.mark.parametrize("workspace", ["solo", "team"])
+def test_hands_off_books_what_someone_else_asked_for(
+    workspace: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.memory import workspace_settings
+    from openexecutive.orchestrator import levels
+
+    workspace_settings.set_workspace_mode(workspace)
+    _from_outside(monkeypatch)
+    pid = _add_person("Alice", "alice@example.com")
+    monkeypatch.setattr(levels, "relaxed", lambda: True)
+    gw = _fake_gateway("evt-hands-off")
+    result = _call({
+        "title": "Sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [pid], "confidence": 0.9,
+    }, gateway=gw)
+    assert result["status"] == "created"
+    monkeypatch.setattr(levels, "relaxed", lambda: False)
+    result = _call({
+        "title": "Other sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [pid], "confidence": 0.9,
+    })
+    assert result["status"] == "proposed"

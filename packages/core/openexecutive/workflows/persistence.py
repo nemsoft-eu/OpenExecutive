@@ -37,17 +37,21 @@ New status values beyond running/done/error:
                    claims such a row (resolved -> running) and executes the
                    steps after the gate.
   timed_out      — awaiting_until passed, timeout policy applied
+  stopped        — someone pressed Stop (``stop_run``, ``workflows.run_control``).
+                   Terminal: nothing writes over it.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from openexecutive.memory.episodic import DB_PATH, _get_conn
+from openexecutive.utils.text_search import words_clause
 
 
 def _resolve(db_path: Path | None) -> Path:
@@ -189,7 +193,7 @@ def complete_run(
     with _get_conn(_resolve(db_path)) as conn:
         conn.execute(
             "UPDATE workflow_runs SET status = 'done', artifact = ?, updated_at = ? "
-            "WHERE run_id = ?",
+            "WHERE run_id = ? AND status != 'stopped'",
             (artifact, now, run_id),
         )
 
@@ -203,9 +207,27 @@ def fail_run(
     with _get_conn(_resolve(db_path)) as conn:
         conn.execute(
             "UPDATE workflow_runs SET status = 'error', error = ?, updated_at = ? "
-            "WHERE run_id = ?",
+            "WHERE run_id = ? AND status != 'stopped'",
             (error, now, run_id),
         )
+
+
+# What a Stop can end: a run that hasn't finished.
+STOPPABLE = ("running", "awaiting_human", "resolved")
+
+
+def stop_run(run_id: str, db_path: Path | None = None) -> bool:
+    """Mark an unfinished run ``stopped``. Returns whether it was unfinished.
+    Clears its resume payload, so the resumer never picks it up again."""
+    now = datetime.now(UTC).isoformat()
+    marks = ", ".join("?" for _ in STOPPABLE)
+    with _get_conn(_resolve(db_path)) as conn:
+        cur = conn.execute(
+            f"UPDATE workflow_runs SET status = 'stopped', resume_state_json = NULL, "  # noqa: S608 — constant marks
+            f"resume_claim = NULL, updated_at = ? WHERE run_id = ? AND status IN ({marks})",
+            (now, run_id, *STOPPABLE),
+        )
+        return cur.rowcount > 0
 
 
 def get_run(run_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
@@ -246,7 +268,8 @@ def list_runs(
     (`run_visible_to`; None = nobody on the roster: team runs only); the
     default "all" is for the server's own reads, never a person's.
     `with_body` adds each run's `inputs` (parsed) and the start of its
-    `artifact` (`BODY_CHARS`), enough to say what came of it."""
+    `artifact` (`BODY_CHARS`), enough to say what came of it. A run paused
+    until something is ready also has `waiting_for`."""
     if not _resolve(db_path).exists():
         return []
     clauses: list[str] = []
@@ -265,12 +288,19 @@ def list_runs(
     params.append(limit)
     with _get_conn(_resolve(db_path)) as conn:
         rows = conn.execute(
-            "SELECT run_id, workflow_name, title, status, created_at, updated_at"
+            "SELECT run_id, workflow_name, title, status, created_at, updated_at, "
+            "CASE WHEN status = 'awaiting_human' AND json_valid(state_json) "
+            "THEN json_extract(state_json, '$.waiting_for') END AS waiting_for"
             + (f", inputs, substr(artifact, 1, {BODY_CHARS}) AS artifact " if with_body else " ")
             + f"FROM workflow_runs {where}ORDER BY updated_at DESC LIMIT ?",
             params,
         ).fetchall()
     out = [dict(r) for r in rows]
+    for run in out:
+        # Only a run paused until something is ready says what
+        # (``extensions.workflow_wait``): "browser:12", say.
+        if not isinstance(run.get("waiting_for"), str) or not run["waiting_for"]:
+            run.pop("waiting_for", None)
     if with_body:
         for run in out:
             try:
@@ -286,9 +316,12 @@ def list_artifact_runs(
     archived: bool = False,
     *,
     visible_to: int | None,
+    exclude_workflows: Collection[str] = (),
+    search: str = "",
 ) -> list[dict[str, Any]]:
     """Completed runs that produced an artifact, newest first, that
-    `visible_to` may see (`run_visible_to`).
+    `visible_to` may see (`run_visible_to`), leaving out the runs of
+    `exclude_workflows`.
 
     Powers the Executive Artifacts section. Mirrors `list_runs` — the heavy
     `artifact` body is intentionally excluded from the list query (fetch it
@@ -300,6 +333,10 @@ def list_artifact_runs(
     `archived` selects which slice to return: the default (False) lists only
     active artifacts (`archived_at IS NULL`); True lists only archived ones,
     mirroring `alerts.store.list_artifact_alerts`.
+
+    `search`, when set, keeps only runs whose title, workflow name (its
+    underscores read as spaces) or artifact text holds every word of it
+    (any case, any order).
     """
     if not _resolve(db_path).exists():
         return []
@@ -307,15 +344,22 @@ def list_artifact_runs(
         "AND archived_at IS NOT NULL" if archived else "AND archived_at IS NULL"
     )
     visible, params = _visible_clause(visible_to)
+    excluded = sorted(set(exclude_workflows))
+    exclude_clause = (
+        f"AND workflow_name NOT IN ({', '.join('?' * len(excluded))}) " if excluded else ""
+    )
+    search_clause, search_params = words_clause(
+        ("title", "REPLACE(workflow_name, '_', ' ')", "artifact"), search
+    )
     with _get_conn(_resolve(db_path)) as conn:
         rows = conn.execute(
             "SELECT run_id, workflow_name, title, status, created_at, updated_at, "
             "archived_at, owner_person_id "
             "FROM workflow_runs "
             "WHERE artifact IS NOT NULL AND artifact != '' AND status = 'done' "
-            f"{archived_clause} AND {visible} "
+            f"{archived_clause} AND {visible} {exclude_clause}{search_clause}"
             "ORDER BY created_at DESC LIMIT ?",
-            (*params, limit),
+            (*params, *excluded, *search_params, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -408,7 +452,7 @@ def save_checkpoint(
                    resume_claim = NULL,
                    resume_attempts = 0,
                    updated_at = ?
-             WHERE run_id = ?{clause}
+             WHERE run_id = ? AND status != 'stopped'{clause}
             """,
             params,
         )

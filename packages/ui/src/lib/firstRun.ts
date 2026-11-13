@@ -68,7 +68,7 @@ export function clearSetupMemory(): void {
 
 /** What reading your own mailbox does, in the one wording every screen uses:
  * Handle it for me can send, so "never sends" would be untrue. */
-export const OWN_MAILBOX_SENDS = "Drafts replies as you. Sends only if you turn on Handle it for me.";
+export const OWN_MAILBOX_SENDS = "Drafts replies as you. Sends on its own only where Approvals lets it.";
 
 const FIRST_QUESTION_MAX = 160;
 
@@ -151,6 +151,10 @@ export interface ChecklistInput {
   /** Team mode: the roster has more than the owner. */
   team: boolean;
   teamSize: number;
+  /** The viewer is the owner. A teammate gets only their own rows: setup,
+   * the Executive's mailbox and the team are the owner's to do. Omitted
+   * means the owner. */
+  isPrincipal?: boolean;
 }
 
 function checkState(checks: readonly SetupCheck[] | null, id: string): SetupCheck["state"] | null {
@@ -158,10 +162,44 @@ function checkState(checks: readonly SetupCheck[] | null, id: string): SetupChec
   return c ? c.state : null;
 }
 
+/**
+ * Whether the viewer gets the owner's checklist. /people/me says false for
+ * everyone while the roster has no principal (a fresh install, before setup
+ * names one), so only a roster that has a principal who isn't the viewer
+ * makes them a teammate. Undefined while either answer is out.
+ */
+export function viewerIsOwner(
+  viewerIsPrincipal: boolean | undefined,
+  rosterHasPrincipal: boolean | undefined,
+): boolean | undefined {
+  if (viewerIsPrincipal === true || rosterHasPrincipal === false) return true;
+  if (viewerIsPrincipal === undefined || rosterHasPrincipal === undefined) return undefined;
+  return false;
+}
+
 /** The checklist rows, in the order they are shown. */
 export function gettingStartedItems(input: ChecklistInput): ChecklistItem[] {
-  const execMail = checkState(input.checks, "gmail");
   const ownMail = checkState(input.checks, "your_gmail");
+  const ownMailbox: ChecklistItem = {
+    id: "own_mailbox",
+    title: "Let it read your own mailbox",
+    detail: `Optional. ${OWN_MAILBOX_SENDS}`,
+    done: ownMail === "ok",
+    optional: true,
+    href: FIRST_RUN_LINKS.ownMailbox,
+    action: "Connect",
+  };
+  const ask: ChecklistItem = {
+    id: "ask",
+    title: "Ask your Executive something",
+    detail: input.hasAsked ? "First conversation saved" : `Try “${ASK_SUGGESTION}”`,
+    done: input.hasAsked,
+    optional: false,
+    href: "/?new=1",
+    action: "Ask",
+  };
+  if (input.isPrincipal === false) return [ask, ownMailbox];
+  const execMail = checkState(input.checks, "gmail");
   const items: ChecklistItem[] = [
     {
       id: "profile",

@@ -13,11 +13,14 @@ import {
   type DepartmentCreate,
   type DepartmentState,
 } from "@/lib/api";
+import { goalCounts } from "@/lib/goalGroups";
+import { PageSpinner } from "@/components/ui/Spinner";
 
+// The Approvals level each department's work runs at.
 const AUTHORITY_LABELS: Record<string, string> = {
-  auto_execute: "Auto",
-  propose_only: "Propose",
-  escalate: "Escalate",
+  auto_execute: "Hands-off",
+  propose_only: "Balanced",
+  escalate: "Careful",
 };
 
 const AUTHORITY_DOT: Record<string, string> = {
@@ -133,7 +136,7 @@ export default function DepartmentsPage() {
             </Button>
           </div>
 
-          {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
+          {loading && <PageSpinner />}
           {error && (
             <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-500 text-[15px] mb-4">
               {error}
@@ -143,8 +146,10 @@ export default function DepartmentsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {depts.map((ds) => {
               const cfg = ds.config;
-              const atRisk = ds.goals.filter((g) => g.status === "at_risk").length;
-              const offTrack = ds.goals.filter((g) => g.status === "off_track").length;
+              const counts = goalCounts(ds.goals);
+              const atRisk = counts.at_risk;
+              const offTrack = counts.off_track;
+              const open = ds.goals.length - counts.done;
               return (
                 <Link
                   key={cfg.slug}
@@ -163,10 +168,11 @@ export default function DepartmentsPage() {
                   <div className="text-[15px] text-fg-muted mt-1.5">{cfg.charter.mission.slice(0, 80)}{cfg.charter.mission.length > 80 ? "…" : ""}</div>
 
                   <div className="flex flex-wrap items-center gap-2 mt-4 text-sm text-fg-muted">
-                    <span className="mr-1">{ds.goals.length} Goal{ds.goals.length !== 1 ? "s" : ""}</span>
+                    <span className="mr-1">{open} Goal{open !== 1 ? "s" : ""}</span>
                     {atRisk > 0 && <GoalStatusPill status="at_risk" />}
                     {offTrack > 0 && <GoalStatusPill status="off_track" />}
-                    {ds.goals.length > 0 && atRisk === 0 && offTrack === 0 && (
+                    {counts.not_checked > 0 && <GoalStatusPill status="not_checked" />}
+                    {counts.on_track > 0 && atRisk === 0 && offTrack === 0 && (
                       <GoalStatusPill status="on_track" />
                     )}
                   </div>

@@ -26,8 +26,9 @@ alone, never the principal, and only in a conversation nobody else can read
 (``orchestrator.history_tools``), even when it was noted in a shared thread. Each person sees, corrects, pins and
 forgets their own notes in Memories → History (``/memories/history``).
 
-**Switches.** Each person turns it on for themselves (``reply_notes``,
-absent means off; despite the name it covers every channel). Any team member
+**Switches.** Each person has their own (``reply_notes``; despite the name
+it covers every channel). Absent means on, for everyone who may keep notes
+(``_on_by_default``): each person's notes are theirs alone. Any team member
 on the People list may (``can_keep_notes``); notes from email replies still
 need Act as me, which writes them. The owner sets how long notes last for the company
 (``retention_days``: 30, 90, 365, or until forgotten; 90 when unset), and a
@@ -263,11 +264,29 @@ def set_company_retention(days: Any, *, by: str, db_path: Path | None = None, no
     return value
 
 
+def _on_by_default(person_id: int | None) -> bool:
+    """Whether "Keep track of what happens" is on for someone who never set
+    it: on for everyone who may keep notes (``can_keep_notes``), since each
+    person's notes are theirs alone. Off for a contact, for no person, and
+    when the People list can't be read."""
+    if person_id is None:
+        return False
+    try:
+        from openexecutive.people.registry import get_person
+
+        return can_keep_notes(get_person(person_id))
+    except Exception:
+        logger.warning("history: couldn't read the roster", exc_info=True)
+        return False
+
+
 def person_settings(person_id: int | None, *, db_path: Path | None = None) -> PersonSettings:
-    """A person's own switches. Off, and the company default, when unset or
-    unreadable."""
-    if person_id is None or not _db_path(db_path).exists():
+    """A person's own switches. When unset: on for everyone who may keep
+    notes, with the company's note length. Off when unreadable."""
+    if person_id is None:
         return PersonSettings()
+    if not _db_path(db_path).exists():
+        return PersonSettings(reply_notes=_on_by_default(person_id))
     try:
         conn = _connect(db_path)
         try:
@@ -281,7 +300,7 @@ def person_settings(person_id: int | None, *, db_path: Path | None = None) -> Pe
         logger.warning("history: couldn't read a person's settings — treating them as off", exc_info=True)
         return PersonSettings()
     if row is None:
-        return PersonSettings()
+        return PersonSettings(reply_notes=_on_by_default(person_id))
     return PersonSettings(reply_notes=bool(row[0]), retention_days=int(row[1]) if row[1] is not None else None)
 
 
@@ -705,12 +724,28 @@ def people_keeping_notes(*, db_path: Path | None = None) -> list[int]:
             rows = conn.execute(
                 f"SELECT person_id FROM {PERSON_TABLE} WHERE reply_notes = 1 ORDER BY person_id",  # noqa: S608 — constant table name
             ).fetchall()
+            ids = {int(r[0]) for r in rows}
+            # Everyone who may keep notes and never turned it off.
+            chose = {int(r[0]) for r in conn.execute(
+                f"SELECT person_id FROM {PERSON_TABLE}",  # noqa: S608 — constant table name
+            ).fetchall()}
+            try:
+                from openexecutive.people.registry import list_people
+
+                roster = list_people()
+            except Exception:
+                logger.warning("history: couldn't read the roster", exc_info=True)
+                roster = []
+            for person in roster:
+                pid = person.id
+                if pid is not None and can_keep_notes(person) and pid not in chose:
+                    ids.add(int(pid))
         finally:
             conn.close()
     except Exception:
         logger.warning("history: couldn't read who keeps notes", exc_info=True)
         return []
-    return [int(r[0]) for r in rows]
+    return sorted(ids)
 
 
 def reminded(person_id: int, day: str, *, db_path: Path | None = None) -> bool:

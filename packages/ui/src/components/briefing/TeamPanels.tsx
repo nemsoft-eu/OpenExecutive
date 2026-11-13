@@ -7,6 +7,13 @@ import type { DepartmentBriefItem, PersonBriefItem } from "@/lib/api";
 
 import { Chip, ClickableBriefingItem, PanelIntro, TONE_TEXT, formatRelTime, type ContinueHandler } from "./shared";
 
+// The Approvals level each department's work runs at.
+const APPROVALS_LABELS: Record<string, string> = {
+  auto_execute: "Hands-off",
+  propose_only: "Balanced",
+  escalate: "Careful",
+};
+
 // The team-only side panels behind Home's Departments and People tiles.
 
 export function DeptCard({
@@ -35,7 +42,7 @@ export function DeptCard({
         <div className="text-base font-semibold text-fg group-hover:text-accent transition-colors" title={dept.title}>
           {dept.title}
         </div>
-        <span className="flex-shrink-0 text-xs text-fg-muted">{dept.authority_level.replace("_", " ")}</span>
+        <span className="flex-shrink-0 text-xs text-fg-muted">{APPROVALS_LABELS[dept.authority_level] ?? dept.authority_level.replace("_", " ")}</span>
       </div>
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span className="text-fg-muted">
@@ -43,7 +50,8 @@ export function DeptCard({
         </span>
         {dept.at_risk_count > 0 && <Chip tone="amber">{dept.at_risk_count} at risk</Chip>}
         {dept.off_track_count > 0 && <Chip tone="rose">{dept.off_track_count} off track</Chip>}
-        {!hasIssues && dept.goal_count > 0 && <Chip tone="emerald">on track</Chip>}
+        {(dept.unchecked_count ?? 0) > 0 && <Chip tone="neutral">{dept.unchecked_count} not checked yet</Chip>}
+        {!hasIssues && dept.goal_count > (dept.unchecked_count ?? 0) && <Chip tone="emerald">on track</Chip>}
         {dept.awaiting_count > 0 && <Chip tone="sky">{dept.awaiting_count} awaiting</Chip>}
       </div>
       {/* The actual off-track / at-risk goals, inline — so the row is
@@ -86,9 +94,12 @@ export function DepartmentsPanelBody({
   const inactive = departments.filter((d) => d.goal_count === 0 && d.awaiting_count === 0);
   const attention = active.filter((d) => d.at_risk_count > 0 || d.off_track_count > 0 || d.awaiting_count > 0);
   const onTrack = active.filter((d) => d.at_risk_count === 0 && d.off_track_count === 0 && d.awaiting_count === 0);
+  // Quiet ones with goals nothing has checked yet aren't called on track.
+  const unchecked = onTrack.filter((d) => (d.unchecked_count ?? 0) > 0).length;
   const quietCount = onTrack.length + inactive.length;
   const quietSummary = [
-    onTrack.length > 0 ? `${onTrack.length} on track` : null,
+    onTrack.length > unchecked ? `${onTrack.length - unchecked} on track` : null,
+    unchecked > 0 ? `${unchecked} not checked yet` : null,
     inactive.length > 0 ? `${inactive.length} inactive` : null,
   ]
     .filter(Boolean)

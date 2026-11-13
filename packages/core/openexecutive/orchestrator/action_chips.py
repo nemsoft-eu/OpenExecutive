@@ -50,6 +50,8 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     # Attunement: closing an open loop stops the nudge engine chasing it;
     # assigning one starts it
     "close_open_loop",
+    "reopen_open_loop",
+    "update_open_loop",
     "assign_open_loop",
     # Corrections (orchestrator/correction_tools.py): a brief item left out,
     # a follow-up cancelled or moved, a chat draft marked sent
@@ -70,6 +72,7 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     # Triage / alerts
     "create_alert",
     "ack_alert",
+    "answer_card",
     # Universal workflow launcher (any built-in / custom workflow from chat)
     "run_workflow",
     # Saves a workflow, or leaves a card for a change to one (workflow_change)
@@ -86,6 +89,8 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "save_my_email_attachment",
     # Act as me: a reminder to the speaker alone
     "remind_me",
+    # Act as me: a watch on the speaker's own mailbox for an awaited email
+    "watch_for_email",
     # Act as me: a card of actions left for the speaker to approve
     "propose_actions",
     # Meetings: booked, or proposed on an approval card
@@ -174,13 +179,37 @@ def _draft_fields(parsed: dict[str, Any]) -> dict[str, Any]:
         value = parsed.get(key)
         return [str(a) for a in value if isinstance(a, str)] if isinstance(value, list) else []
 
+    replaced = parsed.get("replaced_rows")
+    replaces = [
+        r for r in replaced if isinstance(r, int) and not isinstance(r, bool) and 0 < r < row
+    ] if isinstance(replaced, list) else []
     return {"draft": {
         "row": row,
         "to": addresses("to"),
         "cc": addresses("cc"),
         "subject": str(parsed.get("subject") or ""),
         "preview": str(parsed.get("preview") or ""),
+        # Earlier drafts this one replaced: a card for one of them in the
+        # same reply is dropped (``drop_replaced``).
+        **({"replaces": replaces} if replaces else {}),
     }}
+
+
+def drop_replaced(chips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``chips`` without the draft chips a later draft in the same list
+    replaced: the Executive wrote the email again in the same reply, and only
+    the version in their Drafts gets a card."""
+    gone: set[int] = set()
+    for chip in chips:
+        draft = chip.get("draft") if isinstance(chip, dict) else None
+        if isinstance(draft, dict) and isinstance(draft.get("replaces"), list):
+            gone.update(r for r in draft["replaces"] if isinstance(r, int))
+    if not gone:
+        return chips
+    return [
+        c for c in chips
+        if not (isinstance(c, dict) and isinstance(c.get("draft"), dict) and c["draft"].get("row") in gone)
+    ]
 
 
 def summarize_action(
@@ -242,6 +271,10 @@ def summarize_action(
     if tool_name == "close_open_loop" and (parsed or {}).get("status") != "closed":
         # Refused, or the loop was no longer open — nothing changed.
         return None
+    if tool_name == "update_open_loop" and (parsed or {}).get("status") != "changed":
+        return None
+    if tool_name == "reopen_open_loop" and (parsed or {}).get("status") != "reopened":
+        return None
     if tool_name == "assign_open_loop" and (parsed or {}).get("status") != "assigned":
         # Refused, or not assigned (duplicate, at cap, …) — nothing changed.
         return None
@@ -266,6 +299,11 @@ def summarize_action(
         # extension's tool is never held there; what it waits on is its
         # chip's to describe.
         payload["summary"] = "Waiting for approval"
+        payload["link"] = "/today"
+        # The chat shows the card itself under its message, by this id.
+        decision_id = parsed.get("decision_instance_id")
+        if isinstance(decision_id, int) and not isinstance(decision_id, bool):
+            payload["decision_id"] = decision_id
         return payload
     if extension:
         # An installed extension's tool (orchestrator/extensions.py) words
@@ -325,6 +363,15 @@ def summarize_action(
         text = str((parsed or {}).get("text") or "")[:120]
         summary = f"Reminder set for {when}" if when else "Reminder set"
         payload["summary"] = f"{summary}: {text}" if text else summary
+        payload["target"] = None
+    elif tool_name == "watch_for_email":
+        # Only a stored watch earns a chip; the address stays out of it.
+        if (parsed or {}).get("status") != "watching":
+            return None
+        days = (parsed or {}).get("days")
+        payload["summary"] = (
+            f"Watching your inbox for that email for {days} days" if days else "Watching your inbox for that email"
+        )
         payload["target"] = None
     elif tool_name == "propose_actions":
         # A card carried out on its own (allowed in training) says what it did.
@@ -410,8 +457,11 @@ def summarize_action(
     elif tool_name == "mark_draft_sent":
         payload["summary"] = "Marked your draft sent"
     elif tool_name == "close_open_loop":
-        loop_id = tool_input.get("loop_id")
-        payload["summary"] = f"Closed open loop #{loop_id}" if loop_id else "Closed an open loop"
+        payload["summary"] = "Closed a task"
+    elif tool_name == "update_open_loop":
+        payload["summary"] = "Updated a task"
+    elif tool_name == "reopen_open_loop":
+        payload["summary"] = "Reopened a task"
     elif tool_name == "assign_open_loop":
         owner = str((parsed or {}).get("owner") or "")
         task = " ".join(str(tool_input.get("task", "") or "").split())[:80]
@@ -532,9 +582,16 @@ def summarize_action(
         payload["target"] = str(tool_input.get("field") or "") or None
         payload["link"] = "/company-profile"
     elif tool_name == "create_alert":
-        headline = (tool_input.get("headline") or "")[:60]
-        payload["summary"] = f"Flagged alert: {headline}" if headline else "Flagged alert"
-        payload["target"] = headline or None
+        # Only an alert handed to review gets a chip: "ask_in_reply" and
+        # "sender_has_open_card" raised nothing. Review may still drop it, so
+        # the chip doesn't promise a card. The tool's title field is
+        # "subject" (alert_tools.CREATE_ALERT_TOOL); kept cards land on Home.
+        if parsed is not None and parsed.get("status") != "alert_scheduled":
+            return None
+        subject = " ".join(str(tool_input.get("subject") or "").split())[:80]
+        payload["summary"] = f"Flagged for review: {subject}" if subject else "Flagged for review"
+        payload["target"] = subject or None
+        payload["link"] = "/"
     elif tool_name == "draft_artifact":
         title = (tool_input.get("title") or "")[:60]
         payload["summary"] = f"Drafted artifact for review: {title}" if title else "Drafted artifact for review"
@@ -548,6 +605,14 @@ def summarize_action(
         payload["summary"] = (
             f"{verb} proposal #{alert_id}" if alert_id is not None else f"{verb} proposal"
         )
+        payload["target"] = str(alert_id) if alert_id is not None else None
+    elif tool_name == "answer_card":
+        reply = tool_input.get("reply")
+        verb = {"approve": "Approved", "answer": "Answered", "dismiss": "Skipped"}.get(
+            reply if isinstance(reply, str) else "", "Answered",
+        )
+        alert_id = tool_input.get("alert_id")
+        payload["summary"] = f"{verb} a card"
         payload["target"] = str(alert_id) if alert_id is not None else None
     elif tool_name == "call_tool":
         # MCP — the underlying tool name lives in tool_input["name"]. The chip

@@ -36,9 +36,22 @@ Endpoints:
 - POST   /artifacts/{composite_id}/archive   Soft-hide (reversible)
 - POST   /artifacts/{composite_id}/restore   Un-archive
 - DELETE /artifacts/{composite_id}           Permanently delete the underlying row
+- POST   /artifacts/{composite_id}/share     Share by link (answers the link's path)
+- DELETE /artifacts/{composite_id}/share     Stop sharing: the link stops at once
+- GET    /shared-documents/{key}             What a share link opens (public page)
+
+`GET /artifacts?q=` searches titles, sources and the documents' text within
+what the caller may see, in the view asked for (`utils.text_search`).
+
+Share by link (`orchestrator/artifact_shares.py`): the owner of a document,
+or the principal for the team's, gets an unguessable link to a read-only
+page of that one version. `GET /shared-documents/{key}` is what the UI's
+public `/shared/<key>` page reads, server to server: the title, the kind
+and the text, nothing else, and not found for anything but a live link.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 from typing import Annotated, Literal
@@ -46,6 +59,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
+from openexecutive.orchestrator import artifact_shares
 from openexecutive.orchestrator.artifact_formats import get_format
 from openexecutive.orchestrator.artifact_records import (
     ArtifactNotFound,
@@ -68,12 +82,26 @@ from openexecutive.orchestrator.artifact_records import (
 )
 from openexecutive.orchestrator.extensions import Change, get_collection
 from openexecutive.orchestrator.extensions import notify as notify_collection
+from openexecutive.utils.text_search import clean_search
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Max artifacts returned by the list endpoint (mirrors alerts.list_alerts' cap).
 _DEFAULT_LIMIT = 200
+# The Executive's own working notes: kept in the run log and recall, left
+# off the Documents page (its owner never asked for them).
+_OFF_THE_PAGE: frozenset[str] = frozenset({"executive_reflection", "executive_research"})
+# Daily write-ups that pile up: one closed group at the bottom of the page.
+_BRIEFS: frozenset[str] = frozenset({"morning_brief", "end_of_day_digest"})
+_BRIEFS_LABEL = "Briefs and wrap-ups"
+# What a run's title says about how it started (workflows/, research_tools,
+# workflow_run_tools, onboarding).
+_HOW_IT_STARTED: tuple[str, ...] = (
+    "(periodic)", "(post-onboarding auto-fire)", "(chat-tool fire)",
+)
+_CHATS_LABEL = "From chats"
+
 # Chars of body shown as a card preview. Unrelated to _DEFAULT_LIMIT despite
 # the shared value — keep them as separate named knobs.
 _PREVIEW_CHARS = 200
@@ -103,6 +131,16 @@ class ArtifactSummary(BaseModel):
     # the Documents page gives each its own filter.
     collection: str | None = None
     collection_label: str | None = None
+    # Where the Documents page files it: "chats" (drafted in a chat),
+    # "briefs" (morning briefs and wrap-ups, one closed group), "c:<name>"
+    # (an extension's collection) or "wf:<workflow name>"; and that group's
+    # plain name.
+    group: str = "chats"
+    group_label: str = "From chats"
+    # Share by link: whether the caller may share it, and the link's path
+    # (on the app's own address) while it is shared.
+    can_share: bool = False
+    share_path: str | None = None
 
 
 class ArtifactDetail(ArtifactSummary):
@@ -114,24 +152,42 @@ class ArtifactDetail(ArtifactSummary):
 
 @router.get("/artifacts")
 async def list_artifacts(
-    request: Request, limit: int = _DEFAULT_LIMIT, archived: bool = False
+    request: Request,
+    limit: int = _DEFAULT_LIMIT,
+    archived: bool = False,
+    q: str | None = None,
 ) -> dict[str, list[ArtifactSummary]]:
     """Unified, newest-first list of the artifacts the caller may see.
 
     Defaults to active artifacts; `?archived=true` returns only archived ones
     (the gallery's Active / Archived views are clean swaps, not supersets).
+    The Executive's own working notes (`_OFF_THE_PAGE`) are left out of the
+    active list; they still open by id, and one archived earlier still shows
+    under Archived so it can be restored or deleted.
+
+    `?q=` keeps only those whose title, source or text holds every word of
+    it, in the same view.
     """
-    records = list_artifact_records(limit, viewer=_viewer(request), archived=archived)
-    return {"artifacts": [_summary(r) for r in records]}
+    viewer = _viewer(request)
+    records = list_artifact_records(
+        limit,
+        viewer=viewer,
+        archived=archived,
+        exclude_workflows=() if archived else _OFF_THE_PAGE,
+        search=clean_search(q),
+    )
+    labels: dict[str, str] = {}
+    shared = artifact_shares.share_keys(r.id for r in records)
+    return {"artifacts": [_summary(r, labels, viewer, shared) for r in records]}
 
 
 @router.get("/artifacts/{composite_id}")
 async def get_artifact(composite_id: str, request: Request) -> ArtifactDetail:
     """One artifact with its displayable body, addressed by composite id."""
+    viewer = _viewer(request)
     rec = _load(composite_id, request)
-    stored = rec.stored or ""
-    body = stored if rec.format == "html" else get_format(rec.format).display(stored)
-    return ArtifactDetail(**_summary(rec).model_dump(), body=body, rationale=rec.rationale)
+    summary = _summary(rec, {}, viewer, artifact_shares.share_keys([rec.id]))
+    return ArtifactDetail(**summary.model_dump(), body=_body(rec), rationale=rec.rationale)
 
 
 @router.get("/artifacts/{composite_id}/download")
@@ -201,7 +257,63 @@ async def delete_artifact(composite_id: str, request: Request) -> dict[str, str]
     # The canonical id (`alert:5`, not whatever spelling the path used) is
     # what indexing keyed the chunks on.
     await unindex_artifact(rec.id)
+    artifact_shares.forget(rec.id)
     return {"status": "deleted", "id": composite_id}
+
+
+@router.post("/artifacts/{composite_id}/share")
+async def share_artifact(composite_id: str, request: Request) -> dict[str, str]:
+    """Share a document by link. Answers the link's path on the app's own
+    address; asking again answers the same link."""
+    viewer = _viewer(request)
+    try:
+        key = artifact_shares.share(composite_id, viewer=viewer)
+    except artifact_shares.ShareRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MalformedArtifactId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ArtifactNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    logger.info("artifact %s shared by link by person %s", composite_id, viewer.person_id)
+    return {"status": "shared", "id": composite_id, "share_path": artifact_shares.public_path(key)}
+
+
+@router.delete("/artifacts/{composite_id}/share")
+async def stop_sharing_artifact(composite_id: str, request: Request) -> dict[str, str]:
+    """Stop sharing a document by link. The link stops working at once."""
+    viewer = _viewer(request)
+    _mutate(lambda: _stop_share(composite_id, viewer))
+    logger.info("artifact %s link stopped by person %s", composite_id, viewer.person_id)
+    return {"status": "stopped", "id": composite_id}
+
+
+class SharedDocument(BaseModel):
+    """All a share link shows: no ids, no names, no source."""
+
+    title: str
+    format: str
+    format_label: str
+    created_at: str
+    body: str
+
+
+@router.get("/shared-documents/{key}")
+async def shared_document(key: str, response: Response) -> SharedDocument:
+    """The document a share link opens, for the UI's public page. Not found
+    for anything but a live link (`artifact_shares.load_shared`)."""
+    rec = artifact_shares.load_shared(key)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    fmt = get_format(rec.format)
+    return SharedDocument(
+        title=_title(rec),
+        format=fmt.name,
+        format_label=fmt.label,
+        created_at=rec.created_at,
+        body=_body(rec),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -245,6 +357,18 @@ async def _notify_collection(composite_id: str, request: Request, change: Change
         ) from exc
 
 
+def _stop_share(composite_id: str, viewer: Viewer) -> ArtifactRecord:
+    artifact_shares.stop_share(composite_id, viewer=viewer)
+    return load_artifact(composite_id, viewer=viewer)
+
+
+def _body(rec: ArtifactRecord) -> str:
+    """What the page renders: raw (sanitized) HTML for 'html', Markdown
+    for every other format."""
+    stored = rec.stored or ""
+    return stored if rec.format == "html" else get_format(rec.format).display(stored)
+
+
 def _mutate(action: Callable[[], ArtifactRecord]) -> ArtifactRecord:
     try:
         return action()
@@ -255,14 +379,68 @@ def _mutate(action: Callable[[], ArtifactRecord]) -> ArtifactRecord:
 
 
 
-def _summary(rec: ArtifactRecord) -> ArtifactSummary:
+def workflow_label(name: str) -> str:
+    """A workflow's plain name, also for one switched off or deleted since
+    its runs were written: its title where one is known, else its key in
+    words ("weekly_laptop_restock" -> "Weekly laptop restock")."""
+    from openexecutive.workflows import get_workflow
+    from openexecutive.workflows.dynamic_store import get_definition
+
+    with contextlib.suppress(Exception):
+        return get_workflow(name).title
+    with contextlib.suppress(Exception):
+        defn = get_definition(name)
+        if defn is not None and defn.title.strip():
+            return defn.title.strip()
+    words = name.removeprefix("quick_").replace("_", " ").strip()
+    return words[:1].upper() + words[1:] if words else "Workflow"
+
+
+def _group(rec: ArtifactRecord, collection_label: str | None, labels: dict[str, str]) -> tuple[str, str]:
+    """The Documents page group a record files under, and its name.
+    `labels` caches workflow names across one list."""
+    if rec.collection:
+        return f"c:{rec.collection}", collection_label or rec.collection
+    if rec.kind == "draft":
+        return "chats", _CHATS_LABEL
+    if rec.source_label in _BRIEFS:
+        return "briefs", _BRIEFS_LABEL
+    if rec.source_label not in labels:
+        labels[rec.source_label] = workflow_label(rec.source_label)
+    return f"wf:{rec.source_label}", labels[rec.source_label]
+
+
+def _title(rec: ArtifactRecord) -> str:
+    """A run's title without the note on how it started."""
+    if rec.kind != "workflow":
+        return rec.title
+    # The note on how a run started that the code appends to its name. Only
+    # these: "Report (Q1)" keeps its "(Q1)".
+    title = rec.title.rstrip()
+    for note in _HOW_IT_STARTED:
+        if title.endswith(note):
+            title = title[: -len(note)].rstrip()
+            break
+    return title or rec.title
+
+
+def _summary(
+    rec: ArtifactRecord,
+    labels: dict[str, str],
+    viewer: Viewer | None = None,
+    shared: dict[str, str] | None = None,
+) -> ArtifactSummary:
     fmt = get_format(rec.format)
     collection = get_collection(rec.collection)
     preview = fmt.text(rec.stored)[:_PREVIEW_CHARS] if rec.stored else ""
+    collection_label = collection.label if collection is not None else None
+    group, group_label = _group(rec, collection_label, labels)
+    can_share = viewer is not None and artifact_shares.may_share(rec, viewer)
+    key = (shared or {}).get(rec.id)
     return ArtifactSummary(
         id=rec.id,
         kind=rec.kind,
-        title=rec.title,
+        title=_title(rec),
         source_label=rec.source_label,
         created_at=rec.created_at,
         preview=preview or None,
@@ -276,5 +454,9 @@ def _summary(rec: ArtifactRecord) -> ArtifactSummary:
         link_label=rec.link_label,
         supersedes_id=rec.supersedes_id,
         collection=rec.collection,
-        collection_label=collection.label if collection is not None else None,
+        collection_label=collection_label,
+        group=group,
+        group_label=group_label,
+        can_share=can_share,
+        share_path=artifact_shares.public_path(key) if can_share and key else None,
     )

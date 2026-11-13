@@ -23,6 +23,7 @@ from openexecutive.orchestrator.schedule_tools import current_session
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.workflows import chat_tools, dynamic_store, tool_catalog
+from openexecutive.workflows import persistence as wf_persistence
 
 OWNER = "olivia@co.example"
 TEAM = "ben@co.example"
@@ -48,8 +49,11 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     path = tmp_path / "episodic.db"
     monkeypatch.setattr(episodic, "DB_PATH", path)
     monkeypatch.setattr(people_store, "DB_PATH", path)
+    # run_control.watch reads the run's row, so the runs table must be here.
+    monkeypatch.setattr(wf_persistence, "DB_PATH", path)
     episodic.initialize_db(path)
     people_store.initialize_db(path)
+    wf_persistence.initialize_runs_db(path)
     people_registry.invalidate()
     monkeypatch.setattr(audit_logger, "_default_logger", AuditLogger(db_path=path))
     token = current_session.set(None)
@@ -156,7 +160,7 @@ def test_not_without_act_as_me(people) -> None:
 
     out = _search(mailbox, creator=owner_id, run_owner=owner_id)
 
-    assert "Act as me" in out["error"] and mailbox.searched == []
+    assert "As you" in out["error"] and mailbox.searched == []
 
 
 def test_not_when_the_workflow_reaches_outside(on, monkeypatch: pytest.MonkeyPatch) -> None:

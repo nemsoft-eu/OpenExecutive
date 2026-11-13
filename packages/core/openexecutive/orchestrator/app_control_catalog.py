@@ -527,7 +527,7 @@ async def _edit_memory(request: Any, ref: str, value: str) -> str:
 
     kind, mid = _memory_ref(ref)
     if kind == "decision":
-        await _call(episodic.patch_decision, mid, episodic.DecisionUpdate(summary=value))
+        await _call(episodic.patch_decision, mid, episodic.DecisionUpdate(summary=value), request)
     elif kind == "initiative":
         await _call(episodic.patch_initiative, mid, episodic.InitiativeUpdate(summary=value))
     else:
@@ -539,12 +539,11 @@ async def _delete_memory(request: Any, ref: str, value: str) -> str:
     from openexecutive.api.routes import episodic
 
     kind, mid = _memory_ref(ref)
-    remove = {
-        "decision": episodic.remove_decision,
-        "initiative": episodic.remove_initiative,
-        "advice": episodic.remove_advice,
-    }[kind]
-    await _call(remove, mid)
+    if kind == "decision":
+        await _call(episodic.remove_decision, mid, request)
+    else:
+        remove = {"initiative": episodic.remove_initiative, "advice": episodic.remove_advice}[kind]
+        await _call(remove, mid)
     return f"Deleted the {kind} from memory"
 
 
@@ -633,13 +632,12 @@ _SETTINGS: dict[str, str] = {
     "quiet_hours": "Quiet hours",
     "delivery": "How messages arrive (instant or digest)",
     "urgent_through": "Let urgent things through quiet hours",
-    "act_as_me": "Act as me",
-    "inbox_drafts": "Draft replies to my inbox",
-    "handle_it": "Handle it for me",
-    "take_the_lead": "Take the lead as me",
+    "act_as_me": "As you",
+    "inbox_drafts": "Draft replies to your inbox",
 }
-# Turning these on lets the Executive send as the person or act on its own.
-_WIDENING = frozenset({"act_as_me", "handle_it", "take_the_lead"})
+# Turning these on lets the Executive write as the person, or (inbox
+# replies, where Approvals lets them go) send as them.
+_WIDENING = frozenset({"act_as_me", "inbox_drafts"})
 
 
 async def _find_settings(request: Any) -> list[Item]:
@@ -660,7 +658,7 @@ async def _find_settings(request: Any) -> list[Item]:
         d = await delegation.get_delegation(request)
         state = d.model_dump()
         items.append(Item(id="act_as_me", title=_SETTINGS["act_as_me"], detail="on" if state.get("enabled") else "off"))
-        items += [Item(id=k, title=_SETTINGS[k]) for k in ("inbox_drafts", "handle_it", "take_the_lead")]
+        items.append(Item(id="inbox_drafts", title=_SETTINGS["inbox_drafts"]))
     except Exception:
         pass
     return items
@@ -708,12 +706,8 @@ async def _change_setting(request: Any, setting: str, value: str) -> str:
     on = _on(value)
     if setting == "act_as_me":
         await delegation.update_delegation(request, delegation.DelegationUpdate(enabled=on))
-    elif setting == "inbox_drafts":
-        await delegation.update_delegation_inbox(request, delegation.InboxUpdate(enabled=on))
-    elif setting == "handle_it":
-        await delegation.update_delegation_handle_it(request, delegation.HandleItUpdate(enabled=on))
     else:
-        await delegation.update_take_the_lead_as_you(request, delegation.LeadUpdate(enabled=on))
+        await delegation.update_delegation_inbox(request, delegation.InboxUpdate(enabled=on))
     return f"Turned {label} {'on' if on else 'off'}"
 
 
@@ -733,32 +727,34 @@ async def _check_inbox(request: Any, item_id: str, value: str) -> str:
     return "Started checking your inbox"
 
 
-async def _find_lead_rules(request: Any) -> list[Item]:
-    from openexecutive.api.routes import delegation
-
-    rules = (await _call(delegation.get_my_lead_rules, request)).rules
-    return [Item(id=str(r.id), title=f"{r.kind}: {r.value}") for r in rules]
+# --------------------------------------------------------------------------- #
+# Standing jobs (Delegate, As me): things the owner asked it to keep doing
+# --------------------------------------------------------------------------- #
 
 
-async def _add_lead_rule(request: Any, item_id: str, value: str) -> str:
-    from openexecutive.api.routes import delegation
+async def _find_jobs(request: Any) -> list[Item]:
+    from openexecutive.api.routes import take_the_lead as lead_route
 
-    kind, sep, text = value.partition(":")
-    if not sep:
-        raise Refused("Give the rule as kind: value, e.g. domain: acme.com. Kinds: person, domain, words, amount.")
-    await _call(
-        delegation.add_my_lead_rule, request, delegation.LeadRuleIn(kind=kind.strip().lower(), value=text.strip()),
-    )
-    return f"Added the rule: always ask first about {kind.strip().lower()} {_q(text.strip())}"
+    out = await _call(lead_route.get_take_the_lead, request)
+    return [Item(id=str(j.id), title=j.text, detail=j.this_week) for j in out.jobs]
 
 
-async def _remove_lead_rule(request: Any, rule_id: str, value: str) -> str:
-    from openexecutive.api.routes import delegation
+async def _add_job(request: Any, item_id: str, value: str) -> str:
+    from openexecutive.api.routes import take_the_lead as lead_route
 
-    if not rule_id.isdigit():
-        raise Refused("That isn't a rule id.")
-    await _call(delegation.delete_my_lead_rule, request, int(rule_id))
-    return "Removed the rule"
+    await _call(lead_route.add_job, request, lead_route.JobIn(text=value))
+    return f"Added the standing job {_q(' '.join(value.split()))}"
+
+
+async def _stop_job(request: Any, job_id: str, value: str) -> str:
+    from openexecutive.api.routes import take_the_lead as lead_route
+
+    try:
+        number = int(job_id)
+    except ValueError as exc:
+        raise Refused("That isn't one of the standing jobs.") from exc
+    await _call(lead_route.stop_job, request, number)
+    return "Stopped the standing job"
 
 
 # --------------------------------------------------------------------------- #
@@ -796,8 +792,8 @@ _KINDS = (
     Kind("skill", "skill", _find_skills, principal_only=True),
     Kind("setting", "setting", _find_settings),
     Kind("inbox", "inbox", _nothing, no_item=True),
-    Kind("lead_rule", "Take the lead rule", _find_lead_rules),
-    Kind("new_lead_rule", "new Take the lead rule", _nothing, no_item=True),
+    Kind("standing_job", "standing job (something As me keeps doing)", _find_jobs, principal_only=True),
+    Kind("new_standing_job", "new standing job", _nothing, principal_only=True, no_item=True),
 )
 
 _ACTIONS = (
@@ -873,15 +869,16 @@ _ACTIONS = (
     # Settings
     Action("change_setting", "setting",
            "Change one of the person's own settings: quiet_hours (start-end or off), delivery "
-           "(instant or digest), urgent_through, act_as_me, inbox_drafts, handle_it, take_the_lead (on or off)",
+           "(instant or digest), urgent_through, act_as_me, inbox_drafts (on or off)",
            _change_setting, confirm=_setting_needs_tap, value="the new value", card="Set {title} to {value}"),
+    # Standing jobs: each step for one still goes through Approvals.
+    Action("add_standing_job", "new_standing_job",
+           "Give As me a standing job, something to keep doing in its own name (use id \"new\")",
+           _add_job, confirm=True, value="what to keep doing, in the person's words",
+           card="Give As me the standing job: {value}"),
+    Action("stop_standing_job", "standing_job", "Stop a standing job", _stop_job),
     Action("check_inbox_now", "inbox", "Check the person's inbox for emails to draft replies to now (use id \"inbox\")",
            _check_inbox),
-    Action("add_lead_rule", "new_lead_rule",
-           "Add a rule that makes Take the lead ask first (use id \"new\")", _add_lead_rule,
-           value="kind: value, kinds person, domain, words, amount"),
-    Action("remove_lead_rule", "lead_rule", "Remove a Take the lead rule, so more goes ahead on its own",
-           _remove_lead_rule, confirm=True, card="Remove the Take the lead rule {title}"),
 )
 
 # Where a link from chat can go (the web app's own paths).
@@ -890,7 +887,8 @@ _SCREENS = (
     ("chats", "/chats", "all chats"),
     ("settings", "/settings", "Settings"),
     ("notifications", "/settings/notifications", "Settings, Notifications"),
-    ("act_as_me", "/settings/act-as-me", "Settings, Act as me"),
+    ("act_as_me", "/settings/act-as-me", "Delegate, As you"),
+    ("as_me", "/delegate#as-me", "Delegate, As me"),
     ("memory_settings", "/settings/memory", "Settings, Memory"),
     ("people", "/people", "People"),
     ("departments", "/departments", "Departments"),
