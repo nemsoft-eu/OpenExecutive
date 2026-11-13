@@ -56,7 +56,9 @@ def _call(gateway: MCPGateway, tool_name: str, arguments: dict[str, Any] | None 
 
 def _load(gateway: MCPGateway, name: str) -> str:
     with patch.object(gw_module, "get_settings", return_value=_settings()):
-        return asyncio.run(gateway.load_mcp_server({"name": name, "url": "https://example.test/mcp"}))
+        return asyncio.run(
+            gateway.load_mcp_server({"name": name, "url": "https://example.test/mcp"})
+        )
 
 
 def _blocked(result: str) -> bool:
@@ -174,7 +176,9 @@ def test_a_megabyte_long_crafted_name_is_truncated_in_the_audit_row_and_the_reas
     rows: list[dict[str, Any]] = []
     with patch(
         "openexecutive.audit.log_event",
-        lambda _kind, summary, **kw: (summaries.append(summary), rows.append(kw.get("details", {}))),
+        lambda _kind, summary, **kw: (
+            summaries.append(summary), rows.append(kw.get("details", {}))
+        ),
     ):
         gateway, session_call = _make_gateway()
         result = _call(gateway, "regradar__" + "A" * 1_000_000, {})
