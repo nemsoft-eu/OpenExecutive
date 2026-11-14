@@ -1,9 +1,11 @@
 """Fixture load → unload must hand the user back their own workspace settings,
 including when ``_user_backup/`` is a stale snapshot from an earlier load
-(unload keeps it) that predates ``workspace.yaml``."""
+(unload keeps it) that predates ``workspace.yaml``. A load that cannot
+snapshot or wipe must stop before it swaps anything."""
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -151,3 +153,33 @@ def test_bad_zone_in_fixture_file_does_not_abort_the_load(settings: Any, tmp_pat
     _load(settings)
     assert ws.get_workspace() == ws.WorkspaceSettings(mode="solo", timezone=None)
     assert "Demo Co" in settings.company_profile_path.read_text()  # the load completed
+
+
+def test_a_failed_first_snapshot_aborts_the_load(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load wipes the user's tables, so with no snapshot unload would have
+    nothing to restore: it must not go ahead."""
+    def _fail(_settings: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(fixture_loader, "snapshot_user_state", _fail)
+    people_store.upsert_person(full_name="Me Myself", is_principal=True)
+    with pytest.raises(OSError):
+        _load(settings)
+    assert "My Co" in settings.company_profile_path.read_text()
+    assert [p.full_name for p in people_store.list_people()] == ["Me Myself"]
+
+
+def test_a_failed_wipe_leaves_the_outgoing_company_whole(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wipe runs before any file is swapped, so a locked database cannot
+    leave the old company's rows under the new company's profile."""
+    def _locked(*_a: object, **_k: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("openexecutive.memory.company_tables.wipe_per_company_tables", _locked)
+    with pytest.raises(sqlite3.OperationalError):
+        _load(settings)
+    assert "My Co" in settings.company_profile_path.read_text()

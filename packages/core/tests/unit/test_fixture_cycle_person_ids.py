@@ -90,5 +90,6 @@ def test_unload_restores_the_principal_under_a_new_id(settings: Any) -> None:
     principal = people_store.find_principal_person()
     assert principal is not None
     assert (principal.full_name, principal.role) == ("Me Myself", "Owner")
-    # One row each for the user, the demo principal, then the user again.
-    assert principal.id == before + 2
+    # Pins today's behaviour, not a requirement: a backup that kept ids would
+    # rightly fail this, and should then flip it to ==.
+    assert principal.id != before

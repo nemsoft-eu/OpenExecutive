@@ -237,9 +237,15 @@ KEPT_ON_FIXTURE_SWAP: dict[str, str] = {
 
 def _children_first(conn: sqlite3.Connection, tables: list[str]) -> list[str]:
     """``tables`` ordered so no table is deleted before one that references it."""
-    wanted = set(tables)
+    # SQLite table names are case-insensitive, and a REFERENCES clause keeps
+    # whatever case it was written in, so match parents by their lowered name.
+    by_lower = {t.lower(): t for t in tables}
     parents = {
-        t: {row[2] for row in conn.execute(f'PRAGMA foreign_key_list("{t}")')} & wanted - {t}
+        t: {
+            by_lower[ref]
+            for ref in (row[2].lower() for row in conn.execute(f'PRAGMA foreign_key_list("{t}")'))
+            if ref in by_lower and by_lower[ref] != t
+        }
         for t in tables
     }
     ordered: list[str] = []
@@ -264,7 +270,9 @@ def wipe_per_company_tables(db_path: Path, *, keep: Collection[str] = ()) -> dic
     """
     if not db_path.exists():
         return {}
-    conn = sqlite3.connect(str(db_path))
+    # The slot restore's 30 seconds: a scheduler or bot write holding the lock
+    # must not abort a swap.
+    conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

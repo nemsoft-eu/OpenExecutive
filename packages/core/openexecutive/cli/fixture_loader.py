@@ -290,13 +290,12 @@ async def _load_from_dir(
         backup_dir = _user_backup_dir(settings)
         auto_snapshot_taken = False
         if not (backup_dir / "profile.yaml").exists() and not sentinel.exists():
-            try:
-                snapshot_user_state(settings)
-                auto_snapshot_taken = True
-            except Exception:
-                # Best-effort: do not block the fixture load if snapshot fails
-                # on a truly empty environment. User can call snapshot manually.
-                pass
+            # Not best-effort: the load wipes every per-company table, so going
+            # ahead without a snapshot would leave unload nothing to restore.
+            # An empty environment snapshots fine (snapshot_user_state writes
+            # empty artifacts), so a failure here is a real one.
+            snapshot_user_state(settings)
+            auto_snapshot_taken = True
         elif live_is_users and backup_dir.is_dir():
             # An earlier snapshot is being reused (unload keeps _user_backup),
             # but the workspace settings are the user's own right now and may
@@ -432,6 +431,32 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
         else CompanyProfile()
     )
 
+    # ── 0b. Wipe every per-company table ──────────────────────────────────
+    # From the one registry the blank client switch and the factory reset use
+    # too (memory.company_tables), less what this path keeps (audit_log,
+    # workspace_settings, the knowledge review state) and the authored tables
+    # no swap wipes. The seeders below then write the source's rows back.
+    #
+    # It runs before any file is swapped, so a failed wipe (a locked
+    # database, a foreign key error) aborts with the outgoing company still
+    # whole instead of its rows under the incoming profile and docs. It runs
+    # unconditionally, and not inside a seeder: each seeder
+    # returns early when its file is missing or empty, and a fixture needs only
+    # profile.yaml, so a wipe behind one would be skipped on exactly the loads
+    # that still swap the company. Tables the source's files do not carry
+    # (chat history among them) stay empty: on unload the user's own rows come
+    # back only as far as _user_backup/'s files hold them.
+    from openexecutive.memory.company_tables import (
+        KEPT_ON_EVERY_SWAP,
+        KEPT_ON_FIXTURE_SWAP,
+        wipe_per_company_tables,
+    )
+    from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
+
+    tables_cleared = wipe_per_company_tables(
+        EPISODIC_DB_PATH, keep={**KEPT_ON_EVERY_SWAP, **KEPT_ON_FIXTURE_SWAP}
+    )
+
     # ── 1. Write profile.yaml (empty profile is fine — produces empty company)
     profile.save_to_yaml(settings.company_profile_path)
 
@@ -487,29 +512,6 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
             store=store,
             collection=ChromaDBStore.COMPANY_COLLECTION,
         )
-
-    # ── 3b. Wipe every per-company table ──────────────────────────────────
-    # From the one registry the blank client switch and the factory reset use
-    # too (memory.company_tables), less what this path keeps (audit_log,
-    # workspace_settings, the knowledge review state) and the authored tables
-    # no swap wipes. The seeders below then write the source's rows back.
-    #
-    # It sits here, unconditionally, and not inside a seeder: each seeder
-    # returns early when its file is missing or empty, and a fixture needs only
-    # profile.yaml, so a wipe behind one would be skipped on exactly the loads
-    # that still swap the company. Tables the source's files do not carry
-    # (chat history among them) stay empty: on unload the user's own rows come
-    # back only as far as _user_backup/'s files hold them.
-    from openexecutive.memory.company_tables import (
-        KEPT_ON_EVERY_SWAP,
-        KEPT_ON_FIXTURE_SWAP,
-        wipe_per_company_tables,
-    )
-    from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
-
-    tables_cleared = wipe_per_company_tables(
-        EPISODIC_DB_PATH, keep={**KEPT_ON_EVERY_SWAP, **KEPT_ON_FIXTURE_SWAP}
-    )
 
     # ── 4. Seed people first so episodic seeding can resolve
     #       assigned_to_person on scheduled_actions, and departments seeding

@@ -148,6 +148,20 @@ def test_the_wipe_deletes_children_before_parents(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM generated_fixtures").fetchone()[0] == 1
 
 
+def test_the_wipe_matches_a_parent_named_in_another_case(tmp_path: Path) -> None:
+    """SQLite resolves ``REFERENCES Department_Goals`` to ``department_goals``,
+    so the ordering must too, or the child is deleted after its parent."""
+    db = tmp_path / "fk_case.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE department_goals (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE TABLE departments (id INTEGER PRIMARY KEY, g INTEGER REFERENCES Department_Goals(id))"
+        )
+        conn.execute("INSERT INTO department_goals VALUES (1)")
+        conn.execute("INSERT INTO departments VALUES (1, 1)")
+    assert wipe_per_company_tables(db) == {"departments": 1, "department_goals": 1}
+
+
 def test_the_wipe_honours_keep(tmp_path: Path) -> None:
     db = tmp_path / "keep.db"
     with sqlite3.connect(db) as conn:
