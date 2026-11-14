@@ -157,12 +157,10 @@ def test_a_reason_alone_is_kept_on_the_decision() -> None:
     assert [d.id for d in episodic.list_decisions()] == [now.id], "nothing else is kept, so nothing changes"
 
 
-def test_a_blank_client_and_a_factory_reset_drop_the_decisions(db: Path) -> None:
+def test_a_blank_client_drops_the_decisions_and_the_other_facts(db: Path) -> None:
     # Decisions are facts now: wiping the old decisions table alone left the
-    # previous company's in the next one's Memory page and prompts.
-    import inspect
-
-    from openexecutive.cli.fixture_loader import reset_all_state
+    # previous company's in the next one's Memory page and prompts. The other
+    # standing facts are that company's too, and every prompt renders them.
     from openexecutive.clients import slots
 
     _old_decision(db, "Slow hiring through Q3.", days_ago=5)
@@ -177,5 +175,4 @@ def test_a_blank_client_and_a_factory_reset_drop_the_decisions(db: Path) -> None
         assert conn.execute("SELECT COUNT(*) FROM facts_meta").fetchone()[0] == 0
     facts.ensure_ready(db)
     assert facts.decision_rows() == []
-    assert [f.statement for f in facts.list_facts()] == ["The office is on Pine St."]
-    assert "drop_decisions(_conn)" in inspect.getsource(reset_all_state)
+    assert facts.list_facts() == []

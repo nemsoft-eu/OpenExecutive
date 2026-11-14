@@ -5,23 +5,25 @@ but left ``workflow_runs``, ``audit_log`` and ``eval_runs`` intact. The /jobs
 "Runs" tab and /audit page then kept showing the previous fixture's executions
 and the demo-page reset looked broken.
 
-This test reaches into the ``_delete_all_rows`` helper that
-``reset_all_state`` delegates to, seeds one row in each of the three tables
-via their real persistence helpers, and confirms they're empty afterwards.
-We invoke ``_delete_all_rows`` directly (not the async ``reset_all_state``)
-to avoid pulling ChromaDB, Honcho, and an ``app.state`` shim into a unit
-test — the assertion that matters is that the new table names appear in the
-wipe tuple and that the deletion actually works against the live schemas.
+This test seeds one row in each of the three tables via their real persistence
+helpers and runs the wipe ``reset_all_state`` uses
+(``memory.company_tables.wipe_per_company_tables``) directly, not the async
+reset, to avoid pulling ChromaDB, Honcho, and an ``app.state`` shim into a
+unit test. ``test_company_tables.py`` runs the whole reset against a row in
+every table.
 """
 from __future__ import annotations
 
-import inspect
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from openexecutive.cli.fixture_loader import _delete_all_rows, reset_all_state
+from openexecutive.memory.company_tables import (
+    KEPT_ON_EVERY_SWAP,
+    PER_COMPANY_TABLES,
+    wipe_per_company_tables,
+)
 
 
 @pytest.fixture
@@ -74,43 +76,28 @@ def test_reset_clears_workflow_runs_audit_log_and_eval_runs(
         assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM eval_runs").fetchone()[0] == 1
 
-    # --- act: invoke the same helper reset_all_state uses ---
-    cleared = _delete_all_rows(
-        _episodic_db,
-        ("workflow_runs", "audit_log", "eval_runs"),
-    )
+    # --- act: the same wipe reset_all_state runs ---
+    cleared = wipe_per_company_tables(_episodic_db, keep=KEPT_ON_EVERY_SWAP)
 
     # --- assert: counts returned + tables actually empty ---
-    assert cleared == {"workflow_runs": 1, "audit_log": 1, "eval_runs": 1}
+    assert {t: cleared[t] for t in ("workflow_runs", "audit_log", "eval_runs")} == {
+        "workflow_runs": 1, "audit_log": 1, "eval_runs": 1,
+    }
     with sqlite3.connect(str(_episodic_db)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM eval_runs").fetchone()[0] == 0
 
 
-def test_reset_all_state_wipe_list_includes_run_history_tables() -> None:
-    """Guard against silently dropping a table from the wipe list.
+def test_reset_wipes_run_history_the_decision_ledger_and_act_as_me() -> None:
+    """A reset box has run nothing, proposed nothing, and keeps nobody's Act
+    as me state. Act as me's tables come from its own list, so a new one is
+    wiped too."""
+    from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
 
-    ``reset_all_state`` is a long async function with side effects (ChromaDB,
-    Honcho, file I/O) that makes it expensive to invoke from a unit test.
-    To make sure a future refactor doesn't quietly drop one of the run/audit
-    table names from the tuple passed to ``_delete_all_rows``, assert their
-    presence in the function's source.
-    """
-    src = inspect.getsource(reset_all_state)
-    for table in ("workflow_runs", "audit_log", "eval_runs"):
-        assert f'"{table}"' in src, (
-            f"reset_all_state no longer mentions {table!r} — the demo-page "
-            "reset will stop clearing it and previously-run jobs/audit/eval "
-            "rows will reappear after reset."
-        )
-
-
-def test_reset_all_state_wipes_the_decision_ledger_and_act_as_me() -> None:
-    """A reset box has proposed nothing, and keeps nobody's Act as me state.
-    Act as me's tables come from its own list, so a new one is wiped too."""
-    src = inspect.getsource(reset_all_state)
-    for table in ("decision_instances", "decision_class_state"):
-        assert f'"{table}"' in src
-    assert "*DELEGATION_TABLES" in src
-
+    wiped = set(PER_COMPANY_TABLES) - set(KEPT_ON_EVERY_SWAP)
+    assert {
+        "workflow_runs", "audit_log", "eval_runs",
+        "decision_instances", "decision_class_state",
+        *DELEGATION_TABLES,
+    } <= wiped

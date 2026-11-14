@@ -372,14 +372,9 @@ def test_archiving_drops_the_profile(team: SimpleNamespace) -> None:
 
 
 def test_reset_paths_wipe_profiles() -> None:
-    import inspect
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 
-    from openexecutive.cli import fixture_loader
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
-
-    assert {"attunement_profiles", "attunement_profile_history"} <= set(_BLANK_WIPE_TABLES)
-    src = inspect.getsource(fixture_loader)
-    assert '"attunement_profiles"' in src and '"attunement_profile_history"' in src
+    assert {"attunement_profiles", "attunement_profile_history"} <= set(PER_COMPANY_TABLES)
 
 
 # --------------------------------------------------------------------------- #

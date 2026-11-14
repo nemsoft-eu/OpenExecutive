@@ -278,10 +278,10 @@ def test_typed_addresses_skip_quoted_backstory() -> None:
 
 
 def test_its_tables_are_per_company() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
     from openexecutive.delegation.schema import TABLES
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 
-    assert set(TABLES) <= set(_BLANK_WIPE_TABLES)
+    assert set(TABLES) <= set(PER_COMPANY_TABLES)
 
 
 # --------------------------------------------------------------------------- #

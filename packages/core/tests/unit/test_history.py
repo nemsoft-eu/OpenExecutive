@@ -148,10 +148,10 @@ def test_unknown_trust_or_kind_is_refused() -> None:
 
 
 def test_tables_swap_with_a_client_slot() -> None:
-    from openexecutive.clients import slots
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
     from openexecutive.memory.history_schema import TABLES
 
-    assert set(TABLES) <= set(slots._BLANK_WIPE_TABLES)
+    assert set(TABLES) <= set(PER_COMPANY_TABLES)
 
 
 def test_a_retention_change_never_backdates_an_unpinned_note() -> None:
