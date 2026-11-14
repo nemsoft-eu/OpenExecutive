@@ -14,7 +14,14 @@ test("loading over another fixture does not ask", () => {
 test("the return note names what comes back and what comes back empty", () => {
   assert.equal(
     returnNote("Unload"),
-    "Unload restores your profile, documents, decisions, initiatives, advice, people, departments and workspace settings from the snapshot. Chat history, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings come back empty.",
+    "Unload restores your profile, Markdown documents, decisions, initiatives, advice, team roster, departments and workspace settings from the snapshot. Everything else comes back empty, such as chat history, uploaded PDF, Word, Excel and text files, contacts, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings.",
   );
-  assert.ok(returnNote("Going back to it").startsWith("Going back to it restores your profile"));
+});
+
+test("a path that loses more names it at the end", () => {
+  assert.ok(
+    returnNote("Going back to it", "your Safety level").endsWith(
+      "Always in the loop settings, and your Safety level.",
+    ),
+  );
 });

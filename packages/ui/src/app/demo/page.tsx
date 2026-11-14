@@ -119,7 +119,13 @@ export default function DemoPage() {
     try {
       const result = await createFixture(draft.bundle, description.trim());
       setToast({
-        message: `Saved ${result.display_name}${thenLoad ? " — loading…" : ""}`,
+        message: `Saved ${result.display_name}${
+          !thenLoad
+            ? ""
+            : loadNeedsConfirm(status.active_fixture)
+              ? ` — type ${LOAD_CONFIRM_TOKEN} on its card to load it`
+              : " — loading…"
+        }`,
         kind: "success",
       });
       closeCreate();
@@ -680,9 +686,19 @@ export default function DemoPage() {
                     {/* Load button, or the typed confirm over your own company */}
                     {loadConfirmName === fx.name ? (
                       <div className="mt-auto rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-                        <p className="text-xs text-fg-muted leading-relaxed">
+                        <p
+                          id={`load-confirm-note-${fx.name}`}
+                          className="text-xs text-fg-muted leading-relaxed"
+                        >
                           This replaces your company until you unload.{" "}
                           {returnNote("Unload")}
+                          {status.has_snapshot && (
+                            <>
+                              {" "}The snapshot was taken earlier, not just now:
+                              click Snapshot current as my company first to
+                              keep today&apos;s changes.
+                            </>
+                          )}
                         </p>
                         <div className="mt-3 flex items-center gap-2 flex-wrap">
                           <label
@@ -699,13 +715,17 @@ export default function DemoPage() {
                             autoFocus
                             value={loadConfirmText}
                             onChange={(e) => setLoadConfirmText(e.target.value)}
+                            disabled={busy || loadingFixture !== null}
+                            aria-describedby={`load-confirm-note-${fx.name}`}
                             placeholder={LOAD_CONFIRM_TOKEN}
                             className="w-20 text-xs font-mono px-2 py-1.5 rounded-md border border-line bg-surface-input text-fg placeholder:text-fg-subtle focus:outline-none focus:border-amber-500/50"
                           />
                           <button
                             type="button"
                             disabled={
-                              loadingFixture !== null || loadConfirmText !== LOAD_CONFIRM_TOKEN
+                              busy ||
+                              loadingFixture !== null ||
+                              loadConfirmText !== LOAD_CONFIRM_TOKEN
                             }
                             onClick={() => void handleLoad(fx.name)}
                             className="text-xs font-medium px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed whitespace-nowrap"
@@ -714,8 +734,9 @@ export default function DemoPage() {
                           </button>
                           <button
                             type="button"
+                            disabled={busy}
                             onClick={closeLoadConfirm}
-                            className="text-xs font-medium px-3 py-1.5 rounded-lg border border-line bg-surface-overlay text-fg-muted hover:text-fg transition-colors cursor-pointer"
+                            className="text-xs font-medium px-3 py-1.5 rounded-lg border border-line bg-surface-overlay text-fg-muted hover:text-fg transition-colors cursor-pointer disabled:opacity-50"
                           >
                             Cancel
                           </button>

@@ -11699,10 +11699,22 @@ clients:
     _seed_people / _seed_departments return early when their file is
     missing or empty, and load_fixture only requires profile.yaml, so a wipe
     inside a seeder is skipped on exactly those loads while the company
-    still swaps.
+    still swaps. It also runs BEFORE any file is swapped (profile, docs,
+    vector store), right after the source profile is read, so a failed wipe
+    (a locked database; the connection waits 30 s like the slot restore)
+    aborts with the outgoing company whole instead of its rows under the
+    incoming profile. For the same reason the first load's auto-snapshot is
+    no longer best-effort: if snapshot_user_state raises, the load raises
+    before wiping anything (an empty environment snapshots fine).
     ACCEPTED LOSS on the fixture path: _user_backup/ is YAML (profile.yaml,
-    docs/, memory.json with decisions/initiatives/advice, people.yaml,
-    departments.yaml, workspace.yaml), not a database copy, and unload
+    docs/ with *.md ONLY - uploaded PDF/Word/Excel/CSV/text files are deleted
+    by the load's rmtree and never restored, memory.json with
+    decisions/initiatives/advice, people.yaml from list_people()'s defaults -
+    team members only, no contacts or archived people, and no contact
+    details, aliases, reports_to or on_leave_until - departments.yaml,
+    workspace.yaml), not a database copy, taken on the first switch and
+    reused after that (only workspace.yaml is refreshed on a later fixture
+    load from the user's own company), and unload
     restores only what those files carry. Every other per-company table the
     fixture path does not keep comes back EMPTY after a demo load and unload
     — chat_messages/sessions and the chat review, standing facts (non-decision

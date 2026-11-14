@@ -1,17 +1,23 @@
 // What comes back when you return to your own company after a demo fixture or
 // a client. The return restores from the snapshot, which is taken on the first
 // switch and reused after that, and which carries only these parts
-// (cli/fixture_loader.py, snapshot_user_state). Every other per-company table
-// is wiped on the swap (memory/company_tables.py), so it comes back empty.
+// (cli/fixture_loader.py, snapshot_user_state): Markdown docs only, and team
+// members only (no contacts, archived people, contact details or reporting
+// lines). Every other per-company table is wiped on the swap
+// (memory/company_tables.py), so it comes back empty.
 
 const RESTORED =
-  "your profile, documents, decisions, initiatives, advice, people, departments and workspace settings";
+  "your profile, Markdown documents, decisions, initiatives, advice, team roster, departments and workspace settings";
 const EMPTY =
-  "Chat history, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings";
+  "chat history, uploaded PDF, Word, Excel and text files, contacts, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings";
 
-/** Names what `action` (e.g. "Unload") restores and what comes back empty. */
-export function returnNote(action: string): string {
-  return `${action} restores ${RESTORED} from the snapshot. ${EMPTY} come back empty.`;
+/**
+ * Names what `action` (e.g. "Unload") restores and what comes back empty.
+ * `alsoEmpty` adds what that path loses beyond the shared list.
+ */
+export function returnNote(action: string, alsoEmpty?: string): string {
+  const empty = alsoEmpty ? `${EMPTY}, and ${alsoEmpty}` : EMPTY;
+  return `${action} restores ${RESTORED} from the snapshot. Everything else comes back empty, such as ${empty}.`;
 }
 
 /** Typed to confirm a load that replaces your own company. */
