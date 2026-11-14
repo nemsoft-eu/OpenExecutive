@@ -557,3 +557,156 @@ async def test_clearing_history_lets_an_unchanged_scan_run_again(
     # Same state, but the gate has no prior run to compare against → runs.
     await research_scheduler.run_watchlist_research_scan(db_path=db, store=MagicMock())
     assert calls["n"] == 2
+
+
+# --------------------------------------------------------------------- #
+# A run nobody answered must not become the skip baseline
+# --------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def runs_db(db: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the workflow_runs store at the test DB so a run's status can be read."""
+    from openexecutive.workflows import persistence
+
+    monkeypatch.setattr(persistence, "DB_PATH", db)
+    persistence.initialize_runs_db(db)
+    return db
+
+
+def _register_specialist_outcome_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    counter: dict[str, int],
+    outcomes: list[dict[str, int]],
+) -> None:
+    """A workflow stub whose n-th run reports ``outcomes[n]`` as its
+    ``specialist_calls``, the way the real workflow's result event does."""
+
+    async def run(*, inputs, store):
+        from openexecutive.workflows.base import WorkflowEvent
+        specialist_calls = outcomes[counter["n"]]
+        counter["n"] += 1
+        yield WorkflowEvent(
+            type="result",
+            data={"findings": [], "tool_calls": [], "specialist_calls": specialist_calls},
+        )
+        yield WorkflowEvent(type="artifact", content="(quiet run)")
+        yield WorkflowEvent(type="done")
+
+    workflow = MagicMock()
+    workflow.run = run
+    workflow.input_model.return_value = _MinimalInput
+    workflow.title = "Executive Research"
+    monkeypatch.setitem(
+        __import__(
+            "openexecutive.workflows", fromlist=["WORKFLOW_REGISTRY"]
+        ).WORKFLOW_REGISTRY,
+        "executive_research", workflow,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_whose_specialists_all_failed_is_not_the_baseline(
+    runs_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live failure: the model server is down for one tick, every
+    specialist call fails, and the run completes with nothing. It must be
+    audited as failed (not ran), and the next tick — same state, well
+    inside the staleness floor — must run rather than skip on its hash."""
+    from openexecutive.audit import get_audit_logger
+    from openexecutive.workflows.persistence import get_run
+
+    calls = {"n": 0}
+    _register_specialist_outcome_workflow(
+        monkeypatch, calls, [{"ok": 0, "failed": 3}, {"ok": 3, "failed": 0}],
+    )
+
+    surfaced = await research_scheduler.run_watchlist_research_scan(
+        db_path=runs_db, store=MagicMock(),
+    )
+    assert surfaced == 0
+    assert calls["n"] == 1
+    audit = get_audit_logger()
+    assert audit.query(event_type=research_scheduler.EVENT_RAN) == []
+    failed = audit.query(event_type=research_scheduler.EVENT_FAILED, limit=1)
+    details = failed[0].details or {}
+    assert details.get("reason") == "all_specialists_failed"
+    assert details.get("specialist_calls") == {"ok": 0, "failed": 3}
+    assert details.get("trigger") == "cold_start"
+    # The run record agrees with the audit row: failed, not done.
+    run = get_run(str(details.get("run_id")), db_path=runs_db)
+    assert run is not None
+    assert run["status"] == "error"
+
+    # Next tick, nothing changed: no baseline was recorded, so it runs.
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    assert calls["n"] == 2
+    ran = audit.query(event_type=research_scheduler.EVENT_RAN, limit=1)
+    assert len(ran) == 1
+    run = get_run(str((ran[0].details or {}).get("run_id")), db_path=runs_db)
+    assert run is not None
+    assert run["status"] == "done"
+
+    # That run succeeded, so it is the baseline and the tick after skips.
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_with_some_specialists_failed_is_still_the_baseline(
+    runs_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial failure is a normal run: what the specialists that answered
+    found went on to synthesis, so re-running would repeat it. The
+    counts ride on the ran row so the partial failure stays visible."""
+    from openexecutive.audit import get_audit_logger
+
+    calls = {"n": 0}
+    _register_specialist_outcome_workflow(
+        monkeypatch, calls, [{"ok": 1, "failed": 6}, {"ok": 7, "failed": 0}],
+    )
+
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    assert calls["n"] == 1
+    audit = get_audit_logger()
+    assert audit.query(event_type=research_scheduler.EVENT_FAILED) == []
+    ran = audit.query(event_type=research_scheduler.EVENT_RAN, limit=1)
+    assert (ran[0].details or {}).get("specialist_calls") == {"ok": 1, "failed": 6}
+
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    assert calls["n"] == 1  # skipped on the partial run's baseline
+
+
+@pytest.mark.asyncio
+async def test_real_workflow_with_every_provider_call_failing_retries_next_tick(
+    runs_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end through the real executive_research workflow: each
+    specialist's provider call raises (connection refused), the fan-out
+    absorbs it, and the cron still refuses to record a baseline."""
+    from openexecutive.agents.base import BaseAgent
+    from openexecutive.audit import get_audit_logger
+
+    provider_up = {"value": False}
+
+    async def analyze_with_tools(self, *args: Any, **kwargs: Any) -> Any:
+        if not provider_up["value"]:
+            raise ConnectionError("connection refused")
+        message = MagicMock()
+        message.content = []  # answered, found nothing
+        return message
+
+    monkeypatch.setattr(BaseAgent, "analyze_with_tools", analyze_with_tools)
+
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    audit = get_audit_logger()
+    assert audit.query(event_type=research_scheduler.EVENT_RAN) == []
+    failed = audit.query(event_type=research_scheduler.EVENT_FAILED, limit=1)
+    assert (failed[0].details or {}).get("reason") == "all_specialists_failed"
+
+    # The model server comes back; the next tick (same state) runs.
+    provider_up["value"] = True
+    await research_scheduler.run_watchlist_research_scan(db_path=runs_db, store=MagicMock())
+    ran = audit.query(event_type=research_scheduler.EVENT_RAN, limit=1)
+    assert len(ran) == 1
+    assert ((ran[0].details or {}).get("specialist_calls") or {}).get("failed") == 0

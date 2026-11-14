@@ -43,9 +43,12 @@ async def research_one_specialist(
     """Run one specialist through a research-mode turn. Returns the
     parsed findings (may be empty).
 
-    Failures are caught + logged + returned as empty so the workflow's
-    asyncio.gather doesn't abort on one specialist's crash. The
-    workflow records per-specialist outcomes separately for the artifact.
+    A provider failure raises rather than returning empty: an empty list
+    means the specialist answered and found nothing, and the workflow's
+    ``_run_one`` catches the exception and records it as that specialist's
+    error. Swallowing it here made a run in which every call failed look
+    like a quiet run, and the periodic cron then recorded it as the
+    skip-if-unchanged baseline.
     """
     from openexecutive.agents.research_council import (
         get_research_model,
@@ -95,26 +98,20 @@ async def research_one_specialist(
     # chat-time Opus tier so a chat-quality bump can't re-inflate research
     # cost. Pinned per-call via analyze_with_tools' overrides; the agent's
     # chat-path defaults are untouched.
-    try:
-        message = await agent.analyze_with_tools(
-            research_context,
-            actor="specialist_research",
-            tools=tools,
-            system_addendum=addendum,
-            timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
-            model_override=research_model,
-            deep_reasoning_override=get_research_use_deep_reasoning(),
-            client_tool_handlers=client_search_handlers(search, seen),
-            terminal_tool_names={"emit_research_findings"},
-            max_client_tool_rounds=client_tool_rounds(
-                search, with_fetch=seen is not None
-            ),
-        )
-    except Exception:
-        logger.exception(
-            "research: specialist=%s provider call failed", specialist_slug,
-        )
-        return []
+    message = await agent.analyze_with_tools(
+        research_context,
+        actor="specialist_research",
+        tools=tools,
+        system_addendum=addendum,
+        timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
+        model_override=research_model,
+        deep_reasoning_override=get_research_use_deep_reasoning(),
+        client_tool_handlers=client_search_handlers(search, seen),
+        terminal_tool_names={"emit_research_findings"},
+        max_client_tool_rounds=client_tool_rounds(
+            search, with_fetch=seen is not None
+        ),
+    )
 
     return _extract_findings(message, specialist_slug)
 
