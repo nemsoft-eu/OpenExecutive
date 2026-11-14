@@ -183,3 +183,25 @@ def test_a_failed_wipe_leaves_the_outgoing_company_whole(
     with pytest.raises(sqlite3.OperationalError):
         _load(settings)
     assert "My Co" in settings.company_profile_path.read_text()
+
+
+def test_a_snapshot_that_fails_part_way_is_retaken_on_the_next_load(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """profile.yaml marks a snapshot as taken, so it is written last: a dump
+    that fails before it must not let the next load skip the snapshot."""
+    people_store.upsert_person(full_name="Me Myself", is_principal=True)
+    real_dump = fixture_loader._dump_people
+
+    def _fail(_path: Path) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(fixture_loader, "_dump_people", _fail)
+    with pytest.raises(sqlite3.OperationalError):
+        _load(settings)
+    assert not (_backup(settings) / "profile.yaml").exists()
+
+    monkeypatch.setattr(fixture_loader, "_dump_people", real_dump)
+    _load(settings)
+    _unload(settings)
+    assert [p.full_name for p in people_store.list_people()] == ["Me Myself"]

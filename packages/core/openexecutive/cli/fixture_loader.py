@@ -1042,18 +1042,9 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     backup_dir = _user_backup_dir(settings)
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. profile.yaml ────────────────────────────────────────────────────
     src_profile = settings.company_profile_path
-    dst_profile = backup_dir / "profile.yaml"
-    if src_profile.exists():
-        shutil.copy2(src_profile, dst_profile)
-    else:
-        # Write empty profile so restore can detect "no real profile to apply".
-        from openexecutive.memory.company_profile import CompanyProfile
 
-        CompanyProfile().save_to_yaml(dst_profile)
-
-    # ── 2. docs/ ───────────────────────────────────────────────────────────
+    # ── 1. docs/ ───────────────────────────────────────────────────────────
     src_docs = src_profile.parent / "docs"
     dst_docs = backup_dir / "docs"
     if dst_docs.exists():
@@ -1065,17 +1056,31 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
             shutil.copy2(f, dst_docs / f.name)
             docs_count += 1
 
-    # ── 3. memory.json (episodic) ─────────────────────────────────────────
+    # ── 2. memory.json (episodic) ─────────────────────────────────────────
     memory_count = _dump_episodic_memory(backup_dir / "memory.json")
 
-    # ── 4. people.yaml ─────────────────────────────────────────────────────
+    # ── 3. people.yaml ─────────────────────────────────────────────────────
     people_count = _dump_people(backup_dir / "people.yaml")
 
-    # ── 5. departments.yaml ───────────────────────────────────────────────
+    # ── 4. departments.yaml ───────────────────────────────────────────────
     departments_count = _dump_departments(backup_dir / "departments.yaml")
 
-    # ── 6. workspace.yaml — so unload restores the user's mode and zone ───
+    # ── 5. workspace.yaml — so unload restores the user's mode and zone ───
     _dump_workspace(backup_dir / "workspace.yaml")
+
+    # ── 6. profile.yaml, written LAST ─────────────────────────────────────
+    # Its presence is what marks a snapshot as taken (has_snapshot, and the
+    # auto-snapshot gate in _load_from_dir), so a dump above that raises must
+    # leave no profile.yaml behind, or the next load would skip the snapshot
+    # and wipe the tables this one failed to save.
+    dst_profile = backup_dir / "profile.yaml"
+    if src_profile.exists():
+        shutil.copy2(src_profile, dst_profile)
+    else:
+        # Write empty profile so restore can detect "no real profile to apply".
+        from openexecutive.memory.company_profile import CompanyProfile
+
+        CompanyProfile().save_to_yaml(dst_profile)
 
     # Clear active-fixture marker — this state IS the user's company now.
     _fixture_active_sentinel(settings).unlink(missing_ok=True)

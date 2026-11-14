@@ -9,15 +9,11 @@
 const RESTORED =
   "your profile, Markdown documents, decisions, initiatives, advice, team roster, departments and workspace settings";
 const EMPTY =
-  "chat history, uploaded PDF, Word, Excel and text files, contacts, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings";
+  "chat history, uploaded PDF, Word, Excel, CSV and text files, contacts, learned facts, department notes, and Act as me, Take the lead and Always in the loop settings";
 
-/**
- * Names what `action` (e.g. "Unload") restores and what comes back empty.
- * `alsoEmpty` adds what that path loses beyond the shared list.
- */
-export function returnNote(action: string, alsoEmpty?: string): string {
-  const empty = alsoEmpty ? `${EMPTY}, and ${alsoEmpty}` : EMPTY;
-  return `${action} restores ${RESTORED} from the snapshot. Everything else comes back empty, such as ${empty}.`;
+/** Names what `action` (e.g. "Unload") restores and what comes back empty. */
+export function returnNote(action: string): string {
+  return `${action} restores ${RESTORED} from the snapshot. Everything else comes back empty, such as ${EMPTY}.`;
 }
 
 /** Typed to confirm a load that replaces your own company. */

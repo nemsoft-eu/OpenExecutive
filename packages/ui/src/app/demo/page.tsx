@@ -694,9 +694,8 @@ export default function DemoPage() {
                           {returnNote("Unload")}
                           {status.has_snapshot && (
                             <>
-                              {" "}The snapshot was taken earlier, not just now:
-                              click Snapshot current as my company first to
-                              keep today&apos;s changes.
+                              {" "}That snapshot was taken earlier, so changes
+                              made since then do not come back.
                             </>
                           )}
                         </p>

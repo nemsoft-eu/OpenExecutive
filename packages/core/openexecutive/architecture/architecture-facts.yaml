@@ -11705,7 +11705,11 @@ clients:
     aborts with the outgoing company whole instead of its rows under the
     incoming profile. For the same reason the first load's auto-snapshot is
     no longer best-effort: if snapshot_user_state raises, the load raises
-    before wiping anything (an empty environment snapshots fine).
+    before wiping anything (an empty environment snapshots fine). Because
+    profile.yaml is what marks a snapshot as taken, snapshot_user_state
+    writes it LAST, so a snapshot that fails part way is retaken by the next
+    load rather than skipped. The client-slot callers (create_client_slot,
+    activate_client_slot) still swallow a snapshot failure.
     ACCEPTED LOSS on the fixture path: _user_backup/ is YAML (profile.yaml,
     docs/ with *.md ONLY - uploaded PDF/Word/Excel/CSV/text files are deleted
     by the load's rmtree and never restored, memory.json with
@@ -11723,8 +11727,12 @@ clients:
     notes, Act as me / Always in the loop / Take the lead state, Council
     overrides, contact notes, telegram_chats and the rest. A blank client
     switch from the user's own company takes the same YAML snapshot, so
-    exiting client mode restores the same subset (the owner's Safety level
-    included: it returns as Balanced). People come back under NEW ids, and
+    exiting client mode restores the same subset. The owner's Safety level
+    (outside_content_mode) is not in it: the blank switch wipes it, and exit
+    goes through unload_fixture, whose KEPT_ON_FIXTURE_SWAP keeps the live
+    row, so it stays at the last client's level (Balanced unless someone
+    changed it there); /clients says so. A demo load and unload from the
+    user's own company never touches it. People come back under NEW ids, and
     did before the registry too: _dump_people writes no ids, _seed_people
     deletes and re-inserts, and people.id is AUTOINCREMENT with nothing
     resetting sqlite_sequence (tests/unit/test_fixture_cycle_person_ids.py).

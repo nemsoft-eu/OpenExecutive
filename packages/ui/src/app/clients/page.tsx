@@ -462,7 +462,8 @@ export default function ClientsPage() {
           Only the active client is live — its scheduled actions fire and its
           documents are indexed; parked clients sleep in their slots. Your
           original company is snapshotted the first time you switch.{" "}
-          {returnNote("Going back to it", "your Safety level")}
+          {returnNote("Going back to it")} Your Safety level stays at the last
+          client&apos;s, so check it in Settings.
         </p>
       </div>
 
