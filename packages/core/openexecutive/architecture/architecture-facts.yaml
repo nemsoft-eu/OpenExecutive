@@ -3033,7 +3033,7 @@ knowledge:
 memory:
   episodic_db: ./episodic_memory.db
   tables:
-    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written. A blank client, a factory reset and a fixture load drop the decision facts and that marker (facts.drop_decisions), since wiping this table alone left the previous company's decisions in facts (found in review of nemsoft-eu/OpenExecutive#70)."
+    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written. Every company swap (blank client, factory reset, fixture load and unload) empties facts and facts_meta from memory.company_tables, so no decision or other standing fact carries over; a fixture load that seeds this table from memory.json then drops the decision facts and the marker (facts.drop_decisions) so its rows are copied in afresh. Wiping this table alone used to leave the previous company's decisions in facts (found in review of nemsoft-eu/OpenExecutive#70)."
     - initiatives
     - "advice_given — legacy. No longer written; old rows stay readable."
     - scheduled_actions
@@ -3667,7 +3667,8 @@ peer_memory:
     rules; for a teammate who shares their work style, role, departments
     and style rules, never notes). append_department_note also writes
     ``department_notes`` (``memory.department_notes``, newest 200 per
-    department), which a department-bound specialist's prefetch reads when
+    department, wiped by every company swap from ``memory.company_tables``),
+    which a department-bound specialist's prefetch reads when
     Honcho has nothing. The brief's person insight falls back to the shared
     work style. Keep track of what happens is on by default for every team
     member. The About you card reads Honcho only and hides when it is off.
@@ -4450,7 +4451,7 @@ attunement:
     reset: |
       Loops live in scheduled_actions and attribution in chat_messages (both
       already wiped by client-slot switches and reset_all_state);
-      `attunement_usage` added to `_BLANK_WIPE_TABLES` and reset_all_state.
+      `attunement_usage` is in memory.company_tables.PER_COMPANY_TABLES.
     tests: |
       tests/conftest.py no-ops `schedule_open_loop_pass` for every test so
       Executive turns don't call a provider or write default-DB rows; tests
@@ -4849,7 +4850,7 @@ departments:
     optional in the PUT body like timezone, null/blank clears one). GET
     stays open, but returns the role only to a caller the PUT would accept
     (_caller_is_principal_or_unclaimed) and nulls to anyone else. Per company: blank
-    client slots wipe it (clients.slots._BLANK_WIPE_TABLES), saved slots
+    client slots wipe it (memory.company_tables), saved slots
     carry it in state.db, and the factory reset returns it to the defaults
     before re-bootstrapping. Fixtures: `_apply_state_from_source` reads and
     validates the source's optional workspace.yaml before swapping anything
@@ -5418,9 +5419,9 @@ people:
     - Caps: ROSTER_ACK_WINDOW_DAYS=7, ROSTER_ACK_DAILY_CAP=20,
       ROSTER_REQUEST_DAILY_CAP=30, ROSTER_REQUEST_TTL_DAYS=14 (config.py),
       MAX_HELD_MESSAGES=10, DECLINE_QUIET_DAYS=30.
-    - Wiped on a company swap: `clients.slots._BLANK_WIPE_TABLES`,
-      `fixture_loader.reset_all_state` and `_seed_people` (with
-      `person_emails`, children first).
+    - Wiped on every company swap (blank slot, factory reset, fixture
+      load/unload) from `memory.company_tables.PER_COMPANY_TABLES`, with
+      `person_emails`, children first.
   registry: openexecutive.people.registry — in-memory cache + lookup
   channel: |
     openexecutive.people.channel — resolves a person to a deliverable
@@ -9138,7 +9139,7 @@ integrations:
       • A department's Slack/Discord pickers pre-select the room named most
         like the department (lib/chatDirectory.closestOption in the UI);
         saved only when the person presses Save.
-      • telegram_chats is per company: clients.slots._BLANK_WIPE_TABLES.
+      • telegram_chats is per company: memory.company_tables.PER_COMPANY_TABLES.
   chat_app_conversations: |
     A Telegram chat, a Slack or Discord DM and a person's @mentions in
     one channel are each one endless stream with a fixed base id
@@ -11209,7 +11210,7 @@ company_onboarding:
     evicts it; a store failure is a warning, never a failed turn. Every
     store call also sweeps expired and over-cap rows, PRAGMA secure_delete
     zeroes deleted pages, and a blank client slot wipes the table
-    (clients/slots._BLANK_WIPE_TABLES). A session belongs to whoever
+    (memory.company_tables). A session belongs to whoever
     started it (InterviewSession.owner_key = api_caller.identity_key):
     every read or turn by another caller is the same 404 an unknown id
     gets, since the id alone is no longer a capability once sessions
@@ -11655,13 +11656,106 @@ clients:
     company_docs collection + company-authored skills are re-indexed from
     the restored dirs, and recent_research artifacts are wiped (same rule as
     fixtures: per-company research never crosses companies). Activating a
-    blank slot (no state.db yet) factory-wipes the per-client tables and
+    blank slot (no state.db yet) factory-wipes the per-company tables and
     re-seeds defaults (departments, principal briefs, cadences) so the new
-    client's Today works without a process restart. That wipe and
-    reset_all_state also clear email_thread_replies
-    (integrations.email_replies): recent_elsewhere finds rows by the
-    recipient's address, so an advisor writing for two clients would be
-    shown the previous client's replies.
+    client's Today works without a process restart.
+    ONE REGISTRY: memory.company_tables. THREE paths swap live company state
+    — clients.slots._wipe_per_client_tables (switch into a blank/seed slot),
+    cli.fixture_loader.reset_all_state (factory reset), and
+    _apply_state_from_source (fixture load AND unload) — and each used to keep
+    its own hand-written table list, so a table added to one stayed live in
+    the others (the live instance: fixture load kept department_notes, so a
+    shared department slug such as `finance` served the previous company's
+    notes through the department prefetch; standing facts that were not
+    decisions survived every path). All three now call
+    company_tables.wipe_per_company_tables, which deletes every table in
+    PER_COMPANY_TABLES that exists, children before parents from the DB's
+    own foreign keys, in one transaction, then drops the in-process Agent
+    Council override cache (agents.overrides has no TTL). PER_COMPANY_TABLES
+    is composed from the modules' own TABLES tuples where they exist
+    (delegation.schema, delegation.sign_in_notice, memory.history_schema,
+    orchestrator.take_the_lead, people.roster_requests).
+    COMPANY_INDEPENDENT_TABLES names every other table with its reason:
+    generated_fixtures (operator demo library), executive_control (pause
+    switch), architecture_sections (repo-derived cache), app_migrations /
+    monitoring_migrations / review_meta (one-shot markers per DB file),
+    departments_new / department_goals_new (migration scratch tables).
+    tests/unit/test_company_tables.py scans every CREATE TABLE under
+    openexecutive/ (literal names and f-string constants) and fails on a
+    table in neither list, and runs each path against one seeded row per
+    table. Per-path exceptions are named, with reasons, never implicit:
+      • KEPT_ON_EVERY_SWAP: dynamic_workflows, eval_scenarios, saved_tools and
+        saved_tool_versions (saved_tool_runs, the run history, is wiped). They ARE
+        client-scoped (a saved slot's state.db restore swaps them), but they
+        are authored, not derived, and no backup carries them — the fixture
+        backup and the first-activation snapshot (snapshot_user_state) hold
+        only profile/docs/memory.json/people/departments/workspace — so a
+        wipe would irrecoverably delete the operator's own work. Known leak:
+        the outgoing company's workflow definitions stay registered AND
+        active (list_definitions(active_only=True)) after a blank switch, a
+        reset or a demo, runnable against the incoming company's data, with
+        full bodies exposed via /workflows. The fix is to carry them in a
+        backup FIRST, then wipe.
+      • KEPT_ON_FIXTURE_SWAP: audit_log (load/unload keep the audit history
+        by design; only the research run-history rows that gate the seeded
+        scan are cleared, clear_research_run_history), workspace_settings
+        (the path sets it itself via _apply_workspace: a fixture resets to
+        the defaults first; a user backup without workspace.yaml keeps the
+        live row), review_items / review_annotations (review state of the
+        knowledge files, which a fixture does not swap; with no row a
+        rejected upload of the user's would be retrievable again),
+        outside_content_mode (the owner's Safety level: no backup carries it
+        and a missing row reads as Balanced, so a wipe would silently lower a
+        Careful owner's checking after a demo). The blank switch and the
+        factory reset wipe all five; a blank client starts on the defaults.
+    The fixture-path wipe sits in _apply_state_from_source, unconditionally
+    and BEFORE the seeders, NOT in a seeder: _seed_episodic_memory /
+    _seed_people / _seed_departments return early when their file is
+    missing or empty, and load_fixture only requires profile.yaml, so a wipe
+    inside a seeder is skipped on exactly those loads while the company
+    still swaps. It also runs BEFORE any file is swapped (profile, docs,
+    vector store), right after the source profile is read, so a failed wipe
+    (a locked database; the connection waits 30 s like the slot restore)
+    aborts with the outgoing company whole instead of its rows under the
+    incoming profile. For the same reason the first load's auto-snapshot is
+    no longer best-effort: if snapshot_user_state raises, the load raises
+    before wiping anything (an empty environment snapshots fine). Because
+    profile.yaml is what marks a snapshot as taken, snapshot_user_state
+    writes it LAST, so a snapshot that fails part way is retaken by the next
+    load rather than skipped. The client-slot callers (create_client_slot,
+    activate_client_slot) still swallow a snapshot failure.
+    ACCEPTED LOSS on the fixture path: _user_backup/ is YAML (profile.yaml,
+    docs/ with *.md ONLY - uploaded PDF/Word/Excel/CSV/text files are deleted
+    by the load's rmtree and never restored, memory.json with
+    decisions/initiatives/advice, people.yaml from list_people()'s defaults -
+    team members only, no contacts or archived people, and no contact
+    details, aliases, reports_to or on_leave_until - departments.yaml,
+    workspace.yaml), not a database copy, taken on the first switch and
+    reused after that (only workspace.yaml is refreshed on a later fixture
+    load from the user's own company), and unload
+    restores only what those files carry. Every other per-company table the
+    fixture path does not keep comes back EMPTY after a demo load and unload
+    — chat_messages/sessions and the chat review, standing facts (non-decision
+    facts included), scheduled_actions (memory.json already dumped them as
+    []), alerts, the watchlist and derived caches (as before), department
+    notes, Act as me / Always in the loop / Take the lead state, Council
+    overrides, contact notes, telegram_chats and the rest. A blank client
+    switch from the user's own company takes the same YAML snapshot, so
+    exiting client mode restores the same subset. The owner's Safety level
+    (outside_content_mode) is not in it: the blank switch wipes it, and exit
+    goes through unload_fixture, whose KEPT_ON_FIXTURE_SWAP keeps the live
+    row, so it stays at the last client's level (Balanced unless someone
+    changed it there); /clients says so. A demo load and unload from the
+    user's own company never touches it. People come back under NEW ids, and
+    did before the registry too: _dump_people writes no ids, _seed_people
+    deletes and re-inserts, and people.id is AUTOINCREMENT with nothing
+    resetting sqlite_sequence (tests/unit/test_fixture_cycle_person_ids.py).
+    So person-keyed state could not survive the round trip even if kept.
+    The UI says this plainly: the Company Simulator and /clients pages name
+    what comes back and what comes back empty (lib/companySwap.ts,
+    returnNote), and loading a fixture while no fixture is active asks for a
+    typed LOAD first, like Reset everything's typed RESET; a load over
+    another fixture does not ask.
     Wipe lists must cover the DERIVED CACHES, not just authored state.
     briefing_narrative and person_insights were wiped by NO path, and because
     /today serves the cached narrative unconditionally (regenerating only in a
@@ -11674,34 +11768,11 @@ clients:
     identity. The key is a reused autoincrement person_id, so an outgoing
     principal and a freshly seeded incoming principal hash identically
     whenever those signals coincide. Ordinary steady state, not a collision.
-    THREE paths swap live company state and each kept its own hand-written
-    table list, which is why fixing one left the leak live in the other two.
-    They now all consume `cli.fixture_loader.PER_CLIENT_CACHE_TABLES`:
-    `clients.slots._BLANK_WIPE_TABLES` (switch into a blank/seed slot),
-    `reset_all_state` (factory reset), and `_apply_state_from_source` (fixture
-    load AND unload — the worst surface, since a demo is what gets
-    screen-shared). The fixture-path wipe sits in `_apply_state_from_source`
-    beside the unconditional watchlist wipe, NOT in `_seed_episodic_memory`:
-    that seeder returns early when a fixture has no readable `memory.json`,
-    and `load_fixture` only requires `profile.yaml`, so a wipe inside the
-    seeder is skipped on exactly those loads while the company still swaps.
+    email_thread_replies (integrations.email_replies) is per company:
+    recent_elsewhere finds rows by the recipient's address, so an advisor
+    writing for two clients would be shown the previous client's replies.
     Client→client switching into a slot that HAS state.db was already safe:
     the sqlite backup API truncates the destination to an exact copy.
-    Add any new per-company cache table to that constant, once.
-    Graded as NOT wiped: generated_fixtures (operator-level, see
-    _GLOBAL_TABLES) and architecture_sections (repo-derived, keyed by a hash of
-    the facts file). Still UNGRADED, deliberately deferred: dynamic_workflows
-    and eval_scenarios. These ARE client-scoped — the non-blank path already
-    swaps them with the whole DB — and on the blank path the outgoing client's
-    workflow definitions stay registered AND active (`list_definitions(
-    active_only=True)`), runnable against the incoming client's data, with full
-    bodies exposed via /workflows. They are not in the wipe list because they
-    are authored, not derived, and `snapshot_user_state` (the first-activation
-    branch, when no client is active) captures only profile/docs/memory.json/
-    people/departments — so wiping them there would irrecoverably delete the
-    operator's own work. The fix is to capture them in that snapshot FIRST,
-    then wipe. Both tables were observed empty on all known installs as of
-    2026-09 — an observation at a point in time, not an invariant to rely on.
   invariants:
     - At most one slot is active; the .active_client sentinel records it
       (allowlist-validated on read, same defence as the fixture sentinel).
@@ -11728,12 +11799,12 @@ clients:
     - workspace_settings (solo/team mode + the user's time zone,
       memory.workspace_settings) is per company, NOT operator-level - a
       saved slot carries its row in state.db and a blank slot's wipe
-      (_BLANK_WIPE_TABLES) returns it to the defaults before the briefs and
+      (memory.company_tables) returns it to the defaults before the briefs and
       cadences are re-seeded.
     - Act as me's tables (delegation.schema.TABLES - delegation_settings,
       delegation_voice, delegation_voice_history, delegation_drafts,
       delegation_inbox_watch, delegation_inbox_messages) are per company
-      too - in _BLANK_WIPE_TABLES and reset_all_state - so a blank client
+      too - in memory.company_tables.PER_COMPANY_TABLES - so a blank client
       starts with it off, no writing profile and no inbox watcher. The
       watcher never scans while a slot is active. The per-person Gmail
       credential is a file outside the slot, re-checked against the live
@@ -13246,8 +13317,8 @@ delegation:
     delegation_mail_read, delegation_training, delegation_saved_files and
     delegation_saved_folder (delegation.schema.TABLES) in the episodic DB (created by
     memory.episodic.initialize_db via delegation.schema.ensure_schema); per
-    company — in clients.slots._BLANK_WIPE_TABLES and
-    cli.fixture_loader.reset_all_state. A reply card is a decision_instances
+    company — in memory.company_tables.PER_COMPANY_TABLES, so every company
+    swap wipes them. A reply card is a decision_instances
     row (see trust_ledger).
   later_phases: |
     Each is its own change behind its own switch, off by default: more

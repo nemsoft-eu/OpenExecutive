@@ -453,6 +453,6 @@ def test_outreach_route_is_principal_or_owner(
 
 
 def test_reset_paths_wipe_the_ledger() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 
-    assert "proactive_outcomes" in _BLANK_WIPE_TABLES
+    assert "proactive_outcomes" in PER_COMPANY_TABLES

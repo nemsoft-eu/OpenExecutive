@@ -86,16 +86,17 @@ def test_old_notes_expire() -> None:
     assert "fresh" in text and "old call" not in text
 
 
-def test_factory_reset_and_blank_slot_clear_the_table() -> None:
-    import inspect
+def test_every_company_swap_clears_the_table() -> None:
+    from openexecutive.memory.company_tables import (
+        KEPT_ON_EVERY_SWAP,
+        KEPT_ON_FIXTURE_SWAP,
+        PER_COMPANY_TABLES,
+    )
 
-    from openexecutive.cli.fixture_loader import reset_all_state
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
-
-    assert dn.TABLE in _BLANK_WIPE_TABLES
-    assert f'"{dn.TABLE}"' in inspect.getsource(reset_all_state)
-    # Before departments, like the department's other rows.
-    assert _BLANK_WIPE_TABLES.index(dn.TABLE) < _BLANK_WIPE_TABLES.index("departments")
+    # Fixture load/unload too: it used to keep the outgoing company's notes,
+    # served under a shared department slug.
+    assert dn.TABLE in PER_COMPANY_TABLES
+    assert dn.TABLE not in {**KEPT_ON_EVERY_SWAP, **KEPT_ON_FIXTURE_SWAP}
 
 
 def test_a_turn_private_to_the_principal_keeps_nothing() -> None:

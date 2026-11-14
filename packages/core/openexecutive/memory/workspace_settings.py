@@ -28,7 +28,7 @@ One row (``id = 1``) in the ``workspace_settings`` table of the episodic DB:
 The row lives in its own table rather than on ``CompanyProfile`` on purpose:
 onboarding's commit and the form wizard rebuild the profile from scratch,
 which would silently wipe it. It is per company (it swaps with a client slot
-like the other company tables — see ``clients.slots._BLANK_WIPE_TABLES``).
+like the other company tables — see ``memory.company_tables``).
 
 Reads are always fresh (one small SQLite read) and never cached on a
 ``Session``, so a change applies to the very next turn. They are also
