@@ -18,6 +18,7 @@ import {
   deleteFixture,
 } from "@/lib/api";
 import { PageSpinner, Spinner } from "@/components/ui/Spinner";
+import { LOAD_CONFIRM_TOKEN, loadNeedsConfirm, returnNote } from "@/lib/companySwap";
 
 const RESET_CONFIRM_TOKEN = "RESET";
 
@@ -68,6 +69,9 @@ export default function DemoPage() {
   } | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
   const [resetConfirmText, setResetConfirmText] = useState("");
+  // The fixture waiting on a typed confirm before it replaces your company.
+  const [loadConfirmName, setLoadConfirmName] = useState<string | null>(null);
+  const [loadConfirmText, setLoadConfirmText] = useState("");
 
   // Create-with-AI modal state.
   const [createOpen, setCreateOpen] = useState(false);
@@ -120,7 +124,7 @@ export default function DemoPage() {
       });
       closeCreate();
       await refreshFixtures();
-      if (thenLoad) await handleLoad(result.name);
+      if (thenLoad) await requestLoad(result.name);
     } catch (e: unknown) {
       setToast({
         message: e instanceof Error ? e.message : "Save failed",
@@ -178,7 +182,23 @@ export default function DemoPage() {
     }
   }
 
+  function closeLoadConfirm() {
+    setLoadConfirmName(null);
+    setLoadConfirmText("");
+  }
+
+  // Over your own company, ask first; over another fixture, load at once.
+  async function requestLoad(name: string) {
+    if (loadNeedsConfirm(status.active_fixture)) {
+      setLoadConfirmName(name);
+      setLoadConfirmText("");
+      return;
+    }
+    await handleLoad(name);
+  }
+
   async function handleLoad(name: string) {
+    closeLoadConfirm();
     setLoadingFixture(name);
     try {
       const result: FixtureLoadResult = await loadFixture(name);
@@ -484,10 +504,11 @@ export default function DemoPage() {
           <div className="mb-5 rounded-xl border border-line bg-surface-elevated px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
             <p className="text-xs text-fg-muted flex-1 basis-56">
               {status.has_snapshot ? (
-                <>Snapshot of your company exists. Loading a fixture will replace state; unload restores from the snapshot.</>
+                <>Snapshot of your company exists. Loading a fixture replaces your company until you unload.</>
               ) : (
                 <>No snapshot of your company yet. Loading a fixture will auto-snapshot first. You can also snapshot manually now.</>
-              )}
+              )}{" "}
+              {returnNote("Unload")}
             </p>
             <button
               type="button"
@@ -656,27 +677,72 @@ export default function DemoPage() {
                       </div>
                     )}
 
-                    {/* Load button */}
-                    <button
-                      type="button"
-                      disabled={isLoading || loadingFixture !== null}
-                      onClick={() => void handleLoad(fx.name)}
-                      className={`w-full mt-auto px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer border ${
-                        isActive
-                          ? "bg-indigo-500/20 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30"
-                          : "bg-surface-overlay border-line text-fg hover:bg-surface-input"
-                      } disabled:opacity-50 disabled:cursor-not-allowed`}
-                    >
-                      {isLoading ? (
-                        <span className="flex items-center justify-center">
-                          <Spinner />
-                        </span>
-                      ) : isActive ? (
-                        "Reload"
-                      ) : (
-                        "Load"
-                      )}
-                    </button>
+                    {/* Load button, or the typed confirm over your own company */}
+                    {loadConfirmName === fx.name ? (
+                      <div className="mt-auto rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                        <p className="text-xs text-fg-muted leading-relaxed">
+                          This replaces your company until you unload.{" "}
+                          {returnNote("Unload")}
+                        </p>
+                        <div className="mt-3 flex items-center gap-2 flex-wrap">
+                          <label
+                            htmlFor={`load-confirm-input-${fx.name}`}
+                            className="text-xs text-fg-muted whitespace-nowrap"
+                          >
+                            Type{" "}
+                            <code className="font-mono text-amber-300">{LOAD_CONFIRM_TOKEN}</code>{" "}
+                            to confirm:
+                          </label>
+                          <input
+                            id={`load-confirm-input-${fx.name}`}
+                            type="text"
+                            autoFocus
+                            value={loadConfirmText}
+                            onChange={(e) => setLoadConfirmText(e.target.value)}
+                            placeholder={LOAD_CONFIRM_TOKEN}
+                            className="w-20 text-xs font-mono px-2 py-1.5 rounded-md border border-line bg-surface-input text-fg placeholder:text-fg-subtle focus:outline-none focus:border-amber-500/50"
+                          />
+                          <button
+                            type="button"
+                            disabled={
+                              loadingFixture !== null || loadConfirmText !== LOAD_CONFIRM_TOKEN
+                            }
+                            onClick={() => void handleLoad(fx.name)}
+                            className="text-xs font-medium px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed whitespace-nowrap"
+                          >
+                            Confirm load
+                          </button>
+                          <button
+                            type="button"
+                            onClick={closeLoadConfirm}
+                            className="text-xs font-medium px-3 py-1.5 rounded-lg border border-line bg-surface-overlay text-fg-muted hover:text-fg transition-colors cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={isLoading || loadingFixture !== null}
+                        onClick={() => void requestLoad(fx.name)}
+                        className={`w-full mt-auto px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer border ${
+                          isActive
+                            ? "bg-indigo-500/20 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30"
+                            : "bg-surface-overlay border-line text-fg hover:bg-surface-input"
+                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                      >
+                        {isLoading ? (
+                          <span className="flex items-center justify-center">
+                            <Spinner />
+                          </span>
+                        ) : isActive ? (
+                          "Reload"
+                        ) : (
+                          "Load"
+                        )}
+                      </button>
+                    )}
                   </div>
                 );
               })}

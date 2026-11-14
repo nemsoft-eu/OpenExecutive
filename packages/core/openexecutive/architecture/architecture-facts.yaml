@@ -11712,7 +11712,16 @@ clients:
     overrides, contact notes, telegram_chats and the rest. A blank client
     switch from the user's own company takes the same YAML snapshot, so
     exiting client mode restores the same subset (the owner's Safety level
-    included: it returns as Balanced).
+    included: it returns as Balanced). People come back under NEW ids, and
+    did before the registry too: _dump_people writes no ids, _seed_people
+    deletes and re-inserts, and people.id is AUTOINCREMENT with nothing
+    resetting sqlite_sequence (tests/unit/test_fixture_cycle_person_ids.py).
+    So person-keyed state could not survive the round trip even if kept.
+    The UI says this plainly: the Company Simulator and /clients pages name
+    what comes back and what comes back empty (lib/companySwap.ts,
+    returnNote), and loading a fixture while no fixture is active asks for a
+    typed LOAD first, like Reset everything's typed RESET; a load over
+    another fixture does not ask.
     Wipe lists must cover the DERIVED CACHES, not just authored state.
     briefing_narrative and person_insights were wiped by NO path, and because
     /today serves the cached narrative unconditionally (regenerating only in a
