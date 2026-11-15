@@ -27,6 +27,9 @@ _HASH_RE = re.compile(r"[0-9a-f]{64}")
 # would let a caller make the API hash megabytes per request
 _MAX_TOKEN_CHARS = 256
 TOKEN_BYTES = 32
+# the last malformed value already logged: configured() runs on every request,
+# before any auth, so logging each time would let anyone flood the log
+_logged_bad_raw: str | None = None
 
 
 class SourcesError(ValueError):
@@ -71,14 +74,21 @@ def parse_sources(raw: str) -> dict[str, str]:
 
 
 def configured() -> dict[str, str]:
-    """The configured sources; empty, with an error logged, when the setting
-    can't be read (fail closed: no token is accepted)."""
+    """The configured sources; empty, with an error logged once until the
+    value changes, when the setting can't be read (fail closed: no token is
+    accepted)."""
+    global _logged_bad_raw
     from openexecutive.config import get_settings
 
+    raw = get_settings().progress_sources
     try:
-        return parse_sources(get_settings().progress_sources)
+        return parse_sources(raw)
     except SourcesError as exc:
-        logger.error("%s can't be used, progress updates are off: %s", ENV, exc)
+        # the line carries the error only, never the raw value: it holds
+        # token hashes
+        if raw != _logged_bad_raw:
+            _logged_bad_raw = raw
+            logger.error("%s can't be used, progress updates are off: %s", ENV, exc)
         return {}
 
 

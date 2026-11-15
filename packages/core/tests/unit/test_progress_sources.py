@@ -15,6 +15,8 @@ DIGEST = hashlib.sha256(TOKEN.encode()).hexdigest()
 @pytest.fixture(autouse=True)
 def no_sources(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ps.ENV, raising=False)
+    # forget the logged malformed value so test order can't hide a log line
+    monkeypatch.setattr(ps, "_logged_bad_raw", None)
 
 
 def test_parse_reads_each_entry() -> None:
@@ -78,6 +80,35 @@ def test_a_malformed_setting_fails_closed(monkeypatch: pytest.MonkeyPatch, caplo
     finally:
         ps.logger.removeHandler(caplog.handler)
     assert "PROGRESS_SOURCES can't be used" in caplog.text
+
+
+def test_a_malformed_setting_is_logged_once_per_value(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the route and the MCP tool call this before any auth, so a repeated
+    # request must not repeat the log line. propagate is off as the app's
+    # logging config sets it, so the root capture can't count a record twice
+    monkeypatch.setattr(ps.logger, "propagate", False)
+    ps.logger.addHandler(caplog.handler)
+    try:
+        monkeypatch.setenv(ps.ENV, f"marketing-planner:{DIGEST},broken")
+        for _ in range(3):
+            assert ps.enabled() is False
+            assert ps.source_for(TOKEN) is None
+        assert len(caplog.records) == 1
+        assert DIGEST not in caplog.text
+
+        monkeypatch.setenv(ps.ENV, "still-broken")
+        assert ps.enabled() is False
+        assert ps.enabled() is False
+        assert len(caplog.records) == 2
+
+        monkeypatch.setenv(ps.ENV, f"marketing-planner:{DIGEST}")
+        assert ps.enabled() is True
+        assert ps.source_for(TOKEN) == "marketing-planner"
+        assert len(caplog.records) == 2
+    finally:
+        ps.logger.removeHandler(caplog.handler)
 
 
 def test_every_entry_is_compared_in_constant_time(monkeypatch: pytest.MonkeyPatch) -> None:
