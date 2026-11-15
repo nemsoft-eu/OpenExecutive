@@ -85,6 +85,7 @@ These bypass the shared-secret check because they're hit by external services th
 - `/health` — the platform's health checker
 - `/webhook/telegram` — verifies Telegram's own secret token
 - `/webhook/google-chat` — verifies the GCP project's signed JWT
+- `/progress-updates` — admits only a configured source's `x-source-token` (see [Source tokens](#source-tokens-agents-posting-progress-updates)); under local login it still answers only on a loopback host
 - `OPTIONS *` — CORS preflight (no auth headers possible)
 
 See [`_UNAUTHENTICATED_PATHS`](../packages/core/openexecutive/api/main.py) — any new webhook from an external service must be added here.
@@ -527,6 +528,67 @@ own page). Every host origin you list is
 trusted that far: list only apps whose administrators you would trust with it, and read every change
 to the host list, the `host` surface's tools and these policies with a security review.
 
+### Source tokens (agents posting progress updates)
+
+Other agents and services working for the founders (for example a marketing planning
+session) can post short progress updates, which Open Executive stores and sends to the
+founders' chat apps. Each such **source** has a token of its own. The feature is off until
+`PROGRESS_SOURCES` names a source.
+
+**Create** a token for one source:
+
+```bash
+uv run python scripts/make-source-token.py marketing-planner
+```
+
+It prints two lines. The token goes to that source only, once: keep it as secret as
+`BACKEND_SHARED_SECRET`, because it is not printed again and can't be recovered from its
+hash. The `PROGRESS_SOURCES=<source id>:<sha256>` entry goes on the **API**; several sources
+are comma-separated. Restart the API after a change. The API holds only the hashes, so its
+environment leaking doesn't let anyone post as a source. A malformed `PROGRESS_SOURCES` turns
+the feature off and logs one error; it never falls back to accepting tokens.
+
+**Rotate** a source by making a new token for the same id and replacing its entry. **Revoke**
+it by dropping the entry. Either takes effect when the API restarts.
+
+**What a token can do.** Post progress updates under its own source, up to
+`PROGRESS_MAX_PER_SOURCE_PER_DAY` a day. The source an update is filed under comes from the
+token, never from the update. Each update goes to every active principal as a chat-app
+message, quoted as received under a header that names the source. A principal it doesn't
+reach (quiet hours, In my briefs, the anti-spam guard, no chat app), or every principal once
+the source is over its relay cap, gets it in their next brief instead. Principals also see
+the latest updates when they ask in chat.
+
+**What it can't do.** On its own a token reads nothing, can't act as a person or the owner,
+reaches no one but the principals, and can't post as another source. A relay never goes by
+email directly, though a held message released later can, as any held message can. An update
+is never recorded as anyone's words.
+
+**Which path needs what:**
+
+| Path | Headers | Notes |
+|---|---|---|
+| `POST /progress-updates` | `x-source-token` | Exempt from the shared-secret check. The least-privilege path: the source holds nothing else. |
+| MCP tool `post_progress_update` on `/mcp` | `x-api-key` (when `BACKEND_SHARED_SECRET` is set) **and** `x-source-token` | `/mcp` sits behind the shared-secret check, so a source using MCP also holds the shared secret, which opens the whole API (as a service, never the owner, with signed callers on). Give it MCP only if you would trust it with that; otherwise give it the REST route. |
+
+The route answers `404` while the feature is off and `401` for a missing or unknown token;
+the MCP tool gives one fixed refusal whatever failed.
+
+```bash
+curl -X POST https://api.example.com/progress-updates \
+  -H "x-source-token: $SOURCE_TOKEN" -H "content-type: application/json" \
+  -d '{"topic": "Launch plan", "status": "on_track", "summary": "First draft is ready for review."}'
+```
+
+**What the content check does not catch.** An update is checked before anything is stored
+or sent, and rejected with the field and the reason when it holds an email address, a phone
+number, an IBAN, something shaped like a credential, `<` or `>`, a control or invisible
+character, or a URL outside the `link` field (whose host must be in `PROGRESS_LINK_HOSTS`).
+It **accepts** amounts and prices: keeping an unpublished price out is up to the source, and
+the tool description says so. It also can't catch people's names, health or HR detail,
+indirect identifiers, or anything paraphrased. Give every source the same contract: write
+for the founders, in plain text, nothing you wouldn't put in a team chat.
+
 ---
 
 ## Operations
@@ -596,6 +658,7 @@ If `AUTH_GOOGLE_SECRET` is leaked, regenerate in Google Cloud Console (Clients �
 | Every UI call fails with `caller signing is misconfigured` | `CALLER_ASSERTION_PRIVATE_KEY` on the UI isn't `<key id>:<key>` as `scripts/make-caller-keys.py` prints it |
 | API refuses to start with `CALLER_ASSERTION_PUBLIC_KEYS can't be used` | The list is malformed. Paste the line the script printed |
 | An owner-only route refuses your `curl` | With signed callers on, a request carrying only `x-api-key` is a service and never the owner. Sign it with `scripts/mint-caller-assertion.py` |
+| `POST /progress-updates` answers `404` | `PROGRESS_SOURCES` is empty or malformed. The API log says which, once per value |
 | Sign-in works but the chat stays empty | Backend is auth'd but `ANTHROPIC_API_KEY` is missing on the API. Its logs will show the error |
 | Signed in, but no past chats are listed | Your email isn't on your own People entry, so the API can't tell who you are. Setup saves it from the **Your sign-in email** field; to fix it afterwards, add the email to your row on the People page |
 | **Open** says it only works on this computer | You opened the app by a network address. Use `http://localhost:3000` in a browser on the machine running `make dev` |
@@ -635,6 +698,7 @@ curl -sv -H "x-api-key: $SHARED" https://api.example.com/sessions           # 20
 **Does not mitigate:**
 - A compromised `BACKEND_SHARED_SECRET` — anyone who learns it can hit the API as if they were the UI. Rotate if leaked. With signed callers on, they can use it only as a service, never as a signed-in user or the owner.
 - A compromised `CALLER_ASSERTION_PRIVATE_KEY` — whoever holds it can sign as anyone. It lives only on the UI; rotate it (above) if the UI's environment leaks.
+- A compromised source token — whoever holds it can post progress updates under that source, up to its caps, to every principal. Revoke it by dropping its `PROGRESS_SOURCES` entry and restarting the API.
 - A compromised Google account on the allow-list — that user has full access to all shared data. The product is currently a **shared workspace**; there is no per-user data isolation.
 - A compromised deploy credential — attacker can change secrets, redeploy, or read logs. Rotate deploy credentials if a CI workflow is compromised.
 - Browser-side XSS — Auth.js sessions are httpOnly cookies, so JS can't read them, but a successful XSS could make authenticated requests from the victim's browser. Standard same-origin protections apply.
