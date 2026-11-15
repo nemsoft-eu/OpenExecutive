@@ -379,6 +379,25 @@ def render_and_trust(
         drafts_block = _waiting_drafts_block()
         if drafts_block:
             block = f"{block}\n\n{drafts_block}" if block else drafts_block
+    # what the company's own agents reported is the principals' to read, as
+    # the relay sends it to every one of them: never a teammate's or a shared
+    # chat's turn. it is per-turn content, so it rides here in the user turn
+    # and never in a cached system block. the store reads the episodic db
+    # and opening it would create the file, so a missing db shows nothing,
+    # as in _waiting_drafts_block.
+    if verified:
+        try:
+            from openexecutive.integrations import progress_updates
+            from openexecutive.memory import episodic
+
+            progress_block = (
+                progress_updates.for_chat() if episodic._resolve_db_path(None).exists() else ""
+            )
+        except Exception:
+            logger.exception("briefing_context.progress_updates_failed")
+            progress_block = ""
+        if progress_block:
+            block = f"{block}\n\n{progress_block}" if block else progress_block
     return block
 
 
