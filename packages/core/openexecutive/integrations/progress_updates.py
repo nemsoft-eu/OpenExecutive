@@ -21,9 +21,10 @@ person keeps at most ``held_messages.MAX_HELD_PER_PERSON`` open rows.
 The relay text is a fixed template. Its first line is written by the server
 and names the update id, so the guard's dedup prefix differs per update;
 every line the agent wrote follows behind ``> ``, split on every line
-break a chat client may draw (U+2028 and U+2029 too, which the guard lets
-through). The guard rejects ``<``, ``>``, control characters and URLs in
-free text, so no agent line can pass for that header.
+break a chat client may draw (U+2028 and U+2029 too, as a second line of
+defence: the guard already rejects them). The guard rejects ``<``, ``>``,
+control characters, line and paragraph separators and URLs in free text,
+so no agent line can pass for that header.
 
 Each send runs sessionless (``set_session(None)``), so no reply linkage or
 attunement outcome is written and the relay is never auto-muted, and inside
