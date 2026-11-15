@@ -48,6 +48,7 @@ from openexecutive.api.routes import (
     onboarding,
     people,
     personas,
+    progress_updates,
     python_jobs,
     reflection,
     review,
@@ -171,9 +172,12 @@ _configure_logging()
 # Paths that bypass the shared-secret gate. /health is hit by the platform's
 # health checker;
 # the /webhook/* routes are called by external services (Google, Telegram) and
-# carry their own verification.
+# carry their own verification. /progress-updates does too: it admits only a
+# configured source's x-source-token, so a source never holds the shared
+# secret. It is deliberately not in _webhook_verifies_its_caller: under local
+# login it is still only reachable at a loopback Host.
 _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
-    {"/health", "/webhook/telegram", "/webhook/google-chat", "/webhook/slack"}
+    {"/health", "/webhook/telegram", "/webhook/google-chat", "/webhook/slack", "/progress-updates"}
 )
 
 
@@ -1030,6 +1034,7 @@ def create_app() -> FastAPI:
     app.include_router(google_chat_router, tags=["google-chat"])
     app.include_router(telegram_router, tags=["telegram"])
     app.include_router(slack_events_router, tags=["slack"])
+    app.include_router(progress_updates.router, tags=["progress-updates"])
     app.include_router(architecture.router, tags=["architecture"])
     app.include_router(guide.router, tags=["guide"])
     app.include_router(health.router, tags=["health"])
