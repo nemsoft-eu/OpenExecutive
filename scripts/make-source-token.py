@@ -25,7 +25,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "packages" / "core"))
 
 from openexecutive.integrations.progress_sources import (  # noqa: E402
-    SOURCE_ID_RE,
+    SourcesError,
     make_token,
 )
 
@@ -37,10 +37,11 @@ def main() -> int:
         help="the source id: 2-40 of a-z, 0-9 and -, starting with a letter or digit",
     )
     args = parser.parse_args()
-    if not SOURCE_ID_RE.fullmatch(args.source):
-        print("the source id must be 2-40 of a-z, 0-9 and -, starting with a letter or digit", file=sys.stderr)
+    try:
+        token, entry = make_token(args.source)
+    except SourcesError as exc:
+        print(exc, file=sys.stderr)
         return 2
-    token, entry = make_token(args.source)
     print(f"# The source ({args.source}) only, sent as the x-source-token header. Secret:")
     print(token)
     print("# The API only; add it to PROGRESS_SOURCES (comma-separated):")

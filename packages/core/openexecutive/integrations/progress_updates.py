@@ -40,11 +40,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from openexecutive.attunement.outcomes import SOURCE_PROGRESS_UPDATE
@@ -92,33 +90,16 @@ class Paused(Exception):
     was stored or sent. The surfaces answer as if it were not configured."""
 
 
-def _sentinel_present(path: Path) -> bool:
-    # existence, not the parsed value: the slot and fixture readers return
-    # None for an unreadable or garbage sentinel, which here would let an
-    # update into the wrong company. Anything but "not there" counts as there.
-    try:
-        os.stat(path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
 def _other_company_live() -> bool:
     """Whether a client slot or demo fixture holds the live data. Sources are
     process-wide, so an update would otherwise land in, and be sent to the
     founders of, whichever company is live (as Act as me, off while a slot
     is active). A failed check counts as live."""
     try:
-        from openexecutive.cli.fixture_loader import _fixture_active_sentinel
-        from openexecutive.clients.slots import _active_client_sentinel
+        from openexecutive.clients.slots import other_company_live
         from openexecutive.config import get_settings
 
-        settings = get_settings()
-        return _sentinel_present(_active_client_sentinel(settings)) or _sentinel_present(
-            _fixture_active_sentinel(settings)
-        )
+        return other_company_live(get_settings())
     except Exception as exc:
         # no traceback: this runs before the token check, on every request
         logger.warning("progress_updates: client-slot check failed (%s); refusing", type(exc).__name__)
@@ -212,9 +193,9 @@ def _audit_ingest(source: str, update_id: int | None, status: str, outcome: str)
         logger.warning("progress_updates: couldn't audit an update from %s", source, exc_info=True)
 
 
-def _hold(person_id: int, text: str, update_id: int, ref: str) -> bool:
-    """Keep ``text`` for ``person_id``'s next brief under ``ref``. False,
-    logged, when it couldn't be stored: the update itself stays stored and
+def _hold(person_id: int, text: str, update_id: int, ref: str) -> None:
+    """Keep ``text`` for ``person_id``'s next brief under ``ref``. Logs and
+    returns when it couldn't be stored: the update itself stays stored and
     visible in chat."""
     from openexecutive.people.held_messages import hold
 
@@ -222,8 +203,6 @@ def _hold(person_id: int, text: str, update_id: int, ref: str) -> bool:
         hold(person_id, text, source=SOURCE_PROGRESS_UPDATE, release_at=None, ref=ref)
     except Exception:
         logger.exception("progress_updates: couldn't hold update #%s for person %s", update_id, person_id)
-        return False
-    return True
 
 
 async def _send(person: Person, text: str, source: str, update_id: int) -> tuple[bool, bool]:
@@ -342,13 +321,12 @@ async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: b
             ok, held = await _send(live, text, source, update_id)
             if ok and not held:
                 delivered += 1
-            elif ok:
-                # check_hold already stored it for their quiet hours or brief
-                queued = True
-            else:
-                queued = True
-                if not await _locked(partial(hold_now, live.id, text, _ref(update_id))):
-                    return
+                continue
+            queued = True
+            # held by check_hold for their quiet hours or brief already, or
+            # not sent at all: then it waits for their brief
+            if not ok and not await _locked(partial(hold_now, live.id, text, _ref(update_id))):
+                return
         if not delivered and not queued:
             logger.warning("progress_updates: nobody left to relay #%s to", update_id)
         state = "sent" if delivered and not queued else "queued"

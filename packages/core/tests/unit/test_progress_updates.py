@@ -480,14 +480,16 @@ def test_a_live_slot_or_fixture_refuses_and_stores_nothing(
 def test_an_unreadable_sentinel_counts_as_live(
     db: Path, founders: list[int], deliver: Any, live: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_stat = pu.os.stat
+    from openexecutive.clients import slots
+
+    real_stat = slots.os.stat
 
     def stat(path: Any, *a: Any, **k: Any) -> Any:
         if Path(path) == live["client"]:
             raise PermissionError("denied")
         return real_stat(path, *a, **k)
 
-    monkeypatch.setattr(pu.os, "stat", stat)
+    monkeypatch.setattr(slots.os, "stat", stat)
     calls = deliver(None)
     with pytest.raises(pu.Paused):
         submit(payload())

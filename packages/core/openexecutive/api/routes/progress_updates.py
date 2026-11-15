@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 PATH = "/progress-updates"
-TOKEN_HEADER = "x-source-token"
+TOKEN_HEADER = progress_sources.TOKEN_HEADER
 MAX_BODY_BYTES = 8 * 1024
 
 

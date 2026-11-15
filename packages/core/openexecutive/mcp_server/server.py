@@ -91,6 +91,7 @@ from pydantic import Field
 
 from openexecutive.api import caller as api_caller
 from openexecutive.integrations.progress_guard import STATUSES
+from openexecutive.integrations.progress_sources import TOKEN_HEADER as SOURCE_TOKEN_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -615,7 +616,6 @@ async def ask_executive(message: str) -> str:
 # The source is whoever the ``x-source-token`` header belongs to, never an
 # argument, so the token stays out of model context and tool-call logs.
 # ---------------------------------------------------------------------------
-SOURCE_TOKEN_HEADER = "x-source-token"
 # one message for every refusal, so it says nothing about which check failed
 PROGRESS_REFUSED = "This server does not accept progress updates from this caller."
 PROGRESS_UNAVAILABLE = "Progress updates can't be stored right now; nothing was stored or sent. Try again later."

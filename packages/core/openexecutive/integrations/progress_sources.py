@@ -19,6 +19,8 @@ import secrets
 logger = logging.getLogger(__name__)
 
 ENV = "PROGRESS_SOURCES"
+# the header a source sends its token in, on the HTTP route and on /mcp
+TOKEN_HEADER = "x-source-token"
 # a source id is part of every relay's header line and of the audit actor,
 # so it stays short, lowercase and free of anything a line could hide behind
 SOURCE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,39}")
