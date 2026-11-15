@@ -53,6 +53,9 @@ SOURCE_RESEARCH = "research"
 SOURCE_ALERT_REVIEW = "alert_review"
 SOURCE_TASK_ASSIGNED = "task_assigned"
 SOURCE_RIGHT_NOW = "right_now"
+# another agent's progress update relayed to the founders
+# (integrations.progress_updates); sent with no session, so never auto-muted
+SOURCE_PROGRESS_UPDATE = "progress_update"
 
 SOURCE_LABELS: dict[str, str] = {
     SOURCE_NUDGE_STALLED: "approval nudges",
@@ -65,6 +68,7 @@ SOURCE_LABELS: dict[str, str] = {
     SOURCE_ALERT_REVIEW: "alert-review DMs",
     SOURCE_TASK_ASSIGNED: "task notices",
     SOURCE_RIGHT_NOW: "Right now pings",
+    SOURCE_PROGRESS_UPDATE: "progress relays",
 }
 
 OUTCOME_REPLIED = "replied"
