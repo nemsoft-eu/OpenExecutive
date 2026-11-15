@@ -1120,7 +1120,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "web_search_allowed_domains", "web_search_blocked_domains",
-        "research_specialists", "workflow_file_dirs", mode="before",
+        "research_specialists", "workflow_file_dirs", "progress_link_hosts", mode="before",
     )
     @classmethod
     def _parse_domain_list(cls, v: Any) -> list[str]:
@@ -1197,6 +1197,29 @@ class Settings(BaseSettings):
     outbound_rate_window_minutes: int = Field(60, alias="OUTBOUND_RATE_WINDOW_MINUTES")
     outbound_dedup_window_minutes: int = Field(360, alias="OUTBOUND_DEDUP_WINDOW_MINUTES")
     outbound_respect_quiet_hours: bool = Field(True, alias="OUTBOUND_RESPECT_QUIET_HOURS")
+
+    # Progress updates posted by other agents and services
+    # (integrations/progress_*.py). PROGRESS_SOURCES is
+    # `source-id:sha256-hex[,…]`, as scripts/make-source-token.py prints it;
+    # empty keeps the feature off. The caps count per source over a rolling
+    # window: accepted updates per day, and relays (a DM to each founder) per
+    # hour and per day, so one source cannot spend the founders' whole
+    # outbound-guard budget. An update over the relay cap is still stored and
+    # waits for the founders' next brief. PROGRESS_LINK_HOSTS lists the exact
+    # hosts an update's https link may point at; empty refuses every link.
+    progress_sources: str = Field("", alias="PROGRESS_SOURCES")
+    progress_max_per_source_per_day: int = Field(
+        30, ge=0, alias="PROGRESS_MAX_PER_SOURCE_PER_DAY"
+    )
+    progress_relay_max_per_source_per_hour: int = Field(
+        2, ge=0, alias="PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR"
+    )
+    progress_relay_max_per_source_per_day: int = Field(
+        8, ge=0, alias="PROGRESS_RELAY_MAX_PER_SOURCE_PER_DAY"
+    )
+    progress_link_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="PROGRESS_LINK_HOSTS"
+    )
 
     # Overnight client rotation (multi-client practice mode) — during a quiet
     # window, activate each parked client slot in turn, generate its morning
