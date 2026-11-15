@@ -304,7 +304,10 @@ def test_call_tool_defaults_empty_arguments(tmp_path: Path) -> None:
     assert called_args[1]["arguments"] == {}
 
 
-def test_load_mcp_server_passes_name_and_url(tmp_path: Path) -> None:
+def test_load_mcp_server_sends_the_pinned_servers_argument_names(tmp_path: Path) -> None:
+    # The model-facing schema says `name`; the pinned extensible-mcp tool takes
+    # `server_name`, so the label is renamed on the wire (as call_tool does for
+    # `tool_name`). Sent as `name` it fails the server's argument validation.
     session = _make_mock_session()
     session.call_tool.return_value = _make_text_result('{"ok": true}')
     config = tmp_path / "mcp_servers.json"
@@ -318,7 +321,7 @@ def test_load_mcp_server_passes_name_and_url(tmp_path: Path) -> None:
 
     result = asyncio.run(_run())
     session.call_tool.assert_awaited_with(
-        "load_mcp_server", {"name": "hubspot", "url": "https://mcp.hubspot.com"}
+        "load_mcp_server", {"server_name": "hubspot", "url": "https://mcp.hubspot.com"}
     )
     assert json.loads(result)["ok"] is True
 

@@ -4546,7 +4546,7 @@ class MCPGateway:
         result = await _session_call(
             session,
             "load_mcp_server",
-            {"name": tool_input["name"], "url": url},
+            {"server_name": tool_input["name"], "url": url},
             self._call_timeout(),
         )
         return result.content[0].text if result.content else json.dumps({"ok": True})
