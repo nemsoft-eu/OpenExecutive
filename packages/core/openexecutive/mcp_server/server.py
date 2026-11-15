@@ -696,7 +696,9 @@ async def post_progress_update(
         status: on_track, at_risk, blocked, done or info.
         summary: What happened, 10-800 characters, at most 8 lines.
         ask: What you need from the founders, one line, up to 300 characters.
-        link: An https link on an allowed host, for the details.
+        link: An https link on an allowed host, for the details: up to 300
+            characters, no %-encoding or #fragment, and query parameters
+            only from id, resourcekey, usp, tab, gid, v and node-id.
         idempotency_key: Your own retry key (8-64 of A-Z, a-z, 0-9, _ and -):
             posting the same key again returns the first update.
     """

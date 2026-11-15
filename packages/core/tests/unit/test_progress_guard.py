@@ -230,16 +230,25 @@ def test_an_oversized_field_is_refused_before_the_patterns_scan_it() -> None:
         ("https://docs.google.com/<x>", "must be a single URL"),
         ("https://docs.google.com:99999/doc", "is not a valid URL"),
         ("https://docs.google.com/" + "a" * 300, "must be at most 300 characters"),
-        # the free-text checks for secrets and personal data apply to the link
+        # what follows the host is allowed by construction, not scanned
+        ("https://docs.google.com/doc/ada%40example.com", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/doc?access%5Ftoken=x", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/dоc", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/doc#heading=h.abc123", "must not carry a fragment (#...)"),
+        ("https://docs.google.com/doc#", "must not carry a fragment (#...)"),
         (
             "https://docs.google.com/doc?access_token=ghp_abcdefghijklmnopqrstuvwxyz0123",
-            "contains something shaped like a credential",
+            "carries a query parameter that is not allowed; link to the page itself",
         ),
+        ("https://docs.google.com/doc?id=a+b", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?id=a;sig=x", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?id=", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?usp=sharing&x=1", "carries a query parameter that is not allowed; link to the page itself"),
+        # the free-text checks for secrets and personal data still cover the path
         ("https://docs.google.com/doc/sk-ant-abcdefghijklmnopqrst", "contains something shaped like a credential"),
-        ("https://docs.google.com/doc?t=AbCdEfGhIjKlMnOpQrStUvWx12", "contains something shaped like a credential"),
-        ("https://docs.google.com/doc#AbCdEfGhIjKlMnOpQrStUvWx12", "contains something shaped like a credential"),
-        ("https://docs.google.com/doc?to=ada@example.com", "contains an email address"),
-        ("https://docs.google.com/doc?call=+32470123456", "contains a phone number"),
+        ("https://docs.google.com/u/ada@example.com", "contains an email address"),
+        ("https://docs.google.com/call/+32470123456", "contains a phone number"),
     ],
 )
 def test_link_rules(link: str, reason: str) -> None:
@@ -252,7 +261,8 @@ def test_link_rules(link: str, reason: str) -> None:
     [
         # a document id in the path has a token's shape and is allowed
         "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?usp=sharing",
-        "https://docs.google.com/doc/2026/11/15/pull/1234567#heading=h.abc123",
+        "https://docs.google.com/open?id=1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789&resourcekey=0-AbC_d.e",
+        "https://docs.google.com/doc/2026/11/15/pull/1234567",
     ],
 )
 def test_ordinary_links_pass_the_sensitive_checks(link: str) -> None:

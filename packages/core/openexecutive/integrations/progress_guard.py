@@ -47,6 +47,11 @@ ASK_MAX = 300
 # the link rides in the chat block too, so one long URL must not crowd out
 # the other updates there
 LINK_MAX = 300
+# the query parameters a link may carry, each with a plain value: a Drive file
+# id and its resource key, Docs' usp and tab, a Sheets gid, a video's v and a
+# Figma node-id. Anything else in a query is refused, not inspected
+LINK_QUERY_NAMES = frozenset({"id", "resourcekey", "usp", "tab", "gid", "v", "node-id"})
+LINK_QUERY_VALUE_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 
 FIELDS = ("topic", "status", "summary", "ask", "link", "idempotency_key")
 
@@ -279,15 +284,24 @@ def _link(payload: Mapping[str, Any], allowed_hosts: list[str]) -> str | None:
     host = (parts.hostname or "").lower()
     if not host or host not in {h.strip().lower() for h in allowed_hosts}:
         raise Rejected("link", "points at a host that is not allowed")
-    # an allowed host does not make the rest of the URL safe to relay: a token
-    # in the query is as much a secret as one in the summary
+    # an allowed host does not make the rest of the URL safe to relay, so the
+    # rest is allowed by construction rather than scanned for what is bad: no
+    # encoding (so every check below sees the literal text), no fragment, and
+    # only named, plain query parameters. A secret-shaped value in the path or
+    # under an allowed name still passes, as a token-shaped path segment does
+    if "%" in link or not link.isascii():
+        raise Rejected("link", "must not contain percent-encoded or non-ASCII characters")
+    if "#" in link:
+        raise Rejected("link", "must not carry a fragment (#...)")
+    if "?" in link:
+        # split by hand: parse_qsl would also decode "+" and treat ";" its own way
+        for pair in parts.query.split("&"):
+            name, _, value = pair.partition("=")
+            if name not in LINK_QUERY_NAMES or not LINK_QUERY_VALUE_RE.fullmatch(value):
+                raise Rejected("link", "carries a query parameter that is not allowed; link to the page itself")
     for found, reason in _SENSITIVE:
         if found(link):
             raise Rejected("link", reason)
-    # an opaque token only in the query or fragment: a document id in the
-    # path (Google Docs, Drive) has the same shape and is what a link is for
-    if OPAQUE_TOKEN_RE.search(parts.query) or OPAQUE_TOKEN_RE.search(parts.fragment):
-        raise Rejected("link", _CREDENTIAL_REASON)
     return link
 
 

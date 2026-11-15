@@ -602,9 +602,10 @@ curl -X POST https://api.example.com/progress-updates \
 or sent, and rejected with the field and the reason when it holds an email address, a phone
 number, an IBAN, something shaped like a credential, `<` or `>`, a control or invisible
 character, or a URL outside the `link` field. The link itself must be at most 300 characters,
-on a host in `PROGRESS_LINK_HOSTS`, and free of the same email, phone, IBAN and credential
-shapes; a token-shaped value is refused in its query or fragment, but not in its path, where a
-document id looks the same.
+on a host in `PROGRESS_LINK_HOSTS`, with no percent-encoding, non-ASCII character or fragment,
+and query parameters only from `id`, `resourcekey`, `usp`, `tab`, `gid`, `v` and `node-id`, each
+with a plain value; the email, phone, IBAN and credential checks run on it too. A token-shaped
+value in the path or under an allowed parameter still passes, as a document id looks the same.
 It **accepts** amounts and prices: keeping an unpublished price out is up to the source, and
 the tool description says so. It also can't catch people's names, health or HR detail,
 indirect identifiers, or anything paraphrased. Give every source the same contract: write

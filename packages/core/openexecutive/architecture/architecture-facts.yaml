@@ -5494,8 +5494,10 @@ people:
     delivery, else the claim is freed. Postponed if quiet again, or to the
     leave end / next availability window when the guard would refuse them;
     any other failed delivery backs off 2, 4, 8 … min, capped at an hour.
-    Dropped after 7 days or when the person is archived, and the oldest past
-    the cap — each drop audited `held_messages_dropped`, private to the
+    Dropped after 7 days or when the person is archived, rows of a
+    PRINCIPAL_ONLY_SOURCES source (progress_update) when the person is no
+    longer a principal at release, and the oldest past the cap — each drop
+    audited `held_messages_dropped`, private to the
     person, a count and reason only. Digest rows (release_at null) ride the
     principal's next morning brief / EoD digest as one block appended to the
     delivered text (not the stored run artifact), marked sent only when the
@@ -11052,9 +11054,14 @@ integrations:
         on_track|at_risk|blocked|done|info, summary 10-800 and <= 8 lines,
         ask <= 300 one line, link https <= 300 with its host exactly in
         PROGRESS_LINK_HOSTS (empty refuses every link; no userinfo or port)
-        and run through the email/phone/IBAN/credential checks
-        (progress_guard._SENSITIVE); OPAQUE_TOKEN_RE only on its query and
-        fragment, since a Docs/Drive id in the path has a token's shape,
+        and, after the host, ALLOWED BY CONSTRUCTION rather than scanned
+        (three deny-list review rounds kept finding bypasses: encoded
+        secrets, then Drive ?id= links refused): no `%` or non-ASCII (so
+        every check sees literal text), no fragment, query parameters only
+        from LINK_QUERY_NAMES with values [A-Za-z0-9_.-]{1,80}, split by
+        hand (parse_qsl decodes "+"); then the email/phone/IBAN/credential
+        checks (progress_guard._SENSITIVE). A token-shaped value in the path
+        or under an allowed name passes (a Docs/Drive id has that shape),
         idempotency_key [A-Za-z0-9_-]{8,64}. AMOUNTS ARE ACCEPTED by
         decision: unpublished prices are kept out only by the content
         contract (the tool description and docs/auth.md). The guard cannot

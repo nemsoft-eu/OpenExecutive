@@ -232,6 +232,29 @@ def test_only_the_stale_rows_are_dropped(ids: dict[str, int], sent: list[tuple[i
     assert held.held_count(pid) == 0
 
 
+def test_a_progress_update_held_for_a_demoted_founder_is_dropped(
+    ids: dict[str, int], sent: list[tuple[int, str]]
+) -> None:
+    # held while they were a principal; a teammate by the time it is due
+    pid = ids["teammate"]
+    held.hold(pid, "Progress update #1", source=held.SOURCE_PROGRESS_UPDATE, release_at=NOW, now=NOW)
+    held.hold(pid, "Fresh", source="alert_review", release_at=NOW, now=NOW)
+    assert asyncio.run(held.release_due(NOW)) == 1
+    [(_, text)] = sent
+    assert "Fresh" in text and "Progress update" not in text
+    assert held.held_count(pid) == 0
+
+
+def test_a_progress_update_held_for_a_principal_is_released(
+    ids: dict[str, int], sent: list[tuple[int, str]]
+) -> None:
+    pid = ids["principal"]
+    held.hold(pid, "Progress update #1", source=held.SOURCE_PROGRESS_UPDATE, release_at=NOW, now=NOW)
+    assert asyncio.run(held.release_due(NOW)) == 1
+    [(to, text)] = sent
+    assert to == pid and "Progress update #1" in text
+
+
 def test_a_failing_backoff_does_not_stop_the_pass(
     ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:

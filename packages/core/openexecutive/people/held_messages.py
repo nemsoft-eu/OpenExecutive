@@ -41,6 +41,8 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from openexecutive.attunement.outcomes import SOURCE_PROGRESS_UPDATE
+
 if TYPE_CHECKING:
     from openexecutive.people.models import Person
 
@@ -60,6 +62,9 @@ CLAIM_TTL = timedelta(minutes=10)
 _MARK_SENT_TRIES = 3
 MAX_BACKOFF = timedelta(hours=1)
 HEADING = "While you were away"
+# held-row sources only a principal may read: a release to someone who is no
+# longer one drops them (relayed progress updates go to founders only)
+PRINCIPAL_ONLY_SOURCES = frozenset({SOURCE_PROGRESS_UPDATE})
 
 _last_release_at: datetime | None = None
 _task: asyncio.Task[int] | None = None
@@ -516,6 +521,17 @@ async def release_due(now: datetime, *, db_path: Path | None = None) -> int:
                 _drop(ids, now, db_path)
                 _audit_dropped(person_id, len(ids), "no longer on the People list")
                 continue
+            if not person.is_principal:
+                # held for a founder who has since become a teammate: what
+                # only principals may read goes no further
+                founders_only = [m.id for m in messages if m.source in PRINCIPAL_ONLY_SOURCES]
+                if founders_only:
+                    _drop(founders_only, now, db_path)
+                    _audit_dropped(person_id, len(founders_only), "no longer a principal")
+                    messages = [m for m in messages if m.id not in set(founders_only)]
+                    ids = [m.id for m in messages]
+                    if not messages:
+                        continue
             # Drop only the rows past the give-up age; newer ones still go.
             stale = [
                 m.id for m in messages
