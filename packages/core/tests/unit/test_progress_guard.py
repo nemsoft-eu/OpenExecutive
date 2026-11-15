@@ -81,6 +81,21 @@ def test_a_newline_in_a_one_line_field_is_rejected() -> None:
     assert rejected(ask="Pick one\nby Friday").reason == "must be one line"
 
 
+@pytest.mark.parametrize("field", ["topic", "summary", "ask"])
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029"])
+def test_unicode_line_separators_are_rejected(field: str, sep: str) -> None:
+    # a chat client may render them as a line break, one the relay never
+    # prefixes with its quote marker
+    err = rejected(**{field: f"Pick one of the{sep}taglines"})
+    assert (err.field, err.reason) == (field, "contains a line or paragraph separator")
+
+
+@pytest.mark.parametrize("sep", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85"])
+def test_other_splitlines_breaks_are_rejected_as_controls(sep: str) -> None:
+    err = rejected(summary=f"Done with the draft.{sep}Second line.")
+    assert (err.field, err.reason) == ("summary", "contains a control or invisible character")
+
+
 def test_a_nine_line_summary_is_rejected_not_collapsed() -> None:
     eight = "\n".join(f"Line {i} of the update." for i in range(8))
     assert check(summary=eight).summary == eight

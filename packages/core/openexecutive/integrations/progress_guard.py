@@ -11,8 +11,9 @@ cleaning cannot hide what the guard must reject:
 1. Any control, format or invisible character (``NFKC(raw) != plain(raw)``).
    A CRLF line break is the one thing turned into ``\\n`` first; it hides
    nothing, while a lone ``\\r`` is still rejected.
-2. Line checks on the raw text: a line break in a one-line field, more than
-   ``SUMMARY_MAX_LINES`` lines in the summary.
+2. Line checks on the raw text: any line break other than ``\\n`` (U+2028
+   and U+2029, which a chat client may render as one), a line break in a
+   one-line field, more than ``SUMMARY_MAX_LINES`` lines in the summary.
 3. The deny patterns, on the NFKC text (a full-width ＜ is a <).
 4. Cleaning (runs of spaces and tabs collapsed, each line trimmed, line breaks
    kept) and then the length limits on the cleaned form.
@@ -103,6 +104,9 @@ URL_RE = re.compile(
 )
 
 _SPACES_RE = re.compile(r"[ \t]+")
+# the line breaks str.splitlines() honours that the control-character check
+# lets through (they are Zl and Zp, not Cc); every other one is a control
+_UNICODE_LINE_BREAK_RE = re.compile("[\u2028\u2029]")
 
 
 class Rejected(ValueError):
@@ -190,6 +194,8 @@ def _free_text(
     # is rejected below as a control character
     raw = raw.replace("\r\n", "\n")
     folded = _visible_only(field, raw)
+    if _UNICODE_LINE_BREAK_RE.search(raw):
+        raise Rejected(field, "contains a line or paragraph separator")
     if one_line and "\n" in raw:
         raise Rejected(field, "must be one line")
     if not one_line and len(raw.strip("\n").split("\n")) > SUMMARY_MAX_LINES:
