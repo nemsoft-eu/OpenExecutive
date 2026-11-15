@@ -287,7 +287,7 @@ separate server process to start: the server is mounted into the FastAPI app at
 `/mcp` over Streamable HTTP, so running the API is running the MCP server.
 
 The endpoint is `http://localhost:8000/mcp`, or `https://<your-host>/mcp` once
-deployed. Authentication is the same shared-secret gate as every other route,
+deployed. Authentication is the same shared-secret gate as the rest of the API,
 so clients send `x-api-key: $BACKEND_SHARED_SECRET`. With that variable unset
 locally the gate is off and the header can be omitted.
 
@@ -319,10 +319,38 @@ claude mcp add --transport http open-executive http://localhost:8000/mcp \
 
 Connected clients get eight read-only resources (company profile, today's
 briefing and activity, people roster, department state, and episodic memory for
-decisions, initiatives and advice) and four tools: `consult_specialist` (domain
+decisions, initiatives and advice) and five tools: `consult_specialist` (domain
 analysis from any of the ten specialists, each grounded in your company's
-knowledge base), `search_knowledge`, `list_workflows` and `ask_executive`. The
-full inventory is on the **MCP Server** section of the `/architecture` page.
+knowledge base), `search_knowledge`, `list_workflows`, `ask_executive` and
+`post_progress_update`. The full inventory is on the **MCP Server** section of
+the `/architecture` page.
+
+`post_progress_update` is for other agents working for you. It stores a short
+progress update and sends it, quoted as received, to the principals' chat apps
+(or to their next brief when a message can't reach them). It needs a source
+token as well as the shared secret; make one with
+`uv run python scripts/make-source-token.py <source-id>` and put the printed
+`PROGRESS_SOURCES` entry on the API:
+
+```json
+{
+  "mcpServers": {
+    "open-executive": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "x-api-key": "YOUR_BACKEND_SHARED_SECRET",
+        "x-source-token": "YOUR_SOURCE_TOKEN"
+      }
+    }
+  }
+}
+```
+
+A source that only posts updates doesn't need the shared secret at all:
+`POST /progress-updates` takes the source token alone. See
+[Source tokens](docs/auth.md#source-tokens-agents-posting-progress-updates) for
+what a token can do, rotation, and what the content check does not catch.
 
 `/mcp` answers as the caller the API verified, by the web app's rules. With no
 `x-caller-email` (open mode) the client is the owner, as the CLI is. A request
@@ -357,9 +385,10 @@ shared secret to say who is asking.
 This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
 under [Configuration](#configuration), which configure the MCP *gateway*: Open
 Executive consuming other servers' tools. The server side needs no configuration
-beyond `BACKEND_SHARED_SECRET`. If a client errors on connect, try `/mcp/` with
-the trailing slash, since the endpoint 307-redirects and not every client
-follows the redirect.
+beyond `BACKEND_SHARED_SECRET`, plus `PROGRESS_SOURCES` for
+`post_progress_update`. If a client errors on connect, try `/mcp/` with the
+trailing slash, since the endpoint 307-redirects and not every client follows
+the redirect.
 
 ## Document Upload
 
@@ -453,6 +482,10 @@ the app refuses to start.
 | `MS365_MCP_ONEDRIVE` | No | `false` | Add the OneDrive tools (and the file permissions they need) to the Microsoft 365 sign-in; run `--login` again after turning it on |
 | `MCP_ENABLED` | No | on when the config file exists | MCP gateway (the Executive using other servers' tools); `false` keeps it off with the file in place |
 | `MCP_SERVERS_CONFIG_PATH` | No | `./company/mcp_servers.json` | MCP gateway server list and tool filters (see [mcp_servers.json.example](packages/core/mcp_servers.json.example)) |
+| `PROGRESS_SOURCES` | No | — | Agents allowed to post progress updates, as `<source id>:<token sha256>` entries from `scripts/make-source-token.py`; empty keeps the feature off, as does a live client slot or demo fixture (see [Source tokens](docs/auth.md#source-tokens-agents-posting-progress-updates)) |
+| `PROGRESS_MAX_PER_SOURCE_PER_DAY` | No | `30` | Progress updates one source may post in a rolling day |
+| `PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR` / `_PER_DAY` | No | `2` / `8` | Updates per source sent to the principals as a DM, per rolling hour and day; the rest are stored but not sent, and each principal's next brief carries one notice per source that more are waiting |
+| `PROGRESS_LINK_HOSTS` | No | — | Comma-separated hosts an update's https link may point at; empty refuses every link |
 | `EMAIL_PROVIDER` | No | `google` | Backend for the inbound mailbox poller + alert email: `google` or `microsoft` |
 | `CALENDAR_PROVIDER` | No | `google` | Backend for the typed calendar booking tools: `google` or `microsoft` |
 | `DELEGATION_GOOGLE_CREDENTIALS_DIR` | No | — | Where the owner's own Gmail credential for Act as me lives (see [docs/deployment.md](docs/deployment.md#your-own-gmail-act-as-me-optional)) |

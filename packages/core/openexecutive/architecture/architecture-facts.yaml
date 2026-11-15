@@ -5494,8 +5494,10 @@ people:
     delivery, else the claim is freed. Postponed if quiet again, or to the
     leave end / next availability window when the guard would refuse them;
     any other failed delivery backs off 2, 4, 8 … min, capped at an hour.
-    Dropped after 7 days or when the person is archived, and the oldest past
-    the cap — each drop audited `held_messages_dropped`, private to the
+    Dropped after 7 days or when the person is archived, rows of a
+    PRINCIPAL_ONLY_SOURCES source (progress_update) when the person is no
+    longer a principal at release, and the oldest past the cap — each drop
+    audited `held_messages_dropped`, private to the
     person, a count and reason only. Digest rows (release_at null) ride the
     principal's next morning brief / EoD digest as one block appended to the
     delivered text (not the stored run artifact), marked sent only when the
@@ -10839,6 +10841,8 @@ integrations:
     =False)): the endpoint authenticates with a header secret, not a cookie, so
     a browser rebinding attack cannot supply the key, and traffic arrives behind
     the deployment's TLS terminator. The shared secret is the real access control.
+    post_progress_update also needs a source's x-source-token (see
+    `progress_updates:` below), checked after the gate, never instead of it.
 
     WHO IS ASKING: every handler answers as the caller the API verified. The
     mounted app shares the outer request's scope state, so what caller_gate
@@ -10895,7 +10899,9 @@ integrations:
     anything; tell the person to ask in Open Executive itself) and an audit
     row refused="mcp_client". The conversation itself is still recorded in
     memory, so ask_executive is annotated readOnlyHint=False,
-    destructiveHint=False; the other three tools readOnlyHint=True. Every
+    destructiveHint=False; consult_specialist, search_knowledge and
+    list_workflows readOnlyHint=True; post_progress_update readOnlyHint=False,
+    destructiveHint=False, idempotentHint=False, openWorldHint=True. Every
     tool has an MCP title and annotations, and descriptions state what a
     tool does without steering a client between tools.
 
@@ -10988,7 +10994,9 @@ integrations:
         list_workflows (workflows.list_workflows → Workflow.meta), and ask_executive
         (Executive.chat, non-streaming, as the verified caller, reading only
         unless the request may act — see ASK_EXECUTIVE READS ONLY and MAY
-        ACT). No other tool here sends or mutates company state;
+        ACT), and post_progress_update (see `progress_updates:` below).
+        Apart from post_progress_update, which stores and sends without
+        may_act, no tool here sends or mutates company state;
         ask_executive's conversation is recorded in memory.
 
     DEFERRED by design: workflow EXECUTION is not exposed — workflows are
@@ -11001,6 +11009,186 @@ integrations:
     Prompt-caching: unaffected. This path is parallel to chat; resources are
     pure reads and consult_specialist delegates to the same BaseAgent.analyze
     that reuses the existing cached system blocks.
+  progress_updates: |
+    Progress updates from other agents and services working for the
+    founders (integrations.progress_sources / progress_guard /
+    progress_store / progress_updates). Two surfaces over one core:
+    POST /progress-updates (api/routes/progress_updates.py) and the MCP tool
+    post_progress_update (mcp_server/server.py) only authenticate, parse and
+    call progress_updates.submit, which holds every rule. Off until
+    PROGRESS_SOURCES names a source, and off while a client slot or demo
+    fixture is live (progress_updates.accepting()).
+
+    INVARIANTS:
+      - The source comes from the token, never the payload. PROGRESS_SOURCES
+        is `source-id:sha256-hex[,…]` (scripts/make-source-token.py prints a
+        32-byte token and its entry); source_for hashes the presented
+        x-source-token and compares it with every entry via
+        hmac.compare_digest. The API holds hashes only. Source ids match
+        [a-z0-9][a-z0-9-]{1,39}. There is no `source` field (the route's
+        model is extra="forbid", so one is a 422). A malformed value fails
+        closed (feature off) and logs one ERROR per distinct value, never
+        the value: configured() runs on every request before any auth.
+      - Never the principal's words. An update reaches no episodic table,
+        no extractor and no Executive turn; nothing on this path calls a
+        model. The ingest audit row is integration_inbound with
+        actor=f"source:{source}" and only id, source, status and outcome.
+      - Guard before clean (progress_guard.check), reject, never redact,
+        with {field, reason}: on the raw text, any control/format/invisible
+        character (NFKC(raw) != plain(raw); CRLF is normalised first, a lone
+        \r is rejected), U+2028/U+2029, a newline in a one-line field, more
+        than 8 summary lines; on the NFKC text, the deny list: email,
+        phone (>= 9 digits), checksum-valid IBAN, credential shapes (known
+        prefixes, JWT, PEM private key, secret-named setting, a 24+ run
+        mixing upper, lower and digits), < and >, URLs outside `link` (a
+        scheme, www., an IPv4 address, or a bare domain under ANY TLD,
+        alphabetic in any script or punycode xn--, since chat apps link new
+        and internationalised TLDs too; labels may hold letters in any
+        script, and the ideographic full stops U+3002 / U+FF61 count as
+        dots; a file name whose extension is not a TLD, such as .js, .json,
+        .yaml, .lock, .php, .rb, .kt, .sql or .xml, passes, while
+        .py, .md and .sh are TLDs and are rejected).
+        Spaces collapse and limits apply on the cleaned text, the maximum
+        before the deny list (so its patterns never scan an over-long field)
+        and the minimum after it: topic 3-80 one line, status
+        on_track|at_risk|blocked|done|info, summary 10-800 and <= 8 lines,
+        ask <= 300 one line, link https <= 300 with its host exactly in
+        PROGRESS_LINK_HOSTS (empty refuses every link; no userinfo or port)
+        and, after the host, ALLOWED BY CONSTRUCTION rather than scanned
+        (three deny-list review rounds kept finding bypasses: encoded
+        secrets, then Drive ?id= links refused): no `%` or non-ASCII (so
+        every check sees literal text), no fragment, query parameters only
+        from LINK_QUERY_NAMES with values [A-Za-z0-9_.-]{1,80}, split by
+        hand (parse_qsl decodes "+"); then the email/phone/IBAN/credential
+        checks (progress_guard._SENSITIVE). A token-shaped value in the path
+        or under an allowed name passes (a Docs/Drive id has that shape),
+        idempotency_key [A-Za-z0-9_-]{8,64}. AMOUNTS ARE ACCEPTED by
+        decision: unpublished prices are kept out only by the content
+        contract (the tool description and docs/auth.md). The guard cannot
+        catch amounts, names, health/HR detail, indirect identifiers or
+        paraphrase; it is a tripwire, not the control.
+      - One atomic admit (progress_store.admit, BEGIN IMMEDIATE): repeat
+        (same (source, idempotency_key), or the same content_hash from the
+        source within 24 h) -> the first id, `duplicate`, nothing sent,
+        unless that row is still `pending` with no relay of it running in
+        this process (_RELAYING): a restart or failed store read cut it
+        short, so the repeat relays the STORED row (at-least-once; a
+        founder reached before the cut may get it twice);
+        daily cap (PROGRESS_MAX_PER_SOURCE_PER_DAY, 30) -> nothing stored;
+        relay claimed only under PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR (2)
+        and _PER_DAY (8). All caps are rolling windows; the relay-cap count
+        reads relay_claimed, not relay_state. A store failure raises
+        StoreUnavailable (HTTP 503, a fixed MCP message) and nothing is
+        sent; reads never raise. Pruned at 90 days, no row cap.
+      - Chat apps only. For each people.store.active_principals() row,
+        re-read via scheduler.runner._live_principal just before its send,
+        one deliver_to_person(..., chat_only=True), run under
+        set_session(None), restrict_to_principal(), via_app(source),
+        recorded_as(BRIEF_DELIVERY_KIND), tag_proactive("progress_update",
+        "progress:<id>") and track_holds(). Not inside private_rows(): that
+        would drop the `done` row the outbound guard counts. Sessionless, so
+        no reply linkage and no proactive_outcomes row: never auto-muted.
+      - Agent text quoted. The DM header is server-written:
+        `Progress update #<id> from <source> (automated agent, quoted as
+        received)`; the id keeps the guard's 160-char dedup prefix distinct.
+        Every agent line (topic and status, summary lines, `Needs you:`,
+        the link) follows behind `> `, split with splitlines().
+      - Held-message fallback (people.held_messages.hold, release_at=None,
+        ref progress:<id>): a founder the DM did not reach (not ok:
+        suppressed, failed, no chat app) gets the same text; a DM their own
+        settings held (track_holds saw an id) is already a held row. Over
+        the relay cap there is no DM and the update itself is not held:
+        each founder gets one fixed overflow notice per source, `<source>
+        posted more progress updates than are relayed; ask me for the
+        latest.` (progress_updates.overflow_line, ref
+        progress-overflow:<source>), held only while none is already open
+        for that founder (held_messages.waiting_for), so a busy source can't
+        push other features' held rows past MAX_HELD_PER_PERSON (50). The
+        check and the hold are one step under the fixture lock, so
+        concurrent over-cap posts still hold one notice per founder per
+        source; a failed read costs at most one extra row. The
+        principal-brief handler's _with_held_messages appends a founder's
+        rows to their own copy after generation, so it works for a shared
+        co-principal brief run and the brief's model context is unchanged.
+        relay_state: pending (admitted, or a company switch stopped the
+        relay), sent (every founder DM'd), queued (any copy held, not
+        claimed, or no principal / roster read failed). The caller sees
+        only `accepted` or `duplicate`: whether a DM went out is never
+        returned, so a source can't learn a founder's quiet hours, leave or
+        settings.
+      - One company at a time. PROGRESS_SOURCES is process-wide, so while a
+        client slot (clients/slots.py) or demo fixture is live an update
+        would land in, and be DM'd to the founders of, whichever company is
+        live; the feature is off then (_other_company_live), as Act as me
+        is while a slot is active. It checks that the slot and fixture
+        sentinel files EXIST, not their parsed value: an empty, garbage or
+        unreadable sentinel, or a failed check, counts as live. The route
+        answers 404 and the MCP tool its usual PROGRESS_REFUSED, as with no
+        sources.
+      - Local steps under cli.fixture_loader._FIXTURE_OP_LOCK, never a chat
+        send. The lock is held by a fixture or slot operation, a knowledge
+        sync's write phase, or another submit's store step. The store step
+        (_admit: live-company check, admit, audit row) waits up to
+        LOCK_WAIT_SECONDS (10) for it and raises StoreUnavailable (503 /
+        PROGRESS_UNAVAILABLE, nothing stored) only if it is still held
+        then, so concurrent submits queue rather than fail. The relay takes
+        the lock (_locked, waiting with no timeout) around each local step
+        only: each founder's pre-send roster re-read, each fallback hold,
+        the overflow check-and-hold, and the final relay_state write.
+        Another lock holder delays a relay but never stops it.
+      - A swap is detected from the update's own row. Before each relay
+        step, same_company() checks that no slot or fixture sentinel exists
+        and that the row is still there and pending
+        (progress_store.still_pending: id + source + content_hash; False on
+        any error). Every swap, including a factory reset that sets no
+        sentinel, wipes or replaces the table. When either check fails the
+        relay stops and writes nothing more, so the row can stay pending:
+        person ids repeat across company databases, so a send or hold
+        after a swap would reach the other company.
+      - The store step and the relay run as one task the caller cannot
+        cancel (asyncio.shield over a task kept in _SUBMITS): a dropped
+        connection neither frees the lock mid-write nor leaves a stored
+        update unrelayed.
+      - User turn only in chat. briefing.context.render_and_trust appends
+        progress_updates.for_chat() to the <briefing> block when `verified`
+        (a principal's own verified turn), in its own try/except, and only
+        when the episodic db file exists: latest per (source, topic_key),
+        30 days, at most 8 lines and ~1,200 chars, one wrap_untrusted block
+        per source (author = the source id). A line carries status, the
+        summary cut to CHAT_SUMMARY_CHARS (160), the ask and the link: an
+        update over its relay cap reaches the founders nowhere else, and the
+        overflow notice tells them to ask for it. No cached block changes, no
+        chat tool is added, and _INSTRUCTIONS on the MCP server is static.
+      - Company data: "progress_updates" is in
+        memory.company_tables.PER_COMPANY_TABLES.
+
+    AUTH SURFACES: /progress-updates is in api.main._UNAUTHENTICATED_PATHS
+    but NOT in _webhook_verifies_its_caller, so under local login it still
+    needs a loopback Host. Route order: feature off 404 -> token (exactly
+    one header) 401 -> non-numeric Content-Length 400 -> > 8 KB declared
+    or as read 413 -> pydantic (strict, extra=forbid) or guard 422 {field,
+    reason} -> fixture lock still held after 10 s 503 -> slot or fixture
+    gone live since the first check 404 -> daily cap 429 -> store 503; 201
+    stored, 200 duplicate, body {id, stored, relay} with relay `accepted`
+    or `duplicate`. "Feature off" is no sources, or a client slot or demo
+    fixture live. The MCP tool refuses with one fixed message
+    (PROGRESS_REFUSED) for an in-process call, no request, feature off,
+    missing/unknown token and, with BACKEND_SHARED_SECRET set, a request
+    the gate did not mark shared_secret_ok. Behind a shared secret an MCP
+    source must hold x-api-key, which opens the whole API, so the REST
+    route is the least-privilege path.
+
+    RESIDUALS (accepted, documented): a founder with Slack and a second
+    chat app can get the relay on the second app after Slack's rate cap
+    refused it (the guard counts per channel ref); a held row released by
+    held_messages (quiet hours over, or the 36 h digest fallback) goes
+    through deliver_to_person without chat_only, so it may go by email;
+    a swap that starts during one in-flight send still lets that send
+    finish, as for any scheduled DM; and
+    the feature is unavailable on a multi-client instance until sources
+    can be bound to a slot (a follow-up). The saved DM is still the
+    Executive's own message in the founder's DM conversation, with every
+    agent line quoted.
   peer_memory: |
     The peer-keyed memory integration has its own top-level section
     (see `peer_memory:`). From the integrations perspective: each
@@ -11864,6 +12052,18 @@ clients:
       credential is a file outside the slot, re-checked against the live
       roster on every use, and no verbatim exemplars are learned while a
       slot is active.
+    - Progress updates (integrations/progress_updates.py) are off while a
+      slot or a demo fixture sentinel file exists (an unreadable or garbage
+      one included), and when that check fails, because PROGRESS_SOURCES is
+      process-wide and an update would otherwise land in, and be DM'd to
+      the founders of, whichever company is live. A submit waits up to 10 s
+      for _FIXTURE_OP_LOCK and is refused as unavailable only if a slot,
+      fixture or sync operation still holds it then. The relay takes the
+      lock around each local step, never across a chat send, and stops
+      once it no longer sees its own row pending (every swap, factory reset
+      included, wipes or replaces the table) or a sentinel appears. On a
+      multi-client instance the feature is therefore unavailable until
+      sources can be bound to a slot.
     - First activation with no active client auto-snapshots the user's
       original company to _user_backup (same restore point the fixture
       switcher uses; POST /fixtures/unload brings it back).

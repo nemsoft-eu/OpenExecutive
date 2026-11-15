@@ -138,6 +138,7 @@ PER_COMPANY_TABLES: tuple[str, ...] = (
     # Chat-app and mail state: who wrote, what was asked, which cards went out,
     # and what the Executive mailed back (found by the recipient's address).
     "email_thread_replies",
+    "progress_updates",
     "chat_asks",
     "chat_card_pushes",
     "telegram_chats",

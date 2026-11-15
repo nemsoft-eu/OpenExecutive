@@ -46,6 +46,19 @@ Design notes
   ``MCP_CLIENT_ACTING_WITHHELD_TOOLS``, and every audit row it writes names
   the app (``audit.via_app``).
 
+* **post_progress_update writes and sends without may_act.** It is the one
+  tool that does, and it does not depend on who the caller is: the update is
+  filed under the source its ``x-source-token`` header belongs to
+  (``integrations.progress_sources``, a hashed per-source token, so the
+  source is never an argument and the token never reaches model context),
+  and with a shared secret configured the request must also have passed the
+  gate. ``integrations.progress_updates.submit`` holds every rule: the
+  content guard rejects personal data, credentials, markup and stray URLs;
+  per-source daily and relay caps bound the volume; the text goes only to
+  the active principals, only to their chat apps, quoted behind a header
+  the server writes. A missing or unknown token, the feature off, or an
+  in-process call gets one fixed refusal.
+
 * **DNS-rebinding protection** (FastMCP's Host-header check) is disabled: the
   endpoint authenticates with a header secret (not a cookie), so a browser
   rebinding attack cannot supply credentials, and the server runs behind the
@@ -77,6 +90,8 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from openexecutive.api import caller as api_caller
+from openexecutive.integrations.progress_guard import STATUSES
+from openexecutive.integrations.progress_sources import TOKEN_HEADER as SOURCE_TOKEN_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +142,11 @@ _INSTRUCTIONS = (
     "or changes anything, except `ask_executive` when this server allows it to "
     "act: then it makes changes inside Open Executive and leaves messages and "
     "meetings on cards the person approves (or that go on their own under "
-    "their Approvals)."
+    "their Approvals).\n\n"
+    "`post_progress_update` is for other agents working for the founders: it "
+    "stores a short progress update and sends it, quoted as received, to the "
+    "founders' chat apps. It needs a source token in the `x-source-token` "
+    "header and is refused without one."
 )
 
 # The request header that asks for a turn that may act (``may_act``).
@@ -429,7 +448,8 @@ async def memory_advice() -> str:
 
 # ---------------------------------------------------------------------------
 # Tools — structured capabilities. None of them sends, posts, books or
-# changes anything; ask_executive records the conversation in memory.
+# changes anything (ask_executive records the conversation in memory, and
+# acts only when ``may_act``), except post_progress_update below.
 # ---------------------------------------------------------------------------
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 
@@ -589,6 +609,118 @@ async def ask_executive(message: str) -> str:
             briefing_context=briefing_context,
             memory_text=message, fetch_own_urls=person_id is not None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Progress updates — the one tool that stores and sends without ``may_act``.
+# The source is whoever the ``x-source-token`` header belongs to, never an
+# argument, so the token stays out of model context and tool-call logs.
+# ---------------------------------------------------------------------------
+# one message for every refusal, so it says nothing about which check failed
+PROGRESS_REFUSED = "This server does not accept progress updates from this caller."
+PROGRESS_UNAVAILABLE = "Progress updates can't be stored right now; nothing was stored or sent. Try again later."
+# how much of a guard field name goes back in an error, as consult_specialist
+# truncates the name it echoes
+_FIELD_PREVIEW_CHARS = 40
+
+StatusArg = Annotated[str, Field(json_schema_extra={"enum": list(STATUSES)})]
+
+
+def _progress_source() -> str:
+    """The source the request's ``x-source-token`` belongs to. Raises
+    :class:`CallerRefused` with :data:`PROGRESS_REFUSED` for an in-process
+    call, a call with no HTTP request, the feature off (no sources, or a
+    client slot or demo fixture live), no token or an unknown one, and, with
+    a shared secret configured, a request the gate did not mark as
+    authenticated by it (as ``may_act`` requires)."""
+    import os
+
+    from openexecutive.integrations import progress_sources, progress_updates
+
+    request = _request()
+    if request is None or request is _NO_MCP_REQUEST:
+        raise CallerRefused(PROGRESS_REFUSED)
+    if os.environ.get("BACKEND_SHARED_SECRET", "").strip():
+        state = getattr(request, "state", None)
+        if getattr(state, SHARED_SECRET_OK, False) is not True:
+            raise CallerRefused(PROGRESS_REFUSED)
+    if not progress_updates.accepting():
+        raise CallerRefused(PROGRESS_REFUSED)
+    source = progress_sources.source_for(request.headers.get(SOURCE_TOKEN_HEADER))
+    if source is None:
+        raise CallerRefused(PROGRESS_REFUSED)
+    return source
+
+
+@mcp.tool(
+    title="Post a progress update",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+async def post_progress_update(
+    topic: str,
+    status: StatusArg,
+    summary: str,
+    ask: str = "",
+    link: str = "",
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Post a short progress update on work you are doing for the founders.
+
+    The update is stored and sent, quoted as received, to each founder as a
+    chat-app message; a founder it does not reach gets it in their next
+    morning brief. Past your source's relay cap an update is stored but not
+    sent, and each founder gets one notice that more updates are waiting.
+    It is filed under the source your ``x-source-token`` header belongs to;
+    there is no source argument.
+
+    Content contract: write for the founders, in plain text. Do not post
+    unpublished prices or other confidential commercial terms, personal
+    data (names of private individuals, contact details, health or HR
+    detail), credentials, or anything you would not put in a team chat.
+    Amounts are accepted, so keeping an unpublished price out is your
+    responsibility. Updates with email addresses, phone numbers, IBANs,
+    credential-like strings, ``<`` or ``>``, control characters, or a URL
+    outside ``link`` are rejected with the field and the reason.
+
+    Returns ``{id, stored, relay}``: ``relay`` is ``accepted`` for a new
+    update and ``duplicate`` for a repeat of an update already stored
+    (nothing sent). Whether a message went out is not returned.
+
+    Args:
+        topic: What the update is about, one line, 3-80 characters.
+        status: on_track, at_risk, blocked, done or info.
+        summary: What happened, 10-800 characters, at most 8 lines.
+        ask: What you need from the founders, one line, up to 300 characters.
+        link: An https link on an allowed host, for the details: up to 300
+            characters, no %-encoding or #fragment, and query parameters
+            only from id, resourcekey, usp, tab, gid, v and node-id.
+        idempotency_key: Your own retry key (8-64 of A-Z, a-z, 0-9, _ and -):
+            posting the same key again returns the first update.
+    """
+    from openexecutive.integrations import progress_updates
+
+    source = _progress_source()
+    payload: dict[str, Any] = {"topic": topic, "status": status, "summary": summary}
+    # an empty optional is an omitted one, not a value the guard should check
+    optional = {"ask": ask, "link": link, "idempotency_key": idempotency_key}
+    payload.update({k: v for k, v in optional.items() if v})
+    try:
+        result = await progress_updates.submit(source, payload)
+    except progress_updates.Rejected as exc:
+        raise ValueError(f"{exc.field[:_FIELD_PREVIEW_CHARS]}: {exc.reason}") from None
+    except progress_updates.Paused:
+        raise CallerRefused(PROGRESS_REFUSED) from None
+    except progress_updates.OverLimit as exc:
+        raise ValueError(str(exc)) from None
+    except progress_updates.StoreUnavailable:
+        logger.warning("mcp_server: progress update from %s not stored: store unavailable", source, exc_info=True)
+        raise RuntimeError(PROGRESS_UNAVAILABLE) from None
+    return {"id": result.id, "stored": result.stored, "relay": result.relay}
 
 
 # ---------------------------------------------------------------------------

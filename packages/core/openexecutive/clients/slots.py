@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import sqlite3
 from datetime import UTC, datetime
@@ -130,6 +131,30 @@ def get_active_client(settings: Any) -> str | None:
     if content and _SAFE_NAME_RE.match(content):
         return content
     return None
+
+
+def _sentinel_present(path: Path) -> bool:
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def other_company_live(settings: Any) -> bool:
+    """Whether a client slot or demo fixture may hold the live data, for a
+    feature that must not write into, or send from, another company's state.
+
+    Fails closed, unlike :func:`get_active_client` and ``get_fixture_status``
+    (which hide garbage from the UI): a sentinel that exists counts, whatever
+    it holds, and so does one that can't be checked."""
+    from openexecutive.cli import fixture_loader
+
+    return _sentinel_present(_active_client_sentinel(settings)) or _sentinel_present(
+        fixture_loader._fixture_active_sentinel(settings)
+    )
 
 
 def list_client_slots(settings: Any) -> list[dict[str, Any]]:

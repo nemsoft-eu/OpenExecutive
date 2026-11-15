@@ -1,0 +1,283 @@
+"""The content guard for progress updates (integrations/progress_guard.py)."""
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from openexecutive.integrations import progress_guard as pg
+
+HOSTS = ["docs.google.com", "github.com"]
+
+GOOD: dict[str, Any] = {
+    "topic": "Q1 go-to-market plan",
+    "status": "at_risk",
+    "summary": (
+        "Positioning draft done for the Benelux launch.\n"
+        "Pricing page copy waits on the 2026-11-20 10:00 review.\n"
+        "Budget so far: €12,500 of the €40k plan; v2.3 of the deck is out."
+    ),
+    "ask": "Pick one of the two taglines by Friday",
+    "link": "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit",
+    "idempotency_key": "gtm-plan-2026-11-15",
+}
+
+
+def check(**overrides: Any) -> pg.CleanUpdate:
+    payload = {**GOOD, **overrides}
+    payload = {k: v for k, v in payload.items() if v is not ...}
+    return pg.check(payload, link_hosts=HOSTS)
+
+
+def rejected(**overrides: Any) -> pg.Rejected:
+    with pytest.raises(pg.Rejected) as info:
+        check(**overrides)
+    return info.value
+
+
+def test_a_realistic_update_is_accepted_and_cleaned() -> None:
+    clean = check(topic="  Q1   go-to-market\tplan ", summary="  Positioning draft done.  \n\n  Next:  pricing.  ")
+    assert clean.topic == "Q1 go-to-market plan"
+    assert clean.topic_key == "q1 go-to-market plan"
+    assert clean.status == "at_risk"
+    # spaces collapse and lines are trimmed; line breaks stay
+    assert clean.summary == "Positioning draft done.\n\nNext: pricing."
+    assert clean.ask == "Pick one of the two taglines by Friday"
+    assert clean.link == GOOD["link"]
+    assert clean.idempotency_key == "gtm-plan-2026-11-15"
+    assert check().summary == GOOD["summary"]
+
+
+def test_optional_fields_may_be_absent_or_blank() -> None:
+    clean = check(ask=..., link=..., idempotency_key=...)
+    assert (clean.ask, clean.link, clean.idempotency_key) == (None, None, None)
+    clean = check(ask="   ", link=None, idempotency_key=None)
+    assert (clean.ask, clean.link) == (None, None)
+
+
+def test_crlf_line_breaks_are_accepted() -> None:
+    assert check(summary="First line of it.\r\nSecond line.").summary == "First line of it.\nSecond line."
+
+
+@pytest.mark.parametrize(
+    ("field", "text"),
+    [
+        ("summary", "Done with the draft.\rSecond"),  # a lone carriage return
+        ("summary", "Done with the\x07 draft."),  # a bell
+        ("summary", "Done with the​ draft."),  # a zero-width space
+        ("topic", "GTM⁠plan"),  # a word joiner
+        ("ask", "Approve­ it"),  # a soft hyphen
+        ("link", "https://docs.google.com/​doc"),
+    ],
+)
+def test_hidden_characters_are_rejected_not_stripped(field: str, text: str) -> None:
+    err = rejected(**{field: text})
+    assert err.field == field
+    assert err.reason == "contains a control or invisible character"
+
+
+def test_a_newline_in_a_one_line_field_is_rejected() -> None:
+    assert rejected(topic="GTM\nplan").reason == "must be one line"
+    assert rejected(ask="Pick one\nby Friday").reason == "must be one line"
+
+
+@pytest.mark.parametrize("field", ["topic", "summary", "ask"])
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029"])
+def test_unicode_line_separators_are_rejected(field: str, sep: str) -> None:
+    # a chat client may render them as a line break, one the relay never
+    # prefixes with its quote marker
+    err = rejected(**{field: f"Pick one of the{sep}taglines"})
+    assert (err.field, err.reason) == (field, "contains a line or paragraph separator")
+
+
+@pytest.mark.parametrize("sep", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85"])
+def test_other_splitlines_breaks_are_rejected_as_controls(sep: str) -> None:
+    err = rejected(summary=f"Done with the draft.{sep}Second line.")
+    assert (err.field, err.reason) == ("summary", "contains a control or invisible character")
+
+
+def test_a_nine_line_summary_is_rejected_not_collapsed() -> None:
+    eight = "\n".join(f"Line {i} of the update." for i in range(8))
+    assert check(summary=eight).summary == eight
+    # blank lines count too: the check runs on the raw text
+    err = rejected(summary=eight + "\n\nLine nine.")
+    assert (err.field, err.reason) == ("summary", "has more than 8 lines")
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("Sent the brief to jane.doe@example.org for review.", "contains an email address"),
+        ("Call the agency at +32 470 12 34 56 tomorrow.", "contains a phone number"),
+        ("Call the agency at 0470 12 34 56 tomorrow.", "contains a phone number"),
+        ("Call the agency at (555) 123-4567 tomorrow.", "contains a phone number"),
+        ("Call the agency at 555-123-4567 tomorrow.", "contains a phone number"),
+        ("Pay the invoice to BE68 5390 0754 7034 this week.", "contains a bank account number (IBAN)"),
+        ("Pay the invoice to GB82WEST12345698765432 THIS WEEK.", "contains a bank account number (IBAN)"),
+        ("Use key sk-ant-api03-abcdefghijklmnop to run it.", "contains something shaped like a credential"),
+        ("The bot token xoxb-1234567890-abcdefghij works.", "contains something shaped like a credential"),
+        ("Pushed with ghp_abcdefghijklmnopqrstuvwxyz0123 today.", "contains something shaped like a credential"),
+        ("The AWS key AKIAABCDEFGHIJKLMNOP is set.", "contains something shaped like a credential"),
+        ("Session eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.sig leaked.", "contains something shaped like a credential"),
+        ("-----BEGIN RSA PRIVATE KEY----- is in the repo.", "contains something shaped like a credential"),
+        ("Staging login: password = hunter22 for now.", "contains something shaped like a credential"),
+        ("Use Zx9Kq2LmN8pR4tV7wY1bC3dF6gH0jK5s to sign in.", "contains something shaped like a credential"),
+        ("Header is <b>bold</b> now.", "contains < or >"),
+        ("Fake header > quoted line.", "contains < or >"),
+        ("Full-width ＜b＞ still counts.", "contains < or >"),
+        ("Draft is at https://evil.example/x for now.", "contains a URL; put one link in the link field"),
+        ("Draft is at www.example.org for now.", "contains a URL; put one link in the link field"),
+        ("Draft is at acme-launch.com for now.", "contains a URL; put one link in the link field"),
+        # any alphabetic TLD, not a fixed list: chat apps link these too
+        ("Re-verify billing at acme-billing.xyz/login today.", "contains a URL; put one link in the link field"),
+        ("Re-auth at EVIL.RU now please.", "contains a URL; put one link in the link field"),
+        ("Visit bücher.xyz for the brief.", "contains a URL; put one link in the link field"),
+        ("Pay the invoice via 203.0.113.9/pay today.", "contains a URL; put one link in the link field"),
+        # .py is Paraguay's TLD, so a file name under it counts as a domain
+        ("Fixed the bug in runner.py today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil.java today.", "contains a URL; put one link in the link field"),
+        # a hyphen or a trailing digit label after the TLD still leaves a link
+        ("See evil.com- now please.", "contains a URL; put one link in the link field"),
+        ("Check evil.com.1 for the draft.", "contains a URL; put one link in the link field"),
+        # internationalised and punycode domains, and ideographic dots
+        ("Re-verify at пример.рф today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil.cоm today.", "contains a URL; put one link in the link field"),  # Cyrillic о
+        ("Re-verify at evil.xn--p1ai today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil。com today.", "contains a URL; put one link in the link field"),
+    ],
+)
+def test_each_deny_pattern_rejects(text: str, reason: str) -> None:
+    err = rejected(summary=text)
+    assert (err.field, err.reason) == ("summary", reason)
+    # the reason never quotes the text back
+    assert text not in str(err)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Jane from the agency reviewed the draft.",  # a name
+        "The launch budget is €12,500 in total.",
+        "Ads ran at $99.00 per day last week.",
+        "The pipeline is now worth £1.2m this quarter.",
+        "The starter plan stays at $49/month for now.",
+        "We spent twelve thousand euros on the event.",
+        "Review on 05/11/2026 10:30 with the team.",  # a date and a time
+        "Merged 3f9a2c4e5b6d7f8091a2b3c4d5e6f708192a3b4c into main.",  # a commit hash
+        "Target FY26 PLAN WITH MORE REACH in Q3 2026.",  # capitals in prose
+        "Shipped the Q3-Go-To-Market-Plan-For-Benelux-2026 page copy.",  # a slug
+        "Our secret: start a week earlier.",
+        # dotted text that is not a domain
+        "Upgraded Node.js and updated app.config.json today.",
+        "Bumped yarn.lock and Cargo.lock; index.php is gone.",
+        "Revenue could reach €1.2bn, e.g. by Q3; release 1.2.3 is out.",
+        "Ph.D. hire starts at 3 p.m. on claude-3.5-sonnet work.",
+    ],
+)
+def test_documented_misses_are_accepted(text: str) -> None:
+    assert check(summary=text).summary == text
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field", "reason"),
+    [
+        ({"topic": "ab"}, "topic", "must be at least 3 characters"),
+        ({"topic": "x" * 81}, "topic", "must be at most 80 characters"),
+        ({"topic": "   "}, "topic", "must be at least 3 characters"),
+        ({"topic": ...}, "topic", "is required"),
+        ({"summary": "Too short"}, "summary", "must be at least 10 characters"),
+        ({"summary": "x" * 801}, "summary", "must be at most 800 characters"),
+        ({"ask": "x" * 301}, "ask", "must be at most 300 characters"),
+        ({"status": "great"}, "status", "must be one of on_track, at_risk, blocked, done, info"),
+        ({"status": ...}, "status", "must be one of on_track, at_risk, blocked, done, info"),
+        ({"topic": 42}, "topic", "must be a string"),
+        ({"idempotency_key": "short"}, "idempotency_key", "must be 8-64 of A-Z, a-z, 0-9, _ and -"),
+        ({"idempotency_key": "has space in it"}, "idempotency_key", "must be 8-64 of A-Z, a-z, 0-9, _ and -"),
+        ({"source": "someone-else"}, "source", "is not a field of a progress update"),
+    ],
+)
+def test_limits_and_types(overrides: dict[str, Any], field: str, reason: str) -> None:
+    err = rejected(**overrides)
+    assert (err.field, err.reason) == (field, reason)
+
+
+def test_limits_apply_to_the_cleaned_form() -> None:
+    # 80 visible characters padded with runs of spaces still fit
+    assert len(check(topic="  " + "x" * 40 + "      " + "y" * 39 + "  ").topic) == 80
+
+
+def test_an_oversized_field_is_refused_before_the_patterns_scan_it() -> None:
+    # URL_RE backtracks quadratically on a long run of "a.", so the length
+    # check must come first: 8 KB took about 1.5 s on the event loop
+    import time
+
+    started = time.monotonic()
+    err = rejected(summary="a." * 4000)
+    assert (err.field, err.reason) == ("summary", "must be at most 800 characters")
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    ("link", "reason"),
+    [
+        ("http://docs.google.com/doc", "must be an https URL"),
+        ("javascript:alert(1)", "must be an https URL"),
+        ("https://evil.example/doc", "points at a host that is not allowed"),
+        ("https://docs.google.com.evil.example/doc", "points at a host that is not allowed"),
+        ("https://user:pw@docs.google.com/doc", "must not carry credentials or a port"),
+        ("https://docs.google.com:8443/doc", "must not carry credentials or a port"),
+        ("https://docs.google.com/a b", "must be a single URL"),
+        ("https://docs.google.com/<x>", "must be a single URL"),
+        ("https://docs.google.com:99999/doc", "is not a valid URL"),
+        ("https://docs.google.com/" + "a" * 300, "must be at most 300 characters"),
+        # what follows the host is allowed by construction, not scanned
+        ("https://docs.google.com/doc/ada%40example.com", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/doc?access%5Ftoken=x", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/dоc", "must not contain percent-encoded or non-ASCII characters"),
+        ("https://docs.google.com/doc#heading=h.abc123", "must not carry a fragment (#...)"),
+        ("https://docs.google.com/doc#", "must not carry a fragment (#...)"),
+        (
+            "https://docs.google.com/doc?access_token=ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "carries a query parameter that is not allowed; link to the page itself",
+        ),
+        ("https://docs.google.com/doc?id=a+b", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?id=a;sig=x", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?id=", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?", "carries a query parameter that is not allowed; link to the page itself"),
+        ("https://docs.google.com/doc?usp=sharing&x=1", "carries a query parameter that is not allowed; link to the page itself"),
+        # the free-text checks for secrets and personal data still cover the path
+        ("https://docs.google.com/doc/sk-ant-abcdefghijklmnopqrst", "contains something shaped like a credential"),
+        ("https://docs.google.com/u/ada@example.com", "contains an email address"),
+        ("https://docs.google.com/call/+32470123456", "contains a phone number"),
+    ],
+)
+def test_link_rules(link: str, reason: str) -> None:
+    err = rejected(link=link)
+    assert (err.field, err.reason) == ("link", reason)
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        # a document id in the path has a token's shape and is allowed
+        "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?usp=sharing",
+        "https://docs.google.com/open?id=1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789&resourcekey=0-AbC_d.e",
+        "https://docs.google.com/doc/2026/11/15/pull/1234567",
+    ],
+)
+def test_ordinary_links_pass_the_sensitive_checks(link: str) -> None:
+    assert pg.check({**GOOD, "link": link}, link_hosts=HOSTS).link == link
+
+
+def test_link_host_matches_without_case_and_needs_a_list() -> None:
+    assert check(link="https://GitHub.com/org/repo/pull/1").link == "https://GitHub.com/org/repo/pull/1"
+    with pytest.raises(pg.Rejected, match="not allowed"):
+        pg.check({**GOOD}, link_hosts=[])
+
+
+def test_link_hosts_default_to_the_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROGRESS_LINK_HOSTS", "docs.google.com, github.com")
+    assert pg.check(dict(GOOD)).link == GOOD["link"]
+    monkeypatch.setenv("PROGRESS_LINK_HOSTS", "")
+    with pytest.raises(pg.Rejected, match="not allowed"):
+        pg.check(dict(GOOD))
