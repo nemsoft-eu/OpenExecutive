@@ -67,9 +67,16 @@ def test_off_with_no_sources() -> None:
 
 
 def test_a_malformed_setting_fails_closed(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    monkeypatch.setenv(ps.ENV, f"marketing-planner:{DIGEST},broken")
-    assert ps.enabled() is False
-    assert ps.source_for(TOKEN) is None
+    # attach caplog to the module logger directly: the app's logging config
+    # (run by other tests on the same worker) sets propagate = False on the
+    # openexecutive tree, so the root-level capture would see nothing
+    ps.logger.addHandler(caplog.handler)
+    try:
+        monkeypatch.setenv(ps.ENV, f"marketing-planner:{DIGEST},broken")
+        assert ps.enabled() is False
+        assert ps.source_for(TOKEN) is None
+    finally:
+        ps.logger.removeHandler(caplog.handler)
     assert "PROGRESS_SOURCES can't be used" in caplog.text
 
 
