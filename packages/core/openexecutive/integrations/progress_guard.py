@@ -44,6 +44,9 @@ TOPIC_MIN, TOPIC_MAX = 3, 80
 SUMMARY_MIN, SUMMARY_MAX = 10, 800
 SUMMARY_MAX_LINES = 8
 ASK_MAX = 300
+# the link rides in the chat block too, so one long URL must not crowd out
+# the other updates there
+LINK_MAX = 300
 
 FIELDS = ("topic", "status", "summary", "ask", "link", "idempotency_key")
 
@@ -175,13 +178,18 @@ def _has_iban(text: str) -> bool:
     return False
 
 
-# each deny check with the reason the caller gets back
-_DENY: tuple[tuple[Callable[[str], bool], str], ...] = (
+_CREDENTIAL_REASON = "contains something shaped like a credential"
+# each deny check with the reason the caller gets back. The personal-data and
+# credential checks also run on the link; the rest are free text's only
+_SENSITIVE: tuple[tuple[Callable[[str], bool], str], ...] = (
     (lambda t: EMAIL_RE.search(t) is not None, "contains an email address"),
     (_has_phone, "contains a phone number"),
     (_has_iban, "contains a bank account number (IBAN)"),
-    (lambda t: CREDENTIAL_RE.search(t) is not None, "contains something shaped like a credential"),
-    (lambda t: OPAQUE_TOKEN_RE.search(t) is not None, "contains something shaped like a credential"),
+    (lambda t: CREDENTIAL_RE.search(t) is not None, _CREDENTIAL_REASON),
+)
+_DENY: tuple[tuple[Callable[[str], bool], str], ...] = (
+    *_SENSITIVE,
+    (lambda t: OPAQUE_TOKEN_RE.search(t) is not None, _CREDENTIAL_REASON),
     (lambda t: ANGLE_RE.search(t) is not None, "contains < or >"),
     (lambda t: URL_RE.search(t) is not None, "contains a URL; put one link in the link field"),
 )
@@ -255,6 +263,8 @@ def _link(payload: Mapping[str, Any], allowed_hosts: list[str]) -> str | None:
     link = raw.strip()
     if not link:
         return None
+    if len(link) > LINK_MAX:
+        raise Rejected("link", f"must be at most {LINK_MAX} characters")
     if any(ch.isspace() for ch in link) or ANGLE_RE.search(link):
         raise Rejected("link", "must be a single URL")
     try:
@@ -269,6 +279,15 @@ def _link(payload: Mapping[str, Any], allowed_hosts: list[str]) -> str | None:
     host = (parts.hostname or "").lower()
     if not host or host not in {h.strip().lower() for h in allowed_hosts}:
         raise Rejected("link", "points at a host that is not allowed")
+    # an allowed host does not make the rest of the URL safe to relay: a token
+    # in the query is as much a secret as one in the summary
+    for found, reason in _SENSITIVE:
+        if found(link):
+            raise Rejected("link", reason)
+    # an opaque token only in the query or fragment: a document id in the
+    # path (Google Docs, Drive) has the same shape and is what a link is for
+    if OPAQUE_TOKEN_RE.search(parts.query) or OPAQUE_TOKEN_RE.search(parts.fragment):
+        raise Rejected("link", _CREDENTIAL_REASON)
     return link
 
 

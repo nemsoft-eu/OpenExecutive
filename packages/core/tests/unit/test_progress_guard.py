@@ -229,11 +229,34 @@ def test_an_oversized_field_is_refused_before_the_patterns_scan_it() -> None:
         ("https://docs.google.com/a b", "must be a single URL"),
         ("https://docs.google.com/<x>", "must be a single URL"),
         ("https://docs.google.com:99999/doc", "is not a valid URL"),
+        ("https://docs.google.com/" + "a" * 300, "must be at most 300 characters"),
+        # the free-text checks for secrets and personal data apply to the link
+        (
+            "https://docs.google.com/doc?access_token=ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "contains something shaped like a credential",
+        ),
+        ("https://docs.google.com/doc/sk-ant-abcdefghijklmnopqrst", "contains something shaped like a credential"),
+        ("https://docs.google.com/doc?t=AbCdEfGhIjKlMnOpQrStUvWx12", "contains something shaped like a credential"),
+        ("https://docs.google.com/doc#AbCdEfGhIjKlMnOpQrStUvWx12", "contains something shaped like a credential"),
+        ("https://docs.google.com/doc?to=ada@example.com", "contains an email address"),
+        ("https://docs.google.com/doc?call=+32470123456", "contains a phone number"),
     ],
 )
 def test_link_rules(link: str, reason: str) -> None:
     err = rejected(link=link)
     assert (err.field, err.reason) == ("link", reason)
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        # a document id in the path has a token's shape and is allowed
+        "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?usp=sharing",
+        "https://docs.google.com/doc/2026/11/15/pull/1234567#heading=h.abc123",
+    ],
+)
+def test_ordinary_links_pass_the_sensitive_checks(link: str) -> None:
+    assert pg.check({**GOOD, "link": link}, link_hosts=HOSTS).link == link
 
 
 def test_link_host_matches_without_case_and_needs_a_list() -> None:

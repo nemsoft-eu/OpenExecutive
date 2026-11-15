@@ -800,16 +800,32 @@ def test_for_chat_wraps_each_source_on_its_own(db: Path, deliver: Any) -> None:
     assert block.startswith(pu.CHAT_HEADER)
     assert block.count("<untrusted_content") == 2
     assert 'author="ops-bot"' in block and f'author="{SOURCE}"' in block
-    assert f"{SOURCE}: GTM plan: on track. Needs you: Approve the budget" in block
-    assert "ops-bot: Launch post: blocked" in block
-    # one line per update: the summary stays out
-    assert "Positioning" not in block
+    assert (
+        f"{SOURCE}: GTM plan: on track. Positioning draft 1 is done. Channel plan next. "
+        "Needs you: Approve the budget"
+    ) in block
+    assert "ops-bot: Launch post: blocked. Positioning draft 1 is done." in block
+
+
+def test_for_chat_carries_a_cut_summary_and_the_link(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # an update over the relay cap reaches the founders only here
+    from openexecutive.integrations.progress_guard import check
+
+    update = check(
+        payload(summary="word " * 100, link="https://github.com/org/repo/pull/7"),
+        link_hosts=["github.com"],
+    )
+    progress_store.admit(SOURCE, update, db_path=db)
+    [line] = [line for line in pu.for_chat().splitlines() if line.startswith("- #")]
+    summary = line.split("on track. ", 1)[1].split(" Link: ")[0]
+    assert len(summary) == pu.CHAT_SUMMARY_CHARS and summary.endswith("...")
+    assert line.endswith(" Link: https://github.com/org/repo/pull/7")
 
 
 def test_for_chat_stops_at_the_character_budget(db: Path) -> None:
     from openexecutive.integrations.progress_guard import CleanUpdate
 
-    # five topics, each line about 365 characters with a 300-character ask:
+    # five topics, each line about 390 characters with a 300-character ask:
     # three fit in CHAT_MAX_CHARS (1200), the fourth would not
     now = datetime.now(UTC)
     for n in range(1, 6):

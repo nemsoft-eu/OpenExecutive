@@ -11050,8 +11050,11 @@ integrations:
         before the deny list (so its patterns never scan an over-long field)
         and the minimum after it: topic 3-80 one line, status
         on_track|at_risk|blocked|done|info, summary 10-800 and <= 8 lines,
-        ask <= 300 one line, link https with its host exactly in
-        PROGRESS_LINK_HOSTS (empty refuses every link; no userinfo or port),
+        ask <= 300 one line, link https <= 300 with its host exactly in
+        PROGRESS_LINK_HOSTS (empty refuses every link; no userinfo or port)
+        and run through the email/phone/IBAN/credential checks
+        (progress_guard._SENSITIVE); OPAQUE_TOKEN_RE only on its query and
+        fragment, since a Docs/Drive id in the path has a token's shape,
         idempotency_key [A-Za-z0-9_-]{8,64}. AMOUNTS ARE ACCEPTED by
         decision: unpublished prices are kept out only by the content
         contract (the tool description and docs/auth.md). The guard cannot
@@ -11144,7 +11147,10 @@ integrations:
         (a principal's own verified turn), in its own try/except, and only
         when the episodic db file exists: latest per (source, topic_key),
         30 days, at most 8 lines and ~1,200 chars, one wrap_untrusted block
-        per source (author = the source id). No cached block changes, no
+        per source (author = the source id). A line carries status, the
+        summary cut to CHAT_SUMMARY_CHARS (160), the ask and the link: an
+        update over its relay cap reaches the founders nowhere else, and the
+        overflow notice tells them to ask for it. No cached block changes, no
         chat tool is added, and _INSTRUCTIONS on the MCP server is static.
       - Company data: "progress_updates" is in
         memory.company_tables.PER_COMPANY_TABLES.
