@@ -95,11 +95,30 @@ OPAQUE_TOKEN_RE = re.compile(
 # < and >: no markup, and no line that could pass for the relay's header or
 # its "> " quote marker
 ANGLE_RE = re.compile(r"[<>]")
-# a URL in free text (a scheme, www., or a bare domain under a common TLD);
-# a link goes only in the link field, where its host is checked
+# file extensions a dotted name may end in without counting as a domain:
+# none of them is a top-level domain. Extensions that are one (.py, .md,
+# .sh, .rs, .zip, .mov, .java) stay rejected, since a chat app may make them
+# a link
+_FILE_EXTENSIONS = (
+    "js|jsx|ts|tsx|mjs|json|yaml|yml|toml|lock|txt|html|css|csv|pdf|png|jpg|svg|ipynb"
+    "|docx|xlsx|pptx|php|rb|kt|sql|xml"
+)
+# what a browser or chat app reads as a dot between labels: the full stop,
+# and the ideographic and halfwidth ideographic full stops (UTS 46 maps both)
+_DOT = "[.。｡]"
+# a URL in free text: a scheme, www., an IPv4 address, or a bare domain under
+# ANY TLD, alphabetic in any script or punycode (chat apps link new and
+# internationalised TLDs too, so a fixed list let acme-billing.xyz through).
+# A domain's first label holds a letter, so an amount like 1.2bn is not one;
+# a name whose last label is a listed file extension (app.config.json) is a
+# file name; a hyphen after the TLD ends the host (evil.com- still links). A
+# link goes only in the link field, where its host is checked
 URL_RE = re.compile(
     r"\b[a-z][a-z0-9+.-]*://|\bwww\."
-    r"|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|ai|co|eu|be|nl|de|fr|uk|dev|app|me|info|biz)\b",
+    r"|(?<![0-9.])\d{1,3}(?:\.\d{1,3}){3}(?![0-9])"
+    rf"|(?<![\w-])(?=[\w-]*[^\W\d_])[\w-]+(?:{_DOT}[\w-]+)*{_DOT}"
+    rf"(?!(?:{_FILE_EXTENSIONS})(?![\w-]))(?:[^\W\d_]{{2,63}}|xn--[a-z0-9-]{{1,59}})"
+    rf"(?![^\W_]|{_DOT}[^\W\d_])",
     re.IGNORECASE,
 )
 

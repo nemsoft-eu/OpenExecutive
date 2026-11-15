@@ -555,9 +555,24 @@ it by dropping the entry. Either takes effect when the API restarts.
 `PROGRESS_MAX_PER_SOURCE_PER_DAY` a day. The source an update is filed under comes from the
 token, never from the update. Each update goes to every active principal as a chat-app
 message, quoted as received under a header that names the source. A principal it doesn't
-reach (quiet hours, In my briefs, the anti-spam guard, no chat app), or every principal once
-the source is over its relay cap, gets it in their next brief instead. Principals also see
-the latest updates when they ask in chat.
+reach (quiet hours, In my briefs, the anti-spam guard, no chat app) gets it in their next
+brief instead. Once the source is over its relay cap, an update is stored but not sent: each
+principal's next brief carries one fixed notice that the source posted more updates than are
+relayed, and only one per source waits at a time. Principals also see the latest updates when
+they ask in chat. The response says only whether the update was `accepted` or a `duplicate`,
+never whether a message went out, so a source can't learn a principal's quiet hours or
+settings.
+
+The feature is also off while a client slot or a demo fixture is live, because
+`PROGRESS_SOURCES` is process-wide: an update would land in, and be sent to the founders of,
+whichever company is live. Act as me is off while a slot is active for the same reason. The
+check looks only at whether a slot or fixture marker file exists, so an unreadable or damaged
+marker counts as live, as does a failed check. So on an instance that serves several clients,
+progress updates are unavailable for now. While a fixture load, slot switch or knowledge sync
+is writing, a submit waits up to 10 seconds for it to finish and is refused as unavailable,
+with nothing stored, only if it is still running after that. Once an update is stored, its
+relay stops, writing nothing more, if the live company has changed since, though a message
+already being sent when the swap starts still goes out.
 
 **What it can't do.** On its own a token reads nothing, can't act as a person or the owner,
 reaches no one but the principals, and can't post as another source. A relay never goes by
@@ -571,8 +586,10 @@ is never recorded as anyone's words.
 | `POST /progress-updates` | `x-source-token` | Exempt from the shared-secret check. The least-privilege path: the source holds nothing else. |
 | MCP tool `post_progress_update` on `/mcp` | `x-api-key` (when `BACKEND_SHARED_SECRET` is set) **and** `x-source-token` | `/mcp` sits behind the shared-secret check, so a source using MCP also holds the shared secret, which opens the whole API (as a service, never the owner, with signed callers on). Give it MCP only if you would trust it with that; otherwise give it the REST route. |
 
-The route answers `404` while the feature is off and `401` for a missing or unknown token;
-the MCP tool gives one fixed refusal whatever failed.
+The route answers `404` while the feature is off (no sources, or a client slot or demo
+fixture live), `401` for a missing or unknown token, and `503` when a fixture, slot or sync
+write is still running after a 10-second wait. The MCP tool gives one fixed refusal for either of the first two,
+whatever failed, and its "unavailable" error for the third.
 
 ```bash
 curl -X POST https://api.example.com/progress-updates \
@@ -658,7 +675,7 @@ If `AUTH_GOOGLE_SECRET` is leaked, regenerate in Google Cloud Console (Clients â
 | Every UI call fails with `caller signing is misconfigured` | `CALLER_ASSERTION_PRIVATE_KEY` on the UI isn't `<key id>:<key>` as `scripts/make-caller-keys.py` prints it |
 | API refuses to start with `CALLER_ASSERTION_PUBLIC_KEYS can't be used` | The list is malformed. Paste the line the script printed |
 | An owner-only route refuses your `curl` | With signed callers on, a request carrying only `x-api-key` is a service and never the owner. Sign it with `scripts/mint-caller-assertion.py` |
-| `POST /progress-updates` answers `404` | `PROGRESS_SOURCES` is empty or malformed. The API log says which, once per value |
+| `POST /progress-updates` answers `404` | `PROGRESS_SOURCES` is empty or malformed (the API log says which, once per value), or a client slot or demo fixture is live. Progress updates are off while either is active |
 | Sign-in works but the chat stays empty | Backend is auth'd but `ANTHROPIC_API_KEY` is missing on the API. Its logs will show the error |
 | Signed in, but no past chats are listed | Your email isn't on your own People entry, so the API can't tell who you are. Setup saves it from the **Your sign-in email** field; to fix it afterwards, add the email to your row on the People page |
 | **Open** says it only works on this computer | You opened the app by a network address. Use `http://localhost:3000` in a browser on the machine running `make dev` |

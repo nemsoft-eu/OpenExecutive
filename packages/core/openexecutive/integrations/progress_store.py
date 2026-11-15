@@ -225,6 +225,29 @@ def admit(
         conn.close()
 
 
+def still_pending(update_id: int, source: str, digest: str, *, db_path: Path | None = None) -> bool:
+    """Whether the row ``admit`` stored for this update is still here and not
+    yet relayed. Every company swap (fixture load or unload, factory reset,
+    slot switch) wipes or replaces this table, so False means the live
+    company is no longer the one the update was posted to; matching the
+    source and content hash too keeps another database's row with the same
+    id from passing. False on any error, so a failed check stops a relay."""
+    try:
+        conn = _connect(db_path)
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM {TABLE} WHERE id = ? AND source = ? AND content_hash = ? "  # noqa: S608 — constant table name
+                "AND relay_state = 'pending'",
+                (update_id, source, digest),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("progress_store: couldn't check update #%s", update_id, exc_info=True)
+        return False
+    return row is not None
+
+
 def set_relay_state(
     update_id: int, state: str, *, now: datetime | None = None, db_path: Path | None = None
 ) -> None:

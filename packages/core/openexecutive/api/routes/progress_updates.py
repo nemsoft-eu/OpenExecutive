@@ -7,7 +7,8 @@ reads the caller: with signed callers on, a request with no assertion is a
 service, and the source an update is filed under comes from the token alone.
 
 The order is fixed so that nothing about the body is looked at for a caller
-who may not send one: feature off → 404, token missing or unknown → 401,
+who may not send one: feature off (no sources, or a client slot or demo
+fixture live) → 404, token missing or unknown → 401,
 then the body (8 KB at most → 413), parsing (422) and
 ``integrations.progress_updates.submit``, which holds every other rule.
 """
@@ -48,8 +49,9 @@ class ProgressRequest(BaseModel):
 
 
 class ProgressResponse(BaseModel):
-    """What became of the update. ``relay`` is ``sent``, ``queued`` or
-    ``duplicate``; a founder's own settings are never named."""
+    """What became of the update. ``relay`` is ``accepted`` or
+    ``duplicate``; whether a DM went out is never returned, so a source
+    cannot learn a founder's quiet hours or settings."""
 
     id: int
     stored: bool
@@ -79,7 +81,7 @@ async def _read_capped(request: Request) -> bytes | None:
 async def post_progress_update(request: Request) -> JSONResponse:
     """Submit one progress update as the source the token names. 201 when
     stored, 200 for a repeat of an update already stored."""
-    if not progress_sources.enabled():
+    if not pu.accepting():
         return _error(404, "Not Found")
     tokens = request.headers.getlist(TOKEN_HEADER)
     source = progress_sources.source_for(tokens[0]) if len(tokens) == 1 else None
@@ -111,6 +113,9 @@ async def post_progress_update(request: Request) -> JSONResponse:
         result = await pu.submit(source, parsed.model_dump(exclude_none=True))
     except pu.Rejected as exc:
         return _rejected(exc.field, exc.reason)
+    except pu.Paused:
+        # a slot or fixture went live after the check above: still "off"
+        return _error(404, "Not Found")
     except pu.OverLimit:
         return _error(429, "this source is at its daily limit of progress updates")
     except pu.StoreUnavailable:

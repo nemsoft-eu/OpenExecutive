@@ -37,6 +37,16 @@ def body(n: int = 1, **changes: Any) -> dict[str, Any]:
     return out
 
 
+def isolate_company_sentinels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The slot and fixture sentinels on temp paths, so a developer's own
+    live slot does not turn the feature off."""
+    from openexecutive.cli import fixture_loader
+    from openexecutive.clients import slots
+
+    monkeypatch.setattr(slots, "_active_client_sentinel", lambda _s: tmp_path / ".active_client")
+    monkeypatch.setattr(fixture_loader, "_fixture_active_sentinel", lambda _s: tmp_path / ".fixture_active")
+
+
 @pytest.fixture(autouse=True)
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Every store the route writes on one temp DB (progress updates, held
@@ -50,6 +60,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setattr(audit_logger, "_default_logger", audit_logger.AuditLogger(db_path=path))
     for var in ("BACKEND_SHARED_SECRET", "OE_LOCAL_LOGIN", "OE_PUBLIC_DEPLOYMENT", "CALLER_ASSERTION_PUBLIC_KEYS"):
         monkeypatch.delenv(var, raising=False)
+    isolate_company_sentinels(tmp_path, monkeypatch)
     people_store.upsert_person(full_name="Ada Founder", is_principal=True, slack_user_id="UADA")
     yield path
     people_registry.invalidate()
@@ -109,7 +120,7 @@ def stored_count(db: Path) -> int:
 def test_a_new_update_is_stored_and_relayed(token: str, sends: list[str], db: Path) -> None:
     res = post(client(), token, body())
     assert res.status_code == 201
-    assert res.json() == {"id": res.json()["id"], "stored": True, "relay": "sent"}
+    assert res.json() == {"id": res.json()["id"], "stored": True, "relay": "accepted"}
     assert len(sends) == 1 and f"from {SOURCE}" in sends[0]
     assert stored_count(db) == 1
 
@@ -123,13 +134,13 @@ def test_a_repeat_is_200_with_the_first_id_and_sends_nothing(token: str, sends: 
     assert len(sends) == 1
 
 
-def test_a_held_copy_reads_queued_never_held(token: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_held_copy_reads_accepted_never_held(token: str, monkeypatch: pytest.MonkeyPatch) -> None:
     async def suppressed(person: Person, text: str, *, label: str = "", chat_only: bool = False) -> PrincipalDelivery:
         return PrincipalDelivery(False, "slack_dm → U", "suppressed", "slack_dm")
 
     monkeypatch.setattr(runner, "deliver_to_person", suppressed)
     res = post(client(), token, body())
-    assert res.status_code == 201 and res.json()["relay"] == "queued"
+    assert res.status_code == 201 and res.json()["relay"] == "accepted"
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +156,27 @@ def test_feature_off_is_404_before_any_token_work(monkeypatch: pytest.MonkeyPatc
     res = post(client(), "anything", body())
     assert res.status_code == 404
     assert sends == []
+
+
+def test_a_live_client_slot_is_404_and_stores_nothing(
+    token: str, sends: list[str], db: Path, tmp_path: Path
+) -> None:
+    (tmp_path / ".active_client").write_text("acme")
+    res = post(client(), token, body())
+    assert res.status_code == 404
+    assert sends == [] and stored_count(db) == 0
+
+
+def test_a_slot_going_live_after_the_check_is_404(
+    token: str, sends: list[str], db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.integrations import progress_updates as pu
+
+    async def paused(source: str, payload: Any) -> pu.SubmitResult:
+        raise pu.Paused("a slot went live")
+
+    monkeypatch.setattr(pu, "submit", paused)
+    assert post(client(), token, body()).status_code == 404
 
 
 @pytest.mark.parametrize(

@@ -128,6 +128,22 @@ def test_a_nine_line_summary_is_rejected_not_collapsed() -> None:
         ("Draft is at https://evil.example/x for now.", "contains a URL; put one link in the link field"),
         ("Draft is at www.example.org for now.", "contains a URL; put one link in the link field"),
         ("Draft is at acme-launch.com for now.", "contains a URL; put one link in the link field"),
+        # any alphabetic TLD, not a fixed list: chat apps link these too
+        ("Re-verify billing at acme-billing.xyz/login today.", "contains a URL; put one link in the link field"),
+        ("Re-auth at EVIL.RU now please.", "contains a URL; put one link in the link field"),
+        ("Visit bücher.xyz for the brief.", "contains a URL; put one link in the link field"),
+        ("Pay the invoice via 203.0.113.9/pay today.", "contains a URL; put one link in the link field"),
+        # .py is Paraguay's TLD, so a file name under it counts as a domain
+        ("Fixed the bug in runner.py today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil.java today.", "contains a URL; put one link in the link field"),
+        # a hyphen or a trailing digit label after the TLD still leaves a link
+        ("See evil.com- now please.", "contains a URL; put one link in the link field"),
+        ("Check evil.com.1 for the draft.", "contains a URL; put one link in the link field"),
+        # internationalised and punycode domains, and ideographic dots
+        ("Re-verify at пример.рф today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil.cоm today.", "contains a URL; put one link in the link field"),  # Cyrillic о
+        ("Re-verify at evil.xn--p1ai today.", "contains a URL; put one link in the link field"),
+        ("Re-verify at evil。com today.", "contains a URL; put one link in the link field"),
     ],
 )
 def test_each_deny_pattern_rejects(text: str, reason: str) -> None:
@@ -151,6 +167,11 @@ def test_each_deny_pattern_rejects(text: str, reason: str) -> None:
         "Target FY26 PLAN WITH MORE REACH in Q3 2026.",  # capitals in prose
         "Shipped the Q3-Go-To-Market-Plan-For-Benelux-2026 page copy.",  # a slug
         "Our secret: start a week earlier.",
+        # dotted text that is not a domain
+        "Upgraded Node.js and updated app.config.json today.",
+        "Bumped yarn.lock and Cargo.lock; index.php is gone.",
+        "Revenue could reach €1.2bn, e.g. by Q3; release 1.2.3 is out.",
+        "Ph.D. hire starts at 3 p.m. on claude-3.5-sonnet work.",
     ],
 )
 def test_documented_misses_are_accepted(text: str) -> None:

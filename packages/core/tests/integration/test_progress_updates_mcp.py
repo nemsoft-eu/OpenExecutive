@@ -51,6 +51,13 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     episodic.initialize_db(path)
     people_store.initialize_db(path)
     monkeypatch.setattr(audit_logger, "_default_logger", audit_logger.AuditLogger(db_path=path))
+    # the slot and fixture sentinels on temp paths: a developer's own live
+    # slot must not turn the feature off
+    from openexecutive.cli import fixture_loader
+    from openexecutive.clients import slots
+
+    monkeypatch.setattr(slots, "_active_client_sentinel", lambda _s: tmp_path / ".active_client")
+    monkeypatch.setattr(fixture_loader, "_fixture_active_sentinel", lambda _s: tmp_path / ".fixture_active")
     people_registry.invalidate()
     people_store.upsert_person(
         full_name="Ada Founder", is_principal=True, slack_user_id="UADA", email="ada@co.example"
@@ -189,7 +196,7 @@ def test_a_valid_token_stores_and_relays(
     # service) and off: the tool never reads the caller
     app, endpoint = _app(monkeypatch, signed=signed)
     out = _ok(_post(app, endpoint, {HEADER: TOKEN}))
-    assert out == {"id": 1, "stored": True, "relay": "sent"}
+    assert out == {"id": 1, "stored": True, "relay": "accepted"}
     assert _stored(db) == [(1, SOURCE, "GTM plan", "sent")]
     slack.assert_awaited_once()
     text = slack.await_args.kwargs["text"]
@@ -259,7 +266,7 @@ def test_behind_a_shared_secret_the_token_works_and_may_act_does_not_matter(
 ) -> None:
     app, endpoint = _app(monkeypatch, secret="s3cret")
     headers = {"x-api-key": "s3cret", HEADER: TOKEN, **extra}
-    assert _ok(_post(app, endpoint, headers))["relay"] == "sent"
+    assert _ok(_post(app, endpoint, headers))["relay"] == "accepted"
     slack.assert_awaited_once()
 
 

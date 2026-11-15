@@ -481,9 +481,9 @@ the app refuses to start.
 | `MS365_MCP_ONEDRIVE` | No | `false` | Add the OneDrive tools (and the file permissions they need) to the Microsoft 365 sign-in; run `--login` again after turning it on |
 | `MCP_ENABLED` | No | on when the config file exists | MCP gateway (the Executive using other servers' tools); `false` keeps it off with the file in place |
 | `MCP_SERVERS_CONFIG_PATH` | No | `./company/mcp_servers.json` | MCP gateway server list and tool filters (see [mcp_servers.json.example](packages/core/mcp_servers.json.example)) |
-| `PROGRESS_SOURCES` | No | — | Agents allowed to post progress updates, as `<source id>:<token sha256>` entries from `scripts/make-source-token.py`; empty keeps the feature off (see [Source tokens](docs/auth.md#source-tokens-agents-posting-progress-updates)) |
+| `PROGRESS_SOURCES` | No | — | Agents allowed to post progress updates, as `<source id>:<token sha256>` entries from `scripts/make-source-token.py`; empty keeps the feature off, as does a live client slot or demo fixture (see [Source tokens](docs/auth.md#source-tokens-agents-posting-progress-updates)) |
 | `PROGRESS_MAX_PER_SOURCE_PER_DAY` | No | `30` | Progress updates one source may post in a rolling day |
-| `PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR` / `_PER_DAY` | No | `2` / `8` | Updates per source sent to the principals as a DM, per rolling hour and day; the rest wait for their next brief |
+| `PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR` / `_PER_DAY` | No | `2` / `8` | Updates per source sent to the principals as a DM, per rolling hour and day; the rest are stored but not sent, and each principal's next brief carries one notice per source that more are waiting |
 | `PROGRESS_LINK_HOSTS` | No | — | Comma-separated hosts an update's https link may point at; empty refuses every link |
 | `EMAIL_PROVIDER` | No | `google` | Backend for the inbound mailbox poller + alert email: `google` or `microsoft` |
 | `CALENDAR_PROVIDER` | No | `google` | Backend for the typed calendar booking tools: `google` or `microsoft` |

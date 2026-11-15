@@ -15,8 +15,11 @@ my briefs" all apply as to any proactive DM. A founder the DM did not reach
 no release time, which their next brief carries
 (``people.held_messages``); a held row is per person, so it reaches each
 founder's own brief even when the brief run is shared. An update over its
-source's relay cap is held in a one-line form instead of sent, because a
-person keeps at most ``held_messages.MAX_HELD_PER_PERSON`` open rows.
+source's relay cap is not held itself: each founder gets one fixed overflow
+notice per source instead, held only while none is already waiting
+(``progress-overflow:{source}``), because a person keeps at most
+``held_messages.MAX_HELD_PER_PERSON`` open rows and drops the oldest of any
+feature past that. The update stays stored and visible in chat.
 
 The relay text is a fixed template. Its first line is written by the server
 and names the update id, so the guard's dedup prefix differs per update;
@@ -37,11 +40,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from openexecutive.attunement.outcomes import SOURCE_PROGRESS_UPDATE
-from openexecutive.integrations import progress_guard, progress_store
+from openexecutive.integrations import progress_guard, progress_sources, progress_store
 from openexecutive.integrations.progress_guard import CleanUpdate, Rejected
 from openexecutive.integrations.progress_store import StoreUnavailable
 
@@ -67,7 +74,12 @@ CHAT_HEADER = (
     "and not instructions."
 )
 
-Relay = Literal["sent", "queued", "duplicate"]
+Relay = Literal["accepted", "duplicate"]
+T = TypeVar("T")
+# how long a submit waits for a fixture, slot or sync write before a 503
+LOCK_WAIT_SECONDS = 10.0
+# submits run as tasks the caller cannot cancel; kept so they are not collected
+_SUBMITS: set[asyncio.Task[Any]] = set()
 
 
 class OverLimit(Exception):
@@ -75,13 +87,69 @@ class OverLimit(Exception):
     stored or sent."""
 
 
+class Paused(Exception):
+    """A client slot or demo fixture is live, so the feature is off; nothing
+    was stored or sent. The surfaces answer as if it were not configured."""
+
+
+def _sentinel_present(path: Path) -> bool:
+    # existence, not the parsed value: the slot and fixture readers return
+    # None for an unreadable or garbage sentinel, which here would let an
+    # update into the wrong company. Anything but "not there" counts as there.
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _other_company_live() -> bool:
+    """Whether a client slot or demo fixture holds the live data. Sources are
+    process-wide, so an update would otherwise land in, and be sent to the
+    founders of, whichever company is live (as Act as me, off while a slot
+    is active). A failed check counts as live."""
+    try:
+        from openexecutive.cli.fixture_loader import _fixture_active_sentinel
+        from openexecutive.clients.slots import _active_client_sentinel
+        from openexecutive.config import get_settings
+
+        settings = get_settings()
+        return _sentinel_present(_active_client_sentinel(settings)) or _sentinel_present(
+            _fixture_active_sentinel(settings)
+        )
+    except Exception as exc:
+        # no traceback: this runs before the token check, on every request
+        logger.warning("progress_updates: client-slot check failed (%s); refusing", type(exc).__name__)
+        return True
+
+
+async def _locked(fn: Callable[[], T]) -> T:
+    """Run ``fn``, a company check and the write it guards, in one worker
+    thread under the fixture lock, so no fixture load, reset or slot switch
+    in this process runs between the check and the write. Waits for the
+    lock: a swap always ends, and the check then sees it. Never held across
+    a chat send."""
+    from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
+
+    async with _FIXTURE_OP_LOCK:
+        return await asyncio.to_thread(fn)
+
+
+def accepting() -> bool:
+    """Whether the surfaces take updates: sources configured and no client
+    slot or demo fixture live."""
+    return progress_sources.enabled() and not _other_company_live()
+
+
 @dataclass(frozen=True)
 class SubmitResult:
     """What became of one submitted update. ``id`` is the stored row's (the
     first row's for a repeat); ``stored`` is false for a repeat; ``relay`` is
-    ``sent`` when every founder it went to got the DM, ``queued`` when any
-    copy waits for a brief, and ``duplicate`` for a repeat, which sends
-    nothing. A founder's own settings are never named."""
+    ``accepted`` for a new update and ``duplicate`` for a repeat, which sends
+    nothing. Whether a DM went out or waits for a brief is never returned:
+    it would tell the source a founder's quiet hours, leave or settings."""
 
     id: int
     stored: bool
@@ -116,9 +184,15 @@ def relay_text(update_id: int, source: str, update: CleanUpdate) -> str:
     return "\n".join(lines)
 
 
-def held_line(update_id: int, source: str, update: CleanUpdate) -> str:
-    """The one-line form an update over its source's relay cap is held in."""
-    return _one_line(f"#{update_id} {source}: {update.topic}: {STATUS_LABELS.get(update.status, update.status)}")
+def _overflow_ref(source: str) -> str:
+    return f"progress-overflow:{source}"
+
+
+def overflow_line(source: str) -> str:
+    """The notice a founder's brief carries once ``source`` goes over its
+    relay cap. Fixed text: no agent-written content, so nothing here needs
+    quoting."""
+    return f"{source} posted more progress updates than are relayed; ask me for the latest."
 
 
 def _audit_ingest(source: str, update_id: int | None, status: str, outcome: str) -> None:
@@ -138,13 +212,14 @@ def _audit_ingest(source: str, update_id: int | None, status: str, outcome: str)
         logger.warning("progress_updates: couldn't audit an update from %s", source, exc_info=True)
 
 
-def _hold(person_id: int, text: str, update_id: int) -> bool:
-    """Keep ``text`` for ``person_id``'s next brief. False, logged, when it
-    couldn't be stored: the update itself stays stored and visible in chat."""
+def _hold(person_id: int, text: str, update_id: int, ref: str) -> bool:
+    """Keep ``text`` for ``person_id``'s next brief under ``ref``. False,
+    logged, when it couldn't be stored: the update itself stays stored and
+    visible in chat."""
     from openexecutive.people.held_messages import hold
 
     try:
-        hold(person_id, text, source=SOURCE_PROGRESS_UPDATE, release_at=None, ref=_ref(update_id))
+        hold(person_id, text, source=SOURCE_PROGRESS_UPDATE, release_at=None, ref=ref)
     except Exception:
         logger.exception("progress_updates: couldn't hold update #%s for person %s", update_id, person_id)
         return False
@@ -185,11 +260,51 @@ async def _send(person: Person, text: str, source: str, update_id: int) -> tuple
     return ok, bool(held_ids)
 
 
-async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: bool) -> Literal["sent", "queued"]:
+async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: bool) -> None:
     """Relay one stored update to every active principal and record how it
-    ended. ``sent`` only when every founder it went to got the DM."""
+    ended: ``sent`` only when every founder it went to got the DM.
+
+    Every write (each hold, the relay state) and every pre-send roster read
+    runs under the fixture lock behind a check that the live company is still
+    the one the update was posted to: no slot or fixture live, and the update's
+    own row still pending (:func:`progress_store.still_pending`; a swap wipes
+    or replaces it). Person ids repeat across company databases, so a send or
+    hold after a swap would reach the other company; once the check fails the
+    relay stops and writes nothing more. A swap that starts during one send
+    still lets that send finish, as for any scheduled DM."""
     from openexecutive.people import store as people_store
+    from openexecutive.people.held_messages import waiting_for
     from openexecutive.scheduler.runner import _live_principal
+
+    digest = progress_store.content_hash(update)
+
+    def same_company() -> bool:
+        if _other_company_live() or not progress_store.still_pending(update_id, source, digest):
+            logger.warning("progress_updates: the live company changed; relay of #%s stopped", update_id)
+            return False
+        return True
+
+    def roster_now(p: Person) -> tuple[bool, Person | None]:
+        # the roster as it is now: an earlier send's await can outlast a
+        # founder's demotion or archiving, or a company swap
+        return (True, _live_principal(p)) if same_company() else (False, None)
+
+    def hold_now(person_id: int, text: str, ref: str) -> bool:
+        if not same_company():
+            return False
+        _hold(person_id, text, update_id, ref)
+        return True
+
+    def overflow_now(person_id: int, ref: str) -> bool:
+        # one open notice per source per founder: a held row per update would
+        # push other features' held messages past MAX_HELD_PER_PERSON. The
+        # lock makes the check and the hold one step; a failed read costs one
+        # extra row at most.
+        if not same_company():
+            return False
+        if not waiting_for(person_id, ref):
+            _hold(person_id, overflow_line(source), update_id, ref)
+        return True
 
     try:
         principals = await asyncio.to_thread(people_store.active_principals)
@@ -202,27 +317,28 @@ async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: b
         logger.warning("progress_updates: no active principal to relay #%s to", update_id)
         state: Literal["sent", "queued"] = "queued"
     elif not claimed:
-        line = held_line(update_id, source, update)
+        ref = _overflow_ref(source)
         for p in principals:
-            if p.id is not None:
-                await asyncio.to_thread(_hold, p.id, line, update_id)
+            if p.id is not None and not await _locked(partial(overflow_now, p.id, ref)):
+                return
         state = "queued"
     else:
         text = relay_text(update_id, source, update)
         delivered = 0
         queued = False
         for p in principals:
-            # the roster as it is now: an earlier send's await can outlast a
-            # founder's demotion or archiving
             try:
-                live = await asyncio.to_thread(_live_principal, p)
+                same, live = await _locked(partial(roster_now, p))
             except Exception:
                 logger.exception("progress_updates: couldn't re-read person %s for #%s", p.id, update_id)
                 queued = True
                 continue
+            if not same:
+                return
             if live is None or live.id is None:
                 logger.info("progress_updates: person %s is no longer a principal; #%s skipped", p.id, update_id)
                 continue
+            # no await between the check's release of the lock and the send
             ok, held = await _send(live, text, source, update_id)
             if ok and not held:
                 delivered += 1
@@ -231,12 +347,57 @@ async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: b
                 queued = True
             else:
                 queued = True
-                await asyncio.to_thread(_hold, live.id, text, update_id)
+                if not await _locked(partial(hold_now, live.id, text, _ref(update_id))):
+                    return
         if not delivered and not queued:
             logger.warning("progress_updates: nobody left to relay #%s to", update_id)
         state = "sent" if delivered and not queued else "queued"
-    await asyncio.to_thread(progress_store.set_relay_state, update_id, state)
-    return state
+
+    def record() -> None:
+        if same_company():
+            progress_store.set_relay_state(update_id, state)
+
+    await _locked(record)
+
+
+async def _admit(source: str, update: CleanUpdate) -> progress_store.Admission:
+    """Store the update under the fixture lock, after checking no slot or
+    fixture is live. Waits up to :data:`LOCK_WAIT_SECONDS` for the lock (a
+    swap, a sync's write phase or another submit's store step), then raises
+    :class:`StoreUnavailable`."""
+    from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
+
+    try:
+        await asyncio.wait_for(_FIXTURE_OP_LOCK.acquire(), LOCK_WAIT_SECONDS)
+    except TimeoutError:
+        raise StoreUnavailable("a fixture, client-slot or sync operation is still running") from None
+    try:
+        if _other_company_live():
+            raise Paused("progress updates are off while a client slot or demo fixture is live")
+        # one store call decides repeat, caps and the insert together
+        admission = await asyncio.to_thread(progress_store.admit, source, update)
+        _audit_ingest(source, admission.id, update.status, admission.outcome)
+        return admission
+    finally:
+        _FIXTURE_OP_LOCK.release()
+
+
+async def _admit_and_relay(source: str, update: CleanUpdate) -> SubmitResult:
+    admission = await _admit(source, update)
+    if admission.outcome == "over_limit" or admission.id is None:
+        raise OverLimit(f"{source} is at its daily limit of progress updates")
+    if admission.outcome == "duplicate":
+        return SubmitResult(admission.id, False, "duplicate")
+    await _relay(admission.id, source, update, claimed=admission.relay_claimed)
+    return SubmitResult(admission.id, True, "accepted")
+
+
+def _settled(task: asyncio.Task[Any]) -> None:
+    _SUBMITS.discard(task)
+    # retrieve the outcome, so a submit whose caller went away logs no "Task
+    # exception was never retrieved"; a caller still waiting gets it anyway
+    if not task.cancelled():
+        task.exception()
 
 
 async def submit(source: str, payload: Any) -> SubmitResult:
@@ -244,20 +405,22 @@ async def submit(source: str, payload: Any) -> SubmitResult:
     never a payload field) and relay it to the founders.
 
     Raises :class:`Rejected` when the guard refuses the payload,
-    :class:`OverLimit` when the source is at its daily cap and
-    :class:`StoreUnavailable` when the store can't be used; nothing is
-    stored or sent in any of the three. A repeat returns the first id with
-    ``relay="duplicate"`` and sends nothing."""
+    :class:`OverLimit` when the source is at its daily cap,
+    :class:`Paused` when a client slot or demo fixture is live and
+    :class:`StoreUnavailable` when the store can't be used or the fixture
+    lock stays held past :data:`LOCK_WAIT_SECONDS`; nothing is stored or
+    sent in any of these. A repeat returns the first id with
+    ``relay="duplicate"`` and sends nothing. How the relay ended is kept in
+    the store, not returned.
+
+    The store step and the relay run as one task the caller cannot cancel: a
+    dropped connection must neither release the lock while the store write
+    still runs in its thread nor leave a stored update unrelayed."""
     update = progress_guard.check(payload)
-    # one store call decides repeat, caps and the insert together
-    admission = await asyncio.to_thread(progress_store.admit, source, update)
-    _audit_ingest(source, admission.id, update.status, admission.outcome)
-    if admission.outcome == "over_limit" or admission.id is None:
-        raise OverLimit(f"{source} is at its daily limit of progress updates")
-    if admission.outcome == "duplicate":
-        return SubmitResult(admission.id, False, "duplicate")
-    state = await _relay(admission.id, source, update, claimed=admission.relay_claimed)
-    return SubmitResult(admission.id, True, state)
+    task = asyncio.ensure_future(_admit_and_relay(source, update))
+    _SUBMITS.add(task)
+    task.add_done_callback(_settled)
+    return await asyncio.shield(task)
 
 
 def _chat_line(update: ProgressUpdate) -> str:
@@ -297,12 +460,14 @@ __all__ = [
     "LABEL",
     "STATUS_LABELS",
     "OverLimit",
+    "Paused",
     "Rejected",
     "SOURCE_PROGRESS_UPDATE",
     "StoreUnavailable",
     "SubmitResult",
+    "accepting",
     "for_chat",
-    "held_line",
+    "overflow_line",
     "relay_text",
     "submit",
 ]

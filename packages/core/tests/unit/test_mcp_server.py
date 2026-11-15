@@ -7,6 +7,7 @@ mount, and the shared-secret gate), not the underlying subsystems.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -530,16 +531,22 @@ def _progress_request(token: str | None = "tok", *, secret_ok: bool | None = Non
 
 
 @pytest.fixture
-def progress_source(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    """A request carrying a known token (no shared secret), and ``submit``
-    stubbed; returns the stub."""
+def progress_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncMock:
+    """A request carrying a known token (no shared secret), the slot and
+    fixture sentinels on temp paths (none live), and ``submit`` stubbed;
+    returns the stub."""
+    from openexecutive.cli import fixture_loader
+    from openexecutive.clients import slots
     from openexecutive.integrations import progress_sources, progress_updates
+
+    monkeypatch.setattr(slots, "_active_client_sentinel", lambda _s: tmp_path / ".active_client")
+    monkeypatch.setattr(fixture_loader, "_fixture_active_sentinel", lambda _s: tmp_path / ".fixture_active")
 
     monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
     monkeypatch.setattr(mcp_server, "_request", lambda: _progress_request("tok"))
     monkeypatch.setattr(progress_sources, "enabled", lambda: True)
     monkeypatch.setattr(progress_sources, "source_for", lambda t: "planner" if t == "tok" else None)
-    submit = AsyncMock(return_value=progress_updates.SubmitResult(7, True, "sent"))
+    submit = AsyncMock(return_value=progress_updates.SubmitResult(7, True, "accepted"))
     monkeypatch.setattr(progress_updates, "submit", submit)
     return submit
 
@@ -565,7 +572,7 @@ async def test_post_progress_update_advertises_the_statuses() -> None:
 @pytest.mark.asyncio
 async def test_post_progress_update_files_under_the_token_source(progress_source: AsyncMock) -> None:
     out = await mcp_server.post_progress_update(**PROGRESS_ARGS)
-    assert out == {"id": 7, "stored": True, "relay": "sent"}
+    assert out == {"id": 7, "stored": True, "relay": "accepted"}
     source, payload = progress_source.await_args.args
     assert source == "planner"
     # empty optionals are omitted, not sent to the guard as values
@@ -614,6 +621,27 @@ async def test_post_progress_update_is_refused_when_the_feature_is_off(
     progress_source.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_post_progress_update_is_refused_while_a_client_slot_is_live(
+    progress_source: AsyncMock, tmp_path: Path
+) -> None:
+    (tmp_path / ".active_client").write_text("acme")
+    with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    progress_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_progress_update_paused_mid_submit_is_refused(
+    progress_source: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.integrations import progress_updates
+
+    progress_source.side_effect = progress_updates.Paused("a slot went live")
+    with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+
+
 @pytest.mark.parametrize(("secret_ok", "allowed"), [(None, False), (False, False), (True, True)])
 @pytest.mark.asyncio
 async def test_with_a_shared_secret_the_gate_must_have_passed_the_request(
@@ -622,7 +650,7 @@ async def test_with_a_shared_secret_the_gate_must_have_passed_the_request(
     monkeypatch.setenv("BACKEND_SHARED_SECRET", "s3cret")
     monkeypatch.setattr(mcp_server, "_request", lambda: _progress_request("tok", secret_ok=secret_ok))
     if allowed:
-        assert (await mcp_server.post_progress_update(**PROGRESS_ARGS))["relay"] == "sent"
+        assert (await mcp_server.post_progress_update(**PROGRESS_ARGS))["relay"] == "accepted"
     else:
         with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
             await mcp_server.post_progress_update(**PROGRESS_ARGS)

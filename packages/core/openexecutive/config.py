@@ -1204,8 +1204,9 @@ class Settings(BaseSettings):
     # empty keeps the feature off. The caps count per source over a rolling
     # window: accepted updates per day, and relays (a DM to each founder) per
     # hour and per day, so one source cannot spend the founders' whole
-    # outbound-guard budget. An update over the relay cap is still stored and
-    # waits for the founders' next brief. PROGRESS_LINK_HOSTS lists the exact
+    # outbound-guard budget. An update over the relay cap is still stored but
+    # not sent; each founder's next brief carries one fixed notice per source
+    # that more updates are waiting. PROGRESS_LINK_HOSTS lists the exact
     # hosts an update's https link may point at; empty refuses every link.
     progress_sources: str = Field("", alias="PROGRESS_SOURCES")
     progress_max_per_source_per_day: int = Field(
