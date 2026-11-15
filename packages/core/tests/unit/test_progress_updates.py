@@ -326,6 +326,57 @@ def test_a_duplicate_returns_the_first_id_and_sends_nothing(
     assert len(calls) == 2
 
 
+def _stored_but_never_relayed(body: dict[str, Any]) -> int:
+    # what a restart between the store step and the relay leaves behind
+    admission = progress_store.admit(SOURCE, _clean(body))
+    assert admission.outcome == "stored" and admission.id is not None
+    return admission.id
+
+
+def test_a_retry_finishes_a_relay_that_never_ran(db: Path, founders: list[int], deliver: Any) -> None:
+    calls = deliver(None)
+    update_id = _stored_but_never_relayed(payload(idempotency_key="run-0000001"))
+    # the retry carries the same key but other text: the stored row is relayed
+    got = submit(payload(2, idempotency_key="run-0000001"))
+    assert got == pu.SubmitResult(update_id, False, "duplicate")
+    assert [c["person_id"] for c in calls] == founders
+    assert all("Positioning draft 1 is done." in c["text"] for c in calls)
+    assert relay_state(db, update_id) == "sent"
+    # finished now, so a further retry sends nothing
+    submit(payload(idempotency_key="run-0000001"))
+    assert len(calls) == 2
+
+
+def test_a_retry_after_a_failed_pending_check_finishes_the_relay(
+    db: Path, founders: list[int], deliver: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = deliver(None)
+    real_still_pending = progress_store.still_pending
+    failing = [True]
+
+    def flaky(*a: Any, **k: Any) -> bool:
+        # the store read fails on the first relay only
+        return False if failing[0] else real_still_pending(*a, **k)
+
+    monkeypatch.setattr(progress_store, "still_pending", flaky)
+    first = submit(payload())
+    assert calls == [] and relay_state(db, first.id) == "pending"
+    failing[0] = False
+    submit(payload())
+    assert [c["person_id"] for c in calls] == founders
+    assert relay_state(db, first.id) == "sent"
+
+
+def test_a_retry_while_the_relay_runs_starts_no_second_one(
+    db: Path, founders: list[int], deliver: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = deliver(None)
+    update_id = _stored_but_never_relayed(payload())
+    monkeypatch.setattr(pu, "_RELAYING", {update_id})
+    assert submit(payload()) == pu.SubmitResult(update_id, False, "duplicate")
+    assert calls == [] and relay_state(db, update_id) == "pending"
+
+
 def test_a_rejected_update_is_neither_stored_nor_sent(db: Path, founders: list[int], deliver: Any) -> None:
     calls = deliver(None)
     with pytest.raises(pu.Rejected) as caught:

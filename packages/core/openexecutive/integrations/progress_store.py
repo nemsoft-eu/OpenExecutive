@@ -248,6 +248,37 @@ def still_pending(update_id: int, source: str, digest: str, *, db_path: Path | N
     return row is not None
 
 
+def unfinished_relay(update_id: int, *, db_path: Path | None = None) -> tuple[CleanUpdate, bool] | None:
+    """The stored update and its ``relay_claimed`` when its relay never
+    finished (still ``pending``), so a repeat can finish it; None when it
+    finished, is gone, or can't be read."""
+    try:
+        conn = _connect(db_path)
+        try:
+            row = conn.execute(
+                f"SELECT topic, topic_key, status, summary, ask, link, idempotency_key, relay_claimed "  # noqa: S608 — constant table name
+                f"FROM {TABLE} WHERE id = ? AND relay_state = 'pending'",
+                (update_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("progress_store: couldn't read update #%s", update_id, exc_info=True)
+        return None
+    if row is None:
+        return None
+    update = CleanUpdate(
+        topic=row["topic"],
+        topic_key=row["topic_key"],
+        status=row["status"],
+        summary=row["summary"],
+        ask=row["ask"],
+        link=row["link"],
+        idempotency_key=row["idempotency_key"],
+    )
+    return update, bool(row["relay_claimed"])
+
+
 def set_relay_state(
     update_id: int, state: str, *, now: datetime | None = None, db_path: Path | None = None
 ) -> None:

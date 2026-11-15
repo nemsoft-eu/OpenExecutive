@@ -78,6 +78,9 @@ T = TypeVar("T")
 LOCK_WAIT_SECONDS = 10.0
 # submits run as tasks the caller cannot cancel; kept so they are not collected
 _SUBMITS: set[asyncio.Task[Any]] = set()
+# the ids whose relay is running in this process: a repeat finishes a pending
+# row only when no relay of it is still under way
+_RELAYING: set[int] = set()
 
 
 class OverLimit(Exception):
@@ -338,11 +341,25 @@ async def _relay(update_id: int, source: str, update: CleanUpdate, *, claimed: b
     await _locked(record)
 
 
-async def _admit(source: str, update: CleanUpdate) -> progress_store.Admission:
+def _admit_now(source: str, update: CleanUpdate) -> tuple[progress_store.Admission, tuple[CleanUpdate, bool] | None]:
+    # one store call decides repeat, caps and the insert together; a repeat
+    # of a row whose relay never finished also returns that row, read in the
+    # same locked step
+    admission = progress_store.admit(source, update)
+    unfinished = None
+    if admission.outcome == "duplicate" and admission.id is not None:
+        unfinished = progress_store.unfinished_relay(admission.id)
+    return admission, unfinished
+
+
+async def _admit(
+    source: str, update: CleanUpdate
+) -> tuple[progress_store.Admission, tuple[CleanUpdate, bool] | None]:
     """Store the update under the fixture lock, after checking no slot or
     fixture is live. Waits up to :data:`LOCK_WAIT_SECONDS` for the lock (a
     swap, a sync's write phase or another submit's store step), then raises
-    :class:`StoreUnavailable`."""
+    :class:`StoreUnavailable`. For a repeat, also returns the stored update
+    when its relay never finished."""
     from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
 
     try:
@@ -352,21 +369,39 @@ async def _admit(source: str, update: CleanUpdate) -> progress_store.Admission:
     try:
         if _other_company_live():
             raise Paused("progress updates are off while a client slot or demo fixture is live")
-        # one store call decides repeat, caps and the insert together
-        admission = await asyncio.to_thread(progress_store.admit, source, update)
+        admission, unfinished = await asyncio.to_thread(_admit_now, source, update)
         _audit_ingest(source, admission.id, update.status, admission.outcome)
-        return admission
+        return admission, unfinished
     finally:
         _FIXTURE_OP_LOCK.release()
 
 
+async def _relay_once(update_id: int, source: str, update: CleanUpdate, *, claimed: bool) -> None:
+    # at most one relay per row in this process; the check and the add have
+    # no await between them, so two concurrent repeats can't both start one
+    if update_id in _RELAYING:
+        return
+    _RELAYING.add(update_id)
+    try:
+        await _relay(update_id, source, update, claimed=claimed)
+    finally:
+        _RELAYING.discard(update_id)
+
+
 async def _admit_and_relay(source: str, update: CleanUpdate) -> SubmitResult:
-    admission = await _admit(source, update)
+    admission, unfinished = await _admit(source, update)
     if admission.outcome == "over_limit" or admission.id is None:
         raise OverLimit(f"{source} is at its daily limit of progress updates")
     if admission.outcome == "duplicate":
+        # a relay cut short (a restart mid-send, a failed store read) leaves
+        # the row pending; the source's retry is a repeat, so finish it from
+        # the stored row here rather than lose it. A founder already sent the
+        # DM before the cut may get it twice.
+        if unfinished is not None:
+            stored, claimed = unfinished
+            await _relay_once(admission.id, source, stored, claimed=claimed)
         return SubmitResult(admission.id, False, "duplicate")
-    await _relay(admission.id, source, update, claimed=admission.relay_claimed)
+    await _relay_once(admission.id, source, update, claimed=admission.relay_claimed)
     return SubmitResult(admission.id, True, "accepted")
 
 
@@ -388,8 +423,10 @@ async def submit(source: str, payload: Any) -> SubmitResult:
     :class:`StoreUnavailable` when the store can't be used or the fixture
     lock stays held past :data:`LOCK_WAIT_SECONDS`; nothing is stored or
     sent in any of these. A repeat returns the first id with
-    ``relay="duplicate"`` and sends nothing. How the relay ended is kept in
-    the store, not returned.
+    ``relay="duplicate"``. It sends nothing, unless the first row's relay
+    never finished (a restart cut it short) and none is running; then it
+    relays the stored update. How the relay ended is kept in the store, not
+    returned.
 
     The store step and the relay run as one task the caller cannot cancel: a
     dropped connection must neither release the lock while the store write

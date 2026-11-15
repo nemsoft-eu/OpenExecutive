@@ -11059,7 +11059,11 @@ integrations:
         paraphrase; it is a tripwire, not the control.
       - One atomic admit (progress_store.admit, BEGIN IMMEDIATE): repeat
         (same (source, idempotency_key), or the same content_hash from the
-        source within 24 h) -> the first id, `duplicate`, nothing sent;
+        source within 24 h) -> the first id, `duplicate`, nothing sent,
+        unless that row is still `pending` with no relay of it running in
+        this process (_RELAYING): a restart or failed store read cut it
+        short, so the repeat relays the STORED row (at-least-once; a
+        founder reached before the cut may get it twice);
         daily cap (PROGRESS_MAX_PER_SOURCE_PER_DAY, 30) -> nothing stored;
         relay claimed only under PROGRESS_RELAY_MAX_PER_SOURCE_PER_HOUR (2)
         and _PER_DAY (8). All caps are rolling windows; the relay-cap count
