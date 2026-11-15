@@ -281,6 +281,32 @@ def test_the_actions_header_does_not_stand_in_for_the_token(
     slack.assert_not_awaited()
 
 
+def test_the_token_does_not_stand_in_for_the_shared_secret(
+    db: Path, slack: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # unlike POST /progress-updates, /mcp stays behind the shared-secret
+    # gate: a source token without x-api-key never reaches the tool
+    app, _endpoint = _app(monkeypatch, secret="s3cret")
+
+    async def _go() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "post_progress_update", "arguments": ARGS},
+                },
+                headers={"accept": "application/json, text/event-stream", HEADER: TOKEN},
+            )
+
+    response = asyncio.run(_go())
+    assert response.status_code == 401
+    assert response.json() == {"error": "unauthorized"}
+    assert _stored(db) == []
+    slack.assert_not_awaited()
+
+
 def test_a_guard_rejection_names_the_field(db: Path, slack: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
     app, endpoint = _app(monkeypatch)
     out = _post(app, endpoint, {HEADER: TOKEN}, {**ARGS, "summary": "Mail me at a@b.example now."})
@@ -289,6 +315,24 @@ def test_a_guard_rejection_names_the_field(db: Path, slack: AsyncMock, monkeypat
     assert "a@b.example" not in message
     assert _stored(db) == []
     slack.assert_not_awaited()
+
+
+def test_over_the_daily_cap_the_tool_errors_and_sends_nothing(
+    db: Path, slack: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive import config
+
+    # on top of the settings the slack fixture patched in
+    current = config.get_settings()
+    monkeypatch.setattr(
+        config, "get_settings", lambda: current.model_copy(update={"progress_max_per_source_per_day": 1})
+    )
+    app, endpoint = _app(monkeypatch)
+    assert _ok(_post(app, endpoint, {HEADER: TOKEN}))["stored"] is True
+    message = _error(_post(app, endpoint, {HEADER: TOKEN}, {**ARGS, "topic": "Another topic"}))
+    assert message.endswith(f": {SOURCE} is at its daily limit of progress updates")
+    assert _stored(db) == [(1, SOURCE, "GTM plan", "sent")]
+    slack.assert_awaited_once()
 
 
 def test_a_store_failure_returns_the_fixed_error(

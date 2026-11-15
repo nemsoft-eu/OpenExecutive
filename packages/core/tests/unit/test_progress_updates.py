@@ -753,6 +753,27 @@ def test_for_chat_wraps_each_source_on_its_own(db: Path, deliver: Any) -> None:
     assert "Positioning" not in block
 
 
+def test_for_chat_stops_at_the_character_budget(db: Path) -> None:
+    from openexecutive.integrations.progress_guard import CleanUpdate
+
+    # five topics, each line about 365 characters with a 300-character ask:
+    # three fit in CHAT_MAX_CHARS (1200), the fourth would not
+    now = datetime.now(UTC)
+    for n in range(1, 6):
+        update = CleanUpdate(
+            topic=f"Topic {n}", topic_key=f"topic {n}", status="on_track",
+            summary="Positioning draft is done.", ask="x" * 300, link=None, idempotency_key=None,
+        )
+        progress_store.admit(SOURCE, update, now=now - timedelta(minutes=n), db_path=db)
+    block = pu.for_chat()
+    lines = [line for line in block.splitlines() if line.startswith("- #")]
+    # newest first, and the oldest left out rather than cut short
+    assert [line.split(": ")[1] for line in lines] == ["Topic 1", "Topic 2", "Topic 3"]
+    assert all(line.endswith("x" * 300) for line in lines)
+    assert sum(len(line) for line in lines) <= pu.CHAT_MAX_CHARS
+    assert "Topic 4" not in block and "Topic 5" not in block
+
+
 def _clean(body: dict[str, Any]) -> Any:
     from openexecutive.integrations.progress_guard import check
 

@@ -184,6 +184,27 @@ def test_set_relay_state(db: Path) -> None:
         store.set_relay_state(got.id, "held")
 
 
+def test_still_pending_matches_id_source_and_content(db: Path) -> None:
+    got = admit(BASE)
+    assert got.id is not None
+    digest = store.content_hash(BASE)
+    assert store.still_pending(got.id, "marketing-planner", digest) is True
+    # the same id in another company's table: a different source or content
+    assert store.still_pending(got.id, "ops-bot", digest) is False
+    assert store.still_pending(got.id, "marketing-planner", store.content_hash(update(2))) is False
+    assert store.still_pending(got.id + 1, "marketing-planner", digest) is False
+    # relayed already
+    store.set_relay_state(got.id, "sent", now=NOW)
+    assert store.still_pending(got.id, "marketing-planner", digest) is False
+
+
+def test_still_pending_is_false_on_a_broken_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    broken = tmp_path / "a-directory"
+    broken.mkdir()
+    monkeypatch.setattr(episodic, "DB_PATH", broken)
+    assert store.still_pending(1, "marketing-planner", store.content_hash(BASE)) is False
+
+
 def test_latest_per_topic() -> None:
     admit(update(1), at=NOW - timedelta(days=40))  # too old
     admit(replace(BASE, topic="Launch event", topic_key="launch event"), at=NOW - timedelta(days=2))

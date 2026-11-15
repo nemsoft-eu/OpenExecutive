@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -136,3 +139,38 @@ def test_make_token_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ps.source_for(token) == "marketing-planner"
     with pytest.raises(ps.SourcesError):
         ps.make_token("Not Valid")
+
+
+SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "make-source-token.py"
+
+
+def _run_script(source_id: str) -> subprocess.CompletedProcess[str]:
+    # on its own, as an operator runs it: no package installed, another cwd
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), source_id], capture_output=True, text=True, check=False, cwd="/"
+    )
+
+
+def test_the_script_prints_a_token_and_an_entry_the_api_accepts(monkeypatch: pytest.MonkeyPatch) -> None:
+    made: dict[str, tuple[str, str]] = {}
+    for source_id in ("marketing-planner", "ops-bot"):
+        run = _run_script(source_id)
+        assert run.returncode == 0, run.stderr
+        token, setting = [line for line in run.stdout.splitlines() if not line.startswith("#")]
+        name, _, entry = setting.partition("=")
+        assert name == ps.ENV
+        assert token not in entry
+        made[source_id] = (token, entry)
+    # several sources, comma-separated, as the script's own help says
+    raw = ",".join(entry for _, entry in made.values())
+    assert set(ps.parse_sources(raw)) == {"marketing-planner", "ops-bot"}
+    monkeypatch.setenv(ps.ENV, raw)
+    for source_id, (token, _) in made.items():
+        assert ps.source_for(token) == source_id
+
+
+def test_the_script_refuses_a_malformed_source_id() -> None:
+    run = _run_script("Not Valid")
+    assert run.returncode == 2
+    assert run.stdout == ""
+    assert "source id" in run.stderr

@@ -155,6 +155,7 @@ def test_feature_off_is_404_before_any_token_work(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(progress_sources, "source_for", no_token_work)
     res = post(client(), "anything", body())
     assert res.status_code == 404
+    assert res.json() == {"detail": "Not Found"}
     assert sends == []
 
 
@@ -176,7 +177,10 @@ def test_a_slot_going_live_after_the_check_is_404(
         raise pu.Paused("a slot went live")
 
     monkeypatch.setattr(pu, "submit", paused)
-    assert post(client(), token, body()).status_code == 404
+    res = post(client(), token, body())
+    assert res.status_code == 404
+    # the same answer as a feature that is not configured
+    assert res.json() == {"detail": "Not Found"}
 
 
 @pytest.mark.parametrize(
@@ -193,6 +197,7 @@ def test_a_missing_or_unknown_token_is_401(
 ) -> None:
     res = post(client(), presented, payload)
     assert res.status_code == 401
+    assert res.json() == {"detail": "a valid x-source-token header is required"}
     assert sends == [] and stored_count(db) == 0
 
 
@@ -202,11 +207,14 @@ def test_a_token_in_the_body_only_is_401(token: str, sends: list[str], db: Path)
     assert stored_count(db) == 0
 
 
-def test_two_token_headers_are_401(token: str, sends: list[str]) -> None:
+def test_two_token_headers_are_401(token: str, sends: list[str], db: Path) -> None:
+    # even two copies of the valid token: which one counts is never guessed
     res = client().post(
         PATH, headers=[("x-source-token", token), ("x-source-token", token)], json=body()
     )
     assert res.status_code == 401
+    assert res.json() == {"detail": "a valid x-source-token header is required"}
+    assert sends == [] and stored_count(db) == 0
 
 
 def test_the_body_is_not_read_without_a_valid_token(token: str, sends: list[str]) -> None:
@@ -221,6 +229,7 @@ def test_the_body_is_not_read_without_a_valid_token(token: str, sends: list[str]
 def test_a_declared_body_over_8kb_is_413(token: str, sends: list[str], db: Path) -> None:
     res = post(client(), token, body(summary="x" * 9000))
     assert res.status_code == 413
+    assert res.json() == {"detail": "the body must be at most 8192 bytes"}
     assert stored_count(db) == 0
 
 
@@ -232,7 +241,31 @@ def test_a_chunked_body_over_8kb_is_413(token: str, sends: list[str], db: Path) 
     res = post(client(), token, content=chunks(), headers={"content-type": "application/json"})
     assert "content-length" not in {k.lower() for k in res.request.headers}
     assert res.status_code == 413
+    assert res.json() == {"detail": "the body must be at most 8192 bytes"}
     assert stored_count(db) == 0
+
+
+@pytest.mark.parametrize(
+    ("declared", "status", "detail"),
+    [
+        ("abc", 400, "invalid Content-Length"),
+        ("-", 400, "invalid Content-Length"),
+        # a small body declared large is refused on the header alone: read,
+        # it would have parsed (and failed) as a 422
+        ("8193", 413, "the body must be at most 8192 bytes"),
+    ],
+    ids=["not-a-number", "a-dash", "over-the-cap"],
+)
+def test_the_declared_content_length_is_checked_before_the_body(
+    token: str, sends: list[str], db: Path, declared: str, status: int, detail: str
+) -> None:
+    res = post(
+        client(), token, content=b"{}", headers={"content-type": "application/json", "content-length": declared}
+    )
+    assert res.request.headers["content-length"] == declared
+    assert res.status_code == status
+    assert res.json() == {"detail": detail}
+    assert sends == [] and stored_count(db) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -282,6 +315,7 @@ def test_over_the_daily_cap_is_429(token: str, sends: list[str], monkeypatch: py
     assert post(c, token, body(1)).status_code == 201
     res = post(c, token, body(2))
     assert res.status_code == 429
+    assert res.json() == {"detail": "this source is at its daily limit of progress updates"}
     assert len(sends) == 1 and stored_count(db) == 1
 
 
@@ -294,8 +328,29 @@ def test_a_store_failure_is_503_and_sends_nothing(
     monkeypatch.setattr(progress_store, "admit", broken)
     res = post(client(), token, body())
     assert res.status_code == 503
+    assert res.json() == {"detail": "progress updates can't be stored right now"}
     assert "/secret/path" not in res.text
     assert sends == []
+
+
+def test_a_fixture_lock_held_past_the_wait_is_503(
+    token: str, sends: list[str], db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from openexecutive.cli import fixture_loader
+    from openexecutive.integrations import progress_updates as pu
+
+    # a fresh lock taken outside the app's loop and never released, as a
+    # fixture load, slot switch or sync write phase that outlasts the wait
+    held = asyncio.Lock()
+    asyncio.run(held.acquire())
+    monkeypatch.setattr(fixture_loader, "_FIXTURE_OP_LOCK", held)
+    monkeypatch.setattr(pu, "LOCK_WAIT_SECONDS", 0.05)
+    res = post(client(), token, body())
+    assert res.status_code == 503
+    assert res.json() == {"detail": "progress updates can't be stored right now"}
+    assert sends == [] and stored_count(db) == 0
 
 
 # --------------------------------------------------------------------------- #
