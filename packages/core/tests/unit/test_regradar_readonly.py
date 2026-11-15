@@ -309,5 +309,5 @@ def test_a_runtime_load_under_an_unreserved_name_reaches_the_client() -> None:
     session_call.assert_awaited_once()
     assert session_call.await_args is not None
     assert session_call.await_args.args[1] == {
-        "name": "regradar_two", "url": "https://example.test/mcp",
+        "server_name": "regradar_two", "url": "https://example.test/mcp",
     }
