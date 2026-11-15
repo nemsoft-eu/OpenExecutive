@@ -45,12 +45,10 @@ from openexecutive.cli.fixture_loader import (
     get_fixture_status,
     snapshot_user_state,
 )
-from openexecutive.cli.fixture_loader import (
-    PER_CLIENT_CACHE_TABLES as _PER_CLIENT_CACHE_TABLES,
+from openexecutive.memory.company_tables import (
+    KEPT_ON_EVERY_SWAP,
+    wipe_per_company_tables,
 )
-from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
-from openexecutive.memory.history_schema import TABLES as HISTORY_TABLES
-from openexecutive.orchestrator.take_the_lead import TABLES as TAKE_THE_LEAD_TABLES
 
 logger = logging.getLogger(__name__)
 
@@ -85,112 +83,6 @@ ENGAGEMENT_META_FIELDS: frozenset[str] = frozenset(
 )
 
 ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
-
-# Per-client tables wiped when activating a *blank* slot (no state.db yet).
-# Ordered children-before-parents for PRAGMA foreign_keys=ON. Existence-guarded
-# at delete time, so stores that haven't initialized on this box are skipped.
-_BLANK_WIPE_TABLES = (
-    # Derived caches first — see PER_CLIENT_CACHE_TABLES for why they must be
-    # wiped by every company-swapping path, not just this one. Neither declares
-    # a foreign key, so head position is free.
-    #
-    # Do not assume person_insights' input_hash makes it self-guarding. The hash
-    # (people.insights.build_insight_input_hash) covers role, is_principal,
-    # status, awaiting_count, awaiting_reply_count, overdue, on_leave_until,
-    # reachable_now, authority_scope, department_slugs, the hour-bucketed
-    # soonest_sla_at / oldest_awaiting_reply_at / next_window_at /
-    # last_contact_at, and the UTC day — every one of them a per-person signal,
-    # and NOT the person's name, the person's id, or the company. The cache key
-    # is person_id, a reused autoincrement PK. So an outgoing principal and a
-    # freshly seeded incoming principal hash identically whenever those signals
-    # coincide: both principals, same role string, no awaiting work, no leave,
-    # same default departments, same UTC day. That is an ordinary steady state
-    # for a seeded slot, not a collision.
-    *_PER_CLIENT_CACHE_TABLES,
-    "chat_messages",
-    "sessions",
-    "decisions",
-    "initiatives",
-    "advice_given",
-    "scheduled_actions",
-    "voice_personas",
-    "alerts",
-    "mute_topics",
-    "user_preferences",
-    # Solo/team mode and the user's time zone (memory.workspace_settings) are
-    # per company, like user_preferences above: a blank client starts on the
-    # defaults (team, no zone) rather than inheriting the previous client's.
-    # Saved slots carry their own row in state.db.
-    "workspace_settings",
-    "workflow_runs",
-    "audit_log",
-    "eval_runs",
-    "external_signals",
-    "watchlist",
-    "page_watch_state",
-    "outbound_context",
-    # What the Executive mailed back (integrations.email_replies), found by
-    # the recipient's address: an advisor who writes for two clients would
-    # otherwise be shown the previous client's replies.
-    "email_thread_replies",
-    # An in-progress setup interview: the previous client's unedited
-    # description and answers (financials included).
-    "onboarding_interviews",
-    # Attunement's daily model-call counter (open loops themselves live in
-    # scheduled_actions, and sender/feedback columns in chat_messages).
-    "attunement_usage",
-    "proactive_outcomes",
-    "attunement_profiles",
-    "attunement_profile_history",
-    # Act as me (delegation/): who has it on and each person's "How I write"
-    # — per company like the roster it is keyed on, so a blank client starts
-    # with it off and no profile. (Each person's own-Gmail credential is a
-    # file, not a table, and is re-checked against the roster on every use.)
-    *DELEGATION_TABLES,
-    # Always in the loop (memory/history.py): notes about this company's
-    # people and conversations, and their switches.
-    *HISTORY_TABLES,
-    # Take the lead (orchestrator/take_the_lead.py): its switches, rules and
-    # log, per company.
-    *TAKE_THE_LEAD_TABLES,
-    # Legacy talent / staff-onboarding tables. Both features are gone and
-    # nothing writes these any more, but the rows may still exist on upgraded
-    # installs and they carry candidate PII (names, employers, screening
-    # summaries, offer comp) — keep wiping them so a blank slot never inherits
-    # a previous client's pipeline. Existence-guarded, so a no-op on fresh
-    # installs where the tables were never created.
-    "onboarding_tasks",
-    "onboarding_plans",
-    "onboarding_templates",
-    "offers",
-    "candidates",
-    "engagements",
-    "decision_instances",
-    "decision_class_state",
-    "agent_override_history",
-    "agent_overrides",
-    "review_annotations",
-    "review_items",
-    # Roster requests (people.roster_requests) name who wrote to this
-    # company, and aliases are its people's addresses: children first.
-    "roster_ack_log",
-    "roster_request_messages",
-    "roster_requests",
-    # Telegram chats the bot has seen (integrations.telegram_chats): names
-    # of who wrote to this company's bot, for its People pickers.
-    "telegram_chats",
-    "person_emails",
-    "person_authority_scope",
-    "person_availability",
-    "people",
-    "department_goals",
-    # Each department's own notes (memory.department_notes): decisions,
-    # updates and check-ins of this company.
-    "department_notes",
-    "departments",
-    "departments_meta",
-)
-
 
 class ClientSlotError(ValueError):
     """Base error for slot operations (maps to HTTP 400)."""
@@ -511,29 +403,12 @@ def _restore_db_from_file(state_src: Path) -> None:
 
 
 def _wipe_per_client_tables() -> None:
-    """Factory-wipe per-client tables (blank-slot activation). Existence-guarded."""
-    db_path = _episodic_db_path()
-    if not db_path.exists():
-        return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        for table in _BLANK_WIPE_TABLES:
-            if table in existing:
-                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed allowlist
-        # Decisions live in facts now ("decisions" above is the old table).
-        from openexecutive.memory.facts import drop_decisions
+    """Factory-wipe the per-company tables (blank-slot activation).
 
-        drop_decisions(conn)
-        conn.commit()
-    finally:
-        conn.close()
+    The list is ``memory.company_tables.PER_COMPANY_TABLES``, shared with the
+    factory reset and fixture load/unload. Existence-guarded.
+    """
+    wipe_per_company_tables(_episodic_db_path(), keep=KEPT_ON_EVERY_SWAP)
 
 
 def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:

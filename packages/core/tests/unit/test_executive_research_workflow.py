@@ -34,6 +34,7 @@ from openexecutive.workflows.executive_research import (
     _render_research_context,
     _render_synthesis_turn,
     _render_team_roster,
+    active_research_specialists,
 )
 
 
@@ -126,11 +127,13 @@ def test_extract_findings_takes_first_emit_call_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_research_one_specialist_provider_crash_returns_empty() -> None:
+async def test_research_one_specialist_provider_crash_raises() -> None:
+    """A provider failure must not read as "found nothing": it propagates so
+    the workflow records it as that specialist's error."""
     agent = MagicMock()
     agent.analyze_with_tools = AsyncMock(side_effect=RuntimeError("boom"))
-    result = await research_one_specialist("cfo", agent, "context")
-    assert result == []
+    with pytest.raises(RuntimeError, match="boom"):
+        await research_one_specialist("cfo", agent, "context")
 
 
 # --------------------------------------------------------------------- #
@@ -389,6 +392,62 @@ async def test_workflow_skips_synthesis_when_no_findings(
     assert result_data is not None
     assert result_data["findings"] == []
     assert result_data["tool_calls"] == []
+    # Every specialist answered (with nothing), so none failed.
+    assert result_data["specialist_calls"] == {
+        "ok": len(active_research_specialists()), "failed": 0,
+    }
+
+
+async def _run_and_get_result(workflow: ExecutiveResearchWorkflow) -> dict[str, Any]:
+    result_data: dict[str, Any] | None = None
+    async for event in workflow.run(inputs=ExecutiveResearchInput(), store=MagicMock()):
+        if event.type == "result":
+            result_data = event.data
+    assert result_data is not None
+    return result_data
+
+
+@pytest.mark.asyncio
+async def test_result_counts_every_specialist_failure(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run in which no specialist could be asked reports ok=0 on its result
+    event — the signal the periodic cron reads to withhold the baseline. A
+    bare ``TimeoutError()`` has an empty message and must still count."""
+    calls = {"n": 0}
+
+    async def failing(slug, agent, ctx):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError()
+        raise ConnectionError("model server down")
+
+    monkeypatch.setattr(
+        "openexecutive.workflows.executive_research.research_one_specialist", failing,
+    )
+    result = await _run_and_get_result(ExecutiveResearchWorkflow())
+    assert result["findings"] == []
+    assert result["specialist_calls"] == {
+        "ok": 0, "failed": len(active_research_specialists()),
+    }
+
+
+@pytest.mark.asyncio
+async def test_result_counts_a_partial_failure(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def some_fail(slug, agent, ctx):
+        if slug == "cso":
+            return []
+        raise ConnectionError("model server down")
+
+    monkeypatch.setattr(
+        "openexecutive.workflows.executive_research.research_one_specialist", some_fail,
+    )
+    result = await _run_and_get_result(ExecutiveResearchWorkflow())
+    assert result["specialist_calls"] == {
+        "ok": 1, "failed": len(active_research_specialists()) - 1,
+    }
 
 
 @pytest.mark.asyncio

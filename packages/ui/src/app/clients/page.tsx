@@ -23,6 +23,7 @@ import {
   saveActiveClient,
   updateClientMeta,
 } from "@/lib/api";
+import { returnNote } from "@/lib/companySwap";
 import { clientCountsSummary, renewalBadge } from "@/lib/practice";
 import { PageSpinner } from "@/components/ui/Spinner";
 
@@ -460,8 +461,9 @@ export default function ClientsPage() {
         <p className="mt-8 text-sm text-fg-muted leading-relaxed">
           Only the active client is live — its scheduled actions fire and its
           documents are indexed; parked clients sleep in their slots. Your
-          original company is preserved automatically the first time you
-          switch, and can be restored from the Company Simulator page.
+          original company is snapshotted the first time you switch.{" "}
+          {returnNote("Going back to it")} Your Safety level stays at the last
+          client&apos;s, so check it in Settings.
         </p>
       </div>
 

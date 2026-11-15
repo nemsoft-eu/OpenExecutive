@@ -3033,7 +3033,7 @@ knowledge:
 memory:
   episodic_db: ./episodic_memory.db
   tables:
-    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written. A blank client, a factory reset and a fixture load drop the decision facts and that marker (facts.drop_decisions), since wiping this table alone left the previous company's decisions in facts (found in review of nemsoft-eu/OpenExecutive#70)."
+    - "decisions — legacy. Copied once into facts as decision facts (facts_meta marker decisions_copied_to_facts; a row from mail or a chat app as proposed, for the principal to approve); no longer written. Every company swap (blank client, factory reset, fixture load and unload) empties facts and facts_meta from memory.company_tables, so no decision or other standing fact carries over; a fixture load that seeds this table from memory.json then drops the decision facts and the marker (facts.drop_decisions) so its rows are copied in afresh. Wiping this table alone used to leave the previous company's decisions in facts (found in review of nemsoft-eu/OpenExecutive#70)."
     - initiatives
     - "advice_given — legacy. No longer written; old rows stay readable."
     - scheduled_actions
@@ -3667,7 +3667,8 @@ peer_memory:
     rules; for a teammate who shares their work style, role, departments
     and style rules, never notes). append_department_note also writes
     ``department_notes`` (``memory.department_notes``, newest 200 per
-    department), which a department-bound specialist's prefetch reads when
+    department, wiped by every company swap from ``memory.company_tables``),
+    which a department-bound specialist's prefetch reads when
     Honcho has nothing. The brief's person insight falls back to the shared
     work style. Keep track of what happens is on by default for every team
     member. The About you card reads Honcho only and hides when it is off.
@@ -4450,7 +4451,7 @@ attunement:
     reset: |
       Loops live in scheduled_actions and attribution in chat_messages (both
       already wiped by client-slot switches and reset_all_state);
-      `attunement_usage` added to `_BLANK_WIPE_TABLES` and reset_all_state.
+      `attunement_usage` is in memory.company_tables.PER_COMPANY_TABLES.
     tests: |
       tests/conftest.py no-ops `schedule_open_loop_pass` for every test so
       Executive turns don't call a provider or write default-DB rows; tests
@@ -4849,7 +4850,7 @@ departments:
     optional in the PUT body like timezone, null/blank clears one). GET
     stays open, but returns the role only to a caller the PUT would accept
     (_caller_is_principal_or_unclaimed) and nulls to anyone else. Per company: blank
-    client slots wipe it (clients.slots._BLANK_WIPE_TABLES), saved slots
+    client slots wipe it (memory.company_tables), saved slots
     carry it in state.db, and the factory reset returns it to the defaults
     before re-bootstrapping. Fixtures: `_apply_state_from_source` reads and
     validates the source's optional workspace.yaml before swapping anything
@@ -5418,9 +5419,9 @@ people:
     - Caps: ROSTER_ACK_WINDOW_DAYS=7, ROSTER_ACK_DAILY_CAP=20,
       ROSTER_REQUEST_DAILY_CAP=30, ROSTER_REQUEST_TTL_DAYS=14 (config.py),
       MAX_HELD_MESSAGES=10, DECLINE_QUIET_DAYS=30.
-    - Wiped on a company swap: `clients.slots._BLANK_WIPE_TABLES`,
-      `fixture_loader.reset_all_state` and `_seed_people` (with
-      `person_emails`, children first).
+    - Wiped on every company swap (blank slot, factory reset, fixture
+      load/unload) from `memory.company_tables.PER_COMPANY_TABLES`, with
+      `person_emails`, children first.
   registry: openexecutive.people.registry — in-memory cache + lookup
   channel: |
     openexecutive.people.channel — resolves a person to a deliverable
@@ -5701,7 +5702,7 @@ scheduler:
     - "executive_reflection — Shift 5 recurring row. Seeded alongside the principal briefs (idempotent via `_has_pending_brief`), default 07:30 in the user's zone (an explicitly set `PRINCIPAL_REFLECTION_TIME` is read as UTC). The scheduler runs `_run_executive_reflection`: invokes the `executive_reflection` workflow, stores the artifact via `complete_run`, audits the outcome, then chains the next occurrence — same crash-survival pattern as principal briefs. Unlike the briefs, the artifact is NOT delivered to the principal — the morning brief that fires 30 minutes later surfaces what reflection decided via the existing /today/activity rail."
     - "principal_weekly_review — solo-only recurring row that runs the `weekly_review` workflow and delivers the artifact through `deliver_to_each_principal`, exactly like the briefs (`runner._PRINCIPAL_WORKFLOWS` maps each kind to its workflow; the delivery outcome is recorded under `brief_delivery:principal_weekly_review` and counted by `brief_state.last_delivery_outcome` via `DELIVERY_KINDS`, so the Briefing notice and Setup status report a weekly review that was not sent). Default Friday 16:00 in the user's zone (`weekly@fri@16:00` through the DST-safe cadence parser); `PRINCIPAL_WEEKLY_REVIEW_TIME` takes a whole weekly spec (`weekly@DOW@HH:MM`) read as UTC when valid, like the other pinned times, and a malformed value is logged and ignored. Seeded by `seed_principal_briefs()` only when the workspace is solo; `set_workspace_mode('solo')` seeds it (`seed_weekly_review`), `set_workspace_mode('team')` cancels its pending row (`cancel_weekly_reviews`); a row that fires while the STORED mode is team is marked cancelled without running or chaining, and a solo run chains only while the workspace is still solo. Both checks use `_team_for_sure` → `workspace_settings.read_stored_mode()` (None when the read fails or the stored value is not a mode) and fail open: an unreadable mode is not team, so a locked DB neither retires the row nor breaks the chain (`get_workspace` would have read it as team). The weekly chain (`_enqueue_next_principal_brief`) also skips when a weekly row is already pending (`_has_pending_brief`), so a switch to solo that seeds one while a run finishes cannot leave two. Minimum gap between two runs (`_min_gap`, used by `_chain_after` and `reschedule_principal_rhythm`) is 3.5 days instead of 12h, so a zone change can neither run it twice in a week nor skip one."
     - "external_monitor_scan — heartbeat owned by the external-condition monitoring layer. Default every 5 min via EXTERNAL_MONITOR_SCAN_INTERVAL_MINUTES. The runner calls `monitoring.pipeline.run_external_monitor_scan()` which walks enabled watchlist rows whose `last_polled_at` is stale enough, fires the matching adapter (vendor_status, rss, stock, the billed standing-query `query` adapter, the `edgar` SEC-filings adapter, and the stateful `page_watch` change-detector), enriches promotable signals with capture-time relevance, writes `external_signals` rows, and promotes qualifying signals into the alerts pipeline. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`external_monitor`). Chains the next tick via `enqueue_next_external_monitor_scan` after firing — same idempotent / crash-resilient pattern as `nudge_scan`."
-    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 360 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 168 — weekly; a daily forced run re-derived the same findings from unchanged state and re-filed them as fresh alerts every morning) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) PROPOSES ongoing monitors via `propose_watch`; deterministic policy (`monitoring.research.watch_policy`, see external_monitoring) adds a proposal on its own only when it is grounded in company data and corroborated, files the rest as dry-run suggestions the principal approves on /watchlist, and refuses declined targets; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
+    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 360 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 168 — weekly; a daily forced run re-derived the same findings from unchanged state and re-filed them as fresh alerts every morning) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. A run in which every specialist call failed (the workflow's result event reports `specialist_calls.ok == 0`) is audited as `watchlist_research_periodic_failed` (`reason: all_specialists_failed`), not as a successful run, so it never becomes the skip baseline and the next tick retries; a run in which some specialists answered is a normal run. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) PROPOSES ongoing monitors via `propose_watch`; deterministic policy (`monitoring.research.watch_policy`, see external_monitoring) adds a proposal on its own only when it is grounded in company data and corroborated, files the rest as dry-run suggestions the principal approves on /watchlist, and refuses declined targets; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
     - "notion_sync_scan — optional heartbeat (NOTION_SYNC_ENABLED, default off) that incrementally re-indexes Notion pages shared with an internal integration into the isolated `notion_wiki` collection (NOT COMPANY — synced pages are multi-writer and unreviewed). Interval NOTION_SYNC_INTERVAL_MINUTES (default 60). Caps ingest per tick via NOTION_MAX_PAGES_PER_SCAN; overflow is retried and the watermark does not advance past failed or uningested pages. Each tick reconciles: un-shared/deleted pages have files + chunks purged. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`notion_sync`). Chains the next tick via enqueue_next_notion_sync_scan. See knowledge.collections NOTION_WIKI."
     - "confluence_sync_scan — optional heartbeat (CONFLUENCE_SYNC_ENABLED, default off) that lists the pages in CONFLUENCE_SYNC_SPACE_KEYS and re-indexes those whose version changed into the isolated `confluence_wiki` collection, leaving out pages with read restrictions (own or inherited) unless CONFLUENCE_SYNC_SKIP_RESTRICTED=false. Interval CONFLUENCE_SYNC_INTERVAL_MINUTES (default 60), at most CONFLUENCE_MAX_PAGES_PER_SCAN fetches per tick. Each tick reconciles unless a listing failed or was cut short. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`confluence_sync`). Chains the next tick via enqueue_next_confluence_sync_scan. See knowledge.collections CONFLUENCE."
   channel_routing: |
@@ -6551,9 +6552,9 @@ audit:
     - external_signal_deferred — one row per poll that skipped entries whose published_at is more than the row's future-skew tolerance ahead (aggregated — `count`, `future_skew_hours`, `race_tick`, and up to 10 `entries` each with `dedup_key`, `published_at`, `summary` and `provenance_url`, so an operator can tell WHAT was held back). Emitted from the scan loop's finally, so it survives a poll that raises later in the same row. A deferred entry is by design NOT written to external_signals (that would burn its dedup key and mute it for good), so this row is its only trace until its date passes and it is judged normally.
     - external_signal_promoted — one row per signal promoted into the alerts pipeline (post-suppression cascade). Carries `signal_id`, `watchlist_id`, `watchlist_slug`, `source_kind`, `severity_hint`, `dedup_key`, `provenance_url`. Pair with `external_signal_received` to compute promotion rate per watchlist row.
     - external_monitor_poll — one row per watchlist row polled in a scan tick, emitted even when the row's poll raised or was cancelled (`failed` set to true, with `signals_emitted` still counting rows that landed before the failure, so the audit log stands on its own); `failed` is also true when the adapter crashed or no adapter is registered. A row with no registered adapter is still marked polled so it honours the cadence rather than re-firing every heartbeat. Carries `watchlist_id`, `watchlist_slug`, `signal_type`, `signals_emitted`, `duration_ms`, `failed`. Enables per-source health drill-down (`GET /audit?event_type=external_monitor_poll`) without needing a dedicated debug endpoint.
-    - watchlist_research_periodic_ran — emitted by the periodic cron whenever the workflow actually fires. Carries `state_hash` (the input fingerprint at run time), `trigger` (`cold_start`, `state_changed`, or `staleness_floor`), `findings` count, `tool_calls` count, `ok_tool_calls`, `run_id`. The next tick reads the most recent row to decide skip-or-run (its `state_hash` for the fingerprint compare, its `ts` for the staleness floor). These three research run-history rows are the ONLY audit_log rows a fixture load/unload clears (via `monitoring.research.scheduler.clear_research_run_history`, called from `cli.fixture_loader._apply_state_from_source`): load wipes the profile/initiatives/watchlist that feed the fingerprint but otherwise preserves audit_log, so without this reset a same-fixture reload within the staleness floor would make the freshly-seeded scan skip itself and surface zero findings. A full reset still wipes all of audit_log. Also carries `usage` — the run's rollup of every model call it made (`calls`, token classes, `web_search_requests`, and `by_source` per actor), copied from the workflow's `result` event — so a run's weight is readable from the audit log."
+    - watchlist_research_periodic_ran — emitted by the periodic cron whenever the workflow actually fires. Carries `state_hash` (the input fingerprint at run time), `trigger` (`cold_start`, `state_changed`, or `staleness_floor`), `findings` count, `tool_calls` count, `ok_tool_calls`, `run_id`, and `specialist_calls` (`{ok, failed}`, so a partial failure stays visible). The next tick reads the most recent row to decide skip-or-run (its `state_hash` for the fingerprint compare, its `ts` for the staleness floor). These three research run-history rows are the ONLY audit_log rows a fixture load/unload clears (via `monitoring.research.scheduler.clear_research_run_history`, called from `cli.fixture_loader._apply_state_from_source`): load wipes the profile/initiatives/watchlist that feed the fingerprint but otherwise preserves audit_log, so without this reset a same-fixture reload within the staleness floor would make the freshly-seeded scan skip itself and surface zero findings. A full reset still wipes all of audit_log. Also carries `usage` — the run's rollup of every model call it made (`calls`, token classes, `web_search_requests`, and `by_source` per actor), copied from the workflow's `result` event — so a run's weight is readable from the audit log."
     - watchlist_research_periodic_skipped — emitted when the state_hash matches the last `_ran` row. Carries `state_hash`. Visible cost-saving signal in the audit log.
-    - watchlist_research_periodic_failed — emitted on workflow timeout / crash. Carries `state_hash` + `error` or `reason`.
+    - watchlist_research_periodic_failed — emitted on workflow timeout / crash, and on a run in which every specialist call failed (`reason: all_specialists_failed`, with `specialist_calls`, `trigger` and `usage`). Carries `state_hash` + `error` or `reason`. Never read as the skip baseline, so the next tick runs again.
     - watchlist_research_added / watchlist_research_suggested / watchlist_research_rejected — one row per `propose_watch` the research watch policy decided (`monitoring.research.watch_policy`). Carries `slug`, `target`, `signal_type`, `rationale`, `entity`, `grounding_kind`, `score`, `reasons`, and for adds the quiet defaults applied (`cadence`, `severity_floor`, `trigger`). `_added` also renders in the brief's HANDLED block as `watching`.
     - watchlist_suggestion_approved / watchlist_suggestion_declined / watchlist_suggestion_expired — the principal's verdict on a research suggestion (`POST /watchlist/{slug}/approve|decline`, reason on decline) or the sweep removing one unreviewed after WATCHLIST_PROPOSAL_TTL_DAYS. Each also writes a `watchlist_policy_outcomes` row so the policy calibrates.
     - watchlist_auto_disabled — the sweep disabled a research-origin watch (`reason`: dismissed N of M alerts with low trust; no signals in 30 days; 3 consecutive poll failures). Renders in the HANDLED block as `stopped_watching`; re-enable from /watchlist.
@@ -7303,7 +7304,7 @@ external_monitoring:
     triggers:
       - "Manual chat — the principal asks 'what should we look into?'; the Executive calls the `run_executive_research` chat tool. The tool runs the workflow, which both researches AND routes; the chat tool returns the structured summary so the Executive can describe to the principal what it researched and what it did with each finding."
       - "Onboarding completion — when the user saves the reviewed draft (POST /onboard/interview/commit, or the wizard fallback's final answer), `api/routes/onboarding._fire_post_onboarding_research` schedules the workflow as a background task. Both paths share the same helper and the same `_onboarding_research_fired` dedup set, so it fires at most once per setup session. The workflow's synthesis step fires whatever routing tools it deems necessary (DMs to heads, briefing alert, watchlist additions) — the wrapper just runs the workflow with a wall-clock ceiling and creates / completes the workflow_run row."
-      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 360 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 168, i.e. weekly) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) proposes ongoing monitors via `propose_watch`; `monitoring.research.watch_policy` decides per proposal — direct add (grounded in company data: competitor / vendor / ticker / initiative / priority, score >= 4 on a fixed ledger, quiet defaults) vs dry-run suggestion for the principal vs reject — and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
+      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 360 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 168, i.e. weekly) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). A run in which no specialist call succeeded is audited as failed and sets no baseline, so the next tick retries. The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) proposes ongoing monitors via `propose_watch`; `monitoring.research.watch_policy` decides per proposal — direct add (grounded in company data: competitor / vendor / ticker / initiative / priority, score >= 4 on a fixed ledger, quiet defaults) vs dry-run suggestion for the principal vs reject — and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
     skip_if_unchanged: |
       The periodic cron handler (`monitoring.research.scheduler.run_watchlist_research_scan`)
       computes a sha256 over (`CompanyProfile.to_prompt_block()`,
@@ -7326,10 +7327,24 @@ external_monitoring:
       baseline is what makes quiet days actually free — genuine
       profile/initiative/user-watchlist edits still diverge and re-run.
 
+      Only a run in which at least one specialist answered sets the
+      baseline. `research_one_specialist` raises on a provider failure and
+      the workflow's fan-out records it as that specialist's error, so the
+      result event's `specialist_calls` (`{ok, failed}`) tells "found
+      nothing" apart from "could not ask". When `ok == 0` and `failed > 0`
+      (e.g. the model server was down, or every call timed out) the cron calls
+      `fail_run` and audits `watchlist_research_periodic_failed` with
+      `reason: all_specialists_failed` instead of `_ran`. The baseline stays
+      the last run that really happened, so the next tick runs again rather
+      than skipping on the failed run's hash until the staleness floor. A
+      partial failure is still a successful run: what the answering
+      specialists found went on to synthesis, and re-running would repeat
+      that work and its routing; its `_ran` row carries the counts.
+
       Staleness floor: the fingerprint only sees *internal* state, so a
       static profile would otherwise let the council stay blind to
       purely-external change (a competitor move, a regulation shift)
-      indefinitely. `WATCHLIST_RESEARCH_MAX_STALENESS_HOURS` (default 24)
+      indefinitely. `WATCHLIST_RESEARCH_MAX_STALENESS_HOURS` (default 168)
       bounds this — once that many hours have elapsed since the last
       successful run, the next tick fires even when the hash is unchanged.
       The `watchlist_research_periodic_ran` audit row records a `trigger`
@@ -9124,7 +9139,7 @@ integrations:
       • A department's Slack/Discord pickers pre-select the room named most
         like the department (lib/chatDirectory.closestOption in the UI);
         saved only when the person presses Save.
-      • telegram_chats is per company: clients.slots._BLANK_WIPE_TABLES.
+      • telegram_chats is per company: memory.company_tables.PER_COMPANY_TABLES.
   chat_app_conversations: |
     A Telegram chat, a Slack or Discord DM and a person's @mentions in
     one channel are each one endless stream with a fixed base id
@@ -10725,12 +10740,66 @@ integrations:
     rev (docker/Dockerfile) that nothing in this repo tests: a url server's
     tools are fetched once at boot (client_manager), so a revoked key or a
     Linear outage mid-process leaves block 0 and server_names still claiming
-    Linear is connected; and the reason `load_mcp_server` cannot re-point
-    `linear` at the write endpoint is that extensible-mcp resolves a token by
-    SERVER NAME and refuses to connect a name already in use — a bump that
-    changed either would reopen that door with every test here still green.
-    Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a counting
-    answer over a large team can under-report.
+    Linear is connected; and extensible-mcp resolves a url server's bearer
+    token by SERVER NAME, but refuses a runtime `load_mcp_server` name only
+    while that name is connected. A url server whose boot `list_tools` fails
+    is logged and skipped, so after a failed boot connect extensible-mcp alone
+    would let `load_mcp_server({"name": "linear", "url": <anything>})` connect
+    and send the `linear=` token to that URL. OE closes that in its own code:
+    `MCPGateway.load_mcp_server` refuses a name whose `_normalize_tool_name`
+    form is in `_RESERVED_SERVER_NAMES` (`linear`, `regradar`) or among the
+    names the config file defines (`MCPGateway.server_names`, read from the
+    file, so a server whose boot connect failed is still covered), audited
+    with address `<reserved-server>`, before it reaches extensible-mcp and
+    whatever the connection state. NOT covered: a tokens-file line with no
+    config entry (one left behind after an entry was removed, or added for a
+    planned runtime load) — closing that would mean reading the tokens file in
+    OE. A bump that changed token-by-name resolution (for
+    example, resolving by URL or falling back to a default token) would reopen
+    the door for any name not reserved there, with every test here still
+    green. Also: `list_issues` pages can exceed TOOL_RESULT_MAX_CHARS, so a
+    counting answer over a large team can under-report.
+
+    RegRadar (read-only, enforced in code): Nemsoft's internal regulatory
+    horizon scanner, a separate service on the same host. Its MCP server is
+    not built yet (nemsoft-eu/regradar#44), so the LIVE WIRING IS PENDING: the
+    code-side gate ships first and is inert until a `regradar` entry exists.
+    Deploy-side facts the repo cannot see: a url entry in
+    company/mcp_servers.json, `"regradar": {"url":
+    "http://host.containers.internal:<port>/mcp"}`, and a `regradar=` line in
+    the tokens file (docs/regradar_setup.md). INVARIANT:
+    `mcp_gateway._REGRADAR_READ_TOOLS` is a fail-closed frozenset of exactly
+    `search_findings`, `get_finding` and `latest_digest`, the contract pinned
+    in regradar#44, so a rename is a cross-repo change. A `regradar__` name
+    whose bare form is not in it is refused by `call_tool`
+    (`_is_blocked_regradar_tool`, which shares the prefix/normalise/membership
+    helper with `_is_blocked_linear_tool`) with a "Do not retry" reason,
+    audited as `integration_outbound_blocked` with address `<regradar-write>`
+    and a summary naming RegRadar, and dropped from `search_tools` output by
+    `_always_refused_tool`. The same `_refuse` flattening and truncation
+    applies, because everything after `regradar__` is caller-chosen. Like
+    Linear, it is reachable on ordinary chat turns only: private, hosted,
+    MCP-client and delegated scheduled turns pass `PRIVATE_TURN_MCP_TOOLS` /
+    `MCP_CLIENT_MCP_TOOLS`, which name no `regradar__` tool.
+    LIMIT OF THE GUARANTEE: the gate authorises tool NAMES, not behaviour. A
+    server that implemented `search_findings` as a write would pass. That the
+    three are genuine reads with no caller-chosen fetch target rests on
+    RegRadar's implementation and on enumerating the live server's tools and
+    schemas before the entry is enabled; a mismatch means changing
+    `_REGRADAR_READ_TOOLS` deliberately, with its tests, never widening it to
+    make a call work. It is also keyed to the entry name `regradar`, exactly
+    as Linear's is to `linear`, with no look-alike-name warning.
+    The `unconfirmed_secondary` caution (a finding backed only by interpretive
+    sources must not be stated as a settled obligation) is REQUESTED of
+    RegRadar's tool descriptions and of an inline field on each such result
+    row, not added by OE: the data source owns its status vocabulary, and the
+    caution then travels with the data into a saved workflow or a later turn.
+    A gateway-side annotation stays the fallback if the live check shows the
+    model ignoring it. No entry in mcp_servers.json.example: every deployment
+    that copied it would log a connect failure for a server that exists only
+    on Nemsoft's host, and that file is shared with upstream.
+    test_regradar_readonly pins the exact set, the refusal and its audit row,
+    the search filter and the reserved runtime names.
   own_gmail: |
     Act as me (delegation) connects a second, separate Gmail — the
     principal's own — read and drafted into by delegation.gmail.DelegateGmail
@@ -11195,7 +11264,7 @@ company_onboarding:
     evicts it; a store failure is a warning, never a failed turn. Every
     store call also sweeps expired and over-cap rows, PRAGMA secure_delete
     zeroes deleted pages, and a blank client slot wipes the table
-    (clients/slots._BLANK_WIPE_TABLES). A session belongs to whoever
+    (memory.company_tables). A session belongs to whoever
     started it (InterviewSession.owner_key = api_caller.identity_key):
     every read or turn by another caller is the same 404 an unknown id
     gets, since the id alone is no longer a capability once sessions
@@ -11641,13 +11710,106 @@ clients:
     company_docs collection + company-authored skills are re-indexed from
     the restored dirs, and recent_research artifacts are wiped (same rule as
     fixtures: per-company research never crosses companies). Activating a
-    blank slot (no state.db yet) factory-wipes the per-client tables and
+    blank slot (no state.db yet) factory-wipes the per-company tables and
     re-seeds defaults (departments, principal briefs, cadences) so the new
-    client's Today works without a process restart. That wipe and
-    reset_all_state also clear email_thread_replies
-    (integrations.email_replies): recent_elsewhere finds rows by the
-    recipient's address, so an advisor writing for two clients would be
-    shown the previous client's replies.
+    client's Today works without a process restart.
+    ONE REGISTRY: memory.company_tables. THREE paths swap live company state
+    — clients.slots._wipe_per_client_tables (switch into a blank/seed slot),
+    cli.fixture_loader.reset_all_state (factory reset), and
+    _apply_state_from_source (fixture load AND unload) — and each used to keep
+    its own hand-written table list, so a table added to one stayed live in
+    the others (the live instance: fixture load kept department_notes, so a
+    shared department slug such as `finance` served the previous company's
+    notes through the department prefetch; standing facts that were not
+    decisions survived every path). All three now call
+    company_tables.wipe_per_company_tables, which deletes every table in
+    PER_COMPANY_TABLES that exists, children before parents from the DB's
+    own foreign keys, in one transaction, then drops the in-process Agent
+    Council override cache (agents.overrides has no TTL). PER_COMPANY_TABLES
+    is composed from the modules' own TABLES tuples where they exist
+    (delegation.schema, delegation.sign_in_notice, memory.history_schema,
+    orchestrator.take_the_lead, people.roster_requests).
+    COMPANY_INDEPENDENT_TABLES names every other table with its reason:
+    generated_fixtures (operator demo library), executive_control (pause
+    switch), architecture_sections (repo-derived cache), app_migrations /
+    monitoring_migrations / review_meta (one-shot markers per DB file),
+    departments_new / department_goals_new (migration scratch tables).
+    tests/unit/test_company_tables.py scans every CREATE TABLE under
+    openexecutive/ (literal names and f-string constants) and fails on a
+    table in neither list, and runs each path against one seeded row per
+    table. Per-path exceptions are named, with reasons, never implicit:
+      • KEPT_ON_EVERY_SWAP: dynamic_workflows, eval_scenarios, saved_tools and
+        saved_tool_versions (saved_tool_runs, the run history, is wiped). They ARE
+        client-scoped (a saved slot's state.db restore swaps them), but they
+        are authored, not derived, and no backup carries them — the fixture
+        backup and the first-activation snapshot (snapshot_user_state) hold
+        only profile/docs/memory.json/people/departments/workspace — so a
+        wipe would irrecoverably delete the operator's own work. Known leak:
+        the outgoing company's workflow definitions stay registered AND
+        active (list_definitions(active_only=True)) after a blank switch, a
+        reset or a demo, runnable against the incoming company's data, with
+        full bodies exposed via /workflows. The fix is to carry them in a
+        backup FIRST, then wipe.
+      • KEPT_ON_FIXTURE_SWAP: audit_log (load/unload keep the audit history
+        by design; only the research run-history rows that gate the seeded
+        scan are cleared, clear_research_run_history), workspace_settings
+        (the path sets it itself via _apply_workspace: a fixture resets to
+        the defaults first; a user backup without workspace.yaml keeps the
+        live row), review_items / review_annotations (review state of the
+        knowledge files, which a fixture does not swap; with no row a
+        rejected upload of the user's would be retrievable again),
+        outside_content_mode (the owner's Safety level: no backup carries it
+        and a missing row reads as Balanced, so a wipe would silently lower a
+        Careful owner's checking after a demo). The blank switch and the
+        factory reset wipe all five; a blank client starts on the defaults.
+    The fixture-path wipe sits in _apply_state_from_source, unconditionally
+    and BEFORE the seeders, NOT in a seeder: _seed_episodic_memory /
+    _seed_people / _seed_departments return early when their file is
+    missing or empty, and load_fixture only requires profile.yaml, so a wipe
+    inside a seeder is skipped on exactly those loads while the company
+    still swaps. It also runs BEFORE any file is swapped (profile, docs,
+    vector store), right after the source profile is read, so a failed wipe
+    (a locked database; the connection waits 30 s like the slot restore)
+    aborts with the outgoing company whole instead of its rows under the
+    incoming profile. For the same reason the first load's auto-snapshot is
+    no longer best-effort: if snapshot_user_state raises, the load raises
+    before wiping anything (an empty environment snapshots fine). Because
+    profile.yaml is what marks a snapshot as taken, snapshot_user_state
+    writes it LAST, so a snapshot that fails part way is retaken by the next
+    load rather than skipped. The client-slot callers (create_client_slot,
+    activate_client_slot) still swallow a snapshot failure.
+    ACCEPTED LOSS on the fixture path: _user_backup/ is YAML (profile.yaml,
+    docs/ with *.md ONLY - uploaded PDF/Word/Excel/CSV/text files are deleted
+    by the load's rmtree and never restored, memory.json with
+    decisions/initiatives/advice, people.yaml from list_people()'s defaults -
+    team members only, no contacts or archived people, and no contact
+    details, aliases, reports_to or on_leave_until - departments.yaml,
+    workspace.yaml), not a database copy, taken on the first switch and
+    reused after that (only workspace.yaml is refreshed on a later fixture
+    load from the user's own company), and unload
+    restores only what those files carry. Every other per-company table the
+    fixture path does not keep comes back EMPTY after a demo load and unload
+    — chat_messages/sessions and the chat review, standing facts (non-decision
+    facts included), scheduled_actions (memory.json already dumped them as
+    []), alerts, the watchlist and derived caches (as before), department
+    notes, Act as me / Always in the loop / Take the lead state, Council
+    overrides, contact notes, telegram_chats and the rest. A blank client
+    switch from the user's own company takes the same YAML snapshot, so
+    exiting client mode restores the same subset. The owner's Safety level
+    (outside_content_mode) is not in it: the blank switch wipes it, and exit
+    goes through unload_fixture, whose KEPT_ON_FIXTURE_SWAP keeps the live
+    row, so it stays at the last client's level (Balanced unless someone
+    changed it there); /clients says so. A demo load and unload from the
+    user's own company never touches it. People come back under NEW ids, and
+    did before the registry too: _dump_people writes no ids, _seed_people
+    deletes and re-inserts, and people.id is AUTOINCREMENT with nothing
+    resetting sqlite_sequence (tests/unit/test_fixture_cycle_person_ids.py).
+    So person-keyed state could not survive the round trip even if kept.
+    The UI says this plainly: the Company Simulator and /clients pages name
+    what comes back and what comes back empty (lib/companySwap.ts,
+    returnNote), and loading a fixture while no fixture is active asks for a
+    typed LOAD first, like Reset everything's typed RESET; a load over
+    another fixture does not ask.
     Wipe lists must cover the DERIVED CACHES, not just authored state.
     briefing_narrative and person_insights were wiped by NO path, and because
     /today serves the cached narrative unconditionally (regenerating only in a
@@ -11660,34 +11822,11 @@ clients:
     identity. The key is a reused autoincrement person_id, so an outgoing
     principal and a freshly seeded incoming principal hash identically
     whenever those signals coincide. Ordinary steady state, not a collision.
-    THREE paths swap live company state and each kept its own hand-written
-    table list, which is why fixing one left the leak live in the other two.
-    They now all consume `cli.fixture_loader.PER_CLIENT_CACHE_TABLES`:
-    `clients.slots._BLANK_WIPE_TABLES` (switch into a blank/seed slot),
-    `reset_all_state` (factory reset), and `_apply_state_from_source` (fixture
-    load AND unload — the worst surface, since a demo is what gets
-    screen-shared). The fixture-path wipe sits in `_apply_state_from_source`
-    beside the unconditional watchlist wipe, NOT in `_seed_episodic_memory`:
-    that seeder returns early when a fixture has no readable `memory.json`,
-    and `load_fixture` only requires `profile.yaml`, so a wipe inside the
-    seeder is skipped on exactly those loads while the company still swaps.
+    email_thread_replies (integrations.email_replies) is per company:
+    recent_elsewhere finds rows by the recipient's address, so an advisor
+    writing for two clients would be shown the previous client's replies.
     Client→client switching into a slot that HAS state.db was already safe:
     the sqlite backup API truncates the destination to an exact copy.
-    Add any new per-company cache table to that constant, once.
-    Graded as NOT wiped: generated_fixtures (operator-level, see
-    _GLOBAL_TABLES) and architecture_sections (repo-derived, keyed by a hash of
-    the facts file). Still UNGRADED, deliberately deferred: dynamic_workflows
-    and eval_scenarios. These ARE client-scoped — the non-blank path already
-    swaps them with the whole DB — and on the blank path the outgoing client's
-    workflow definitions stay registered AND active (`list_definitions(
-    active_only=True)`), runnable against the incoming client's data, with full
-    bodies exposed via /workflows. They are not in the wipe list because they
-    are authored, not derived, and `snapshot_user_state` (the first-activation
-    branch, when no client is active) captures only profile/docs/memory.json/
-    people/departments — so wiping them there would irrecoverably delete the
-    operator's own work. The fix is to capture them in that snapshot FIRST,
-    then wipe. Both tables were observed empty on all known installs as of
-    2026-09 — an observation at a point in time, not an invariant to rely on.
   invariants:
     - At most one slot is active; the .active_client sentinel records it
       (allowlist-validated on read, same defence as the fixture sentinel).
@@ -11714,12 +11853,12 @@ clients:
     - workspace_settings (solo/team mode + the user's time zone,
       memory.workspace_settings) is per company, NOT operator-level - a
       saved slot carries its row in state.db and a blank slot's wipe
-      (_BLANK_WIPE_TABLES) returns it to the defaults before the briefs and
+      (memory.company_tables) returns it to the defaults before the briefs and
       cadences are re-seeded.
     - Act as me's tables (delegation.schema.TABLES - delegation_settings,
       delegation_voice, delegation_voice_history, delegation_drafts,
       delegation_inbox_watch, delegation_inbox_messages) are per company
-      too - in _BLANK_WIPE_TABLES and reset_all_state - so a blank client
+      too - in memory.company_tables.PER_COMPANY_TABLES - so a blank client
       starts with it off, no writing profile and no inbox watcher. The
       watcher never scans while a slot is active. The per-person Gmail
       credential is a file outside the slot, re-checked against the live
@@ -13232,8 +13371,8 @@ delegation:
     delegation_mail_read, delegation_training, delegation_saved_files and
     delegation_saved_folder (delegation.schema.TABLES) in the episodic DB (created by
     memory.episodic.initialize_db via delegation.schema.ensure_schema); per
-    company — in clients.slots._BLANK_WIPE_TABLES and
-    cli.fixture_loader.reset_all_state. A reply card is a decision_instances
+    company — in memory.company_tables.PER_COMPANY_TABLES, so every company
+    swap wipes them. A reply card is a decision_instances
     row (see trust_ledger).
   later_phases: |
     Each is its own change behind its own switch, off by default: more

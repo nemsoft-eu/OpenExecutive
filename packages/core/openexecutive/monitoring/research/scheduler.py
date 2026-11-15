@@ -36,6 +36,13 @@ adds rows the fingerprint hashes — so recording the pre-run hash would
 leave every subsequent tick seeing a "changed" state and re-running a
 full research pass each interval. Capturing the post-run state as the
 baseline is what makes "quiet days are free" actually hold.
+
+Only a run in which at least one specialist answered sets that baseline.
+The workflow catches each specialist's failure, so a run whose calls all
+failed (the model server down, say) still completes; its result event's
+``specialist_calls`` reports ``ok == 0``, and the tick audits it as
+``EVENT_FAILED`` (``reason: all_specialists_failed``) so the next tick
+retries instead of skipping on its hash until the staleness floor.
 """
 from __future__ import annotations
 
@@ -200,6 +207,9 @@ def _last_successful_research_run() -> tuple[str | None, str | None]:
     Returns (None, None) when no successful periodic run has happened yet —
     a fresh install or a recovered DB. Caller treats a None hash as
     "always run". The ts (ISO8601 string) feeds the staleness floor.
+    Only ``EVENT_RAN`` rows count: a timeout, a crash or a run in which
+    every specialist call failed is audited as ``EVENT_FAILED`` and never
+    becomes the baseline.
     """
     try:
         from openexecutive.audit import get_audit_logger
@@ -223,6 +233,22 @@ def _last_successful_research_run() -> tuple[str | None, str | None]:
     except Exception:
         logger.exception("research.scheduler: audit row parse failed")
         return None, None
+
+
+def _specialist_counts(specialist_calls: dict[str, Any] | None) -> tuple[int, int]:
+    """Read ``(ok, failed)`` from the result event's ``specialist_calls``.
+
+    A missing or malformed value reads as ``(0, 0)``, which the caller
+    treats as an ordinary run: only a positive report that every
+    specialist failed may withhold the baseline.
+    """
+    if not specialist_calls:
+        return 0, 0
+    ok = specialist_calls.get("ok")
+    failed = specialist_calls.get("failed")
+    if not isinstance(ok, int) or not isinstance(failed, int):
+        return 0, 0
+    return ok, failed
 
 
 def _last_successful_research_hash() -> str | None:
@@ -413,7 +439,8 @@ async def run_watchlist_research_scan(
          principal. Dedup_key is date-based so re-runs the same day
          collapse via alerts.UNIQUE(source, external_id).
       5. Audit the outcome with the state_hash so the next tick can
-         skip-if-unchanged.
+         skip-if-unchanged — unless every specialist call failed, which
+         is audited as failed so the next tick retries.
     """
     import asyncio
 
@@ -490,9 +517,10 @@ async def run_watchlist_research_scan(
         findings: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
         usage: dict[str, Any] | None = None
+        specialist_calls: dict[str, Any] | None = None
 
         async def _drive() -> None:
-            nonlocal artifact, findings, tool_calls, usage
+            nonlocal artifact, findings, tool_calls, usage, specialist_calls
             async for event in workflow.run(
                 inputs=wf_inputs, store=effective_store,
             ):
@@ -507,12 +535,55 @@ async def run_watchlist_research_scan(
                     raw_usage = event.data.get("usage")
                     if isinstance(raw_usage, dict):
                         usage = raw_usage
+                    raw_specialists = event.data.get("specialist_calls")
+                    if isinstance(raw_specialists, dict):
+                        specialist_calls = raw_specialists
                 elif event.type == "artifact" and event.content:
                     artifact = event.content
                 elif event.type == "error" and event.message:
                     raise RuntimeError(event.message)
 
         await asyncio.wait_for(_drive(), timeout=_RUN_TIMEOUT_SECONDS)
+
+        # A run in which no specialist could be asked (the model server was
+        # down, say) completes normally — each failure is caught inside the
+        # fan-out — but it researched nothing. Recording it as EVENT_RAN
+        # would make its hash the skip baseline, and every later tick would
+        # skip until the state changed or the staleness floor came round.
+        # Audit it as failed instead, so the next tick compares against the
+        # last run that really happened and retries. A run in which some
+        # specialists answered stays a normal run: what they found went on
+        # to synthesis, so re-running would repeat that work and its routing.
+        ok_specialists, failed_specialists = _specialist_counts(specialist_calls)
+        if failed_specialists and not ok_specialists:
+            logger.warning(
+                "research.scheduler: all %d specialist call(s) failed — "
+                "not recording a baseline; the next tick retries",
+                failed_specialists,
+            )
+            try:
+                fail_run(run_id, "all specialist calls failed")
+            except Exception:
+                logger.exception("research.scheduler: fail_run failed")
+            failed_details: dict[str, Any] = {
+                "state_hash": state_hash,
+                "reason": "all_specialists_failed",
+                "trigger": run_trigger,
+                "specialist_calls": specialist_calls,
+                "run_id": run_id,
+            }
+            if usage:
+                failed_details["usage"] = usage
+            audit_log(
+                EVENT_FAILED,
+                (
+                    f"Watchlist research failed — all {failed_specialists} "
+                    "specialist call(s) failed"
+                ),
+                actor="scheduler",
+                details=failed_details,
+            )
+            return 0
 
         try:
             complete_run(run_id, artifact or "(no artifact)")
@@ -555,6 +626,10 @@ async def run_watchlist_research_scan(
             "ok_tool_calls": ok_tool_calls,
             "run_id": run_id,
         }
+        if specialist_calls is not None:
+            # A partial failure (some specialists could not be asked) is
+            # still a baseline run; the counts keep it visible.
+            details["specialist_calls"] = specialist_calls
         if usage:
             # What the run did: calls, tokens and searches, per source.
             details["usage"] = usage

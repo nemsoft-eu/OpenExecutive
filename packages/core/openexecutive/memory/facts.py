@@ -300,8 +300,8 @@ def _copy_old_decisions(conn: sqlite3.Connection) -> None:
 
 def drop_decisions(conn: sqlite3.Connection) -> None:
     """Drop the decision facts and the copied-once marker, for a path that
-    swaps or wipes the company's decisions (a blank client, a factory reset,
-    a fixture load): decisions live here now, not in ``decisions``, so
+    swaps the company's decisions in (a fixture load or a generated client
+    slot seeding them from memory.json): decisions live here now, not in ``decisions``, so
     wiping that table alone left them. With the marker gone, the next read
     copies in whatever ``decisions`` then holds. Existence-guarded; the
     caller commits."""

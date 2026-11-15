@@ -114,10 +114,10 @@ def test_the_daily_limit_is_shared_and_fails_closed(monkeypatch: pytest.MonkeyPa
 
 
 def test_the_table_is_per_company() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
     from openexecutive.delegation.schema import DRAFTS_TABLE, TABLES
+    from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 
-    assert DRAFTS_TABLE in TABLES and DRAFTS_TABLE in _BLANK_WIPE_TABLES
+    assert DRAFTS_TABLE in TABLES and DRAFTS_TABLE in PER_COMPANY_TABLES
 
 
 class _Mailbox:

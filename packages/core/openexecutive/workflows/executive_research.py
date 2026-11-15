@@ -559,10 +559,13 @@ class ExecutiveResearchWorkflow(Workflow):
                 )
                 return slug, findings, ""
             except Exception as exc:
+                # One specialist's failure must not sink the fan-out; the
+                # error is recorded so the run can tell "found nothing"
+                # apart from "could not ask" (``specialist_calls`` below).
                 logger.exception(
-                    "research: specialist %s raised", slug,
+                    "research: specialist=%s provider call failed", slug,
                 )
-                return slug, [], str(exc)[:200]
+                return slug, [], str(exc)[:200] or type(exc).__name__
 
         specialists = active_research_specialists()
         results = await asyncio.gather(
@@ -583,7 +586,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 per_specialist.append(ResearchRunSummary(
                     specialist=fallback_slug,
                     findings_emitted=0,
-                    error=str(item)[:200],
+                    error=str(item)[:200] or type(item).__name__,
                 ))
                 continue
             slug, findings, error = item
@@ -593,6 +596,15 @@ class ExecutiveResearchWorkflow(Workflow):
                 findings_emitted=len(findings),
                 error=error,
             ))
+
+        # How many specialists answered (findings or not) vs could not be
+        # asked. Carried on the result event so the periodic cron can refuse
+        # to record a run nobody answered as its skip-if-unchanged baseline.
+        failed_specialists = sum(1 for s in per_specialist if s.error)
+        specialist_calls = {
+            "ok": len(per_specialist) - failed_specialists,
+            "failed": failed_specialists,
+        }
 
         total_emitted = sum(len(v) for v in findings_by_specialist.values())
         yield WorkflowEvent(
@@ -645,6 +657,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 type="result",
                 data={
                     "findings": [], "tool_calls": [], "narrative": "",
+                    "specialist_calls": specialist_calls,
                     "usage": {"run_id": run_id, **rollup.as_dict()},
                 },
             )
@@ -776,6 +789,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 ],
                 "tool_calls": tool_calls,
                 "narrative": narrative,
+                "specialist_calls": specialist_calls,
                 "usage": {"run_id": run_id, **rollup.as_dict()},
             },
         )

@@ -124,9 +124,13 @@ def test_reset_path_bootstrap_honours_solo(
     _reset_harness: Any, _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The solo check lives inside bootstrap_cadences, so the reset's own call
-    honours it too (here the workspace is held at solo through the reset)."""
-    ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo"))
-    monkeypatch.setattr(ws, "reset_workspace_settings", lambda db_path=None: None)
+    honours it too (here the workspace is set to solo where the reset would
+    return it to the defaults, after the table wipe and before the bootstraps)."""
+    monkeypatch.setattr(
+        ws,
+        "reset_workspace_settings",
+        lambda db_path=None: ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo")),
+    )
     _run_reset(_reset_harness)
     assert ws.get_workspace().mode == "solo"
     assert _count(_isolated, "dept_cadence") == 0
@@ -321,7 +325,9 @@ def test_fixture_load_path_always_applies_the_workspace_file() -> None:
 
 
 def test_blank_client_slot_wipes_the_workspace_settings() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES, _GLOBAL_TABLES
+    from openexecutive.clients.slots import _GLOBAL_TABLES
+    from openexecutive.memory.company_tables import KEPT_ON_EVERY_SWAP, PER_COMPANY_TABLES
 
-    assert "workspace_settings" in _BLANK_WIPE_TABLES
+    assert "workspace_settings" in PER_COMPANY_TABLES
+    assert "workspace_settings" not in KEPT_ON_EVERY_SWAP
     assert "workspace_settings" not in _GLOBAL_TABLES
