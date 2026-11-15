@@ -206,6 +206,17 @@ def test_limits_apply_to_the_cleaned_form() -> None:
     assert len(check(topic="  " + "x" * 40 + "      " + "y" * 39 + "  ").topic) == 80
 
 
+def test_an_oversized_field_is_refused_before_the_patterns_scan_it() -> None:
+    # URL_RE backtracks quadratically on a long run of "a.", so the length
+    # check must come first: 8 KB took about 1.5 s on the event loop
+    import time
+
+    started = time.monotonic()
+    err = rejected(summary="a." * 4000)
+    assert (err.field, err.reason) == ("summary", "must be at most 800 characters")
+    assert time.monotonic() - started < 0.5
+
+
 @pytest.mark.parametrize(
     ("link", "reason"),
     [

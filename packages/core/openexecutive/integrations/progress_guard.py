@@ -5,8 +5,10 @@ chat apps, so what the guard rejects stays out of the store as well as out of
 Slack. It rejects instead of redacting: the caller gets the field and the
 reason and can rephrase.
 
-The order matters. Every check runs on text nothing has cleaned yet, so
-cleaning cannot hide what the guard must reject:
+The order matters. Every check that looks for something to reject runs on
+text nothing has cleaned yet, so cleaning cannot hide it (the maximum length
+alone is checked first, on the cleaned form, so the patterns never scan a body
+far past what a field may hold):
 
 1. Any control, format or invisible character (``NFKC(raw) != plain(raw)``).
    A CRLF line break is the one thing turned into ``\\n`` first; it hides
@@ -16,7 +18,8 @@ cleaning cannot hide what the guard must reject:
    one-line field, more than ``SUMMARY_MAX_LINES`` lines in the summary.
 3. The deny patterns, on the NFKC text (a full-width ＜ is a <).
 4. Cleaning (runs of spaces and tabs collapsed, each line trimmed, line breaks
-   kept) and then the length limits on the cleaned form.
+   kept) and the length limits on the cleaned form (the maximum before step 3,
+   the minimum after it).
 
 This is a tripwire, not the control. It cannot catch an amount or a price
 (amounts are accepted by design: whether a price is published is the
@@ -219,16 +222,19 @@ def _free_text(
         raise Rejected(field, "must be one line")
     if not one_line and len(raw.strip("\n").split("\n")) > SUMMARY_MAX_LINES:
         raise Rejected(field, f"has more than {SUMMARY_MAX_LINES} lines")
+    cleaned = "\n".join(_SPACES_RE.sub(" ", line).strip() for line in folded.split("\n")).strip("\n")
+    # the upper bound first: it only rejects, so it hides nothing from the deny
+    # patterns, and it keeps them off a body of up to 8 KB (URL_RE backtracks
+    # quadratically on a long run of "a.a.a.", about 1.5 s at 8 KB)
+    if len(cleaned) > max_len:
+        raise Rejected(field, f"must be at most {max_len} characters")
     for found, reason in _DENY:
         if found(folded):
             raise Rejected(field, reason)
-    cleaned = "\n".join(_SPACES_RE.sub(" ", line).strip() for line in folded.split("\n")).strip("\n")
     if not cleaned and not required:
         return None
     if len(cleaned) < min_len:
         raise Rejected(field, f"must be at least {min_len} characters")
-    if len(cleaned) > max_len:
-        raise Rejected(field, f"must be at most {max_len} characters")
     return cleaned
 
 
