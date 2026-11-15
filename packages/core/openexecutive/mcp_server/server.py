@@ -630,9 +630,9 @@ def _progress_source() -> str:
     """The source the request's ``x-source-token`` belongs to. Raises
     :class:`CallerRefused` with :data:`PROGRESS_REFUSED` for an in-process
     call, a call with no HTTP request, the feature off (no sources, or a
-    client slot or demo fixture live), no token or an
-    unknown one, and, with a shared secret configured, a request the gate
-    did not mark as authenticated by it (as ``may_act`` requires)."""
+    client slot or demo fixture live), no token or an unknown one, and, with
+    a shared secret configured, a request the gate did not mark as
+    authenticated by it (as ``may_act`` requires)."""
     import os
 
     from openexecutive.integrations import progress_sources, progress_updates
@@ -675,8 +675,8 @@ async def post_progress_update(
     chat-app message; a founder it does not reach gets it in their next
     morning brief. Past your source's relay cap an update is stored but not
     sent, and each founder gets one notice that more updates are waiting.
-    It is filed under the source your ``x-source-token``
-    header belongs to; there is no source argument.
+    It is filed under the source your ``x-source-token`` header belongs to;
+    there is no source argument.
 
     Content contract: write for the founders, in plain text. Do not post
     unpublished prices or other confidential commercial terms, personal

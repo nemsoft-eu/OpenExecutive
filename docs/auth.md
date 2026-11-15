@@ -587,9 +587,10 @@ is never recorded as anyone's words.
 | MCP tool `post_progress_update` on `/mcp` | `x-api-key` (when `BACKEND_SHARED_SECRET` is set) **and** `x-source-token` | `/mcp` sits behind the shared-secret check, so a source using MCP also holds the shared secret, which opens the whole API (as a service, never the owner, with signed callers on). Give it MCP only if you would trust it with that; otherwise give it the REST route. |
 
 The route answers `404` while the feature is off (no sources, or a client slot or demo
-fixture live), `401` for a missing or unknown token, and `503` when a fixture, slot or sync
-write is still running after a 10-second wait. The MCP tool gives one fixed refusal for either of the first two,
-whatever failed, and its "unavailable" error for the third.
+fixture live), `401` for a missing or unknown token, and `503` when the update can't be
+stored (a fixture, slot or sync write still running after a 10-second wait, or the database
+unavailable). The MCP tool gives one fixed refusal for either of the first two, whatever
+failed, and its "unavailable" error for the third.
 
 ```bash
 curl -X POST https://api.example.com/progress-updates \

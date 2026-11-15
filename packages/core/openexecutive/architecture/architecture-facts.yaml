@@ -11046,7 +11046,9 @@ integrations:
         dots; a file name whose extension is not a TLD, such as .js, .json,
         .yaml, .lock, .php, .rb, .kt, .sql or .xml, passes, while
         .py, .md and .sh are TLDs and are rejected).
-        Then spaces collapse and limits apply: topic 3-80 one line, status
+        Spaces collapse and limits apply on the cleaned text, the maximum
+        before the deny list (so its patterns never scan an over-long field)
+        and the minimum after it: topic 3-80 one line, status
         on_track|at_risk|blocked|done|info, summary 10-800 and <= 8 lines,
         ask <= 300 one line, link https with its host exactly in
         PROGRESS_LINK_HOSTS (empty refuses every link; no userinfo or port),

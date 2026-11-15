@@ -8,8 +8,8 @@ service, and the source an update is filed under comes from the token alone.
 
 The order is fixed so that nothing about the body is looked at for a caller
 who may not send one: feature off (no sources, or a client slot or demo
-fixture live) → 404, token missing or unknown → 401,
-then the body (8 KB at most → 413), parsing (422) and
+fixture live) → 404, token missing or unknown → 401, then the body (a
+non-numeric Content-Length → 400, over 8 KB → 413), parsing (422) and
 ``integrations.progress_updates.submit``, which holds every other rule.
 """
 

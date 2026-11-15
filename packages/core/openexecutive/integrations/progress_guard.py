@@ -7,8 +7,8 @@ reason and can rephrase.
 
 The order matters. Every check that looks for something to reject runs on
 text nothing has cleaned yet, so cleaning cannot hide it (the maximum length
-alone is checked first, on the cleaned form, so the patterns never scan a body
-far past what a field may hold):
+alone is checked before the deny patterns, on the cleaned form, so they never
+scan a body far past what a field may hold):
 
 1. Any control, format or invisible character (``NFKC(raw) != plain(raw)``).
    A CRLF line break is the one thing turned into ``\\n`` first; it hides

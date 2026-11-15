@@ -385,9 +385,10 @@ shared secret to say who is asking.
 This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
 under [Configuration](#configuration), which configure the MCP *gateway*: Open
 Executive consuming other servers' tools. The server side needs no configuration
-beyond `BACKEND_SHARED_SECRET`, plus `PROGRESS_SOURCES` for `post_progress_update`. If a client errors on connect, try `/mcp/` with
-the trailing slash, since the endpoint 307-redirects and not every client
-follows the redirect.
+beyond `BACKEND_SHARED_SECRET`, plus `PROGRESS_SOURCES` for
+`post_progress_update`. If a client errors on connect, try `/mcp/` with the
+trailing slash, since the endpoint 307-redirects and not every client follows
+the redirect.
 
 ## Document Upload
 
