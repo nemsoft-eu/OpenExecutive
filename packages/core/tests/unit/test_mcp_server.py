@@ -85,6 +85,7 @@ async def test_registered_tools() -> None:
         "search_knowledge",
         "list_workflows",
         "ask_executive",
+        "post_progress_update",
     }
 
 
@@ -448,6 +449,13 @@ async def test_tools_carry_titles_and_annotations() -> None:
     assert ask.annotations.destructiveHint is False
     assert ask.annotations.idempotentHint is False
     assert ask.annotations.openWorldHint is False
+    post = tools["post_progress_update"]
+    assert post.title and post.annotations is not None
+    assert post.annotations.readOnlyHint is False
+    assert post.annotations.destructiveHint is False
+    assert post.annotations.idempotentHint is False
+    # it sends to the founders' chat apps
+    assert post.annotations.openWorldHint is True
     # Factual descriptions: no steering between tools.
     for tool in tools.values():
         assert "fallback" not in (tool.description or "").lower()
@@ -504,3 +512,156 @@ def test_an_mcp_call_with_no_http_request_names_no_one(monkeypatch: pytest.Monke
     context = SimpleNamespace(request_context=SimpleNamespace(request=None))
     with patch.object(mcp_server.mcp, "get_context", return_value=context):
         assert mcp_server._who() == Caller("service")
+
+
+# ---------------------------------------------------------------------------
+# post_progress_update: the source comes from the token header, never an
+# argument, and every refusal reads the same.
+# ---------------------------------------------------------------------------
+PROGRESS_ARGS = {"topic": "GTM plan", "status": "on_track", "summary": "Positioning draft is done."}
+
+
+def _progress_request(token: str | None = "tok", *, secret_ok: bool | None = None) -> Any:
+    from types import SimpleNamespace
+
+    headers = {} if token is None else {mcp_server.SOURCE_TOKEN_HEADER: token}
+    state = SimpleNamespace() if secret_ok is None else SimpleNamespace(**{mcp_server.SHARED_SECRET_OK: secret_ok})
+    return SimpleNamespace(headers=headers, state=state)
+
+
+@pytest.fixture
+def progress_source(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """A request carrying a known token (no shared secret), and ``submit``
+    stubbed; returns the stub."""
+    from openexecutive.integrations import progress_sources, progress_updates
+
+    monkeypatch.delenv("BACKEND_SHARED_SECRET", raising=False)
+    monkeypatch.setattr(mcp_server, "_request", lambda: _progress_request("tok"))
+    monkeypatch.setattr(progress_sources, "enabled", lambda: True)
+    monkeypatch.setattr(progress_sources, "source_for", lambda t: "planner" if t == "tok" else None)
+    submit = AsyncMock(return_value=progress_updates.SubmitResult(7, True, "sent"))
+    monkeypatch.setattr(progress_updates, "submit", submit)
+    return submit
+
+
+def test_post_progress_update_takes_no_source_or_token_argument() -> None:
+    import inspect
+
+    assert list(inspect.signature(mcp_server.post_progress_update).parameters) == [
+        "topic", "status", "summary", "ask", "link", "idempotency_key",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_progress_update_advertises_the_statuses() -> None:
+    from openexecutive.integrations.progress_guard import STATUSES
+
+    tools = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    schema = tools["post_progress_update"].inputSchema
+    assert schema["properties"]["status"]["enum"] == list(STATUSES)
+    assert set(schema["required"]) == {"topic", "status", "summary"}
+
+
+@pytest.mark.asyncio
+async def test_post_progress_update_files_under_the_token_source(progress_source: AsyncMock) -> None:
+    out = await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    assert out == {"id": 7, "stored": True, "relay": "sent"}
+    source, payload = progress_source.await_args.args
+    assert source == "planner"
+    # empty optionals are omitted, not sent to the guard as values
+    assert payload == PROGRESS_ARGS
+
+
+@pytest.mark.asyncio
+async def test_post_progress_update_passes_the_optionals(progress_source: AsyncMock) -> None:
+    await mcp_server.post_progress_update(
+        **PROGRESS_ARGS, ask="Approve the budget", link="https://docs.example/x", idempotency_key="retry-0001"
+    )
+    _, payload = progress_source.await_args.args
+    assert payload["ask"] == "Approve the budget"
+    assert payload["link"] == "https://docs.example/x"
+    assert payload["idempotency_key"] == "retry-0001"
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param(lambda: mcp_server._NO_MCP_REQUEST, id="in-process"),
+        pytest.param(lambda: None, id="no-http-request"),
+        pytest.param(lambda: _progress_request(None), id="no-token"),
+        pytest.param(lambda: _progress_request("wrong"), id="unknown-token"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_post_progress_update_refuses_without_a_known_token(
+    progress_source: AsyncMock, monkeypatch: pytest.MonkeyPatch, request_: Any
+) -> None:
+    monkeypatch.setattr(mcp_server, "_request", request_)
+    with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    progress_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_progress_update_is_refused_when_the_feature_is_off(
+    progress_source: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.integrations import progress_sources
+
+    monkeypatch.setattr(progress_sources, "enabled", lambda: False)
+    with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    progress_source.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("secret_ok", "allowed"), [(None, False), (False, False), (True, True)])
+@pytest.mark.asyncio
+async def test_with_a_shared_secret_the_gate_must_have_passed_the_request(
+    progress_source: AsyncMock, monkeypatch: pytest.MonkeyPatch, secret_ok: bool | None, allowed: bool
+) -> None:
+    monkeypatch.setenv("BACKEND_SHARED_SECRET", "s3cret")
+    monkeypatch.setattr(mcp_server, "_request", lambda: _progress_request("tok", secret_ok=secret_ok))
+    if allowed:
+        assert (await mcp_server.post_progress_update(**PROGRESS_ARGS))["relay"] == "sent"
+    else:
+        with pytest.raises(mcp_server.CallerRefused, match=mcp_server.PROGRESS_REFUSED):
+            await mcp_server.post_progress_update(**PROGRESS_ARGS)
+        progress_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_names_the_field_and_reason(progress_source: AsyncMock) -> None:
+    from openexecutive.integrations.progress_updates import Rejected
+
+    progress_source.side_effect = Rejected("summary", "must not contain an email address")
+    with pytest.raises(ValueError, match="^summary: must not contain an email address$"):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_truncates_the_field_it_echoes(progress_source: AsyncMock) -> None:
+    from openexecutive.integrations.progress_updates import Rejected
+
+    progress_source.side_effect = Rejected("x" * 500, "is not a field of a progress update")
+    with pytest.raises(ValueError) as caught:
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    assert str(caught.value) == "x" * mcp_server._FIELD_PREVIEW_CHARS + ": is not a field of a progress update"
+
+
+@pytest.mark.asyncio
+async def test_over_the_daily_cap_is_an_error(progress_source: AsyncMock) -> None:
+    from openexecutive.integrations.progress_updates import OverLimit
+
+    progress_source.side_effect = OverLimit("planner is at its daily limit of progress updates")
+    with pytest.raises(ValueError, match="daily limit"):
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+
+
+@pytest.mark.asyncio
+async def test_a_store_failure_is_one_fixed_error(progress_source: AsyncMock) -> None:
+    from openexecutive.integrations.progress_updates import StoreUnavailable
+
+    progress_source.side_effect = StoreUnavailable("disk I/O error at /secret/path")
+    with pytest.raises(RuntimeError) as caught:
+        await mcp_server.post_progress_update(**PROGRESS_ARGS)
+    assert str(caught.value) == mcp_server.PROGRESS_UNAVAILABLE
