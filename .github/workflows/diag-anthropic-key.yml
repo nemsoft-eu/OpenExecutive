@@ -1,0 +1,42 @@
+# Throwaway diagnostic: never merge. Prints what the Anthropic API says about
+# the ANTHROPIC_API_KEY repo secret, without ever printing the key.
+name: Diagnose Anthropic key
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Probe the key
+        shell: bash
+        run: |
+          set -u
+          K="$ANTHROPIC_API_KEY"
+          echo "key length: ${#K}"
+          echo "key prefix (first 7 chars): ${K:0:7}"
+          echo "non-printable or whitespace chars in key: $(printf '%s' "$K" | tr -d '[:graph:]' | wc -c)"
+          for model in claude-haiku-5-5 claude-opus-5-5; do
+            echo "== POST /v1/messages model=$model"
+            code=$(curl -s -o /tmp/resp.json -w '%{http_code}' -m 30 \
+              https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $K" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "{\"model\":\"$model\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}")
+            echo "http status: $code"
+            jq -r 'if .error then "error.type: \(.error.type)\nerror.message: \(.error.message)" else "ok: stop_reason=\(.stop_reason) in=\(.usage.input_tokens) out=\(.usage.output_tokens)" end' /tmp/resp.json || echo "(response was not JSON)"
+          done
+          echo "== GET /v1/models"
+          curl -s -o /dev/null -w 'http status: %{http_code}\n' -m 30 \
+            https://api.anthropic.com/v1/models \
+            -H "x-api-key: $K" \
+            -H "anthropic-version: 2023-06-01"
+          rm -f /tmp/resp.json
