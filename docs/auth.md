@@ -601,7 +601,8 @@ curl -X POST https://api.example.com/progress-updates \
 **What the content check does not catch.** An update is checked before anything is stored
 or sent, and rejected with the field and the reason when it holds an email address, a phone
 number, an IBAN, something shaped like a credential, `<` or `>`, a control or invisible
-character, or a URL outside the `link` field. The link itself must be at most 300 characters,
+character, or a URL outside the `link` field. A bare domain name such as `chainsafe.be` counts
+as a URL, so write a brand's site as a name ("the ChainSafe site"). The link itself must be at most 300 characters,
 on a host in `PROGRESS_LINK_HOSTS`, with no percent-encoding, non-ASCII character or fragment,
 and query parameters only from `id`, `resourcekey`, `usp`, `tab`, `gid`, `v` and `node-id`, each
 with a plain value; the email, phone, IBAN and credential checks run on it too. A token-shaped

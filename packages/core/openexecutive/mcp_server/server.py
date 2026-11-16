@@ -685,7 +685,9 @@ async def post_progress_update(
     Amounts are accepted, so keeping an unpublished price out is your
     responsibility. Updates with email addresses, phone numbers, IBANs,
     credential-like strings, ``<`` or ``>``, control characters, or a URL
-    outside ``link`` are rejected with the field and the reason.
+    outside ``link`` are rejected with the field and the reason. A bare
+    domain name such as chainsafe.be counts as a URL, so name a site in
+    words ("the ChainSafe site").
 
     Returns ``{id, stored, relay}``: ``relay`` is ``accepted`` for a new
     update and ``duplicate`` for a repeat of an update already stored
