@@ -712,6 +712,29 @@ def test_a_failed_grade_still_runs_the_fixes(db: Path, roster: SimpleNamespace,
     assert row["verdict"] is None and row["reviewed_at"] is not None
 
 
+def test_a_tool_only_turn_is_replayed_to_the_next_call_as_dicts(
+    db: Path, roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A raw response block is not a dict, so the OpenAI-compatible translator
+    # skips it and a local backend gets an assistant turn with no tool_calls
+    # and null content, which Ollama answers with a 400.
+    from openexecutive.providers.translator import to_openai_request
+
+    fake = _Provider([[("not_a_tool_here", {})], []])
+    monkeypatch.setattr(providers, "get_provider", lambda _model: fake)
+    _record(roster.principal)
+    _review(db)
+    assert len(fake.calls) == 2
+    sent = fake.calls[1]["messages"]
+    assistant = next(m for m in sent if m["role"] == "assistant")
+    assert assistant["content"] == [
+        {"type": "tool_use", "id": "tu0", "name": "not_a_tool_here", "input": {}}
+    ]
+    body = to_openai_request("m", {"model": "m", "max_tokens": 8, "messages": sent})
+    turn = next(m for m in body["messages"] if m["role"] == "assistant")
+    assert [c["id"] for c in turn["tool_calls"]] == ["tu0"]
+
+
 def test_misses_are_listed_per_person_and_forgotten_by_their_owner(db: Path, roster: SimpleNamespace,
                                                                    provider: _Provider) -> None:
     _record(roster.principal, text=ASK, reply="I'll keep an eye on it.", at=NOW)

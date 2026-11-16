@@ -1486,6 +1486,7 @@ async def _run_loop(
     them, and only them. ``refused`` collects each change that didn't go
     through, as the tool's name and why (codes and the checks' own words,
     never the person's text), for the review's audit row."""
+    from openexecutive.agents.base import _replay_assistant_turn
     from openexecutive.audit.usage import log_model_usage
     from openexecutive.orchestrator.fact_tools import _quote_error
     from openexecutive.providers import get_provider
@@ -1548,7 +1549,11 @@ async def _run_loop(
                     elif name in _LEARN_TOOLS:
                         _note_refused(refused, name, _refusal_code(out))
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(out)[:2000]})
-        messages.append({"role": "assistant", "content": response.content})
+        # As plain dicts: the OpenAI-compatible translator skips a block that
+        # is not one, so the raw response would reach a local backend as an
+        # assistant turn with no tool_calls and null content, which Ollama
+        # rejects with a 400.
+        messages.append({"role": "assistant", "content": _replay_assistant_turn(response)})
         messages.append({"role": "user", "content": results})
     return done
 
