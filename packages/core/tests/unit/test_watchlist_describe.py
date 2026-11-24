@@ -192,6 +192,21 @@ async def test_draft_defaults_and_fixes_bad_fields(db: Path) -> None:
     assert draft.tell_you_when == "A new result turns up, and only when it is a big change"
 
 
+async def test_email_draft_matches_by_subject_every_time(db: Path) -> None:
+    # "Tell me every time a sign-up email comes in": no sender needed.
+    draft = await describe.build_draft({
+        "signal_type": "mailbox", "target": "sign-up emails",
+        "trigger": {"keywords": ["sign up", "signed up"], "only_big": True},
+    })
+    assert draft.trigger == {"keywords": ["sign up", "signed up"]}
+    assert draft.cadence == "real_time"
+    assert draft.tell_you_when == (
+        "An email that mentions \u201csign up\u201d or \u201csigned up\u201d reaches the Executive or you"
+    )
+    with pytest.raises(describe.DescribeError):
+        await describe.build_draft({"signal_type": "mailbox", "target": "email", "trigger": {}})
+
+
 async def test_draft_slug_is_unique(db: Path) -> None:
     ms.insert_watchlist_item(slug="stock-glbx", signal_type="stock", target="GLBX", db_path=db)
     draft = await describe.build_draft({"signal_type": "stock", "target": "GLBX"})
@@ -312,7 +327,7 @@ async def test_model_call_is_one_forced_tool_call(monkeypatch: pytest.MonkeyPatc
     assert call["tool_choice"] == {"type": "tool", "name": describe.TOOL_NAME}
     tool = call["tools"][0]
     assert set(tool["input_schema"]["properties"]["trigger"]["properties"]) == {
-        "abs_change_pct_gte", "keywords", "forms", "only_big",
+        "abs_change_pct_gte", "keywords", "forms", "only_big", "from",
     }
     assert call["messages"] == [{"role": "user", "content": "<request>\nwatch GLBX\n</request>"}]
 

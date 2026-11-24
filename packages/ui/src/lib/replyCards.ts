@@ -130,11 +130,22 @@ export function mailboxName(link: string): string {
 /** The first Send's question: who it goes to, from where. A reply saved in
  * their mailbox goes exactly as the draft is there; one kept on its card
  * alone goes as the card shows it. */
-export function sendQuestion(recipients: readonly string[], mailbox = "Gmail", inMailbox = true): string {
+export function sendQuestion(
+  recipients: readonly string[],
+  mailbox = "Gmail",
+  inMailbox = true,
+  fromExecutive = "",
+): string {
   const to = recipients.length ? recipients.join(", ") : "the sender";
+  if (fromExecutive) return `Send this to ${to} from ${fromExecutive}, with you on cc, as shown above?`;
   return inMailbox
     ? `Send this reply to ${to} from your ${mailbox}, exactly as the draft is there?`
     : `Send this reply to ${to} from your ${mailbox}, as shown above?`;
+}
+
+/** The card's Send button: from you, or from the Executive. */
+export function sendButtonLabel(card: { from_executive?: boolean; executive_name?: string }, base = "Send"): string {
+  return card.from_executive ? `${base} from ${card.executive_name || "Executive"}` : base;
 }
 
 // Send refusals after which the card is gone for good: its draft was sent or
@@ -187,4 +198,51 @@ export function highlightPieces(
   }
   if (cursor < body.length) pieces.push({ text: body.slice(cursor), changed: false });
   return pieces;
+}
+
+/** Who an email goes to, by name only: "Brennan Monaco and Annamarie
+ * Braden", "A, B and C", "A, B and 2 more". An entry is "Name <address>",
+ * "Name (address)" (cut short or not), or a bare address. */
+export function recipientNames(list: readonly string[]): string {
+  const names = list
+    .map((entry) => {
+      const named = /^\s*"?([^"<(]*?)"?\s*[<(]/.exec(entry);
+      return (named && named[1].trim()) || entry.replace(/[<>()"]/g, "").trim();
+    })
+    .filter(Boolean);
+  if (names.length <= 1) return names[0] ?? "";
+  if (names.length <= 3) return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return `${names.slice(0, 2).join(", ")} and ${names.length - 2} more`;
+}
+
+// Right now's draft rows name who they go to as one line, "Name (address),
+// Name (address)": its entries, one per person.
+function lineEntries(line: string): string[] {
+  return line.match(/[^,(]+\([^)]*\)?|[^,]+/g) ?? [];
+}
+
+/** Right now's draft rows name who they go to as one line, "Name (address),
+ * Name (address)": the same as recipientNames, from that line. */
+export function namesFromLine(line: string): string {
+  return recipientNames(lineEntries(line));
+}
+
+/** Who an email goes to, for a button: first names ("Kyle", "Kyle and
+ * Annamarie"). A name that came with an address is cut to its first word,
+ * unless that word ends in "," or "." ("Monaco, Brennan", "Dr. Kyle
+ * Harrelson"), which stays whole; a bare address or bare words stay whole. */
+export function firstNames(list: readonly string[]): string {
+  return recipientNames(
+    list.map((entry) => {
+      const named = /^\s*"?([^"<(]*?)"?\s*[<(]/.exec(entry)?.[1]?.trim();
+      if (!named) return entry.replace(/[<>()"]/g, "").trim();
+      const first = named.split(/\s+/)[0] ?? named;
+      return /[,.]$/.test(first) ? named : first;
+    }),
+  );
+}
+
+/** firstNames, from a draft row's one line of who it goes to. */
+export function firstNamesFromLine(line: string): string {
+  return firstNames(lineEntries(line));
 }

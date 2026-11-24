@@ -60,6 +60,9 @@ STATUS_CLOSED_EXTERNALLY = "closed_externally"
 
 # Still open: waiting on someone, or being carried out right now.
 OPEN_STATUSES: tuple[str, ...] = (STATUS_PROPOSED, STATUS_EXECUTING)
+# A step that never happened: asking for the same thing again is a new step
+# under the same key (``create_decision_instance``). One that went keeps it.
+FREES_KEY: tuple[str, ...] = (STATUS_REJECTED, STATUS_AUTO_NO_RESPONSE, STATUS_FAILED)
 
 # Severity values for circuit-breaker detection.
 SEVERITY_NONE = ""
@@ -81,6 +84,44 @@ def decision_alert_external_id(instance_id: int) -> str:
 def decision_instance_tag(instance_id: int) -> str:
     """The topic tag carrying the decision_instance id on a briefing alert."""
     return f"{DECISION_INSTANCE_TAG_PREFIX}{instance_id}"
+
+
+def put_on_needs_you(
+    instance_id: int,
+    decision_class: str,
+    *,
+    headline: str,
+    body: str,
+    suggested_action: str,
+    approver_person_id: int | None,
+    severity: str = "medium",
+    private: bool = False,
+    extra_tags: tuple[str, ...] = (),
+) -> None:
+    """Put a waiting decision on its approver's Needs you (web and phone),
+    with Approve and Skip: the companion alert the decisions route clears
+    when it is answered. ``private`` keeps it to the approver. Raises what
+    the alerts store raises; callers decide whether that breaks them."""
+    from openexecutive.alerts.models import PRIVATE_ALERT_TAG
+    from openexecutive.alerts.store import insert_alert
+
+    external_id = decision_alert_external_id(instance_id)
+    insert_alert(
+        source=DECISION_ALERT_SOURCE,
+        external_id=external_id,
+        severity=severity,
+        headline=headline[:160],
+        body=body,
+        suggested_action=suggested_action,
+        topic_tags=[
+            decision_instance_tag(instance_id),
+            f"decision_class:{decision_class}",
+            *extra_tags,
+            *([PRIVATE_ALERT_TAG] if private else []),
+        ],
+        dedup_key=external_id,
+        routed_to_person_id=approver_person_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +188,12 @@ def create_decision_instance(
 ) -> int:
     """Insert a new decision_instances row and return its id.
 
-    Raises sqlite3.IntegrityError if idempotency_key already exists — callers
-    should catch this and return the existing row instead of double-proposing.
+    ``idempotency_key`` says this step was asked for, or done. A step that
+    never happened (skipped, left to lapse, or failed: ``FREES_KEY``) gives
+    its key up here, so asking for the same thing again makes a new step
+    instead of failing. Raises sqlite3.IntegrityError while an open step, or
+    one that went, holds the key: callers look up the open one first
+    (``get_live_by_idem``) and return it instead of double-proposing.
     """
     now = datetime.now(UTC).isoformat()
     sql = """
@@ -159,12 +204,29 @@ def create_decision_instance(
         VALUES (?,?,?,?,?,?,?,?,?,?)
     """
     with _get_conn(db_path or _db_path()) as conn:
+        if idempotency_key is not None:
+            marks = ",".join("?" * len(FREES_KEY))
+            # A lapsed step asked for again is closed for good: the new
+            # step is that ask now, so Undo can never bring the old one back
+            # beside it (``unlapse``).
+            conn.execute(
+                "UPDATE decision_instances SET idempotency_key = NULL,"
+                " status = CASE WHEN status = ? THEN ? ELSE status END"
+                f" WHERE idempotency_key = ? AND status IN ({marks})",  # noqa: S608 - placeholders only
+                (STATUS_AUTO_NO_RESPONSE, STATUS_CLOSED_EXTERNALLY, idempotency_key, *FREES_KEY),
+            )
         cur = conn.execute(sql, (
             decision_class, now, department, originating_session_id,
             json.dumps(proposed_payload), idempotency_key, gate_mode,
             approver_person_id, confidence, STATUS_PROPOSED,
         ))
-        return cur.lastrowid  # type: ignore[return-value]
+        instance_id: int = cur.lastrowid  # type: ignore[assignment]
+    # Whose chat it came from, kept apart from the conversation so deleting
+    # that later doesn't hand the card to the team (alerts.own_chat).
+    from openexecutive.alerts import own_chat
+
+    own_chat.note_decision(instance_id, originating_session_id, db_path or _db_path())
+    return instance_id
 
 
 def get_decision_instance(
@@ -245,6 +307,52 @@ def mark_resolved(
                 external_event_id,
                 instance_id, STATUS_PROPOSED,
             ),
+        )
+        return result.rowcount == 1
+
+
+def instance_id_of(alert: Any) -> int | None:
+    """The waiting step a Needs you card stands for (``put_on_needs_you``):
+    only a ``DECISION_ALERT_SOURCE`` card whose ``external_id`` is that
+    step's, with its ``decision_instance:<id>`` tag. None on any other card:
+    tags can come from outside (triage reads them off mail), so there the
+    tag is just text."""
+    if getattr(alert, "source", None) != DECISION_ALERT_SOURCE:
+        return None
+    for tag in getattr(alert, "topic_tags", None) or []:
+        tag = str(tag)
+        if not tag.startswith(DECISION_INSTANCE_TAG_PREFIX):
+            continue
+        try:
+            decision = int(tag[len(DECISION_INSTANCE_TAG_PREFIX):])
+        except ValueError:
+            continue
+        if getattr(alert, "external_id", None) == decision_alert_external_id(decision):
+            return decision
+    return None
+
+
+def lapse(instance_id: int, db_path: Path | None = None) -> bool:
+    """The tidy-up settled a waiting step nobody answered
+    (``alerts.lifecycle.settle``): it never happened, like Skip, but nobody
+    said no, so nothing is learned from it. Compare-and-set on proposed."""
+    return mark_resolved(instance_id, STATUS_AUTO_NO_RESPONSE, db_path=db_path)
+
+
+def unlapse(instance_id: int, db_path: Path | None = None) -> bool:
+    """Undo of :func:`lapse`: the step waits again. False when it was not
+    lapsed (someone answered it, or it ran) or the same step was asked for
+    again since (a later row of its class with the same payload), so one
+    ask never waits twice."""
+    with _get_conn(db_path or _db_path()) as conn:
+        result = conn.execute(
+            "UPDATE decision_instances SET status = ?, resolved_at = NULL, resolver_person_id = NULL "
+            "WHERE id = ? AND status = ? AND NOT EXISTS ("
+            " SELECT 1 FROM decision_instances later"
+            " WHERE later.id > decision_instances.id"
+            " AND later.decision_class = decision_instances.decision_class"
+            " AND later.proposed_payload_json = decision_instances.proposed_payload_json)",
+            (STATUS_PROPOSED, instance_id, STATUS_AUTO_NO_RESPONSE),
         )
         return result.rowcount == 1
 

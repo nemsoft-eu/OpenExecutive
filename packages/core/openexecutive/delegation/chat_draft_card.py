@@ -81,6 +81,8 @@ async def _client(person: Any, gmail: Any) -> Any:
 
 
 def _shown(row: Any, draft: Any, files: list[str] | None = None) -> dict[str, Any]:
+    from openexecutive.delegation.send_from import executive_name
+
     message = draft.message
     if message.id != row.message_id:
         return {"status": CHANGED}
@@ -92,6 +94,12 @@ def _shown(row: Any, draft: Any, files: list[str] | None = None) -> dict[str, An
         "body": message.text,
         # The names of the files attached to it, so the card shows them.
         "files": list(files or []),
+        # Who it goes from: the person, or (switched on the card) the Executive.
+        "from_executive": row.from_executive,
+        # The version shown: Send sends it back, so a card shown before a
+        # change (on another screen) sends nothing it didn't show.
+        "version": message.id,
+        "executive_name": executive_name(),
     }
 
 
@@ -154,9 +162,11 @@ async def state(
 async def _save(
     person: Any, row_id: int, *, caller: Any, gmail: Any, now: datetime | None, words_for: Any,
 ) -> tuple[dict[str, Any], str]:
-    """Rewrite the draft with the words ``words_for(body)`` returns (and
-    a line on what changed), once every check passed and while the draft is
-    held for it. Returns its state and that line."""
+    """Rewrite the draft with the words ``words_for(person, current)``
+    returns (and a line on what changed, and who it goes from now: True for
+    the Executive, False for the person, None for no change), once every
+    check passed and while the draft is held for it. Returns its state and
+    that line."""
     from openexecutive.audit import rows_for_person
     from openexecutive.delegation import drafts
     from openexecutive.delegation.card_drafts import _check_words
@@ -191,7 +201,13 @@ async def _save(
                 )
             if current["status"] != OPEN:
                 raise SendRefused(409, "draft_gone", "That draft isn't in your Drafts any more.", state=current)
-            written, note = await words_for(person, current)
+            written, note, executive = await words_for(person, current)
+            if executive == current.get("from_executive"):
+                executive = None
+            if written == str(current.get("body") or "") and executive is None:
+                # Nothing to change (a question, answered in the note): the
+                # draft in their mailbox stays as it is.
+                return {**current}, note
             words = _check_words(written)
             try:
                 version = await client.update_draft_text(row.draft_id, row.message_id, words)
@@ -216,12 +232,14 @@ async def _save(
                 raise SendRefused(
                     502, "gmail_error", "Couldn't save the change in your mailbox. Try again in a moment.",
                 )
-            if not drafts.set_version(row.id, row.message_id, version):
+            if not drafts.set_version(row.id, row.message_id, version, executive=executive):
                 raise SendRefused(409, "draft_gone", "That draft was sent or changed meanwhile. Look at it again.")
             _audit("delegation_chat_draft_edited", f"Person {person.id} changed a chat draft on its card", {
                 "person_id": person.id, "draft_row": row.id, "by_hand": not note,
+                **({"from_executive": executive} if executive is not None else {}),
             })
-            return {**current, "body": words}, note
+            going = current.get("from_executive") if executive is None else executive
+            return {**current, "body": words, "from_executive": going, "version": version}, note
         finally:
             _CHANGING.discard(row.id)
 
@@ -232,11 +250,63 @@ async def set_text(
     """Put the person's own words ``text`` in the draft ``row_id``, on their
     tap. Returns its state; raises ``SendRefused``. Sends nothing."""
 
-    async def mine(_person: Any, _current: dict[str, Any]) -> tuple[str, str]:
-        return text, ""
+    async def mine(_person: Any, _current: dict[str, Any]) -> tuple[str, str, bool | None]:
+        return text, "", None
 
     saved, _ = await _save(person, row_id, caller=caller, gmail=gmail, now=now, words_for=mine)
     return saved
+
+
+def _note_and_forward(current: dict[str, Any]) -> tuple[str, str]:
+    """The draft's words to write, and a forward's message under them that
+    stays as it is ("" for any other email)."""
+    from openexecutive.delegation.email_html import split_forward
+
+    body = str(current.get("body") or "")
+    # Only a forward's note: a reply's quoted header stays the model's to see.
+    is_forward = str(current.get("subject") or "").strip().lower().startswith(("fw:", "fwd:"))
+    return split_forward(body) if is_forward else (body, "")
+
+
+def _payload(current: dict[str, Any], words: str) -> dict[str, Any]:
+    """The draft as a card payload, for the shared writers
+    (``answers.rewrite``, ``send_from``): its words, who it goes to, and
+    who it goes from."""
+    from openexecutive.delegation.send_from import FROM_EXECUTIVE
+
+    return {
+        "draft_body": words,
+        "draft_to": [*current.get("to", []), *current.get("cc", [])],
+        FROM_EXECUTIVE: current.get("from_executive") is True,
+    }
+
+
+def _rejoined(current: dict[str, Any], note: str, words: str, forwarded: str) -> str:
+    if words == note:
+        return str(current.get("body") or "")  # unchanged, forward and all
+    return f"{words.rstrip()}\n\n{forwarded}" if forwarded else words
+
+
+async def switch(
+    person: Any, row_id: int, *, executive: bool, caller: Any, gmail: Any = None, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Send the draft ``row_id`` from the Executive (``executive``), with the
+    person on cc, or from the person again, on their tap: its words written
+    once for the new sender (``send_from.rewritten_for``, the same rewrite a
+    reply card's switch makes) and saved in their Drafts like any change, so
+    the card and their Drafts keep one version. Returns its state; raises
+    ``SendRefused``. Sends nothing."""
+    from openexecutive.delegation.send_from import NOTE_TO_EXECUTIVE, NOTE_TO_YOU, rewritten_for
+
+    async def written(who: Any, current: dict[str, Any]) -> tuple[str, str, bool | None]:
+        if (current.get("from_executive") is True) == executive:
+            return str(current.get("body") or ""), "", None
+        note, forwarded = _note_and_forward(current)
+        words = await rewritten_for(who, _payload(current, note), executive=executive)
+        return _rejoined(current, note, words, forwarded), NOTE_TO_EXECUTIVE if executive else NOTE_TO_YOU, executive
+
+    saved, note = await _save(person, row_id, caller=caller, gmail=gmail, now=now, words_for=written)
+    return {**saved, "note": note} if note else saved
 
 
 async def change(
@@ -245,22 +315,65 @@ async def change(
     """Rewrite the draft ``row_id`` the way the person asked, in their words
     (``text``: "drop Lisa's name", or a tone pill's "Make it shorter"), on
     their tap. Returns its state, the sentences that are new, and a short
-    line on what changed. Raises ``SendRefused``. Sends nothing."""
-    from openexecutive.delegation.answers import CONVERSATION_KEY, changed_sentences, rewrite
+    line on what changed. Raises ``SendRefused``. Sends nothing.
+
+    The words are written for whoever sends it (the person, or the
+    Executive once switched). Asking for it to go from the other one
+    ("send it from the Executive") switches it, written once for them, as
+    the card's From does (``switch``). A forward keeps the message it
+    forwards: only the note above it is rewritten."""
+    from openexecutive.delegation.answers import (
+        _SEND_FROM_ASKED,
+        CONVERSATION_KEY,
+        NeedsWork,
+        SendFrom,
+        changed_sentences,
+        rewrite,
+    )
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.delegation.send_from import (
+        NOTE_TO_EXECUTIVE,
+        NOTE_TO_YOU,
+        executive_name,
+        rewritten_for,
+    )
 
     new: list[str] = []
 
-    async def rewritten(who: Any, current: dict[str, Any]) -> tuple[str, str]:
-        body = str(current.get("body") or "")
-        payload = {"draft_body": body, "draft_to": [*current.get("to", []), *current.get("cc", [])]}
-        words, extra, _ = await rewrite(who, payload, [], change=text, now=now)
-        new[:] = changed_sentences(body, words)
+    async def rewritten(who: Any, current: dict[str, Any]) -> tuple[str, str, bool | None]:
+        note, forwarded = _note_and_forward(current)
+        payload = _payload(current, note)
+        try:
+            words, extra, _ = await rewrite(who, payload, [], change=text, now=now)
+        except SendFrom as only:
+            # Only who it goes from, and no change of words.
+            words, extra = note, {_SEND_FROM_ASKED: "executive" if only.executive else "me"}
         turns = extra.get(CONVERSATION_KEY)
         last = turns[-1] if isinstance(turns, list) and turns else {}
-        note = str(last.get("text") or "") if isinstance(last, dict) and last.get("kind") == "note" else ""
-        return words, note or "I changed the email."
+        line = str(last.get("text") or "") if isinstance(last, dict) and last.get("kind") == "note" else ""
+        sender = extra.get(_SEND_FROM_ASKED)
+        executive = sender == "executive" if isinstance(sender, str) else None
+        if executive is not None and executive != (current.get("from_executive") is True):
+            # Who it goes from, asked for too: the new words written once for them.
+            words = await rewritten_for(who, {**payload, "draft_body": words}, executive=executive)
+            line = NOTE_TO_EXECUTIVE if executive else NOTE_TO_YOU
+        else:
+            if executive is not None and words == note and not line:
+                # Asked for the sender it already has: say so, nothing changes.
+                line = f"It already goes from {executive_name() if executive else 'you'}."
+            executive = None
+        new[:] = changed_sentences(note, words)
+        return _rejoined(current, note, words, forwarded), line or "I changed the email.", executive
 
-    saved, note = await _save(person, row_id, caller=caller, gmail=gmail, now=now, words_for=rewritten)
+    try:
+        saved, note = await _save(person, row_id, caller=caller, gmail=gmail, now=now, words_for=rewritten)
+    except NeedsWork as work:
+        # Looking things up takes the Executive's tools, which this card
+        # doesn't have: the draft stays as it is.
+        what = "answer that" if work.question else "do that"
+        raise SendRefused(
+            409, "needs_work", f"I need to look things up to {what}. Ask me in the chat, and the draft stays as it is.",
+        ) from None
     return saved, new, note
 
 

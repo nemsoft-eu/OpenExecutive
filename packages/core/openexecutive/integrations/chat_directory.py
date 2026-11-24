@@ -18,6 +18,8 @@ from the bots this instance runs:
 - **Telegram** (``TELEGRAM_BOT_TOKEN``): Telegram cannot list chats, so this
   reads the ones the bot has seen (``integrations.telegram_chats``): private
   chats are people, groups are rooms.
+- **Google Chat** (a Chat app, ``GOOGLE_CHAT_PROJECT_NUMBER``): rooms only,
+  the group spaces the app is in (``google_chat.group_spaces``).
 
 Each list is cached in-process for ``CACHE_TTL_S`` seconds and capped at
 ``MAX_ITEMS``. A provider with no token reads as ``configured=False`` with no
@@ -83,6 +85,7 @@ class DirectoryListing(BaseModel):
     slack: ProviderList
     discord: ProviderList
     telegram: ProviderList
+    google_chat: ProviderList = Field(default_factory=lambda: ProviderList(configured=False))
 
 
 class SlackMatch(BaseModel):
@@ -450,6 +453,28 @@ async def _provider_list(provider: Provider, kind: Kind) -> ProviderList:
     return await _cached((provider, kind), load)
 
 
+async def _google_chat_spaces() -> ProviderList:
+    """The Chat app's group spaces, as rooms."""
+    from openexecutive.integrations import google_chat
+
+    async def load() -> ProviderList:
+        try:
+            spaces = await asyncio.to_thread(google_chat.group_spaces)
+        except Exception as exc:
+            logger.warning("chat directory: listing Google Chat spaces failed: %s", type(exc).__name__)
+            return ProviderList(configured=True, ok=False)
+        options = [
+            DirectoryOption(id=s["space"], name=s["title"] or "Unnamed space",
+                            detail="Announcements" if s["announce"] else "")
+            for s in spaces
+        ]
+        return ProviderList(configured=True, options=options[:MAX_ITEMS])
+
+    if not get_settings().google_chat_project_number:
+        return ProviderList(configured=False)
+    return await _cached(("google_chat", "channels"), load)
+
+
 async def list_directory(kind: Kind) -> DirectoryListing:
     """Every provider's people or channels, fetched side by side."""
     slack, discord, telegram = await asyncio.gather(
@@ -457,4 +482,6 @@ async def list_directory(kind: Kind) -> DirectoryListing:
         _provider_list("discord", kind),
         _provider_list("telegram", kind),
     )
-    return DirectoryListing(slack=slack, discord=discord, telegram=telegram)
+    # Google Chat lists rooms only: people reach it by DM, never picked.
+    google_chat = await _google_chat_spaces() if kind == "channels" else ProviderList(configured=False)
+    return DirectoryListing(slack=slack, discord=discord, telegram=telegram, google_chat=google_chat)

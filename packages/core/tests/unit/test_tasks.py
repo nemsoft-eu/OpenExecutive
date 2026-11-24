@@ -218,6 +218,168 @@ def test_principal_sees_everyone_a_teammate_only_their_own(team: SimpleNamespace
     assert _status(lambda: route.list_tasks_route(request=None)) == 403  # type: ignore[arg-type]
 
 
+def test_a_task_from_someones_own_chat_is_theirs_and_its_assignees(
+    team: SimpleNamespace, as_caller: Any,
+) -> None:
+    """The principal sees everyone's tasks but not one from a teammate's own
+    chat: that shows only to its chat's owner and the one it is for, and to
+    anyone else reads like no task at all."""
+    from openexecutive.api.routes import people as route
+
+    team_task = _task(team.ben, "the team's task")
+    private = open_loops.open_loop(
+        owner_person_id=team.ben, description="Sara Kim asked Ben Ortiz for: the Ortiz boxes",
+        due_at=datetime.now(UTC) + timedelta(days=2), private_to_person_id=team.sara,
+    )
+    assert private is not None
+    as_caller(team.principal)
+    assert [t.task_id for t in route.list_tasks_route(request=None).tasks] == [team_task]  # type: ignore[arg-type]
+    assert _status(lambda: route.get_task_route(private, request=None)) == 404  # type: ignore[arg-type]
+    assert _status(lambda: route.close_open_loop_route(  # type: ignore[arg-type]
+        private, route.OpenLoopClose(), request=None)) == 404
+    as_caller(team.ben)
+    assert {t.task_id for t in route.list_tasks_route(request=None).tasks} == {team_task, private}  # type: ignore[arg-type]
+    assert route.get_task_route(private, request=None).task_id == private  # type: ignore[arg-type]
+
+
+def test_where_a_task_is_made_decides_who_it_is_kept_for(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real rule (``fact_tools.private_owner``), with no stand-in: a task
+    assigned in Sara's own web chat is kept for her, one assigned in a shared
+    channel is the team's, and the
+    pass after a turn stores whom it was given. A card keeps where it was
+    held."""
+    from openexecutive.orchestrator import levels
+    from openexecutive.orchestrator.open_loop_tools import handle_assign_open_loop
+    from openexecutive.orchestrator.schedule_tools import current_session
+    from openexecutive.orchestrator.session import Session
+
+    monkeypatch.setattr("openexecutive.orchestrator.open_loop_tools._in_speakers_words", lambda t, s: True)
+
+    async def no_notice(**kwargs: Any) -> Any:
+        return SimpleNamespace(as_dict=lambda for_principal: {"status": "skipped"})
+
+    monkeypatch.setattr("openexecutive.attunement.assignment_notice.notify_assignee", no_notice)
+
+    def assign(session: Session, task: str, approved_by: int | None = None) -> Any:
+        token = current_session.set(session)
+        try:
+            if approved_by is None:
+                out = json.loads(asyncio.run(handle_assign_open_loop({"person_id": team.ben, "task": task})))
+            else:
+                with levels.approved(approved_by):
+                    out = json.loads(asyncio.run(handle_assign_open_loop({"person_id": team.ben, "task": task})))
+        finally:
+            current_session.reset(token)
+        assert out.get("loop_id"), out
+        made = open_loops.get_task(int(out["loop_id"]))
+        assert made is not None
+        return made.private_to_person_id
+
+    own = Session(session_id="web:s", caller_person_id=team.sara, from_web_chat=True,
+                  web_caller_signed_in=True)
+    assert assign(own, "the Ortiz boxes") == team.sara
+    shared = Session(session_id="slack:channel:C1:U_SARA", caller_person_id=team.sara,
+                     speaker_verified=True)
+    assert assign(shared, "the shared deck") is None
+    # A card keeps the turn that held it (``take_the_lead.kept_for``): held
+    # in Sara's own chat it stays hers, held in a shared channel it is the
+    # team's, whoever asked.
+    from openexecutive.orchestrator.take_the_lead import kept_for
+
+    def held_in(session: Session) -> dict[str, Any]:
+        token = current_session.set(session)
+        try:
+            return kept_for()
+        finally:
+            current_session.reset(token)
+
+    assert held_in(own) == {"private_to": team.sara}
+    assert held_in(shared) == {}
+    run = Session(session_id="run", unattended=True, private_to=team.sara)
+    assert assign(run, "the card's task", approved_by=team.sara) == team.sara
+    assert assign(Session(session_id="run", unattended=True), "the channel card", approved_by=team.sara) is None
+
+    class _Fake:
+        async def messages_create(self, **kwargs: Any) -> Any:
+            block = SimpleNamespace(type="tool_use", name="record_open_loops", input={"loops": [{
+                "owner": "me", "kind": "commitment", "text": "call the landlord",
+                "due_date": None, "quote": "I'll call the landlord",
+            }], "closed": []})
+            return SimpleNamespace(content=[block])
+
+    monkeypatch.setattr("openexecutive.providers.get_provider", lambda model: _Fake())
+    monkeypatch.setattr("openexecutive.audit.usage.log_model_usage", lambda *a, **k: None)
+    counts = asyncio.run(open_loops.run_open_loop_pass(
+        "I'll call the landlord.", "Noted.", person_id=team.sara, session_id="web:s",
+        private_to_person_id=team.sara,
+    ))
+    assert counts["opened"] == 1
+    [loop] = [t for t in open_loops.list_open_loops(person_id=team.sara) if "landlord" in t.description]
+    assert loop.private_to_person_id == team.sara
+
+
+def test_the_same_words_elsewhere_never_reveal_or_publish_a_private_task(team: SimpleNamespace) -> None:
+    """A private task and the same words said where others hear, or in
+    someone else's own chat, are separate tasks: nobody is told the private
+    one exists, and it stays private. Said again in the same place, it is a
+    duplicate."""
+    due = datetime.now(UTC) + timedelta(days=2)
+    text = "Sara Kim asked Ben Ortiz for: the Acme memo"
+    private = open_loops.open_loop(owner_person_id=team.ben, description=text, due_at=due,
+                                   private_to_person_id=team.sara)
+    assert private is not None
+    assert open_loops.open_loop(owner_person_id=team.ben, description=text, due_at=due,
+                                private_to_person_id=team.sara) is None
+    # The People page (the team's) and the principal's own chat each make their own.
+    page = open_loops.assign_open_loop(owner_person_id=team.ben, text="the Acme memo",
+                                       assigned_by_person_id=team.principal)
+    assert page.loop_id is not None and page.reason != "duplicate"
+    own = open_loops.assign_open_loop(owner_person_id=team.ben, text="the Acme memo",
+                                      assigned_by_person_id=team.principal,
+                                      private_to_person_id=team.principal)
+    assert own.loop_id is not None
+    kept = open_loops.get_task(private)
+    assert kept is not None and kept.private_to_person_id == team.sara
+    assert open_loops.get_task(private, reader=team.principal) is None
+
+
+def test_the_principals_own_reads_keep_their_private_tasks(team: SimpleNamespace) -> None:
+    """The reflection block and Take the lead's overdue watch are written for
+    the principal: their own private tasks show there, a teammate's don't."""
+    from openexecutive.orchestrator.take_the_lead import _overdue_tasks
+
+    due = datetime.now(UTC) - timedelta(hours=1)
+    open_loops.open_loop(owner_person_id=team.ben, description="Pat Principal asked Ben Ortiz for: the Q3 deck",
+                         due_at=due, private_to_person_id=team.principal)
+    open_loops.open_loop(owner_person_id=team.ben, description="Sara Kim asked Ben Ortiz for: the Ortiz boxes",
+                         due_at=due, private_to_person_id=team.sara)
+    lines = "\n".join(open_loops.render_for_reflection())
+    assert "the Q3 deck" in lines and "Ortiz boxes" not in lines
+    overdue = _overdue_tasks(due - timedelta(hours=1), datetime.now(UTC))
+    assert any("the Q3 deck" in d for d in overdue) and not any("Ortiz boxes" in d for d in overdue)
+
+
+def test_waiting_counts_skip_private_tasks(team: SimpleNamespace) -> None:
+    due = datetime.now(UTC) - timedelta(hours=1)
+    open_loops.open_loop(owner_person_id=team.ben, description="Pat Principal asked Ben Ortiz for: the deck", due_at=due)
+    open_loops.open_loop(owner_person_id=team.ben, description="Sara Kim asked Ben Ortiz for: the boxes",
+                         due_at=due, private_to_person_id=team.sara)
+    # Everyone who opens Today sees the same counts: the principal's own
+    # private task is not counted either.
+    open_loops.open_loop(owner_person_id=team.ben, description="Pat Principal asked Ben Ortiz for: the Q3 deck",
+                         due_at=due, private_to_person_id=team.principal)
+    assert episodic.list_awaiting_replies_by_person()[team.ben][0] == 1
+
+
+def test_the_executive_is_told_others_private_things_stay_private() -> None:
+    from openexecutive.prompts.executive_persona import EXECUTIVE_PERSONA_PROMPT
+
+    assert "## Other People's Private Things" in EXECUTIVE_PERSONA_PROMPT
+    assert "never confirm or deny any detail, even one the asker names" in EXECUTIVE_PERSONA_PROMPT
+
+
 def test_patch_conflict_returns_the_latest(team: SimpleNamespace, as_caller: Any) -> None:
     from openexecutive.api.routes import people as route
 

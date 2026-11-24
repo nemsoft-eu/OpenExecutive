@@ -87,6 +87,45 @@ def test_a_service_subset_is_neither_named_nor_pinned(channel_env: Any) -> None:
         assert dropped not in text
 
 
+def test_the_server_config_narrows_what_the_process_variable_says(
+    channel_env: Any, tmp_path: Any
+) -> None:
+    """A company whose MCP config starts Google with Gmail only (a literal in
+    the server's env block) is not told Calendar, Drive, Docs or Sheets are
+    there, whatever this process's own WORKSPACE_MCP_TOOLS says. Priming
+    probes the same narrowed set."""
+    import json
+
+    config = tmp_path / "mcp_servers.json"
+    config.write_text(json.dumps({"mcpServers": {"google_workspace": {
+        "command": "x", "env": {"WORKSPACE_MCP_TOOLS": "gmail", "WORKSPACE_MCP_TOOL_TIER": "$WORKSPACE_MCP_TOOL_TIER"},
+    }}}))
+    channel_env.setenv("MCP_SERVERS_CONFIG_PATH", str(config))
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "all")
+    text = _render(("google_workspace",))
+
+    assert "Gmail." in text
+    for service in ("Calendar", "Drive", "Docs", "Sheets"):
+        for name in GOOGLE_TOOL_MANIFEST[service]:
+            assert name not in text
+    assert "is only for" not in text
+    assert pinned_google_tools(get_settings()) == frozenset(GOOGLE_TOOL_MANIFEST["Gmail"])
+
+
+def test_a_placeholder_in_the_server_config_follows_the_process_variable(
+    channel_env: Any, tmp_path: Any
+) -> None:
+    import json
+
+    config = tmp_path / "mcp_servers.json"
+    config.write_text(json.dumps({"mcpServers": {"google_workspace": {
+        "command": "x", "env": {"WORKSPACE_MCP_TOOLS": "$WORKSPACE_MCP_TOOLS"},
+    }}}))
+    channel_env.setenv("MCP_SERVERS_CONFIG_PATH", str(config))
+    channel_env.setenv("WORKSPACE_MCP_TOOLS", "gmail,calendar")
+    assert get_settings().workspace_mcp_service_list == ["gmail", "calendar"]
+
+
 def test_the_core_tier_drops_the_tools_it_does_not_register(channel_env: Any) -> None:
     """The second axis. Tiers are cumulative and `extended`/`complete` carry all
     24, so only `core` subtracts anything — the ten names in
@@ -178,6 +217,23 @@ def test_channels_and_notion_follow_settings(channel_env: pytest.MonkeyPatch) ->
     assert "Notion: synced into your knowledge base" in on
     # Names only: no token ever reaches the prompt.
     assert "xoxb-test" not in on and "secret_test" not in on
+
+
+def test_google_chat_app_says_how_people_reach_it(channel_env: pytest.MonkeyPatch) -> None:
+    # No Chat app: nothing said about reaching it there.
+    assert "How people reach you in Google Chat" not in _render()
+
+    channel_env.setenv("GOOGLE_CHAT_PROJECT_NUMBER", "1234")
+    text = _render()
+    assert "Google Chat on" in text
+    line = next(x for x in text.splitlines() if "How people reach you in Google Chat" in x)
+    assert "only through your Chat app" in line
+    # A DM to its own Google account is named as never reaching it, and
+    # Google's away summary isn't the app failing.
+    assert "own Google account never reaches you" in line
+    assert '"messaged you while you were away"' in line
+    assert "tell them these steps yourself" in line
+    assert "1234" not in line
 
 
 def test_only_plain_server_names_are_rendered(channel_env: Any) -> None:
@@ -285,6 +341,48 @@ def test_an_unpinned_tool_is_never_searched_for_the_model() -> None:
     out = asyncio.run(gateway.call_tool({"name": name, "arguments": {}}))
     assert out == _undiscovered(name)
     assert forwarded.await_count == 1
+
+
+def test_an_approved_held_steps_tool_is_found_again_and_retried_once() -> None:
+    """A card held before an update runs on a gateway that never found its
+    tool: Approve looks it up again rather than fail."""
+    from openexecutive.orchestrator.mcp_gateway import approved_step_call
+
+    name = "notion__create_page"
+    gateway, forwarded = _gateway([_undiscovered(name), _search_hit(name), "Created."])
+    call = {"name": name, "arguments": {"title": "Plan"}}
+    with approved_step_call(call):
+        out = asyncio.run(gateway.call_tool(call))
+    assert out == "Created."
+    assert [c.args[0] for c in forwarded.await_args_list] == ["call_tool", "search_tools", "call_tool"]
+
+
+def test_only_the_approved_call_itself_is_retried() -> None:
+    from openexecutive.orchestrator.mcp_gateway import approved_step_call
+
+    name = "google_workspace__modify_doc_text"
+    gateway, forwarded = _gateway([_undiscovered(name)])
+    with approved_step_call({"name": name, "arguments": {}}):
+        out = asyncio.run(gateway.call_tool({"name": name, "arguments": {}}))
+    assert out == _undiscovered(name)
+    assert forwarded.await_count == 1
+
+
+def test_carry_out_runs_its_call_as_an_approved_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import mcp_gateway, take_the_lead
+
+    seen: list[bool] = []
+
+    class _Gw:
+        async def call_tool(self, tool_input: dict[str, Any]) -> str:
+            seen.append(mcp_gateway._approved_step_admits(tool_input))
+            return "Inserted text."
+
+    monkeypatch.setattr(mcp_gateway, "get_active_gateway", lambda: _Gw())
+    payload = {"held": True, "mcp": True, "tool": "google_workspace__modify_doc_text",
+               "input": {"document_id": "d1", "text": "x"}}
+    assert asyncio.run(take_the_lead.carry_out(payload, by_principal=True)) == "Inserted text."
+    assert seen == [True]
 
 
 def test_other_errors_are_not_retried() -> None:
@@ -397,3 +495,64 @@ def test_prime_reads_settings_once_for_the_whole_run(monkeypatch: pytest.MonkeyP
 
     assert sorted(missing) == sorted(PINNED_GOOGLE_TOOLS)
     assert calls == 1
+
+
+# ── Microsoft 365 and the calendar check read the real set-up ───────────────
+
+
+def _config(tmp_path: Any, data: dict[str, Any]) -> str:
+    import json
+
+    path = tmp_path / "mcp_servers.json"
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def test_microsoft_is_named_with_what_it_really_offers(channel_env: Any, tmp_path: Any) -> None:
+    channel_env.setenv("MCP_SERVERS_CONFIG_PATH", _config(tmp_path, {
+        "mcpServers": {"microsoft_365": {"command": "x"}},
+        "filters": {"access_control": {"deny_patterns": ["microsoft_365__*mail*"]}},
+    }))
+    text = _render(("microsoft_365",))
+    assert "Microsoft 365: connected" in text
+    assert "not Outlook mail" in text
+    assert "Other tool servers" not in text
+
+    channel_env.setenv("MCP_SERVERS_CONFIG_PATH", _config(tmp_path, {"mcpServers": {"microsoft_365": {"command": "x"}}}))
+    assert "Outlook mail too" in _render(("microsoft_365",))
+
+    dead = render_connected_systems(
+        mcp_servers=("microsoft_365",), settings=get_settings(), needs_reconnect=("microsoft_365",)
+    )
+    assert "Microsoft 365: needs reconnecting" in dead
+
+
+def test_the_calendar_is_on_only_where_its_tools_are_loaded(channel_env: Any, tmp_path: Any) -> None:
+    from unittest.mock import patch
+
+    from openexecutive.orchestrator.calendar_tools import calendar_connected
+
+    gateway = MagicMock()
+    gateway.server_names = ("google_workspace",)
+    channel_env.setenv("CALENDAR_BOOKING_ENABLED", "true")
+    channel_env.setenv("MCP_SERVERS_CONFIG_PATH", _config(tmp_path, {"mcpServers": {"google_workspace": {
+        "command": "x", "env": {"WORKSPACE_MCP_TOOLS": "gmail"}}}}))
+    with patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gateway):
+        assert calendar_connected() is False
+        channel_env.setenv("MCP_SERVERS_CONFIG_PATH", _config(tmp_path, {"mcpServers": {"google_workspace": {
+            "command": "x", "env": {"WORKSPACE_MCP_TOOLS": "gmail,calendar"}}}}))
+        assert calendar_connected() is True
+        # Outlook's calendar needs the Microsoft server itself.
+        channel_env.setenv("CALENDAR_PROVIDER", "microsoft")
+        assert calendar_connected() is False
+        gateway.server_names = ("google_workspace", "microsoft_365")
+        assert calendar_connected() is True
+
+
+def test_synced_folders_are_named(channel_env: Any) -> None:
+    channel_env.delenv("DRIVE_SYNC_ENABLED", raising=False)
+    channel_env.delenv("ONEDRIVE_SYNC_ENABLED", raising=False)
+    assert "folders: synced" not in _render()
+    channel_env.setenv("ONEDRIVE_SYNC_ENABLED", "true")
+    channel_env.setenv("ONEDRIVE_SYNC_FOLDERS", "b!AbC-12_x/01ROOTFOLDER")
+    assert "OneDrive folders: synced into your knowledge base" in _render()

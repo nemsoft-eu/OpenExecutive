@@ -118,10 +118,12 @@ def test_seed_does_not_re_run_after_full_wipe(db: Path) -> None:
     assert store.list_departments() == []
 
 
-def test_default_authority_is_propose_only(db: Path) -> None:
+def test_every_read_says_the_level_its_work_runs_at(db: Path) -> None:
+    from openexecutive.departments.authority import department_level
+
     store.seed_default_departments()
     for state in store.list_departments():
-        assert state.config.authority_level == AuthorityLevel.PROPOSE_ONLY
+        assert state.config.authority_level == department_level(state.config.slug)
 
 
 def test_default_cadence_is_weekly_monday_morning(db: Path) -> None:
@@ -174,7 +176,11 @@ def test_update_department_partial(db: Path) -> None:
     state = store.get_department("marketing")
     assert state is not None
     assert state.config.title == "Growth & Marketing"
-    assert state.config.authority_level == AuthorityLevel.AUTO_EXECUTE
+    import sqlite3
+
+    with sqlite3.connect(str(db)) as conn:
+        stored = conn.execute("SELECT authority_level FROM departments WHERE slug = 'marketing'").fetchone()[0]
+    assert stored == AuthorityLevel.AUTO_EXECUTE.value
     assert state.headcount == 4
     assert state.budget_usd == 12_500.0
 
@@ -339,13 +345,13 @@ def test_episodic_scheduled_action_carries_department(tmp_path: Path) -> None:
     assert fetched.department == "finance"
 
 
-def test_unknown_authority_level_falls_back_to_propose_only(db: Path) -> None:
-    """A future migration or hand-edit could leave a row with an unrecognised
-    authority_level value. The read path must not crash — it falls back to the
-    safest level so a single bad row does not 500 every read of the list."""
+def test_an_unknown_stored_level_changes_no_read(db: Path) -> None:
+    """A hand-edit could leave a row with an unrecognised authority_level
+    value. The stored column decides nothing, so every read still says the
+    level the department's work runs at, and no exception escapes."""
     import sqlite3
 
-    from openexecutive.departments.models import AuthorityLevel
+    from openexecutive.departments.authority import department_level
 
     store.seed_default_departments()
     with sqlite3.connect(str(db)) as conn:
@@ -357,13 +363,13 @@ def test_unknown_authority_level_falls_back_to_propose_only(db: Path) -> None:
 
     state = store.get_department("finance")
     assert state is not None
-    assert state.config.authority_level == AuthorityLevel.PROPOSE_ONLY
+    assert state.config.authority_level == department_level("finance")
 
     # And the list path keeps working — no exception escapes.
     all_states = store.list_departments()
     assert len(all_states) == 8
     finance = next(s for s in all_states if s.config.slug == "finance")
-    assert finance.config.authority_level == AuthorityLevel.PROPOSE_ONLY
+    assert finance.config.authority_level == department_level("finance")
 
 
 def test_audit_log_carries_department(tmp_path: Path) -> None:
@@ -427,7 +433,9 @@ def test_create_department_basic(db: Path) -> None:
     assert state.config.title == "Customer Success"
     assert state.config.charter.mission == "Own post-sale relationships."
     assert state.config.specialist_key is None
-    assert state.config.authority_level == AuthorityLevel.PROPOSE_ONLY
+    from openexecutive.departments.authority import department_level
+
+    assert state.config.authority_level == department_level("customer-success")
     assert state.goals == []
 
 

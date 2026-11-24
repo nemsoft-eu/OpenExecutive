@@ -17,6 +17,7 @@ through the tool), so bodies go through `_html.html_to_text`.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -267,20 +268,34 @@ class MicrosoftMail:
         body: str,
         thread_id: str | None = None,
         html: bool = False,
+        cc: list[str] | None = None,
+        attachments: list[tuple[str, str, bytes]] | None = None,
+        bcc: list[str] | None = None,
     ) -> dict[str, Any]:
         # `mailbox` is implicit (the signed-in account) and Graph's sendMail has
         # no thread parameter — replies thread through reply-mail-message, and
         # a fresh sendMail threads on the client side by subject.
-        return {
-            "body": {
-                "Message": {
-                    "subject": subject,
-                    "body": {"contentType": "HTML" if html else "Text", "content": body},
-                    "toRecipients": [_recipient(to)],
-                },
-                "SaveToSentItems": True,
-            },
+        message: dict[str, Any] = {
+            "subject": subject,
+            "body": {"contentType": "HTML" if html else "Text", "content": body},
+            "toRecipients": [_recipient(a.strip()) for a in to.split(",") if a.strip()],
         }
+        if cc:
+            message["ccRecipients"] = [_recipient(a) for a in cc]
+        if bcc:
+            message["bccRecipients"] = [_recipient(a) for a in bcc]
+        if attachments:
+            # Graph's fileAttachment, inline in the message.
+            message["attachments"] = [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": name,
+                    "contentType": mime,
+                    "contentBytes": base64.b64encode(data).decode("ascii"),
+                }
+                for name, mime, data in attachments
+            ]
+        return {"body": {"Message": message, "SaveToSentItems": True}}
 
     def reply_block(self, msg: InboundMessage) -> str:
         return (

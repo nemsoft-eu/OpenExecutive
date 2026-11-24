@@ -75,6 +75,8 @@ AWAITING_DAYS = 14
 MAX_DAYS = 30
 READ_MESSAGES = 10
 READ_MESSAGE_CHARS = 4000
+# A message they forwarded inside one (``email_poller.readable_text``).
+READ_FORWARDED_CHARS = 12_000
 # Sent mail looked at for my_email_awaiting_reply, and threads opened for it.
 _SENT_LOOKED_AT = 40
 _AWAITING_CANDIDATES = 15
@@ -142,7 +144,8 @@ READ_MY_EMAIL_TOOL: dict[str, Any] = {
         "Read one email thread in the mailbox of the person you are speaking "
         "with, by the thread_id search_my_email or my_email_awaiting_reply "
         f"returned: its last {READ_MESSAGES} messages, each sender's own words "
-        "(quoted history left out), drafts saved there marked not sent, and "
+        "(quoted history left out) and any email they forwarded, under "
+        "'Forwarded message:', drafts saved there marked not sent, and "
         "the files attached to them "
         "(`attachments`: message_id and index; open one with "
         "read_my_email_attachment). Their own messages are marked yours. Use it "
@@ -480,13 +483,17 @@ def _render_thread(messages: list[Any], first: int, own: str) -> str:
     anyone else's inside an untrusted block."""
     from openexecutive.delegation.ghostwriter import one_line
     from openexecutive.delegation.threads import mine
-    from openexecutive.integrations.email_poller import sender_new_text
+    from openexecutive.integrations.email_poller import FORWARDED_HEADING, split_forward
     from openexecutive.orchestrator.content_trust import wrap_untrusted
     from openexecutive.utils.prompt_blocks import no_tags, plain
 
     parts = []
     for i, m in enumerate(messages, first):
-        text = plain(sender_new_text(m.text or ""))[:READ_MESSAGE_CHARS]
+        own_words, forwarded = split_forward(
+            m.text or "", m.subject, max_chars=READ_MESSAGE_CHARS, forwarded_chars=READ_FORWARDED_CHARS,
+        )
+        own_words, forwarded = plain(own_words), plain(forwarded)
+        text = f"{own_words}\n\n{FORWARDED_HEADING}\n{forwarded}".strip() if forwarded else own_words
         date = one_line(m.date or m.received_at, 60)
         if "DRAFT" in m.labels:
             # Saved, never sent: whoever wrote it (them, Act as me, another
@@ -498,8 +505,12 @@ def _render_thread(messages: list[Any], first: int, own: str) -> str:
         if mine(m, own):
             # Outside any block, so it can neither open nor close a tag, nor
             # start what looks like another message.
-            safe = _MESSAGE_HEAD_RE.sub(r"\1> \2", no_tags(text))
+            safe = _MESSAGE_HEAD_RE.sub(r"\1> \2", no_tags(own_words))
             parts.append(f"[{i}] Yours — {date}\n{safe}")
+            if forwarded:
+                # What they forwarded is someone else's words: in its own
+                # block, never under Yours.
+                parts.append(wrap_untrusted(f"{FORWARDED_HEADING}\n{forwarded}", source="email", author="forwarded"))
             continue
         to = ", ".join([*m.to, *m.cc][:10])
         header = f"[{i}] From: {one_line(_sender(m), 160)} — {date}\nTo: {one_line(to, 400)}"

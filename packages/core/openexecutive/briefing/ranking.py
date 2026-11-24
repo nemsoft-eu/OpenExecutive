@@ -48,7 +48,7 @@ _ACTION_SEVERITIES = frozenset({"high", "urgent"})
 # it here is what silently kept its low/medium signals out of the Monitoring
 # lane — they fell through to ``"action"`` instead.
 _EXTERNAL_SOURCES = frozenset({
-    "stock", "vendor_status", "rss", "watchlist", "query", "edgar", "page_watch",
+    "stock", "vendor_status", "rss", "watchlist", "query", "edgar", "page_watch", "mailbox",
 })
 
 
@@ -178,6 +178,24 @@ def watch_slug_from_tags(topic_tags: list[str]) -> str | None:
         if slug and slug not in _EXTERNAL_SOURCES:
             return slug
     return None
+
+
+def watch_slug_of(alert: Any) -> str | None:
+    """The slug of the watch that raised ``alert``: a watch adapter's alert
+    (``source`` is one of the adapter kinds) carrying ``external:<slug>``.
+    ``None`` for anything else, such as an app's ``external:app-entries``
+    card, so only a real watch's card offers to steer it. The tag is written
+    by triage from text that includes the outside source, so it must agree
+    with the dedup key the watch pipeline sets itself (``watch:<slug>``)."""
+    if getattr(alert, "source", None) not in _EXTERNAL_SOURCES:
+        return None
+    dedup = str(getattr(alert, "dedup_key", "") or "")
+    if not dedup.startswith("watch:"):
+        return None
+    # An email watch's card is one email: ``watch:<slug>#<email id>``.
+    slug = dedup[len("watch:"):].split("#", 1)[0]
+    tagged = watch_slug_from_tags(list(getattr(alert, "topic_tags", None) or []))
+    return slug if slug and tagged == slug else None
 
 
 def score_and_categorize(

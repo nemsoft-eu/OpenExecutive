@@ -15,8 +15,8 @@ from openexecutive.orchestrator.activity_labels import summarize_activity
     [
         ("google_workspace__search_drive_files", "Searched Drive", "Searching Drive"),
         ("google_workspace__get_drive_file_content", "Read a Drive file", "Reading a Drive file"),
-        ("google_workspace__search_gmail_messages", "Searched my inbox", "Searching my inbox"),
-        ("microsoft_365__get-mail-message", "Read an email", "Reading an email"),
+        ("google_workspace__search_gmail_messages", "Searched my email", "Searching my email"),
+        ("microsoft_365__get-mail-message", "Read my email", "Reading my email"),
         ("microsoft_365__list-calendar-events", "Checked my calendar", "Checking my calendar"),
         ("google_workspace__manage_event", "Updated my calendar", "Updating my calendar"),
     ],
@@ -117,8 +117,8 @@ def test_long_tool_names_still_agree_between_chip_and_line() -> None:
     chip = summarize_action(tool_name="call_tool", tool_input=tool_input, tool_result="ok")
     activity = summarize_activity([{"id": "t", "name": "call_tool", "input": tool_input}])
     assert chip is not None and activity is not None
-    assert chip["summary"] == "Read an email"
-    assert activity["label"] == "Reading an email…"
+    assert chip["summary"] == "Read my email"
+    assert activity["label"] == "Reading my email…"
 
 
 def test_a_subject_line_in_a_body_is_not_the_target() -> None:
@@ -151,3 +151,64 @@ def test_a_calendar_delete_through_manage_event_says_so() -> None:
     assert tool_labels.labels_for("google_workspace__manage_event", {"action": "update"})[0] == (
         "Updated my calendar"
     )
+
+
+@pytest.mark.parametrize(
+    ("raw", "arguments"),
+    [
+        ("google_workspace__search_gmail_messages", {"query": "in:sent to:dan@example.com"}),
+        ("google_workspace__search_gmail_messages", {"query": "from:me newer_than:2d"}),
+        ("microsoft_365__list-mail-folder-messages", {"mailFolderId": "sentitems"}),
+        ("microsoft_365__list-mail-folder-messages", {"mailFolderId": "Sent Items"}),
+    ],
+)
+def test_a_search_of_sent_mail_says_so(raw: str, arguments: dict[str, str]) -> None:
+    assert tool_labels.labels_for(raw, arguments) == (
+        "Checked email I sent",
+        "Checking email I sent",
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"query": "invoice"},
+        {"query": "-in:sent invoice"},
+        {"query": "sent items report"},
+        {"query": "from:me.smith@example.com"},
+        {"query": "from:me@example.com"},
+        {"query": "in:sent OR in:inbox"},
+        {"query": "{in:sent in:inbox}"},
+        {"query": "NOT in:sent"},
+        {"query": "in:inbox from:me"},
+        {"query": "from:me -in:sent"},
+        {"query": "in:sent", "folder": "Inbox"},
+        None,
+    ],
+)
+def test_any_other_mail_search_is_my_email(arguments: dict[str, str] | None) -> None:
+    assert tool_labels.labels_for("google_workspace__search_gmail_messages", arguments) == (
+        "Searched my email",
+        "Searching my email",
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "own", "theirs"),
+    [
+        ("google_workspace__search_gmail_messages", "search_my_email", "Searching"),
+        ("microsoft_365__get-mail-message", "read_my_email", "Reading"),
+        ("google_workspace__get_gmail_attachment_content", "read_my_email_attachment", "Opening an attachment"),
+    ],
+)
+def test_mail_labels_name_whose_mailbox(raw: str, own: str, theirs: str) -> None:
+    """The Executive's own mailbox reads as "my email" and the person's as
+    "your email", in the same words, for searches, reads and attachments."""
+    executive = summarize_activity(
+        [{"id": "1", "name": "call_tool", "input": {"name": raw, "arguments": {}}}]
+    )
+    person = summarize_activity([{"id": "2", "name": own, "input": {}}])
+    assert executive is not None and person is not None
+    assert executive["label"].startswith(theirs) and executive["label"].endswith("my email…")
+    assert person["label"].startswith(theirs) and person["label"].endswith("your email…")
+    assert executive["label"].replace("my email", "your email") == person["label"]

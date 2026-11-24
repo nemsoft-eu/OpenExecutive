@@ -1,5 +1,5 @@
 // How the Executive's changes to the contacts read (people/contact_keeper.py):
-// "Changes I made" on Contacts and the lines on a person's page; and a
+// People's Needs a look (lib/peopleBoard.ts) and the lines on a person's page; and a
 // person's other contact details (people/contact_info.py), as they read on
 // their page and as the edit form types them, one "Mobile: 555 0100" a line.
 // Plain functions, so scripts/contactChanges.test.mjs can check the wording.
@@ -59,21 +59,6 @@ export function changeLine(change: ContactChange): ChangeLine {
           ? `Also writes from ${change.new_value}.`
           : `${fieldLabel(change.field)} ${change.old_value ? "is now" : "added:"} ${change.new_value}.`;
   return { tag, title: change.full_name, detail: `${what} ${changeReason(change)}` };
-}
-
-/** The changes for the "Changes I made" card: open suggestions, then what
- * wasn't cleared with Got it. */
-export function cardChanges(changes: ContactChange[]): ContactChange[] {
-  return changes.filter((c) => c.status === "suggested" || (c.status === "applied" && !c.seen));
-}
-
-/** People the card lists as just added, for the "New" badge. */
-export function newlyAdded(changes: ContactChange[]): Set<number> {
-  return new Set(
-    cardChanges(changes)
-      .filter((c) => c.action === "add" && c.status === "applied" && c.person_id !== null)
-      .map((c) => c.person_id as number),
-  );
 }
 
 /** Why the switch can't do anything yet, or null. */

@@ -123,15 +123,6 @@ def verified_speaker(session: Any, person: Any) -> bool:
         return False
 
 
-def private_chat(session: Any) -> bool:
-    """Whether nobody but the speaker (and the Executive) reads this
-    conversation: the web chat, a Slack or Discord DM, a Telegram chat, or
-    one its adapter marked so (``Session.private_chat``)."""
-    from openexecutive.delegation.settings import private_conversation
-
-    return getattr(session, "private_chat", False) is True or private_conversation(session)
-
-
 def chat_channel(session: Any) -> str:
     """Where the message came from, as a note names it: the inbound channel,
     or ``web`` for the web chat. Empty when it is neither."""

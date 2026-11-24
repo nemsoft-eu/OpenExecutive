@@ -127,13 +127,12 @@ async def send_message(token: str, chat_id: int, text: str) -> str | None:
 
 async def send_card(
     token: str, chat_id: int, decision_id: int, text: str, *,
-    labels: tuple[str, ...] = ("Approve", "Skip"), raise_on_error: bool = False,
+    options: tuple[tuple[str, str], ...], raise_on_error: bool = False,
 ) -> None:
-    """Send an approval card as a message with its two buttons, Approve (or
-    Send, Accept) and Skip (``integrations.channel_cards``). Plain text: the
-    card quotes what the Executive proposed, which may come from someone's
-    mail."""
-    from openexecutive.integrations import channel_cards
+    """Send an approval card as a message with its buttons, one to a row,
+    the Executive's pick first and Skip last (``channel_cards.card_options``).
+    Plain text: the card quotes what the Executive proposed, which may come
+    from someone's mail."""
 
     resp = await _get_http_client().post(
         _tg_url(token, "sendMessage"),
@@ -141,21 +140,17 @@ async def send_card(
             "chat_id": chat_id,
             "text": text[:_MAX_MSG_LEN],
             "link_preview_options": {"is_disabled": True},
-            "reply_markup": {"inline_keyboard": [
-                [
-                    {"text": labels[0], "callback_data": channel_cards.callback_data(decision_id, channel_cards.APPROVE)},
-                    {"text": labels[1], "callback_data": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
-                ],
-                *([[{"text": labels[2],
-                     "callback_data": channel_cards.callback_data(decision_id, channel_cards.ALLOW)}]]
-                  if len(labels) > 2 else []),
-            ]},
+            "reply_markup": _keyboard(options),
         },
     )
     if resp.is_error:
         logger.error("Telegram: sending card %d failed: %s %s", decision_id, resp.status_code, resp.text)
         if raise_on_error:
             raise RuntimeError(f"telegram sendMessage failed: {resp.status_code}")
+
+
+def _keyboard(options: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+    return {"inline_keyboard": [[{"text": label, "callback_data": data}] for label, data in options]}
 
 
 async def _send_cards(token: str, chat_id: int, cards: list[int]) -> None:
@@ -165,8 +160,8 @@ async def _send_cards(token: str, chat_id: int, cards: list[int]) -> None:
         try:
             text = await asyncio.to_thread(channel_cards.card_text, decision_id)
             if text:
-                labels = await asyncio.to_thread(channel_cards.card_buttons, decision_id)
-                await send_card(token, chat_id, decision_id, text, labels=labels)
+                options = await asyncio.to_thread(channel_cards.card_options, decision_id, text)
+                await send_card(token, chat_id, decision_id, text, options=options)
         except Exception:
             logger.exception("Telegram: couldn't send card %d", decision_id)
 
@@ -174,7 +169,7 @@ async def _send_cards(token: str, chat_id: int, cards: list[int]) -> None:
 async def _handle_card_tap(
     *, callback_id: str, chat_id: int, message_id: int, card_text: str, data: str, token: str,
 ) -> None:
-    """A tap on a card's Approve or Skip button. The webhook checked that
+    """A tap on one of a card's buttons. The webhook checked that
     only Telegram can call it and that the tapper is the private chat's own
     person; the chat must be someone on the roster, and
     ``decisions.resolve_in_chat`` decides whether the card is theirs."""
@@ -183,7 +178,7 @@ async def _handle_card_tap(
     from openexecutive.people.store import find_person_by_telegram_chat_id
 
     client = _get_http_client()
-    parsed = channel_cards.parse_callback(data)
+    parsed = channel_cards.parse_choice(data)
     person = await asyncio.to_thread(find_person_by_telegram_chat_id, str(chat_id))
     if parsed is None or person is None:
         try:
@@ -194,17 +189,17 @@ async def _handle_card_tap(
         except Exception:
             logger.exception("Telegram: couldn't answer a tap on chat %s", chat_id)
         return
-    decision_id, approve = parsed
-    allow = channel_cards.tapped_allow(data)
-    line = await channel_cards.resolve(decision_id, person, approve=approve, allow=allow)
-    choice = "allow" if allow else "approve" if approve else "skip"
+    decision_id = parsed.decision_id
+    tapped = await channel_cards.tap(parsed, person)
+    line = tapped.line
+    name = channel_cards.CHOICE_NAMES[parsed.choice]
     await asyncio.to_thread(
         audit_log,
         "integration_inbound",
-        f"Telegram card {decision_id}: tapped {choice.capitalize()}: {line[:120]}",
+        f"Telegram card {decision_id}: tapped {name.capitalize()}: {line[:120]}",
         actor="telegram",
         details={"channel": "telegram", "chat_id": chat_id, "decision_id": decision_id,
-                 "choice": choice, "outcome": channel_cards.outcome_of(line), "person_id": person.id},
+                 "choice": name, "outcome": channel_cards.outcome_of(line), "person_id": person.id},
     )
     try:
         await client.post(
@@ -214,16 +209,17 @@ async def _handle_card_tap(
         if line == channel_cards.BUSY:
             # The tap still deciding it updates the card.
             return
-        # The card keeps what it said, with the outcome under it and no buttons.
-        await client.post(
-            _tg_url(token, "editMessageText"),
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": f"{card_text}\n\n{line}"[:_MAX_MSG_LEN],
-                "link_preview_options": {"is_disabled": True},
-            },
-        )
+        edit: dict[str, Any] = {
+            "chat_id": chat_id, "message_id": message_id, "link_preview_options": {"is_disabled": True},
+        }
+        if tapped.options:
+            # Still waiting, with new words: shown again with its buttons.
+            edit["text"] = channel_cards.with_line(tapped.text, line)[:_MAX_MSG_LEN]
+            edit["reply_markup"] = _keyboard(tapped.options)
+        else:
+            # The card keeps what it said, with the outcome under it and no buttons.
+            edit["text"] = channel_cards.with_line(card_text, line)[:_MAX_MSG_LEN]
+        await client.post(_tg_url(token, "editMessageText"), json=edit)
     except Exception:
         logger.exception("Telegram: couldn't update card %d after the tap", decision_id)
 
@@ -412,120 +408,54 @@ async def _process_and_reply(
 
         message_text = with_context(reply_context, message_text)
 
-    from openexecutive.integrations.channel_context import (
-        attach_briefing_context,
-        build_channel_context_block,
-    )
-    from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
-    from openexecutive.memory.episodic import format_for_prompt
-    from openexecutive.memory.session_store import (
-        create_session,
-        load_messages,
-        save_message,
-        update_session_timestamp,
-    )
-    from openexecutive.onboarding.profile_builder import load_or_create_profile
-    from openexecutive.orchestrator.executive import Executive
-    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
-    from openexecutive.orchestrator.session import Session
+    from openexecutive.integrations import channel_turn
 
-    response: str | None = None
     async with _chat_lock(chat_id):
         # Again under the lock: a /new queued behind an earlier turn may have
         # started the next conversation since this message was picked up.
         session_id = await asyncio.to_thread(conversation_for, f"telegram:{chat_id}")
         try:
-            profile = load_or_create_profile()
-            # See the note in slack_bot: lets an approval gate raised in
-            # this turn be answered by a reply in this same conversation.
-            session = Session(
-                session_id=session_id,
-                company_profile=profile if not profile.is_empty() else None,
-                origin_channel="telegram",
-                origin_channel_ref=str(chat_id),
-            )
-            history = load_messages(session_id)
-            if history:
-                session.conversation_history = history
-            # Record this channel_ref as user-initiated so the Executive may
-            # schedule follow-ups back to this chat.
-            session.seen_channel_refs.add(("telegram", str(chat_id)))
-            retrieved_context = retrieve(
-                query=own_text, max_chars=get_settings().knowledge_chat_max_chars, n_builtin=chat_builtin_results()
-            )
-            episodic_context = format_for_prompt(session_id=session_id)
-
-            # Look up the OE Person record so Honcho can key per-person
-            # memory off Person.id (shared across channels). No match →
-            # person_id stays None and the Honcho layer no-ops.
+            # No match leaves the turn with no person: nothing is kept under
+            # their name, and the chat shows in the principal's list.
             from openexecutive.people.store import find_person_by_telegram_chat_id
-            person = find_person_by_telegram_chat_id(str(chat_id))
-            person_id = person.id if person else None
-            # Bound here rather than at construction because the id is only
-            # resolved now; an approval gate raised later in this turn reads it.
-            session.caller_person_id = person_id
 
-            # Hydrate with the context of any recent outbound DM oe sent this
-            # chat, so a reply oe solicited from another session lands with its
-            # backstory. Injected into the model's copy only — message_text is
-            # persisted to history below and must stay free of the one-shot
-            # block. One-shot consumed inside the helper.
-            #
-            # Gated to 1:1 private chats (positive chat_id; Telegram groups and
-            # channels are negative) so private outbound context can never be
-            # pulled into a group — mirrors the Discord is_dm / Slack mode=="dm"
-            # guards.
-            chat_user_message = message_text
-            if chat_id > 0:
-                from openexecutive.integrations.inbound_hydration import (
-                    hydrate_user_message,
-                )
-
-                chat_user_message = hydrate_user_message(
+            person = await asyncio.to_thread(find_person_by_telegram_chat_id, str(chat_id))
+            # Telegram private chats are 1:1 (a positive chat id); groups and
+            # channels are negative. Only a private chat gets the person's
+            # open cards and the backstory of a message sent to them earlier.
+            private = chat_id > 0
+            result = await channel_turn.run(
+                channel_turn.ChannelTurn(
                     channel="telegram",
                     channel_ref=str(chat_id),
-                    user_message=message_text,
+                    session_id=session_id,
+                    own_text=own_text,
+                    turn_text=message_text,
+                    person=person,
+                    is_dm=private,
+                    # Their own words: never attachment text or the quote.
+                    memory_text=own_words,
+                    # A group chat (negative id) can reach here from anyone in it,
+                    # roster or not, under the group's own row: only a rostered
+                    # person's private chat may have its links opened.
+                    fetch_own_urls=person is not None and person.id is not None and private,
+                    # This chat wrote to the Executive, so it may schedule
+                    # follow-ups back to it.
+                    reply_ref=("telegram", str(chat_id)) if private else None,
+                    image_blocks=att_image_blocks or None,
+                    # A private chat on a webhook only Telegram can call shows
+                    # the reply's cards with Approve and Skip buttons.
+                    offers_cards=True,
                 )
-
-            from openexecutive.integrations.channel_cards import shows_cards
-
-            # A private chat on a webhook only Telegram can call shows the
-            # reply's cards with Approve and Skip buttons.
-            cards_here = shows_cards(session)
-            cards: list[int] = []
-
-            briefing_context = await asyncio.to_thread(
-                attach_briefing_context,
-                session,
-                # Telegram private chats are 1:1; a group chat is not.
-                is_dm=(str(chat_id).lstrip("-").isdigit() and not str(chat_id).startswith("-")),
-                person=person,
             )
-
-            response = await Executive(mcp_gateway=get_active_gateway()).chat(
-                user_message=chat_user_message,
-                session=session,
-                retrieved_context=retrieved_context,
-                episodic_context=episodic_context,
-                attachment_blocks=att_image_blocks or None,
-                briefing_context=briefing_context,
-                channel_context_block=build_channel_context_block("telegram", cards_here=cards_here),
-                person_id=person_id,
-                # Their own words: never attachment text or the quote.
-                memory_text=own_words,
-                # A group chat (negative id) can reach here from anyone in it,
-                # roster or not, under the group's own row: only a rostered
-                # person's private chat may have its links opened.
-                fetch_own_urls=person_id is not None and chat_id > 0,
-                cards=cards if cards_here else None,
-            )
+            response = result.response
             from openexecutive.orchestrator.disclosure import with_chat_line
 
             await send_message(
                 token, chat_id, with_chat_line(response, f"telegram:{session_id}")
             )
-            if cards:
-                await _send_cards(token, chat_id, cards)
+            if result.cards:
+                await _send_cards(token, chat_id, result.cards)
         except Exception:
             logger.exception("Telegram: handler error for message %s", message_id)
             try:
@@ -538,33 +468,17 @@ async def _process_and_reply(
                 logger.exception("Telegram: also failed to send error reply")
             return
 
-        # Persist only after a successful reply. Failures here must not trigger
-        # a user-facing error — the user already got their answer.
-        #
-        # Channel sessions are owned by the resolved sender if mapped to a
-        # Person, otherwise fall back to the principal so unrostered channel
-        # threads still appear in the operator's sidebar (instead of becoming
-        # invisible NULL-owner rows).
-        from openexecutive.people.store import find_principal_person
-        session_owner_id = person_id
-        if session_owner_id is None:
-            principal = find_principal_person()
-            session_owner_id = principal.id if principal is not None else None
-        try:
-            create_session(
-                session_id,
-                f"Telegram {sender_name}",
-                session.created_at.isoformat(),
-                caller_person_id=session_owner_id,
-            )
-            save_message(session_id, "user", message_text, sender_person_id=person_id)
-            save_message(session_id, "assistant", response)
-            update_session_timestamp(session_id)
-        except Exception:
-            logger.exception(
-                "Telegram: failed to persist turn for session %s", session_id
-            )
-        else:
+        # Kept only after the reply is sent.
+        if await asyncio.to_thread(
+            channel_turn.save_turn,
+            session_id=session_id,
+            title=f"Telegram {sender_name}",
+            created_at=result.session.created_at.isoformat(),
+            owner_person_id=result.person_id,
+            user_text=message_text,
+            assistant_text=response,
+            sender_person_id=result.person_id,
+        ):
             from openexecutive.integrations.conversations import title_after_turn
 
             title_after_turn(session_id, own_text, response)

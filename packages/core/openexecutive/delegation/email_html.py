@@ -46,6 +46,9 @@ _WHITESPACE = re.compile(r"\s+")
 
 # The line a forwarded message starts under (``delegation_tools._forward_header``).
 _FORWARDED = re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}\s*$", re.IGNORECASE | re.MULTILINE)
+# Outlook's forward (Graph ``createForward``) has no such line: its header
+# block starts "From: …" with "Sent: …" on the next line (a blank between).
+_OUTLOOK_FORWARDED = re.compile(r"^From:[^\n]*\n(?:[ \t]*\n)*Sent:", re.MULTILINE)
 
 
 def _cells(row: str) -> int:
@@ -109,8 +112,9 @@ def is_ours(markup: str) -> bool:
 
 def split_forward(text: str) -> tuple[str, str]:
     """``text`` as the note and the forwarded message under it (from its
-    "Forwarded message" line), or the whole text and ""."""
-    match = _FORWARDED.search(text or "")
+    "Forwarded message" line, or the "From:" / "Sent:" header Outlook's
+    forward starts with), or the whole text and ""."""
+    match = _FORWARDED.search(text or "") or _OUTLOOK_FORWARDED.search(text or "")
     if match is None:
         return text, ""
     return text[: match.start()].rstrip("\n"), text[match.start():]

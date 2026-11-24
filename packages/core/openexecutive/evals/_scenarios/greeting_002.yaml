@@ -1,0 +1,16 @@
+id: greeting_002
+domain: greeting
+description: "A two-letter slip ('Ho') is read as a greeting, not as a cut-off message to resend."
+company_context:
+  name: Larkfield Partners
+  stage: Bootstrapped
+  industry: Accounting practice
+  headcount: 6
+query: "Ho"
+no_routing: true
+expected_topics:
+  - greets_them_back
+quality_criteria:
+  brief: true
+  does_not_ask_them_to_resend: true
+  does_not_say_the_message_came_through_cut_off: true

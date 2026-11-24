@@ -20,7 +20,7 @@ from openexecutive.delegation.gmail import CalendarEvent
 from openexecutive.people import store as people_store
 
 from .test_delegation_inbox import NOW, FakeInbox, _msg
-from .test_delegation_inbox_routes import OWNER, TEAMMATE, client, db, gmail, ids  # noqa: F401
+from .test_delegation_inbox_routes import NOT_ON_TEAM, OWNER, TEAMMATE, client, db, gmail, ids  # noqa: F401
 
 # --------------------------------------------------------------------------- #
 # The composer's questions
@@ -217,7 +217,7 @@ def test_a_scan_with_read_my_calendar_on_offers_free_slots(
 
 def _card(
     owner_id: int, monkeypatch: pytest.MonkeyPatch, *, mailbox: FakeInbox | None = None, calendar_on: bool = False,
-    gist: str = "", cc: tuple[str, ...] = (),
+    gist: str = "", cc: tuple[str, ...] = (), questions: bool = True,
 ) -> tuple[FakeInbox, int]:
     from openexecutive.delegation import inbox_classifier as ic
     from openexecutive.delegation.settings import set_enabled
@@ -231,7 +231,7 @@ def _card(
             "body": "Hi Dana,\n\nThanks for the note. I'll get back to you on the time.\n\nOlivia",
             "open_questions": [
                 {"question": "When should we talk?", "choices": ["Friday at 10", "Next week"], "about": "time"},
-            ],
+            ] if questions else [],
             **({"gist": gist} if gist else {}),
         }
 
@@ -276,7 +276,8 @@ def test_answering_rewrites_the_draft_and_marks_the_question(
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "caller_signing_required"
     assert rewriter == []
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    assert client.post(url, json=body, headers=TEAMMATE).status_code == 403
+    assert client.post(url, json=body, headers=TEAMMATE).status_code == 404  # not their card
+    assert client.post(url, json=body, headers=NOT_ON_TEAM).status_code == 403
     assert client.post("/delegation/replies/9999/answer", json=body, headers=OWNER).status_code == 404
     resp = client.post(url, json=body, headers=OWNER)
     assert resp.status_code == 200, resp.text
@@ -339,7 +340,8 @@ def test_tell_me_what_to_change_rewrites_it_and_joins_the_conversation(
     resp = client.post(url, json=ask, headers=OWNER)
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "caller_signing_required"
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    assert client.post(url, json=ask, headers=TEAMMATE).status_code == 403
+    assert client.post(url, json=ask, headers=TEAMMATE).status_code == 404  # not their card
+    assert client.post(url, json=ask, headers=NOT_ON_TEAM).status_code == 403
     assert client.post("/delegation/replies/9999/change", json=ask, headers=OWNER).status_code == 404
     assert client.post(url, json={"text": ""}, headers=OWNER).status_code == 422
     # Not a reply card, even their own: 404.
@@ -528,3 +530,180 @@ def test_the_signature_and_ai_line_stay_out_of_the_rewrite(monkeypatch: pytest.M
     main, tail = answers._split_tail(f"Hi Dana,\n\nSoon.\n\nOlivia Owner\nFernway\n\n{LINE}", "Olivia Owner\nFernway")
     assert main == "Hi Dana,\n\nSoon."
     assert tail == f"Olivia Owner\nFernway\n\n{LINE}"
+
+
+def test_a_reply_written_in_chat_goes_onto_the_waiting_card(
+    ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    from openexecutive.delegation import card_drafts
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    mailbox, card_id = _card(ids["principal"], monkeypatch, cc=("sam@northpeak.example",))
+    person = people_store.get_person(ids["principal"])
+    card = get_decision_instance(card_id)
+    payload = asyncio.run(card_drafts.from_chat(
+        card, person, mailbox, words="Hi Dana,\n\nFriday at 10 works.\n\nOlivia",
+        to=["dana@northpeak.example"], cc=["sam@northpeak.example"],
+    ))
+    assert "Friday at 10 works." in payload["draft_body"]
+    assert payload["draft_to"] == ["dana@northpeak.example", "sam@northpeak.example"]
+    assert payload[card_drafts.QUESTIONS_SETTLED] is True
+    assert card_drafts.EDITED_ON_CARD not in payload
+    # Changed in their Drafts too, and still the one card.
+    assert mailbox.drafts["d1"].message.text == payload["draft_body"]
+    assert [c.id for c in inbox.open_cards(ids["principal"])] == [card_id]
+
+
+def test_a_question_on_the_card_gets_an_answer_and_leaves_the_reply(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    answers._ANSWERED.clear()
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        # Even a body that differs is ignored: a question never edits the reply.
+        return {"body": "Something else entirely.", "question": True, "note": "You offered Thursday at 2."}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    before = mailbox.drafts["d1"].message.text
+    resp = client.post(f"/delegation/replies/{card_id}/change", json={"text": "What time did I offer?"}, headers=OWNER)
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["draft_body"] == before and card["changed_sentences"] == []
+    assert mailbox.drafts["d1"].message.text == before
+    assert [(t["kind"], t["text"]) for t in card["conversation"]] == [
+        ("asked", "What time did I offer?"),
+        ("note", "You offered Thursday at 2."),
+    ]
+    assert "a question never edits the reply" in answers.REWRITE_PROMPT
+
+
+def test_a_question_that_needs_looking_up_goes_to_the_executive_as_a_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        return {"body": "Hi", "question": True, "needs_tools": True}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    monkeypatch.setattr(answers, "_check_rate", lambda *a: None)
+    person = type("P", (), {"id": 1, "full_name": "Rae Moss", "email": "rae@example.com"})()
+    with pytest.raises(answers.NeedsWork) as raised:
+        asyncio.run(answers.rewrite(person, {"draft_body": "Hi"}, [], change="Who signed the LOI?"))
+    assert raised.value.question is True
+
+
+def _go_said(monkeypatch: pytest.MonkeyPatch, go: bool | None) -> list[str]:
+    """The go check's answer (None: it can't be read), and what it was given."""
+    from openexecutive.alerts import replan
+
+    given: list[str] = []
+
+    async def call(system: str, tool: dict[str, Any], turn: str, **kw: Any) -> dict[str, Any]:
+        assert kw.get("actor") == "card_go"
+        given.append(turn)
+        if go is None:
+            raise replan.ReplanError("unavailable", "Couldn't reach me.")
+        return {"go": go}
+
+    monkeypatch.setattr(replan, "_call_tool", call)
+    return given
+
+
+def test_saying_send_it_on_the_card_asks_to_confirm_the_send(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    answers._ANSWERED.clear()
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        main = turn.split("<draft>\n", 1)[1].split("\n</draft>", 1)[0]
+        return {"body": main, "send_now": True}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    given = _go_said(monkeypatch, True)
+    mailbox, card_id = _card(ids["principal"], monkeypatch, questions=False)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    before = mailbox.drafts["d1"].message.text
+    resp = client.post(f"/delegation/replies/{card_id}/change", json={"text": "looks good, send it"}, headers=OWNER)
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    # A go: nothing is sent and nothing rewritten; the card asks to confirm.
+    assert card["send_now"] is True and card["status"] == "proposed"
+    assert card["draft_body"] == before and mailbox.drafts["d1"].message.text == before
+    assert mailbox.sent == []
+    assert [(t["kind"], t["text"]) for t in card["conversation"]] == [
+        ("asked", "looks good, send it"),
+        ("note", answers.NOTE_CONFIRM_SEND),
+    ]
+    # Judged from their words and the reply alone.
+    assert "<person_said>\nlooks good, send it\n</person_said>" in given[0]
+
+
+def test_send_it_with_a_question_open_waits_for_the_answer(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    answers._ANSWERED.clear()
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        main = turn.split("<draft>\n", 1)[1].split("\n</draft>", 1)[0]
+        return {"body": main, "send_now": True}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    _go_said(monkeypatch, True)
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    resp = client.post(f"/delegation/replies/{card_id}/change", json={"text": "looks good, send it"}, headers=OWNER)
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    # Send waits for the card's open question, whatever was said.
+    assert card["send_now"] is False and mailbox.sent == []
+    assert card["conversation"][-1]["text"] == answers.NOTE_ANSWER_FIRST
+
+
+@pytest.mark.parametrize("go", [False, None])
+def test_a_send_it_that_isnt_sure_leaves_the_send_to_a_tap(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch, go: bool | None,  # noqa: F811
+) -> None:
+    answers._ANSWERED.clear()
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        main = turn.split("<draft>\n", 1)[1].split("\n</draft>", 1)[0]
+        return {"body": main, "send_now": True}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    _go_said(monkeypatch, go)
+    mailbox, card_id = _card(ids["principal"], monkeypatch, questions=False)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    resp = client.post(f"/delegation/replies/{card_id}/change", json={"text": "send it?"}, headers=OWNER)
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["send_now"] is False
+    assert card["conversation"][-1]["text"] == answers.NOTE_TAP_SEND
+    assert "send_now" in answers.REWRITE_PROMPT
+
+
+def test_a_change_with_send_it_is_a_change(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    answers._ANSWERED.clear()
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        return {"body": "Hi Dana,\n\nFriday works.", "send_now": True, "note": "I offered Friday."}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    given = _go_said(monkeypatch, True)
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    resp = client.post(
+        f"/delegation/replies/{card_id}/change", json={"text": "say Friday instead and send it"}, headers=OWNER,
+    )
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    # The new words are theirs to see first: no go check, no confirm.
+    assert card["send_now"] is False and "Friday works." in card["draft_body"]
+    assert given == []

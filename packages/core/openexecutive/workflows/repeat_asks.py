@@ -41,6 +41,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from openexecutive.memory import workspace_settings
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 ASKS_TABLE = "repeat_asks"
@@ -75,12 +78,7 @@ hey hi hello ok okay
 _STOP = frozenset(_STOP_WORDS.split())
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:
@@ -119,15 +117,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _zone() -> ZoneInfo:
-    try:
-        from openexecutive.memory.workspace_settings import get_user_timezone
-
-        return get_user_timezone()
-    except Exception:
-        return ZoneInfo("UTC")
-
-
 def key_words(text: str) -> frozenset[str]:
     """The content words of an ask, lowercased, plurals folded."""
     out: set[str] = set()
@@ -154,9 +143,10 @@ _DOW = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 def timing(asked: list[datetime], zone: ZoneInfo) -> str:
-    """The cadence (UTC, the scheduler's DSL) for asks made at ``asked``:
-    weekly on their weekday, daily when they fall inside one week, else
-    weekly on the most common day; at the earliest hour they were made."""
+    """The cadence (the scheduler's DSL, in the company's zone, as workflow
+    cadences are) for asks made at ``asked``: weekly on their weekday, daily
+    when they fall inside one week, else weekly on the most common day; at
+    the earliest hour they were made."""
     local = sorted(a.astimezone(zone) for a in asked)
     hour = min(d.hour for d in local)
     days = Counter(d.weekday() for d in local)
@@ -168,14 +158,9 @@ def timing(asked: list[datetime], zone: ZoneInfo) -> str:
         weekday = local[-1].weekday()
     else:
         weekday = days.most_common(1)[0][0]
-    # The next such local time, read back in UTC: the scheduler runs in UTC.
-    last = local[-1]
-    ahead = (weekday - last.weekday()) % 7 or 7
-    day = last.date() + timedelta(days=ahead)
-    at = datetime(day.year, day.month, day.day, hour, 0, tzinfo=zone).astimezone(UTC)
     if weekly:
-        return f"weekly@{_DOW[at.weekday()]}@{at:%H:%M}"
-    return f"daily@{at:%H:%M}"
+        return f"weekly@{_DOW[weekday]}@{hour:02d}:00"
+    return f"daily@{hour:02d}:00"
 
 
 def _verified_person(session: Any, person_id: int | None) -> Any:
@@ -234,7 +219,7 @@ def note_ask(
             return None
         pid = int(person.id)
         current = now or _now()
-        tz = zone or _zone()
+        tz = zone or workspace_settings.get_user_timezone()
         ask = " ".join(typed.split())[:ASK_MAX]
         session_id = str(getattr(session, "session_id", "") or "")
         conn = _connect(db_path)

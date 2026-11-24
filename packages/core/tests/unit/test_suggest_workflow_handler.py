@@ -39,7 +39,6 @@ def isolated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture()
 def session_with_telegram_ref() -> Iterator[Session]:
     s = Session()
-    s.seen_channel_refs.add(("telegram", "42"))
     token = current_session.set(s)
     yield s
     current_session.reset(token)
@@ -134,17 +133,17 @@ def test_rejects_extra_keys_in_prefilled_inputs(
     assert "bogus_field" in payload["error"]
 
 
-def test_rejects_unseen_channel_ref(session_with_telegram_ref: Session) -> None:
+def test_any_channel_ref_is_accepted(session_with_telegram_ref: Session) -> None:
     payload = _call(
         {
             "workflow_name": "board_prep",
             "run_at": _future_iso(),
             "channel": "telegram",
-            "channel_ref": "999",  # not in seen_channel_refs
+            "channel_ref": "999",  # never came up in this chat
             "reason": "x",
         }
     )
-    assert "not seen in this session" in payload["error"]
+    assert "error" not in payload
 
 
 def test_rejects_past_run_at(session_with_telegram_ref: Session) -> None:

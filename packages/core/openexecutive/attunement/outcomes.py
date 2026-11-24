@@ -39,6 +39,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 # Sources, as stored. Kept small and stable: they key the nudge engine's
@@ -113,10 +115,7 @@ def current_tag() -> tuple[str, str] | None:
     return _proactive.get()
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def record_send(

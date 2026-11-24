@@ -122,3 +122,26 @@ def test_analyze_with_tools_model_and_deep_reasoning_overrides_apply() -> None:
     kwargs = create_mock.await_args.kwargs
     assert kwargs["model"] == "claude-cheap-research"
     assert "thinking" not in kwargs  # deep reasoning off → no adaptive thinking
+
+
+def test_a_specialists_timeout_leaves_room_to_write_its_whole_answer() -> None:
+    """The output cap and the timeout agree: a long analysis is never lost
+    to the clock before it could be written."""
+    from openexecutive.agents.base import _WRITE_TOKENS_PER_SECOND
+
+    kwargs = _run_analyze().await_args.kwargs
+    assert kwargs["timeout"] >= kwargs["max_tokens"] / _WRITE_TOKENS_PER_SECOND
+    tools_kwargs = _run_analyze_with_tools(max_tokens=2_048).await_args.kwargs
+    # Thinking raises max_tokens to 16,000; the timeout follows it.
+    assert tools_kwargs["timeout"] >= tools_kwargs["max_tokens"] / _WRITE_TOKENS_PER_SECOND
+    # A caller's own timeout stands.
+    assert _run_analyze_with_tools(timeout_seconds=30.0).await_args.kwargs["timeout"] == 30.0
+
+
+def test_a_specialists_analysis_writes_at_most_8000_tokens() -> None:
+    """Specialists are held to SPECIALIST_MAX_TOKENS; the Executive's own
+    answers keep MAX_OUTPUT_TOKENS."""
+    from openexecutive.providers.feature_gate import MAX_OUTPUT_TOKENS, SPECIALIST_MAX_TOKENS
+
+    assert SPECIALIST_MAX_TOKENS == 8_000 < MAX_OUTPUT_TOKENS
+    assert _run_analyze().await_args.kwargs["max_tokens"] == SPECIALIST_MAX_TOKENS

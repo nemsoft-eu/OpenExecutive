@@ -50,7 +50,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+
+from openexecutive.memory import workspace_settings
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +281,59 @@ class OpenLoop:
     updated_at: str | None = None
     completed_at: str | None = None
     closed_reason: str | None = None
+    # Whose own chat it came from (``private_owner``): seen only by them and
+    # the person it is assigned to. None: the team's.
+    private_to_person_id: int | None = None
+
+
+class Everyone:
+    """``reader`` for internal reads (the nudge engine, the reflection pass):
+    every task, private ones included. Never a person's view."""
+
+
+EVERYONE = Everyone()
+# Who is reading: a person's id (the team's tasks and their own private
+# ones), None (the team's only), or EVERYONE.
+Reader = int | None | Everyone
+
+# What a reader is told about tasks they don't see, wherever the Executive
+# lists tasks.
+PRIVATE_TASKS_NOTE = (
+    "Tasks from someone else's own chat are private to them and never listed here. "
+    "Say only that they are private: never confirm or deny anything about them, "
+    "even details the person asking names."
+)
+
+
+def visible_to(loop: OpenLoop, reader: Reader) -> bool:
+    """Whether ``reader`` sees ``loop``: the team's tasks are everyone's on
+    the team; a private one only its chat's owner's and its assignee's. The
+    one rule every list, count and lookup of tasks applies."""
+    if isinstance(reader, Everyone) or loop.private_to_person_id is None:
+        return True
+    return reader is not None and reader in (loop.private_to_person_id, loop.owner_person_id)
+
+
+def principal_reader(db_path: Path | None = None) -> int | None:
+    """The principal as a reader: what they see, for a read written for
+    them (the reflection block, Take the lead's watch). None (the team's
+    only) when there is no principal."""
+    from openexecutive.people.store import find_principal_person
+
+    principal = find_principal_person(db_path)
+    return int(principal.id) if principal is not None and principal.id is not None else None
+
+
+def _reader_clause(reader: Reader) -> tuple[str, list[Any]]:
+    """``visible_to`` as SQL over scheduled_actions."""
+    if isinstance(reader, Everyone):
+        return "", []
+    if reader is None:
+        return " AND private_to_person_id IS NULL", []
+    return (
+        " AND (private_to_person_id IS NULL OR private_to_person_id = ? OR assigned_to_person_id = ?)",
+        [reader, reader],
+    )
 
 
 # A task's status while it is open. Closed tasks read "done" whatever the
@@ -289,7 +344,7 @@ _NOTES_MAX = 1000
 _LOOP_COLUMNS = (
     "id, assigned_to_person_id, intent_text, awaiting_response_since, created_at, "
     "originating_session_id, task_status, task_notes, task_updated_at, "
-    "task_completed_at, task_closed_reason, task_closed_due_at"
+    "task_completed_at, task_closed_reason, task_closed_due_at, private_to_person_id"
 )
 
 
@@ -313,6 +368,9 @@ def _loop_from_row(r: Any, names: dict[int, str]) -> OpenLoop:
         updated_at=r["task_updated_at"] or str(r["created_at"]),
         completed_at=r["task_completed_at"],
         closed_reason=r["task_closed_reason"],
+        private_to_person_id=(
+            int(r["private_to_person_id"]) if r["private_to_person_id"] is not None else None
+        ),
     )
 
 
@@ -321,10 +379,7 @@ def _loop_from_row(r: Any, names: dict[int, str]) -> OpenLoop:
 # --------------------------------------------------------------------------- #
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def _clean(text: str, limit: int) -> str:
@@ -340,10 +395,14 @@ def _clean(text: str, limit: int) -> str:
 _MARKUP_DEFANG = str.maketrans({"<": "‹", ">": "›", '"': "'"})
 
 
-def _scope_key(owner_person_id: int, text: str) -> str:
+def _scope_key(owner_person_id: int, text: str, private_to_person_id: int | None = None) -> str:
+    """One open task per owner and text within who sees it: a private one's
+    key carries whose it is, so the same words said elsewhere are their own
+    task, never a duplicate that tells anyone the private one exists."""
     norm = re.sub(r"[^a-z0-9 ]", "", " ".join(text.lower().split()))
     digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
-    return f"{SCOPE_PREFIX}:{owner_person_id}:{digest}"
+    key = f"{SCOPE_PREFIX}:{owner_person_id}:{digest}"
+    return f"{key}:p{private_to_person_id}" if private_to_person_id is not None else key
 
 
 def _person_names() -> dict[int, str]:
@@ -360,9 +419,11 @@ def list_open_loops(
     *,
     person_id: int | None = None,
     limit: int = 50,
+    reader: Reader = EVERYONE,
     db_path: Path | None = None,
 ) -> list[OpenLoop]:
-    """Open loops, soonest-due first; optionally only those one person owns."""
+    """Open loops, soonest-due first; optionally only those one person owns,
+    and only those ``reader`` sees (``visible_to``)."""
     from openexecutive.memory.episodic import _get_conn
 
     resolved = _db(db_path)
@@ -377,6 +438,9 @@ def list_open_loops(
     if person_id is not None:
         sql += " AND assigned_to_person_id = ?"
         params.append(person_id)
+    clause, extra = _reader_clause(reader)
+    sql += clause
+    params.extend(extra)
     sql += " ORDER BY awaiting_response_since, id LIMIT ?"
     params.append(limit)
     with _get_conn(resolved) as conn:
@@ -406,11 +470,14 @@ def open_loop(
     description: str,
     due_at: datetime,
     originating_session_id: str | None = None,
+    private_to_person_id: int | None = None,
     db_path: Path | None = None,
 ) -> int | None:
     """Insert one open loop. Returns its id, or None when an identical loop is
     already open for this owner (the unique index is the dedupe, so two
-    concurrent passes cannot both insert it)."""
+    concurrent passes cannot both insert it). ``private_to_person_id``: the
+    person whose own chat it came from (``private_owner``), None for the
+    team's."""
     from openexecutive.memory.episodic import insert_scheduled_action
 
     text = _clean(description, _TEXT_MAX).translate(_MARKUP_DEFANG)
@@ -426,10 +493,11 @@ def open_loop(
             kind=OPEN_LOOP_KIND,
             assigned_to_person_id=owner_person_id,
             awaiting_response_since=due_at,
-            scope_key=_scope_key(owner_person_id, text),
+            scope_key=_scope_key(owner_person_id, text, private_to_person_id),
             # Recorded, never dispatched: `done` keeps the runner away from
             # it while the nudge engine's commitment source still reads it.
             status="done",
+            private_to_person_id=private_to_person_id,
             db_path=db_path,
         )
     except sqlite3.IntegrityError:
@@ -483,6 +551,7 @@ def assign_open_loop(
     due_date: date | None = None,
     originating_session_id: str | None = None,
     notes: str | None = None,
+    private_to_person_id: int | None = None,
     db_path: Path | None = None,
 ) -> AssignResult:
     """Open a loop someone asked for explicitly — the chat tool and the People
@@ -522,11 +591,12 @@ def assign_open_loop(
         if assigner.id == owner.id
         else f"{assigner.full_name} asked {owner.full_name} for: {clean}"
     )
-    today = datetime.now(_user_tz()).date()
+    today = datetime.now(workspace_settings.get_user_timezone()).date()
     due = _resolve_due(due_date.isoformat() if due_date else None, today=today,
                        default_days=settings.attunement_loop_default_due_days)
     loop_id = open_loop(owner_person_id=owner.id, description=description, due_at=due,
-                        originating_session_id=originating_session_id, db_path=db_path)
+                        originating_session_id=originating_session_id,
+                        private_to_person_id=private_to_person_id, db_path=db_path)
     if loop_id is None:
         return AssignResult(None, "duplicate")
     clean_notes = _clean(notes or "", _NOTES_MAX).translate(_MARKUP_DEFANG)
@@ -594,8 +664,8 @@ def close_open_loop(
     return closed
 
 
-def get_open_loop(loop_id: int, *, db_path: Path | None = None) -> OpenLoop | None:
-    """One loop by id, if it is still open."""
+def get_open_loop(loop_id: int, *, reader: Reader = EVERYONE, db_path: Path | None = None) -> OpenLoop | None:
+    """One loop by id, if it is still open and ``reader`` sees it."""
     from openexecutive.memory.episodic import _get_conn
 
     resolved = _db(db_path)
@@ -610,7 +680,8 @@ def get_open_loop(loop_id: int, *, db_path: Path | None = None) -> OpenLoop | No
         ).fetchone()
     if row is None:
         return None
-    return _loop_from_row(row, _person_names())
+    loop = _loop_from_row(row, _person_names())
+    return loop if visible_to(loop, reader) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -628,8 +699,8 @@ def task_title(description: str) -> str:
     return m.group("title").strip() if m else description
 
 
-def get_task(loop_id: int, *, db_path: Path | None = None) -> OpenLoop | None:
-    """One task by id, open or closed."""
+def get_task(loop_id: int, *, reader: Reader = EVERYONE, db_path: Path | None = None) -> OpenLoop | None:
+    """One task by id, open or closed, when ``reader`` sees it."""
     from openexecutive.memory.episodic import _get_conn
 
     resolved = _db(db_path)
@@ -641,7 +712,10 @@ def get_task(loop_id: int, *, db_path: Path | None = None) -> OpenLoop | None:
             "WHERE id = ? AND kind = ? AND assigned_to_person_id IS NOT NULL",
             (loop_id, OPEN_LOOP_KIND),
         ).fetchone()
-    return _loop_from_row(row, _person_names()) if row is not None else None
+    if row is None:
+        return None
+    loop = _loop_from_row(row, _person_names())
+    return loop if visible_to(loop, reader) else None
 
 
 def list_tasks(
@@ -652,12 +726,13 @@ def list_tasks(
     due_before: datetime | None = None,
     limit: int = 50,
     offset: int = 0,
+    reader: Reader = EVERYONE,
     db_path: Path | None = None,
 ) -> tuple[list[OpenLoop], int]:
     """A page of tasks and how many match in all. ``state`` "open" lists the
     open ones soonest due first (``status`` narrows to one open status and
     ``due_before`` to those due by then); "done" lists the closed ones, most
-    recently closed first."""
+    recently closed first. Only what ``reader`` sees (``visible_to``)."""
     from openexecutive.memory.episodic import _get_conn
 
     resolved = _db(db_path)
@@ -680,6 +755,9 @@ def list_tasks(
     if owner_person_id is not None:
         where += " AND assigned_to_person_id = ?"
         params.append(owner_person_id)
+    clause, extra = _reader_clause(reader)
+    where += clause
+    params.extend(extra)
     with _get_conn(resolved) as conn:
         total = int(conn.execute(f"SELECT COUNT(*) AS n FROM scheduled_actions WHERE {where}", params)
                     .fetchone()["n"])
@@ -706,7 +784,7 @@ def _due_date_of(loop: OpenLoop) -> str | None:
     if not loop.due_at:
         return None
     try:
-        return datetime.fromisoformat(loop.due_at).astimezone(_user_tz()).date().isoformat()
+        return datetime.fromisoformat(loop.due_at).astimezone(workspace_settings.get_user_timezone()).date().isoformat()
     except ValueError:
         return None
 
@@ -802,7 +880,7 @@ def update_task(
         params += [owner.id, f"person:{owner.id}"]
     if description != loop.description or owner_id != loop.owner_person_id:
         sets += ["intent_text = ?", "scope_key = ?"]
-        params += [description, _scope_key(owner_id, description)]
+        params += [description, _scope_key(owner_id, description, loop.private_to_person_id)]
     if notes is not None:
         sets.append("task_notes = ?")
         params.append(_clean(notes, _NOTES_MAX).translate(_MARKUP_DEFANG))
@@ -812,7 +890,7 @@ def update_task(
         sets.append("task_status = ?")
         params.append(status)
     if due_date is not None:
-        today = datetime.now(_user_tz()).date()
+        today = datetime.now(workspace_settings.get_user_timezone()).date()
         due = _resolve_due(due_date.isoformat(), today=today, default_days=0)
         sets.append("awaiting_response_since = ?")
         params.append(due.isoformat())
@@ -956,10 +1034,12 @@ def consume_call_budget(limit: int, *, db_path: Path | None = None) -> bool:
 
 
 def render_for_reflection(limit: int = 10, *, db_path: Path | None = None) -> list[str]:
-    """One line per open loop, soonest-due first, for the reflection prompt."""
+    """One line per open loop, soonest-due first, for the reflection prompt:
+    what the principal sees (``principal_reader``), since it is written for
+    them."""
     now = datetime.now(UTC)
     lines: list[str] = []
-    for loop in list_open_loops(limit=limit, db_path=db_path):
+    for loop in list_open_loops(limit=limit, reader=principal_reader(db_path), db_path=db_path):
         due = _parse_iso(loop.due_at)
         state = "OVERDUE" if due is not None and due <= now else "due"
         lines.append(
@@ -1001,7 +1081,7 @@ def principal_due_soon(
         logger.warning("open_loops: principal due-soon read failed", exc_info=True)
         return []
     now = now or datetime.now(UTC)
-    tz = _user_tz()
+    tz = workspace_settings.get_user_timezone()
     today = now.astimezone(tz).date()
     horizon = now + timedelta(days=max(within_days, 0))
     out: list[dict[str, Any]] = []
@@ -1038,15 +1118,6 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def _user_tz() -> ZoneInfo:
-    from openexecutive.memory.workspace_settings import get_user_timezone
-
-    try:
-        return get_user_timezone()
-    except Exception:
-        return ZoneInfo("UTC")
-
-
 def _stated_due_date(raw: Any) -> date | None:
     """The model's ``due_date`` when it is a real YYYY-MM-DD, else None — the
     difference between a STATED due date and one ``_resolve_due`` defaults."""
@@ -1061,7 +1132,7 @@ def _stated_due_date(raw: Any) -> date | None:
 def _resolve_due(raw: Any, *, today: date, default_days: int) -> datetime:
     """A stated YYYY-MM-DD (clamped to [today, today+60d]) at 17:00 in the
     user's timezone, else ``default_days`` from now."""
-    tz = _user_tz()
+    tz = workspace_settings.get_user_timezone()
     parsed = _stated_due_date(raw)
     if parsed is None:
         return datetime.now(UTC) + timedelta(days=max(default_days, 0))
@@ -1135,6 +1206,7 @@ async def run_open_loop_pass(
     workspace_mode: str | None = None,
     principal_verified: bool = False,
     turn_key: tuple[str | None, str] | None = None,
+    private_to_person_id: int | None = None,
     db_path: Path | None = None,
 ) -> dict[str, int]:
     """One extraction pass for one attributed turn. Never raises; returns the
@@ -1153,6 +1225,8 @@ async def run_open_loop_pass(
     from openexecutive.people.store import get_person, list_people
 
     counts = {"opened": 0, "closed": 0, "dropped": 0}
+    # ``private_to_person_id``: whose own chat the turn was (``private_owner``);
+    # the tasks it opens are theirs and their assignees' (``visible_to``).
     settings = get_settings()
     if not (settings.attunement_enabled and settings.attunement_open_loops_enabled):
         return counts
@@ -1160,10 +1234,12 @@ async def run_open_loop_pass(
     if speaker is None or speaker.archived or speaker.id is None:
         return counts
 
-    # Loops the speaker may close: their own, or any when the principal speaks.
+    # Loops the speaker may close: their own, or any they see when the
+    # principal speaks.
     closable = list_open_loops(
         person_id=None if speaker.is_principal else speaker.id,
         limit=_MAX_LOOPS_IN_PROMPT,
+        reader=speaker.id,
         db_path=db_path,
     )
     if not should_run(user_message, has_open_loops=bool(closable)):
@@ -1174,7 +1250,7 @@ async def run_open_loop_pass(
         return counts
 
     roster = [p for p in list_people() if p.id is not None]
-    today = datetime.now(_user_tz()).date()
+    today = datetime.now(workspace_settings.get_user_timezone()).date()
     turn = _render_turn(user_message, assistant_response, speaker=speaker, roster=roster,
                         closable=closable, today=today)
     solo = _is_solo(workspace_mode)
@@ -1192,6 +1268,7 @@ async def run_open_loop_pass(
             settings=settings, session_id=session_id, dropped=dropped, db_path=db_path,
             solo=solo, principal_verified=principal_verified,
             assigned_owner_ids=set(assigned_this_turn(turn_key)),
+            private_to_person_id=private_to_person_id,
         )
     except Exception as exc:
         failure = type(exc).__name__
@@ -1293,6 +1370,7 @@ def _apply_opens(
     solo: bool = False,
     principal_verified: bool = False,
     assigned_owner_ids: set[int] | None = None,
+    private_to_person_id: int | None = None,
 ) -> int:
     """Open the loops that pass every gate. Returns how many opened."""
     principal = next((p for p in roster if p.is_principal), None)
@@ -1321,7 +1399,8 @@ def _apply_opens(
         due = _resolve_due(item.get("due_date"), today=today,
                            default_days=settings.attunement_loop_default_due_days)
         loop_id = open_loop(owner_person_id=owner.id, description=description, due_at=due,
-                            originating_session_id=session_id or None, db_path=db_path)
+                            originating_session_id=session_id or None,
+                            private_to_person_id=private_to_person_id, db_path=db_path)
         if loop_id is None:
             dropped.append({"kind": "open", "reason": "duplicate"})
             continue
@@ -1412,14 +1491,16 @@ def schedule_open_loop_pass(
     session_id: str = "",
     workspace_mode: str | None = None,
     principal_verified: bool = False,
+    private_to_person_id: int | None = None,
 ) -> None:
     """Fire-and-forget :func:`run_open_loop_pass` for an attributed turn.
 
     ``person_id`` must be the resolved speaker (never a session owner's
     fallback); None — an unrostered sender — does nothing. ``workspace_mode``
     is the turn's pinned mode, so the pass judges the turn in the mode it ran
-    in; ``principal_verified`` says the surface verified the principal (the
-    Executive computes both from the turn's session). Safe to call from sync
+    in; ``principal_verified`` says the surface verified the principal, and
+    ``private_to_person_id`` whose own chat it was (the Executive computes
+    all three from the turn's session). Safe to call from sync
     or async context, like ``schedule_extraction``."""
     if person_id is None or not user_message.strip():
         return
@@ -1451,6 +1532,7 @@ def schedule_open_loop_pass(
                 user_message, assistant_response, person_id=person_id, session_id=session_id,
                 workspace_mode=workspace_mode, principal_verified=principal_verified,
                 turn_key=(audit_sid, audit_tid) if audit_tid else None,
+                private_to_person_id=private_to_person_id,
             )
 
     try:

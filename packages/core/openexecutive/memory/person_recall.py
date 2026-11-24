@@ -38,7 +38,7 @@ def _words(text: str) -> set[str]:
 
 def _note_line(note: Any) -> str:
     day = str(getattr(note, "occurred_at", "") or "")[:10]
-    summary = str(getattr(note, "correction", None) or getattr(note, "summary", "") or "").strip()
+    summary = str(getattr(note, "corrected", "") or getattr(note, "summary", "") or "").strip()
     due = getattr(note, "due_date", None)
     who = str(getattr(note, "counterpart", "") or "").strip()
     bits = [f"{day}: {summary}" if day else summary]

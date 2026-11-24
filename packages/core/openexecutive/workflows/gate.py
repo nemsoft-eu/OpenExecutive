@@ -35,6 +35,7 @@ from typing import cast
 from pydantic import BaseModel
 
 import openexecutive.workflows.gate_delivery as _gate_delivery
+from openexecutive.utils.public_errors import PublicError
 from openexecutive.workflows.base import WorkflowEvent
 from openexecutive.workflows.gate_delivery import DeliveryStatus
 from openexecutive.workflows.persistence import save_checkpoint
@@ -43,7 +44,7 @@ from openexecutive.workflows.wait_for_human import WaitForHumanEvent
 logger = logging.getLogger(__name__)
 
 
-class UnsupportedGateError(RuntimeError):
+class UnsupportedGateError(PublicError):
     """A workflow raised an approval gate at a runner that cannot pause."""
 
 

@@ -1,0 +1,17 @@
+id: big_jobs_002
+domain: big_jobs
+description: "A small question gets no heads-up: the big-job line is only for work that will take a while."
+company_context:
+  stage: "Seed"
+  industry: "Professional services"
+  headcount: 12
+  arr: 900000
+# The heads-up is for a big job only; a quick question is answered on the
+# Length ladder with no "this may take a while" line.
+query: "What's our standard payment term for new clients?"
+expected_topics:
+  - direct_answer
+quality_criteria:
+  no_heads_up_line: true
+  never_mentions_cost_or_money: true
+  brief: true

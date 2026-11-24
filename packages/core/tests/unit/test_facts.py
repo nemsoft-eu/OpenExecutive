@@ -210,6 +210,11 @@ def test_remember_fact_refuses_anyone_but_the_verified_principal(monkeypatch: py
     finally:
         current_session.reset(token)
     assert out["error"].startswith("refused")
+    # Said plainly and passed to no one, so a teammate's ask never becomes
+    # a message on the owner's list.
+    from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
+    assert PASS_ON_NOTHING in out["error"]
     assert facts.list_facts(include_inactive=True) == []
 
 
@@ -878,3 +883,14 @@ def test_both_chat_paths_sort_facts_by_the_message() -> None:
     assert executive._lookup_text(None, "the message") == "the message"
     assert executive._lookup_text("their words", "framed prompt") == "their words"
     assert executive._lookup_text("", "framed prompt") == "framed prompt"
+
+
+def test_a_wait_rule_said_in_chat_goes_to_your_rules_not_memory() -> None:
+    """'Check with me before you email anyone at X' is a rule that holds
+    steps, so remember_fact points it to Your rules."""
+    from openexecutive.orchestrator.fact_tools import REMEMBER_FACT_TOOL
+
+    words = REMEMBER_FACT_TOOL["description"]
+    assert "do_in_app add_waits_rule (open_tools group app" in words and "is not a fact" in words
+    # The review after a chat has no do_in_app: it raises it in the brief.
+    assert "raise it in the brief" in words

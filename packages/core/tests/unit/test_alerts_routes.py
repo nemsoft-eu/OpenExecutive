@@ -229,3 +229,245 @@ def test_snooze_refuses_past_too_far_closed_and_roster_cards(
     roster = _insert(db, "who is this", source="roster_request")
     assert client.post(f"/alerts/{roster}/snooze", json={"until": soon}).status_code == 409
     assert client.post("/alerts/9999/snooze", json={"until": soon}).status_code == 404
+
+
+def _as(monkeypatch: pytest.MonkeyPatch, person_id: int, *, principal: bool) -> None:
+    from openexecutive.orchestrator.artifact_records import Viewer
+
+    monkeypatch.setattr(alerts_route, "_caller_person_id", lambda request: person_id)
+    monkeypatch.setattr(alerts_route, "_caller_is_principal", lambda request: principal)
+    monkeypatch.setattr(alerts_route, "_caller_viewer", lambda request: Viewer(person_id=person_id, is_principal=principal))
+
+
+def test_tidied_up_lists_only_what_was_on_your_needs_you(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mine = _insert(db, "Send the board deck", routed_to_person_id=5)
+    theirs = _insert(db, "Book the offsite", routed_to_person_id=6)
+    unrouted = _insert(db, "Renew the domain")
+    still_open = _insert(db, "Sign the lease", routed_to_person_id=5)
+    for aid, reason in ((mine, "Sent on Tuesday."), (theirs, "Done."), (unrouted, "No longer needed.")):
+        alert = alert_store.get_alert(aid, db_path=db)
+        assert alert is not None and lifecycle.settle(alert, "resolved", reason, db_path=db)
+    _as(monkeypatch, 5, principal=False)
+    items = client.get("/alerts/tidied").json()["items"]
+    assert [(i["alert_id"], i["reason"]) for i in items] == [(mine, "Sent on Tuesday.")]
+    assert items[0]["tidied_at"]
+    _as(monkeypatch, 1, principal=True)
+    assert [i["alert_id"] for i in client.get("/alerts/tidied").json()["items"]] == [unrouted]
+    assert still_open not in [i["alert_id"] for i in client.get("/alerts/tidied").json()["items"]]
+
+
+def test_undo_puts_a_settled_waiting_step_back_and_it_waits_again(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.api.routes import decisions
+    from openexecutive.memory import decision_ledger
+
+    told: list[tuple[int, bool]] = []
+    monkeypatch.setattr(decisions, "run_after_lapse", lambda i, *, lapsed, db_path=None: told.append((i, lapsed)))
+    iid = decision_ledger.create_decision_instance(
+        decision_class="take_the_lead_action", department="", originating_session_id=None,
+        proposed_payload={"tool": "send"}, idempotency_key=None, gate_mode="propose",
+        approver_person_id=None, confidence=None, db_path=db,
+    )
+    aid = _insert(
+        db, "Send the launch note", source="decision_scheduling",
+        external_id=decision_ledger.decision_alert_external_id(iid),
+        topic_tags=[decision_ledger.decision_instance_tag(iid)],
+    )
+    alert = alert_store.get_alert(aid, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "dismissed", "No longer needed.", db_path=db)
+    step = decision_ledger.get_decision_instance(iid, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_AUTO_NO_RESPONSE
+    _as(monkeypatch, 1, principal=True)
+    assert [i["alert_id"] for i in client.get("/alerts/tidied").json()["items"]] == [aid]
+    res = client.post(f"/alerts/{aid}/reopen")
+    assert res.status_code == 200 and res.json()["status"] == "unread"
+    assert res.json()["tidied_reason"] == "" and res.json()["tidied_at"] is None
+    step = decision_ledger.get_decision_instance(iid, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_PROPOSED
+    assert client.get("/alerts/tidied").json()["items"] == []
+    # Its class closed it out on the lapse and opened it again on Undo.
+    assert told == [(iid, True), (iid, False)]
+    # A step someone answered since stays answered.
+    assert lifecycle.settle(alert_store.get_alert(aid, db_path=db), "dismissed", "x", db_path=db)  # type: ignore[arg-type]
+    decision_ledger.unlapse(iid, db_path=db)
+    decision_ledger.mark_resolved(iid, status=decision_ledger.STATUS_REJECTED, db_path=db)
+    assert client.post(f"/alerts/{aid}/reopen").status_code == 409
+
+
+def test_home_counts_what_was_tidied_today_and_this_week(db: Path) -> None:
+    from openexecutive.api.routes import today
+
+    fresh = _insert(db, "Fresh")
+    older = _insert(db, "Older")
+    gone = _insert(db, "Long gone")
+    for aid in (fresh, older, gone):
+        alert = alert_store.get_alert(aid, db_path=db)
+        assert alert is not None and lifecycle.settle(alert, "resolved", "Done.", db_path=db)
+    now = datetime.now(UTC)
+    alert_store.stamp_tidied([older], "Done.", at=(now - timedelta(days=3)).isoformat(), db_path=db)
+    alert_store.stamp_tidied([gone], "Done.", at=(now - timedelta(days=9)).isoformat(), db_path=db)
+    assert today._tidied_counts(None, True) == (1, 2)
+
+
+def test_undo_never_brings_back_a_step_asked_for_again_since(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.memory import decision_ledger
+
+    def ask() -> int:
+        return decision_ledger.create_decision_instance(
+            decision_class="take_the_lead_action", department="", originating_session_id=None,
+            proposed_payload={"tool": "send", "to": "lee"}, idempotency_key="send-lee", gate_mode="propose",
+            approver_person_id=None, confidence=None, db_path=db,
+        )
+
+    first = ask()
+    aid = _insert(
+        db, "Send Lee the note", source="decision_scheduling",
+        external_id=decision_ledger.decision_alert_external_id(first),
+        topic_tags=[decision_ledger.decision_instance_tag(first)],
+    )
+    alert = alert_store.get_alert(aid, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "dismissed", "No longer needed.", db_path=db)
+    ask()  # the same step, asked for again
+    _as(monkeypatch, 1, principal=True)
+    assert client.post(f"/alerts/{aid}/reopen").status_code == 409
+    step = decision_ledger.get_decision_instance(first, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_CLOSED_EXTERNALLY
+
+
+def _waiting_card(db: Path, headline: str, *, key: str | None = None, payload: dict | None = None) -> tuple[int, int]:
+    from openexecutive.memory import decision_ledger
+
+    iid = decision_ledger.create_decision_instance(
+        decision_class="take_the_lead_action", department="", originating_session_id=None,
+        proposed_payload=payload or {"tool": "send", "to": headline}, idempotency_key=key, gate_mode="propose",
+        approver_person_id=None, confidence=None, db_path=db,
+    )
+    aid = _insert(
+        db, headline, source="decision_scheduling",
+        external_id=decision_ledger.decision_alert_external_id(iid),
+        topic_tags=[decision_ledger.decision_instance_tag(iid)],
+    )
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("UPDATE alerts SET created_at=? WHERE id=?", ((datetime.now(UTC) - timedelta(days=90)).isoformat(), aid))
+        conn.commit()
+    return iid, aid
+
+
+def test_the_sweep_lets_an_old_waiting_step_lapse_with_its_card(db: Path) -> None:
+    from openexecutive.memory import decision_ledger
+
+    waiting, waiting_card = _waiting_card(db, "Send the old note")
+    running, running_card = _waiting_card(db, "Book the room")
+    answered, answered_card = _waiting_card(db, "Email Pat")
+    assert decision_ledger.claim_for_execution(running, db_path=db)
+    assert decision_ledger.mark_resolved(answered, decision_ledger.STATUS_REJECTED, db_path=db)
+    assert lifecycle.expire_stale_alerts(db_path=db) == 2
+    card = alert_store.get_alert(waiting_card, db_path=db)
+    assert card is not None and card.status == "expired" and card.tidied_reason.startswith("No change in")
+    step = decision_ledger.get_decision_instance(waiting, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_AUTO_NO_RESPONSE
+    # A running step keeps its card; one answered elsewhere still lets it go.
+    assert alert_store.get_alert(running_card, db_path=db).status == "unread"  # type: ignore[union-attr]
+    assert alert_store.get_alert(answered_card, db_path=db).status == "expired"  # type: ignore[union-attr]
+
+
+def test_undo_never_brings_back_a_step_asked_again_under_its_key(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.memory import decision_ledger
+
+    first, card = _waiting_card(db, "Book Lee", key="book-lee", payload={"title": "Sync", "note": "v1"})
+    alert = alert_store.get_alert(card, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "dismissed", "No longer needed.", db_path=db)
+    decision_ledger.create_decision_instance(
+        decision_class="take_the_lead_action", department="", originating_session_id=None,
+        proposed_payload={"title": "Sync", "note": "v2"}, idempotency_key="book-lee", gate_mode="propose",
+        approver_person_id=None, confidence=None, db_path=db,
+    )
+    _as(monkeypatch, 1, principal=True)
+    assert client.post(f"/alerts/{card}/reopen").status_code == 409
+    step = decision_ledger.get_decision_instance(first, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_CLOSED_EXTERNALLY
+
+
+def test_tidied_up_finds_your_cards_past_a_busy_week_for_the_team(db: Path) -> None:
+    mine = _insert(db, "Mine", routed_to_person_id=5)
+    alert_store.stamp_tidied([mine], "Done.", db_path=db)
+    alert_store.set_status(mine, "resolved", db_path=db)
+    for n in range(3):
+        other = _insert(db, f"Team {n}", routed_to_person_id=6)
+        alert_store.set_status(other, "resolved", db_path=db)
+        alert_store.stamp_tidied([other], "Done.", db_path=db)
+    since = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    assert [a.id for a in alert_store.list_tidied(since, reader=5, unrouted=False, limit=2, db_path=db)] == [mine]
+    assert alert_store.list_tidied(since, reader=None, unrouted=True, db_path=db) == []
+
+
+def test_a_teammates_own_ask_shows_on_their_tidied_up(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    ask = _insert(db, "Sam asks about pilot pricing", source=TEAM_RAISED_SOURCE, owner_person_id=7)
+    alert = alert_store.get_alert(ask, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "dismissed", "Pricing is set.", db_path=db)
+    _as(monkeypatch, 7, principal=False)
+    assert [i["alert_id"] for i in client.get("/alerts/tidied").json()["items"]] == [ask]
+    _as(monkeypatch, 8, principal=False)
+    assert client.get("/alerts/tidied").json()["items"] == []
+
+
+def test_a_step_tag_on_any_other_card_is_just_text(db: Path) -> None:
+    from openexecutive.memory import decision_ledger
+
+    iid, _ = _waiting_card(db, "Send the real note")
+    forged = _insert(db, "Mail that says decision", topic_tags=[decision_ledger.decision_instance_tag(iid)])
+    alert = alert_store.get_alert(forged, db_path=db)
+    assert alert is not None and decision_ledger.instance_id_of(alert) is None
+    assert lifecycle.settle(alert, "dismissed", "No longer needed.", db_path=db)
+    step = decision_ledger.get_decision_instance(iid, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_PROPOSED
+
+
+def test_a_lapsed_department_step_is_audited_as_the_executives(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive import audit
+    from openexecutive.memory import decision_ledger
+
+    rows: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(audit, "log_event", lambda event_type, summary, **kw: rows.append((event_type, kw.get("actor"))))
+    iid = decision_ledger.create_decision_instance(
+        decision_class="department_action", department="sales", originating_session_id=None,
+        proposed_payload={"tool": "send", "summary": "Email the quote", "department": "sales"},
+        idempotency_key=None, gate_mode="propose", approver_person_id=None, confidence=None, db_path=db,
+    )
+    card = _insert(
+        db, "Email the quote", source="decision_scheduling",
+        external_id=decision_ledger.decision_alert_external_id(iid),
+        topic_tags=[decision_ledger.decision_instance_tag(iid)],
+    )
+    alert = alert_store.get_alert(card, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "expired", "No change in 14 days.", db_path=db)
+    assert ("department_action_lapsed", "executive") in rows
+    _as(monkeypatch, 1, principal=True)
+    assert client.post(f"/alerts/{card}/reopen").status_code == 200
+    assert ("department_action_waiting", "user") in rows
+
+
+def test_the_one_who_raised_an_ask_sees_it_tidied_wherever_it_was_routed(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    ask = _insert(db, "Sam asks Dana about pricing", source=TEAM_RAISED_SOURCE, owner_person_id=7, routed_to_person_id=9)
+    alert = alert_store.get_alert(ask, db_path=db)
+    assert alert is not None and lifecycle.settle(alert, "dismissed", "Pricing is set.", db_path=db)
+    for person in (7, 9):
+        _as(monkeypatch, person, principal=False)
+        assert [i["alert_id"] for i in client.get("/alerts/tidied").json()["items"]] == [ask]

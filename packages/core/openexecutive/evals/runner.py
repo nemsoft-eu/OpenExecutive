@@ -63,6 +63,7 @@ from openexecutive.evals.scenarios import (
     scenario_principal_role,
     scenario_voice_persona,
 )
+from openexecutive.utils.public_errors import PublicError
 from openexecutive.workflows.gate import ensure_workflow_event
 
 logger = logging.getLogger(__name__)
@@ -504,7 +505,7 @@ def _make_chat_runner(
             return executive
         gateway = get_active_gateway()
         if gateway is None:
-            raise RuntimeError(NO_MCP_GATEWAY)
+            raise PublicError(NO_MCP_GATEWAY)
         if gateway is not current_gateway:
             current_gateway = gateway
             executive = Executive(mcp_gateway=gateway)

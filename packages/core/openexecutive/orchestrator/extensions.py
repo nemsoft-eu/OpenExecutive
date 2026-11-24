@@ -49,8 +49,10 @@ stop the step where it is (``workflows/action_step.py``):
   from there, a no skips it.
 - ``workflow_wait(key, what)``: something the tool needs isn't there yet (a
   device that isn't connected). The run pauses, and ``resumer.resume_waiting(key)``
-  runs the step again once it is; with no sign of it in time, the run stops
-  and says so.
+  runs the step again once it is; ``resumer.stop_waiting(key)`` stops it
+  there instead, when the person says not to go on (a Stop the tool shows
+  them); with no sign of it in time, the run stops and says so. The tool
+  that pauses calls one of them when it hears.
 
 A tool may sit in a ``tool_groups`` group (opened with open_tools) instead of
 on the direct list, may describe its chip, may name the activity line the chat
@@ -124,6 +126,11 @@ class ExtraTool:
     # Returns text from outside the team, e.g. a vendor app's records (see
     # module doc and ``orchestrator.outside_content``).
     reads_outside: bool = False
+    # A held call can wait on an Approve card and be carried out from it
+    # (``orchestrator.levels.carriable``, ``take_the_lead.carry_out``): the
+    # handler runs again inside ``levels.approved()`` and must take that tap
+    # as the OK it was waiting for.
+    card: bool = False
     # Asked on a turn with no verified caller too (see module doc); needs
     # ``offered``.
     known_caller: bool = True
@@ -132,6 +139,11 @@ class ExtraTool:
     private_row: bool = False
     # The chat's activity line while it runs ("Checking the draft…").
     activity_label: str | None = None
+    # What one call is doing, in plain words from its arguments ("Adding
+    # the blue hat to your cart"), shown in its place: in the chat, a
+    # workflow's progress and its report. None or "" keeps
+    # ``activity_label``; an error is the same as None.
+    describe: Callable[[dict[str, Any]], str | None] | None = None
     # Each call counts toward a workflow step's own call limit, even one a
     # step script makes (scripts otherwise get a larger allowance of their
     # own): for a tool whose every call is slow or acts somewhere, like the
@@ -154,6 +166,10 @@ class Collection:
     # change itself can still fail after it returns.
     on_change: Callable[[str, Change], Awaitable[None]] | None = None
 
+
+# Built in: loaded whatever ``OPENEXECUTIVE_EXTENSIONS`` says. The browser
+# (``openexecutive.browser``) turns itself off with ``OE_BROWSER_OFF=1``.
+BUILTIN: tuple[str, ...] = ("openexecutive.browser.tools",)
 
 _tools: dict[str, ExtraTool] = {}
 _collections: dict[str, Collection] = {}
@@ -228,6 +244,7 @@ def load() -> None:
             from openexecutive.config import get_settings
 
             names = [n for n in (getattr(get_settings(), "extensions", None) or "").split(",") if n]
+            names += [n for n in BUILTIN if n not in names]
             for module_name in names:
                 tools_before, collections_before = set(_tools), set(_collections)
                 try:
@@ -307,6 +324,24 @@ def private_row(tool_name: str) -> bool:
     return tool is not None and tool.private_row
 
 
+def card_handler(tool_name: str) -> Callable[[dict[str, Any]], Awaitable[str]] | None:
+    """The handler an Approve card carries out for ``tool_name``: a
+    registered tool marked ``card``, else None."""
+    load()
+    tool = _tools.get(tool_name)
+    return tool.handler if tool is not None and tool.card else None
+
+
+def asks_through_approvals(tool_name: str) -> bool:
+    """Whether ``tool_name`` (a workflow tool name, ``oe__`` prefix or not)
+    is a registered tool marked ``card``: it puts its own call through
+    Approvals and holds on its own Approve card, so a workflow step doesn't
+    hold it a second time for writing somewhere new."""
+    load()
+    tool = _tools.get(tool_name.removeprefix("oe__"))
+    return tool is not None and tool.card
+
+
 def counts_on_step_budget(tool_name: str) -> bool:
     """Whether ``tool_name`` (``oe__`` prefix or not) is marked
     ``step_budget``: a script's call to it counts toward the step's own
@@ -316,11 +351,37 @@ def counts_on_step_budget(tool_name: str) -> bool:
     return tool is not None and tool.step_budget
 
 
-def activity_label(tool_name: str) -> str | None:
-    """The activity line extension tool ``tool_name`` registered, if any."""
+def activity_label(tool_name: str, arguments: Any = None) -> str | None:
+    """The activity line for a call of extension tool ``tool_name``, if it
+    has one: what this call is doing (``described``), else the line it
+    registered."""
     load()
     tool = _tools.get(tool_name)
-    return tool.activity_label if tool is not None else None
+    if tool is None:
+        return None
+    return described(tool_name, arguments) or tool.activity_label
+
+
+def described(tool_name: str, arguments: Any) -> str | None:
+    """What one call of extension tool ``tool_name`` is doing, in its own
+    plain words (``ExtraTool.describe``), as one line ending in "…", or None
+    when it doesn't say. Never raises."""
+    load()
+    tool = _tools.get(tool_name)
+    if tool is None or tool.describe is None or not isinstance(arguments, dict):
+        return None
+    try:
+        said = tool.describe(arguments)
+    except Exception:
+        logger.warning("extension_describe_failed tool=%s", tool_name, exc_info=True)
+        return None
+    from openexecutive.orchestrator import turn_live
+
+    return turn_live.plain_line(said, _DESCRIBED_MAX) or None
+
+
+# One line in the chat, the ellipsis included: an ``activity`` label's cap.
+_DESCRIBED_MAX = 60
 
 
 def workflow_tools() -> list[ExtraTool]:
@@ -512,6 +573,7 @@ __all__ = [
     "collection_for_tags",
     "collection_tag",
     "counts_on_step_budget",
+    "described",
     "get_collection",
     "has_chip",
     "in_workflow_step",

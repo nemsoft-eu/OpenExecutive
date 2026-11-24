@@ -830,3 +830,13 @@ def test_enrichment_column_migration_is_idempotent(
     cols = {row[1] for row in conn.execute("PRAGMA table_info(external_signals)")}
     conn.close()
     assert "enrichment_json" in cols
+
+
+def test_the_watch_notes_set_the_score_when_they_say_what_to_tell() -> None:
+    # A watch set up for one kind of change ("tell me if the usage terms
+    # change") reaches the principal when that change comes, whether or not it
+    # touches an initiative; the initiatives decide only without such notes.
+    prompt = me._EnrichmentAgent().get_system_prompt()
+    assert "they set the score" in prompt
+    assert "scores 0.8 or more" in prompt
+    assert "The initiatives decide only when the notes don't say" in prompt

@@ -69,6 +69,31 @@ def test_create_round_trips(client: TestClient) -> None:
     assert body["enabled"] is True
 
 
+def test_a_watch_a_teammate_makes_tells_them(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 11-13: Alex's news watches told the owner instead of Alex.
+    from openexecutive.people import store as people
+
+    db_path = tmp_path / "watchlist_routes.db"
+    monkeypatch.setattr(people, "DB_PATH", db_path)
+    people.initialize_db(db_path)
+    people.upsert_person(full_name="Jordan Avery", email="jordan@acme.example", is_principal=True, db_path=db_path)
+    sam_id = people.upsert_person(full_name="Sam Okafor", email="sam@acme.example", db_path=db_path)
+
+    as_sam = {"x-caller-email": "sam@acme.example"}
+    made = client.post("/watchlist", json={"slug": "stock-aapl", "signal_type": "stock", "target": "AAPL"}, headers=as_sam)
+    assert made.status_code == 201, made.text
+    row = ms.get_watchlist_item_by_slug("stock-aapl", db_path=db_path)
+    assert row is not None and row.route_to_person_id == sam_id
+
+    as_owner = {"x-caller-email": "jordan@acme.example"}
+    made = client.post("/watchlist", json={"slug": "stock-msft", "signal_type": "stock", "target": "MSFT"}, headers=as_owner)
+    assert made.status_code == 201, made.text
+    row = ms.get_watchlist_item_by_slug("stock-msft", db_path=db_path)
+    assert row is not None and row.route_to_person_id is None
+
+
 def test_create_rejects_uppercase_slug(client: TestClient) -> None:
     resp = client.post(
         "/watchlist",
@@ -308,3 +333,51 @@ def test_delete_removes_row(client: TestClient) -> None:
 
 def test_delete_404_for_unknown(client: TestClient) -> None:
     assert client.delete("/watchlist/nothing").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Email watches: the caller's own inbox, theirs alone
+# --------------------------------------------------------------------------- #
+
+
+def test_an_email_watch_reads_the_callers_inbox_and_only_they_see_it(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.people import store as people
+
+    db_path = tmp_path / "watchlist_routes.db"
+    monkeypatch.setattr(people, "DB_PATH", db_path)
+    monkeypatch.setattr(watchlist_route, "audit_log", lambda *a, **k: None)
+    people.initialize_db(db_path)
+    people.upsert_person(full_name="Jordan Avery", email="jordan@acme.example", is_principal=True, db_path=db_path)
+    sam_id = people.upsert_person(full_name="Sam Okafor", email="sam@acme.example", db_path=db_path)
+    as_sam = {"x-caller-email": "sam@acme.example"}
+    as_owner = {"x-caller-email": "jordan@acme.example"}
+    body = {
+        "slug": "email-sign-ups", "signal_type": "mailbox", "target": "sign-up emails",
+        # Whose inbox is never the body's to say.
+        "config": {"mailbox_of": 999},
+        "trigger": {"keywords": ["sign up"]}, "cadence": "real_time",
+    }
+
+    made = client.post("/watchlist", json=body, headers=as_sam)
+    assert made.status_code == 201, made.text
+    assert made.json()["config_json"]["mailbox_of"] == sam_id
+    assert made.json()["tells_you_when"] == "An email that mentions “sign up” reaches the Executive or you"
+    slug = made.json()["slug"]
+    assert slug.startswith("email-sign-ups-")  # its own name, never anyone else's
+
+    assert [w["slug"] for w in client.get("/watchlist", headers=as_sam).json()] == [slug]
+    assert client.get("/watchlist", headers=as_owner).json() == []
+    for path in (f"/watchlist/{slug}", f"/watchlist/{slug}/signals"):
+        assert client.get(path, headers=as_owner).status_code == 404
+        assert client.get(path, headers=as_sam).status_code == 200
+    assert client.patch(f"/watchlist/{slug}", json={"enabled": False}, headers=as_owner).status_code == 404
+    assert client.delete(f"/watchlist/{slug}", headers=as_owner).status_code == 404
+
+    # A trigger that can never match is refused, on create and on change.
+    empty = client.patch(f"/watchlist/{slug}", json={"trigger": {"only_big": True}}, headers=as_sam)
+    assert empty.status_code == 422
+    no_words = client.post("/watchlist", json={**body, "slug": "email-x", "trigger": {}}, headers=as_sam)
+    assert no_words.status_code == 422
+    assert client.delete(f"/watchlist/{slug}", headers=as_sam).status_code == 204

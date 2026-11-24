@@ -307,13 +307,18 @@ It prints two lines. Put `CALLER_ASSERTION_PRIVATE_KEY` on the **UI** only and
 `CALLER_ASSERTION_PUBLIC_KEYS` on the **API** only, then restart both, UI first. The UI
 keeps sending `x-caller-email` as well, so it works against an API without the keys.
 
+Without the keys, the shared secret is the sign-in. Whoever holds it, an AI app connected
+to `/mcp` included, runs turns as the owner, or as whoever its `x-caller-email` names,
+under that person's Approvals. On Hands-off those turns can send on their own. Give the
+secret only to what you would let act as you, or set the keys.
+
 With the keys set:
 
 - **Each assertion covers one request.** It holds only for the method and the exact path
-  and query it was signed for, expires within 30 seconds, and works once.
+  and query it was signed for, expires within 2 minutes, and works once.
 - **No caller header at all is a service.** A script, `curl` with only `x-api-key`, or an
   MCP client can still use the API, but it is **never the owner**. For MCP,
-  `ask_executive` asks as no one, and the owner's memory and activity, the
+  `ask_executive`, `answer_card` and `run_workflow` ask as no one, and the owner's memory and activity, the
   briefing and the roster are refused. `/mcp` reads the caller the gate
   verified, so a sign-in in front of it that sends a signed assertion gets
   that person's answers.
@@ -428,7 +433,7 @@ API reads it from the verified assertion only, and the header must agree with it
 otherwise); without them it reads the header, as it does `x-caller-email`. A chat turn on
 that surface (`Session.from_host`) only reads and advises: it is offered the specialists,
 the read tools and the gateway's reads, never anything that sends, posts, books,
-schedules, runs or changes stored state (`MCP_CLIENT_WITHHELD_TOOLS`), the principal-only
+schedules, runs or changes stored state (`READ_ONLY_WITHHELD_TOOLS`), the principal-only
 tools, Act as me, `recall_history`, scripts or extension tools. A call the model makes
 anyway is refused, telling the person to start a new chat in Open Executive itself. Its
 words are never taken as the person's own: no memory extraction, open loop, working
@@ -727,4 +732,4 @@ curl -sv -H "x-api-key: $SHARED" https://api.example.com/sessions           # 20
 - A listed host origin's scripts reading what the host list allows (the briefing, conversations and their replies, the watch list) and starting chat turns as whoever has the host open: see "Host origins", **What remains**.
 - Other users or programs on the same computer while local login is on — anything that can reach `127.0.0.1:3000` can click **Open**. Use it only on a computer that is yours alone.
 
-If/when per-user data isolation matters (e.g. private sessions per teammate), the change is non-trivial — see the original plan note in [PR #86](https://github.com/SenteLabsAI/OpenExecutive/pull/86) about adding `user_id` to the sessions table.
+If/when per-user data isolation matters (e.g. private sessions per teammate), the change is non-trivial — see the original plan note in [PR #86](https://github.com/ForeactLabs/OpenExecutive/pull/86) about adding `user_id` to the sessions table.

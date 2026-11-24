@@ -100,6 +100,7 @@ export function applyLiveEvent(
       });
     }
     case "chunk":
+    case "rewrite":
     case "thinking":
     case "activity":
     case "action_taken":
@@ -109,6 +110,8 @@ export function applyLiveEvent(
       if (event.type === "chunk") {
         return step({ state: { ...state, turn: { ...turn, reply: turn.reply + event.content, thinking: false, activity: null } } });
       }
+      // Written again whole: the next chunks replace what came so far.
+      if (event.type === "rewrite") return step({ state: { ...state, turn: { ...turn, reply: "" } } });
       if (event.type === "thinking") return step({ state: { ...state, turn: { ...turn, thinking: true } } });
       if (event.type === "activity") return step({ state: { ...state, turn: { ...turn, activity: event.label } } });
       if (event.type === "action_taken") {

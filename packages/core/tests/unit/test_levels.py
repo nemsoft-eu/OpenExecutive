@@ -33,7 +33,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     people_registry.invalidate()
 
 
-@pytest.mark.parametrize("reason", sorted(levels.REASONS - {levels.STRANGER, levels.NOT_OWNER, levels.SHARED, levels.AI_APP}))
+@pytest.mark.parametrize("reason", sorted(levels.REASONS - {levels.STRANGER, levels.NOT_OWNER, levels.SHARED, levels.READ_ONLY}))
 def test_hands_off_runs_every_noticed_step(reason: str) -> None:
     assert levels.decide(reason, mode=outside_mode.TRUST) == levels.RUN
 
@@ -49,29 +49,35 @@ def test_a_strangers_mail_is_a_card_at_every_level(mode: str) -> None:
     assert levels.decide(levels.STRANGER, mode=mode) == levels.CARD
 
 
-@pytest.mark.parametrize("reason", [levels.NOT_OWNER, levels.SHARED, levels.AI_APP])
+@pytest.mark.parametrize("reason", [levels.NOT_OWNER, levels.READ_ONLY])
 @pytest.mark.parametrize("mode", sorted(outside_mode.MODES))
 def test_someone_elses_words_are_a_card_at_every_level(mode: str, reason: str) -> None:
     assert levels.decide(reason, mode=mode) == levels.CARD
 
 
 @pytest.mark.parametrize("session", [
-    Session(from_mcp_client=True),
     Session(from_web_chat=True, from_host=True),
-    Session(shared_chat=True, others_spoke_last=True),
 ])
-def test_hands_off_is_the_owners_own_turns(monkeypatch: pytest.MonkeyPatch, session: Session) -> None:
+def test_hands_off_is_not_for_anyone_outside_people(monkeypatch: pytest.MonkeyPatch, session: Session) -> None:
     monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
     assert outside_mode.for_turn(session) == outside_mode.OUTSIDERS
 
 
-def test_a_teammates_turn_is_not_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_level_belongs_to_whoever_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A teammate's turn runs at their level like the owner's, and a shared
+    chat someone else wrote in follows that person's level too."""
     owner = people_store.upsert_person(full_name="Olivia Owner", is_principal=True, email=OWNER)
     mate = people_store.upsert_person(full_name="Ben Teammate", email="ben@co.example")
     people_registry.invalidate()
     monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
-    assert outside_mode.for_turn(Session(from_web_chat=True, caller_person_id=mate)) == outside_mode.OUTSIDERS
+    assert outside_mode.for_turn(Session(from_web_chat=True, caller_person_id=mate)) == outside_mode.TRUST
     assert outside_mode.for_turn(Session(session_id="email:t", caller_person_id=owner)) == outside_mode.TRUST
+    assert outside_mode.for_turn(Session(shared_chat=True, others_spoke_last=True)) == outside_mode.TRUST
+
+
+def test_a_shared_chat_follows_the_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    assert levels.decide(levels.SHARED, mode=outside_mode.TRUST) == levels.RUN
 
 
 def test_an_error_deciding_is_a_card(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,6 +136,51 @@ def test_a_step_that_cant_be_carried_out_is_told_not_dropped() -> None:
     assert "run_script" in out["error"] and "can't wait on a card" in out["error"]
     assert levels.carriable("google_workspace__send_gmail_message", mcp=True)
     assert not levels.carriable("not_a_tool", mcp=False)
+    # A step only the turn reads is never put on a card, whatever it is.
+    for tool in ("run_python_job", "read_document", "find_in_app", "list_saved_tools"):
+        assert tool in levels.TURN_OWN and not levels.carriable(tool, mcp=False)
+
+
+_SPEAKERS_OWN: dict[str, dict[str, Any]] = {
+    "keep_figure": {"subject": "Pine View net to owner", "figure": "$330,241", "source": "DCA statement"},
+    "remember_fact": {"fact": "We close the books on Fridays"},
+    "forget_fact": {"fact_id": 1},
+    "update_company_profile": {"field": "industry", "value": "Logistics"},
+    "cancel_followup": {"action_id": 1},
+    "move_followup": {"action_id": 1, "run_at": "2030-01-01T10:00:00Z"},
+    "leave_out_of_brief": {"item": "the weekly numbers"},
+    "mark_draft_sent": {"draft_id": 1},
+    "record_decision_outcome": {"decision_id": 1, "outcome": "It worked"},
+    "answer_card": {"card_id": 1, "action": "approve"},
+    "do_in_app": {"app": "Notes", "action": "open"},
+}
+
+
+@pytest.mark.parametrize("tool", sorted(_SPEAKERS_OWN))
+async def test_a_step_only_its_speaker_can_do_never_goes_on_a_card(tool: str) -> None:
+    # A tap carries a step out with nobody speaking, and each of these checks
+    # who is speaking: approved from a card, it was turned down every time
+    # (a "Keep figure" card that failed on Do it). So it is the turn's own.
+    from openexecutive.orchestrator import take_the_lead
+    from openexecutive.orchestrator.take_the_lead import result_failed
+
+    assert tool in levels.TURN_OWN and not levels.carriable(tool, mcp=False)
+    out = await take_the_lead.carry_out({"tool": tool, "input": _SPEAKERS_OWN[tool], "held": True}, by_principal=True)
+    assert result_failed(out) or '"refused"' in out
+
+
+def test_an_app_link_is_for_the_turn_that_asked() -> None:
+    # It checks no one, so a card would "succeed" and the link reach nobody.
+    assert "open_in_app" in levels.TURN_OWN and not levels.carriable("open_in_app", mcp=False)
+
+
+def test_a_look_up_or_a_card_is_never_put_on_a_card() -> None:
+    # Its answer is for the turn that asked, gone by the time anyone taps.
+    assert not levels.carriable("google_workspace__search_gmail_messages", mcp=True)
+    assert not levels.carriable("google_workspace__get_drive_file_content", mcp=True)
+    assert levels.carriable("google_workspace__update_drive_file", mcp=True)
+    # Approving a card that makes a card would only make a note to oneself.
+    assert not levels.carriable("create_alert", mcp=False)
 
 
 def test_hold_returns_the_card_and_the_chip_carries_it(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,26 +240,12 @@ def test_a_skill_that_runs_more_steps_is_not_relaxed_by_its_tap() -> None:
     assert {"run_workflow", "run_executive_research"} <= levels.NOT_RELAXED_SKILLS
 
 
-def test_the_owners_own_ai_app_follows_their_level(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Another AI app the owner is signed in to and allowed to act is them:
-    Hands-off runs what it asks, like the web app. Any other stays a card."""
-    from openexecutive.orchestrator import people_tools
-    from openexecutive.orchestrator.schedule_tools import current_session
-
+@pytest.mark.parametrize("person_id", [1, 2])
+def test_an_ai_app_follows_the_signed_in_persons_level(monkeypatch: pytest.MonkeyPatch, person_id: int) -> None:
+    """Another AI app is the person signed in to it, the owner or a teammate:
+    the company's level, as in the web app. Nothing is noticed for the app."""
     monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
-    monkeypatch.setattr(people_tools, "is_principal_on_verified_surface", lambda _s: True)
-    own = Session(from_mcp_client=True, mcp_client_may_act=True, caller_person_id=1)
-    assert outside_mode.for_turn(own) == outside_mode.TRUST
-    token = current_session.set(own)
-    try:
-        assert levels.decide(levels.AI_APP, mode=outside_mode.TRUST) == levels.RUN
-        assert levels.decide(levels.AI_APP, mode=outside_mode.OUTSIDERS) == levels.CARD
-    finally:
-        current_session.reset(token)
-    read_only = Session(from_mcp_client=True, caller_person_id=1)
-    assert outside_mode.for_turn(read_only) == outside_mode.OUTSIDERS
-    monkeypatch.setattr(people_tools, "is_principal_on_verified_surface", lambda _s: False)
-    assert outside_mode.for_turn(own) == outside_mode.OUTSIDERS
+    assert outside_mode.for_turn(Session(from_mcp_client=True, caller_person_id=person_id)) == outside_mode.TRUST
 
 
 def test_hold_many_is_one_card_for_them_all(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,6 +266,20 @@ def test_hold_many_is_one_card_for_them_all(monkeypatch: pytest.MonkeyPatch) -> 
     assert seen == {"input": steps[0], "more": steps[1:]}
 
 
+def test_an_outside_read_the_check_did_not_flag_is_said_as_it_is() -> None:
+    from openexecutive.orchestrator import outside_content
+
+    state = outside_content.begin_turn(Session(), user_message="answer Dana")
+    try:
+        assert levels.outside_reason() == levels.OUTSIDE_READ
+        assert "instructions" not in levels._WHY[levels.OUTSIDE_READ]
+        # A flagged email counts too, whoever's mail it was.
+        state.flags.append((outside_content.MAIL, ("forward_or_share",), ""))
+        assert levels.outside_reason() == levels.OUTSIDE
+    finally:
+        outside_content.end_turn(state)
+
+
 def test_the_card_says_when_a_mail_read_was_flagged() -> None:
     from openexecutive.orchestrator import outside_content
 
@@ -240,3 +291,48 @@ def test_the_card_says_when_a_mail_read_was_flagged() -> None:
         assert "instructions" in levels._WHY[levels.MAIL_FLAGGED]
     finally:
         outside_content.end_turn(state)
+
+
+def test_a_held_browser_step_never_keeps_the_page_the_model_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import department_gate, extensions
+
+    seen: list[dict[str, Any]] = []
+
+    def fake_hold(requester: Any, tool: str, tool_input: dict[str, Any], verdict: Any, **kw: Any) -> int:
+        seen.append(tool_input)
+        return 7
+
+    monkeypatch.setattr(department_gate, "hold", fake_hold)
+    monkeypatch.setattr(extensions, "card_handler", lambda tool: (lambda _i: None) if tool == "browser_click" else None)
+    step = {"ref": 4, "_at": "https://bank.example/", "_element": 'button "Pay"', "_own": True}
+    with set_session(Session(from_web_chat=True)):
+        # Held by Approvals before the tool ran: those keys are the model's.
+        levels.hold("browser_click", dict(step), mcp=False, reason=levels.OUTSIDE)
+        # Held by the tool itself on an email or chat site: they are its own.
+        levels.hold("browser_click", dict(step), mcp=False, reason=levels.SEND_SITE)
+        # Another tool's keys are left as they are.
+        levels.hold("message_person", {"_x": 1}, mcp=False, reason=levels.OUTSIDE)
+    assert seen == [{"ref": 4}, step, {"_x": 1}]
+
+
+def test_a_card_someone_else_approves_says_whose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A contact's or an unattended run's step waits on someone who isn't in
+    the conversation: the model is told whose OK it waits on, never to say
+    "your tap" to a person with no card."""
+    from openexecutive.memory import decision_ledger
+    from openexecutive.orchestrator import speaker as speaker_mod
+
+    owner = people_store.upsert_person(full_name="Olivia Owner", is_principal=True, email="olivia@example.com")
+    people_registry.invalidate()
+    card = decision_ledger.create_decision_instance(
+        decision_class="take_the_lead", department="", originating_session_id=None, proposed_payload={},
+        idempotency_key=None, gate_mode="propose", approver_person_id=owner, confidence=None,
+    )
+
+    monkeypatch.setattr(speaker_mod, "speaker", lambda session=None: None)
+    message = json.loads(levels.waiting_result(card, "it's new"))["message"]
+    assert "for Olivia Owner" in message and "waiting on Olivia Owner's OK" in message
+
+    monkeypatch.setattr(speaker_mod, "speaker", lambda session=None: SimpleNamespace(id=owner))
+    message = json.loads(levels.waiting_result(card, "it's new"))["message"]
+    assert "for them (in this chat" in message and "waiting for their tap" in message

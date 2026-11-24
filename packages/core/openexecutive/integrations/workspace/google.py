@@ -14,6 +14,7 @@ Actual tool names (confirmed via tools/list on the live MCP server):
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -283,6 +284,9 @@ class GoogleMail:
         body: str,
         thread_id: str | None = None,
         html: bool = False,
+        cc: list[str] | None = None,
+        attachments: list[tuple[str, str, bytes]] | None = None,
+        bcc: list[str] | None = None,
     ) -> dict[str, Any]:
         arguments: dict[str, Any] = {
             "user_google_email": mailbox,
@@ -290,6 +294,16 @@ class GoogleMail:
             "subject": subject,
             "body": body,
         }
+        if cc:
+            arguments["cc"] = ", ".join(cc)
+        if bcc:
+            arguments["bcc"] = ", ".join(bcc)
+        if attachments:
+            # workspace-mcp's own attachment shape.
+            arguments["attachments"] = [
+                {"content": base64.b64encode(data).decode("ascii"), "filename": name, "mime_type": mime}
+                for name, mime, data in attachments
+            ]
         if html:
             arguments["body_format"] = "html"
         if thread_id:

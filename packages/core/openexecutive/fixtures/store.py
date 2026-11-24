@@ -19,12 +19,11 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from openexecutive.utils import db
 
 DB_PATH = Path(os.environ.get("EPISODIC_DB_PATH", "./episodic_memory.db"))
 
@@ -39,15 +38,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path)
 
 
 def initialize_db(db_path: Path | None = None) -> None:

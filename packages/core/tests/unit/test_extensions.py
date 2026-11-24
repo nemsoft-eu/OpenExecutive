@@ -327,12 +327,10 @@ def test_only_a_tool_registered_for_it_is_asked_on_a_turn_with_no_known_caller()
     assert json.loads(_results(provider, 1)["tu-1"])["status"] == "made"
     _, _, offered = _run(_session(caller_person_id=None), [])
     assert "open_tool" not in offered[0]
-    # Still never on an unattended, private, AI-app or replay turn.
+    # Still never on an unattended, private or replay turn.
     for kwargs in (
         {"unattended": True},
         {"private_to_principal": True},
-        {"from_mcp_client": True},
-        {"from_mcp_client": True, "mcp_client_may_act": True},
         {"replay": True},
     ):
         _, _, offered = _run(_session(caller_person_id=None, origin_channel="kiosk", **kwargs), [])
@@ -349,6 +347,41 @@ def test_a_tool_can_keep_its_dispatch_row_private_and_name_its_activity() -> Non
     assert extensions.activity_label("make_widget") == "Making a widget…"
     assert extensions.activity_label("open_widget") is None
     assert "Making a widget" in str(summarize_activity([{"id": "tu-1", "name": "make_widget", "input": {}}]))
+
+
+def test_a_tool_can_say_what_each_call_does_in_plain_words() -> None:
+    from openexecutive.orchestrator.activity_labels import summarize_activity
+    from openexecutive.workflows.action_step import progress_line
+
+    def describe(arguments: dict[str, Any]) -> str | None:
+        if arguments.get("boom"):
+            raise RuntimeError("boom")
+        return arguments.get("doing")
+
+    extensions.register_tool(_tool(activity_label="Making a widget…", describe=describe))
+    said = {"doing": "Making the blue widget for Dana"}
+    assert extensions.activity_label("make_widget", said) == "Making the blue widget for Dana…"
+    # Nothing said, or a describe that fails: the registered line.
+    assert extensions.activity_label("make_widget", {}) == "Making a widget…"
+    assert extensions.activity_label("make_widget", {"boom": True}) == "Making a widget…"
+    # The model's words: one plain line, no direction marks, an activity's length.
+    odd = extensions.activity_label("make_widget", {"doing": "Making \u202eevil\u202c widgets " + "x" * 100})
+    assert odd is not None and "\u202e" not in odd and len(odd) == 60 and odd.endswith("…")
+    assert "Making the blue widget for Dana" in str(
+        summarize_activity([{"id": "tu-1", "name": "make_widget", "input": said}])
+    )
+    # A workflow's progress line says the same.
+    assert progress_line("oe__make_widget", said) == "Making the blue widget for Dana…"
+    assert progress_line("oe__make_widget", {"boom": True}) != ""
+
+
+def test_a_runs_report_names_the_tool_and_counts_repeats() -> None:
+    """The model's words go to the live line only: the report keeps the
+    tool's plain name, so repeats still collapse to one line."""
+    from openexecutive.workflows.action_step import _format_output
+
+    report = _format_output("Sent.", [("oe__make_widget", "ok"), ("oe__make_widget", "ok")])
+    assert "- Make widget — ok (×2)" in report
 
 
 def test_a_failing_offered_counts_as_not_offered() -> None:

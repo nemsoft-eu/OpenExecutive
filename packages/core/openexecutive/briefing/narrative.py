@@ -655,8 +655,10 @@ def render_briefing_context(
             parts.append("")
         if handled:
             parts.append("HANDLED OVERNIGHT BY THE EXECUTIVE (already done — report, don't ask):")
+            from openexecutive.briefing.brief_state import handled_line
+
             for h in handled[:15]:
-                parts.append(f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: {str(h.get('summary', ''))[:140]}")
+                parts.append(handled_line(h))
             parts.append("")
         if pending_watch_suggestions > 0:
             n = pending_watch_suggestions
@@ -861,9 +863,11 @@ async def synthesize_briefing_narrative(
     # the render below (which would otherwise read them itself) stays sync.
     standing_facts: str | None = None
     if rendered_context is None:
-        from openexecutive.memory.facts import render_facts_for_prompt
+        from openexecutive.memory.facts import brief_reader, render_facts_for_prompt
 
-        standing_facts = await asyncio.to_thread(render_facts_for_prompt)
+        # The principal's private decisions only in a brief that goes to
+        # them alone.
+        standing_facts = await asyncio.to_thread(render_facts_for_prompt, reader=brief_reader())
     # `rendered_context` lets a caller hand in the exact block it already
     # rendered. The /today header path does, because it hashes that string as
     # its cache key — re-rendering here could quietly drift from what was

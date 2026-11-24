@@ -216,7 +216,7 @@ def test_newest_tool_result_is_marked_and_is_the_last_block() -> None:
 
 
 def test_marker_moves_instead_of_accumulating() -> None:
-    """The regression that blows the 4-breakpoint limit at max_iterations=15."""
+    """The regression that blows the 4-breakpoint limit on a long turn."""
     provider = _scripted_three_iterations()
     _run_loop(provider)
 
@@ -359,7 +359,7 @@ def test_marker_falls_back_when_the_newest_results_are_empty() -> None:
     Losing it re-sends the whole accumulated transcript at full price for
     that step, which is the exact cost this feature exists to remove.
     """
-    from openexecutive.orchestrator.executive import _apply_loop_cache_marker
+    from openexecutive.orchestrator.reading import apply_loop_cache_marker
 
     messages: list[dict[str, Any]] = [
         {
@@ -374,7 +374,7 @@ def test_marker_falls_back_when_the_newest_results_are_empty() -> None:
             "content": [{"type": "tool_result", "tool_use_id": "t2", "content": ""}],
         },
     ]
-    _apply_loop_cache_marker(messages)
+    apply_loop_cache_marker(messages)
 
     marked = [
         b
@@ -392,7 +392,7 @@ def test_non_string_tool_result_content_is_still_markable() -> None:
     able to carry the breakpoint — the cap deliberately passes non-str
     results through untouched, and dropping the marker for them would
     silently lose the cache hit for that whole iteration."""
-    from openexecutive.orchestrator.executive import _apply_loop_cache_marker
+    from openexecutive.orchestrator.reading import apply_loop_cache_marker
 
     messages: list[dict[str, Any]] = [
         {
@@ -406,7 +406,7 @@ def test_non_string_tool_result_content_is_still_markable() -> None:
             ],
         }
     ]
-    _apply_loop_cache_marker(messages)
+    apply_loop_cache_marker(messages)
     assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 

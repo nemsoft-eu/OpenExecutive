@@ -30,18 +30,22 @@ level tells the person what was flagged. Like ``delegation.injection_check``
 generalizes), it is one layer on top of the plain-code rules, never instead
 of them: mail still goes only to People, and so on.
 
-Unchecked is not clean. A failed call, an answer it can't read, content too
-long to read whole (``MAX_CHARS``; an attachment's files are bounded apart,
-``MAX_MEDIA_BLOCKS`` / ``MAX_MEDIA_CHARS``), or a turn past its budget of checks
+Long text is read in pieces of ``MAX_CHARS`` (``_scan_in_pieces``), all of
+it, so a long document is checked like a short one.
+
+Unchecked is not clean. A failed call, an answer it can't read, an
+attachment's files past their bounds (``MAX_MEDIA_BLOCKS`` /
+``MAX_MEDIA_CHARS``), or a turn past its budget of checks
 (``MAX_PER_TURN``, kept by the caller) is ``unchecked``: it holds nothing
 below Careful, and its result reaches the model behind a notice that it is
-data. Content too big to read whole, or read past the turn's budget
-(``TOO_BIG``), is the exception, since padding or a pile of harmless reads is
+data. Files too big to read whole, or reads past the turn's budget
+(``TOO_BIG``), are the exception, since padding or a pile of harmless reads is
 how content would dodge the check: Balanced holds it like a flag. The same content is checked once per process (``_CACHE``, by
 hash). Plain code around one model call; never raises.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -66,8 +70,13 @@ CATEGORIES: dict[str, str] = {
     "other": "tried to give me instructions",
 }
 
-# Text past this is not read, so the item counts as unchecked.
+# One check reads at most this much text; longer text is read in pieces
+# this size (``_scan_in_pieces``), each overlapping the last by
+# ``_PIECE_OVERLAP`` so words split at a seam are read whole once, at most
+# ``_PIECES_AT_ONCE`` at a time.
 MAX_CHARS = 60_000
+_PIECE_OVERLAP = 2_000
+_PIECES_AT_ONCE = 4
 EVIDENCE_CHARS = 160
 
 # Notes a connected Google app adds to its own results, telling the
@@ -109,7 +118,8 @@ def without_server_notes(content: Any) -> Any:
 # bounded apart from its text: past either, the item counts as unchecked.
 MAX_MEDIA_BLOCKS = 5
 MAX_MEDIA_CHARS = 8_000_000
-# Checks one turn may make; past it, a read holds like one too big to check.
+# Reads one turn may check, besides the pieces of long ones; past what a
+# turn may check (``checks_a_turn``), a read holds like one too big to check.
 MAX_PER_TURN = 30
 _MAX_TOKENS = 200
 _CACHE_SIZE = 2000
@@ -423,6 +433,8 @@ async def _scan(content: Any, *, model: str | None, entries: int) -> Verdict:
         content = checked_content(content)
         if content is None or (isinstance(content, str) and not content.strip()):
             return CLEAN
+        if isinstance(content, str) and len(content) > MAX_CHARS:
+            return await _scan_in_pieces(content, model=model, entries=entries)
         if _too_big(content):
             return TOO_BIG
         key = _key(content) + (f":{entries}" if entries else "")
@@ -472,6 +484,71 @@ async def _scan(content: Any, *, model: str | None, entries: int) -> Verdict:
     if verdict is None:
         return UNCHECKED
     return _remember(key, verdict)
+
+
+def _most_a_turn_reads() -> int:
+    """The most text one turn can read, on the largest window this
+    deployment runs (a Claude model, or a local one that holds more): parts
+    come from the start, so nothing past this reaches the model in a turn."""
+    from openexecutive.config import get_settings
+    from openexecutive.providers.feature_gate import CLAUDE_CONTEXT_TOKENS, reading_limits
+
+    local = int(getattr(get_settings(), "local_context_tokens", 0) or 0)
+    return reading_limits(max(CLAUDE_CONTEXT_TOKENS, local)).per_turn
+
+
+def _pieces(text: str) -> list[str]:
+    """``text`` as ``_scan_in_pieces`` reads it: as much as a turn can read,
+    in overlapping pieces of ``MAX_CHARS``."""
+    text = text[: _most_a_turn_reads()]
+    if len(text) <= MAX_CHARS:
+        return [text]
+    step = MAX_CHARS - _PIECE_OVERLAP
+    return [text[i : i + MAX_CHARS] for i in range(0, len(text) - _PIECE_OVERLAP, step)]
+
+
+def checks_for(content: Any) -> int:
+    """How many checks reading ``content`` makes: one, or a long text's
+    pieces. Counted against ``checks_a_turn`` by the caller."""
+    content = checked_content(content)
+    if isinstance(content, str) and len(content) > MAX_CHARS:
+        return len(_pieces(content))
+    return 1
+
+
+def checks_a_turn() -> int:
+    """The checks one turn may make: ``MAX_PER_TURN`` reads, and the pieces
+    of as much long text as a turn can read."""
+    step = MAX_CHARS - _PIECE_OVERLAP
+    return MAX_PER_TURN + -(-_most_a_turn_reads() // step)
+
+
+async def _scan_in_pieces(text: str, *, model: str | None, entries: int) -> Verdict:
+    """Check long text a piece at a time, as much of it as a turn can read
+    (``_most_a_turn_reads``). A flag in any piece flags the whole (its
+    categories and entries together); otherwise a piece that holds
+    (``TOO_BIG``) or couldn't be checked makes the whole so; else clean."""
+    pieces = _pieces(text)
+    at_once = asyncio.Semaphore(_PIECES_AT_ONCE)
+
+    async def _one(piece: str) -> Verdict:
+        async with at_once:
+            return await _scan(piece, model=model, entries=entries)
+
+    verdicts = await asyncio.gather(*(_one(piece) for piece in pieces))
+    flagged = [v for v in verdicts if v.flagged]
+    if flagged:
+        return Verdict(
+            flagged=True,
+            categories=tuple(dict.fromkeys(c for v in flagged for c in v.categories)),
+            items=tuple(sorted({i for v in flagged for i in v.items})),
+            evidence=flagged[0].evidence,
+        )
+    if any(v.too_big for v in verdicts):
+        return TOO_BIG
+    if any(v.unchecked for v in verdicts):
+        return UNCHECKED
+    return CLEAN
 
 
 def reset() -> None:

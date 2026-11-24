@@ -24,13 +24,12 @@ from openexecutive.orchestrator.content_trust import PRINCIPAL_ONLY_TOOLS, princ
 from openexecutive.orchestrator.schedule_tools import (
     current_session,
     host_turn,
-    mcp_rules_turn,
     read_only_turn,
 )
 from openexecutive.orchestrator.session import Session
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
-from tests.unit.test_mcp_client_turns import _gateway, _results, _run_loop
+from tests.unit.test_read_only_turns import _gateway, _results, _run_loop
 
 OWNER_EMAIL = "olivia@co.example"
 
@@ -71,7 +70,7 @@ def _web_turn(person_id: int, *, host: bool) -> Session:
 
 
 # What a host turn is offered, besides the specialists and the gateway's
-# search_tools / call_tool (reads only, MCP_CLIENT_MCP_TOOLS): a new tool
+# search_tools / call_tool (reads only, READ_ONLY_MCP_TOOLS): a new tool
 # that acts must be withheld from it, not slip in.
 HOST_TURN_SKILL_TOOLS = {
     "ask_about_person", "find_alerts", "get_artifact", "list_artifacts",
@@ -83,7 +82,7 @@ HOST_TURN_SKILL_TOOLS = {
 
 def test_a_host_turn_is_read_only() -> None:
     turn = Session(from_web_chat=True, from_host=True)
-    assert host_turn(turn) and read_only_turn(turn) and mcp_rules_turn(turn)
+    assert host_turn(turn) and read_only_turn(turn)
     own = Session(from_web_chat=True)
     assert not host_turn(own) and not read_only_turn(own)
 

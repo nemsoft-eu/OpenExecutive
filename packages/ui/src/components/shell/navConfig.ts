@@ -171,15 +171,21 @@ const WORK_TABS: NavItem[] = [
   },
   {
     href: "/artifacts",
-    label: "Documents",
+    label: "Made for you",
     icon: "book",
-    description: "Your library of finished documents — drafts and workflow outputs.",
+    description: "What your Executive made for you — documents, drafts and workflow outputs.",
   },
   {
     href: "/watchlist",
     label: "Watch list",
     icon: "eye",
     description: "External monitors — tickers, feeds, status pages — that raise alerts.",
+  },
+  {
+    href: "/schedule",
+    label: "Schedule",
+    icon: "calendar",
+    description: "Everything it does without being asked, soonest first.",
   },
 ];
 
@@ -216,7 +222,7 @@ export function buildHubs({
     key: "work",
     label: "Work",
     icon: "briefcase",
-    description: "Tasks, workflows, finished documents and the watch list.",
+    description: "Tasks, workflows, what it made for you, the watch list and the schedule.",
     tabs: WORK_TABS,
   };
   const people: Hub =
@@ -300,7 +306,7 @@ export function buildDestinations({
       icon: "book",
       badge: reviewBadge,
       description:
-        "Upload company documents so the Executive can ground its answers in your context, and approve what it relies on.",
+        "Your company files, so the Executive can ground its answers in your context, and approve what it relies on.",
     },
     { key: "pulse", ...PULSE_NAV_ITEM },
   ];
@@ -446,6 +452,7 @@ export type SettingsPageId =
   | "executive"
   | "notifications"
   | "memory"
+  | "browser"
   | "workspace"
   | "advanced"
   | "about";
@@ -503,6 +510,15 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
     icon: "user",
     description: "Whether it keeps notes of what you say, what you share with the team, and how long notes last.",
     hashes: ["memory"],
+  },
+  {
+    id: "browser",
+    group: "you",
+    label: "Browser",
+    href: "/settings/browser",
+    icon: "globe",
+    description: "Add the Open Executive extension so your Executive can use websites for you.",
+    hashes: ["browser"],
   },
   {
     id: "workspace",

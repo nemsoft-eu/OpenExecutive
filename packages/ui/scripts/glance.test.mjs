@@ -12,7 +12,6 @@ import {
   scheduledWorkflows,
   tasksText,
   watching,
-  watchingText,
 } from "../src/lib/glance.ts";
 
 const NOW = new Date("2026-10-25T12:00:00Z");
@@ -86,7 +85,4 @@ test("each item on Home's bottom line reads on its own", () => {
   assert.equal(departmentsText(3, 2, false), "2 departments need attention");
   assert.equal(peopleText(4, 1), "1 person to follow up");
   assert.equal(peopleText(4, 0), "4 people, all clear");
-  assert.equal(watchingText(6, 0), "Watching 6 things");
-  assert.equal(watchingText(6, 2), "Watching 6 things, 2 new signals");
-  assert.equal(watchingText(0, 1), "1 new signal");
 });

@@ -67,15 +67,25 @@ class ReplyCard:
     # What happened on the card since the draft was written, in order
     # (delegation.answers.conversation): newer email in the conversation,
     # what they asked to change, and what the Executive said it did.
-    conversation: list[dict[str, str]] = field(default_factory=list)
+    conversation: list[dict[str, Any]] = field(default_factory=list)
     # When it was last brought up to date with newer mail ("" never): Send
     # passes it back, so a version the card never showed asks again.
     caught_up_at: str = ""
     # The Executive is doing what the email asks right now
     # (delegation.card_work); the card shows it working.
     working: bool = False
+    # While it works: the steps it did so far, and what it is doing now.
+    work_steps: list[str] = field(default_factory=list)
+    work_now: str = ""
     # The files the reply carries, by name (delegation.card_work).
     files: list[str] = field(default_factory=list)
+    # Who it goes from (delegation.send_from): the Executive, from its own
+    # mailbox with the person on cc, or the person (False).
+    from_executive: bool = False
+    # The Executive's name, for the card's From choice.
+    executive_name: str = ""
+    # Undo can take back the last change they asked for (card_drafts.undo).
+    can_undo: bool = False
 
 
 def _strings(value: Any) -> list[str]:
@@ -84,9 +94,9 @@ def _strings(value: Any) -> list[str]:
 
 def cards(person: Any) -> list[ReplyCard]:
     """``person``'s open reply cards, newest first."""
-    from openexecutive.delegation import card_work, training
-    from openexecutive.delegation.answers import CAUGHT_UP_KEY, conversation, questions_for
-    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
+    from openexecutive.delegation import card_drafts, card_work, send_from, training
+    from openexecutive.delegation.answers import conversation, questions_for
+    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED, version
     from openexecutive.delegation.gmail import credential_provider, mailbox_link
     from openexecutive.delegation.handle_it import REASONS
     from openexecutive.delegation.inbox import REPLY_OTHERS, card_payload, ledger_flags, open_cards
@@ -101,6 +111,7 @@ def cards(person: Any) -> list[ReplyCard]:
     for card, payload in payloads:
         thread_id = str(payload.get("thread_id") or "")
         draft_id = str(payload.get("draft_id") or "")
+        working = payload.get(card_work.WORK_KEY) == card_work.WORKING and card_work.running(card.id)
         flags = list(dict.fromkeys([
             *_strings(payload.get("flags")), *added.get(str(payload.get("message_id") or ""), []),
         ]))
@@ -136,12 +147,17 @@ def cards(person: Any) -> list[ReplyCard]:
             reply_others=[] if payload.get("source") == "follow_up" else _strings(payload.get(REPLY_OTHERS)),
             gist=str(payload.get("gist") or ""),
             conversation=conversation(payload),
-            caught_up_at=str(payload.get(CAUGHT_UP_KEY) or ""),
-            working=payload.get(card_work.WORK_KEY) == card_work.WORKING and card_work.running(card.id),
+            caught_up_at=version(payload),
+            working=working,
+            work_steps=card_work.steps(payload) if working else [],
+            work_now=str(payload.get(card_work.NOW_KEY) or "") if working else "",
             files=[
                 str(f.get("name") or "") for f in payload.get(card_work.FILES_KEY) or []
                 if isinstance(f, dict) and f.get("name")
             ],
+            from_executive=send_from.is_from_executive(payload),
+            executive_name=send_from.executive_name(),
+            can_undo=card_drafts.can_undo(payload),
         ))
     return out
 

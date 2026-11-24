@@ -591,7 +591,7 @@ def test_progress_says_what_a_tool_is_doing_in_plain_words() -> None:
     from openexecutive.workflows.action_step import progress_line
 
     assert progress_line("google_workspace__search_gmail_messages", {"query": "invoice"}) == (
-        'Searching my inbox for "invoice"…'
+        'Searching my email for "invoice"…'
     )
     assert progress_line("oe__send_telegram_message", {"text": "hi"}) == "Sending a Telegram message…"
     assert progress_line("hubspot__create_contact", {"name": "Ada"}) == "Creating contact: Ada · Hubspot…"
@@ -602,3 +602,54 @@ def test_progress_says_what_a_tool_is_doing_in_plain_words() -> None:
     assert long.startswith("Creating contact: Ada") and long.endswith("… · Hubspot…") and len(long) <= 81
     for line in (progress_line("acme__get_x", None), progress_line("oe__whatever_tool", {})):
         assert "__" not in line and line.endswith("…")
+
+
+async def test_reading_a_long_result_in_parts_leaves_turns_for_the_action(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    """Next parts run no tool, so they don't use up the step's turns: a step
+    allowed one call reads a long sheet to the end and still files the row."""
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    monkeypatch.setattr(act, "reading_limits_for", lambda _m="": ReadingLimits(per_read=2_000, per_turn=100_000))
+    gateway.replies[READ] = "r" * 9_000
+    parts = [_resp(_use(READ, {"range": "A:B"}, f"tu_{n}")) for n in range(6)]
+    provider = _ScriptedProvider([
+        *parts,
+        _resp(_use(APPEND, {"values": [["x"]]}, "tu_add")),
+        _resp(_text("Filed it.")),
+    ])
+    _install(monkeypatch, provider)
+
+    out = await _run(_step(max_tool_calls=2))
+
+    assert [c["name"] for c in gateway.calls] == [READ, APPEND]
+    assert "[LAST PART" in str(provider.calls[6]["messages"][-1]["content"])
+    assert out[-1][0] == "output"
+
+
+async def test_a_long_result_is_read_in_parts_without_running_again(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    """A step reads through the same shared reader as the Executive: a long
+    result comes in parts, and repeating the call brings the next part
+    without calling the tool again."""
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    monkeypatch.setattr(act, "reading_limits_for", lambda _m="": ReadingLimits(per_read=2_000, per_turn=100_000))
+    gateway.replies[READ] = "r" * 3_000
+    provider = _ScriptedProvider([
+        _resp(_use(READ, {"range": "A:B"}, "tu_1")),
+        _resp(_use(READ, {"range": "A:B"}, "tu_2")),
+        _resp(_text("Read it all.")),
+    ])
+    _install(monkeypatch, provider)
+
+    out = await _run(_step())
+
+    assert len(gateway.calls) == 1
+    first = provider.calls[1]["messages"][-1]["content"][0]["content"]
+    second = provider.calls[2]["messages"][-1]["content"][0]["content"]
+    assert "exactly the same input" in first and len(first) <= 2_000
+    assert "[LAST PART" in second
+    assert out[-1][0] == "output"

@@ -22,7 +22,12 @@ The model sees a few header lines and the sender's own new words (quoted
 replies stripped, at most 3000 characters), as data in a labelled block, and
 the person's own last email in the thread before it (``their_last_words``),
 so a reply to something they asked reads as one: "my week is open" answers
-their request for a call. It
+their request for a call. When the same sender has another email still
+waiting on the person (an open reply card, ``open_email``: its subject and
+words), the model also says whether this one continues it
+(``continues_open``): it sends what that one promised, adds to the same ask
+or corrects it. The inbox then puts it on that card rather than a new one,
+whatever subject or thread the mailbox filed it under. It
 has no tools but this one, no company context and no memory, so the email can
 ask for anything and there is nothing here to do it with. The prompt is a
 constant, and short enough that it is not cached.
@@ -39,6 +44,8 @@ logger = logging.getLogger(__name__)
 MAX_BODY_CHARS = 3000
 # Of the person's own last email in the thread: enough for what they asked.
 MAX_EARLIER_CHARS = 1500
+# Of the sender's email still waiting on the person (``open_email``).
+MAX_OPEN_CHARS = 1500
 _MAX_TOKENS = 200
 # Attachment names shown in the email's header lines.
 _MAX_ATTACHMENT_NAMES = 5
@@ -119,6 +126,13 @@ you have any questions": they owe a short word back, that it arrived and \
 what happens next, and the deal or task waits on them. A plain thanks or \
 an "ok, will do" that delivers nothing needs no reply.
 
+<their_open_email>, when there is one, is an earlier email from the same \
+sender that is still waiting on this person. Set continues_open true when this \
+email is part of the same ask: it sends what that one said they would send \
+("I will send you last year's list", then an email with the list, even with \
+no words of its own), adds to it, corrects it, or chases it. False when it is \
+about something else. Without <their_open_email>, leave it out.
+
 When unsure, say needs_reply false."""
 
 _CLASSIFY_TOOL: dict[str, Any] = {
@@ -132,6 +146,7 @@ _CLASSIFY_TOOL: dict[str, Any] = {
             "asked_names": {"type": "array", "items": {"type": "string"}},
             "asked_of_them": {"type": "boolean"},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "continues_open": {"type": "boolean"},
         },
         "required": ["needs_reply", "kind", "asked_names", "asked_of_them", "confidence"],
     },
@@ -146,6 +161,9 @@ class Verdict:
     asked_of_them: bool = False
     # Who the email greets or asks by name, as the model read them.
     asked_names: tuple[str, ...] = ()
+    # It continues the sender's email still waiting on the person (only
+    # asked when there is one: ``open_email``).
+    continues_open: bool = False
 
 
 @dataclass(frozen=True)
@@ -223,16 +241,20 @@ def their_last_words(thread: Any, message: Any, own: set[str]) -> str:
 
 def render_email(
     message: Any, *, relation: str, addressed: Addressing | None = None, earlier: str = "",
-    max_body_chars: int = MAX_BODY_CHARS,
+    max_body_chars: int = MAX_BODY_CHARS, open_email: str = "",
 ) -> str:
-    """The user turn: a few header lines and the sender's own new words, as
+    """The user turn: a few header lines and the sender's own new words (and
+    any email they forwarded, ``readable_text``), as
     data in one ``<email>`` block, after the person's own ``earlier`` words
-    in a ``<their_last_email>`` block when they wrote any."""
+    in a ``<their_last_email>`` block when they wrote any, and the sender's
+    email still waiting on them (``open_email``) in ``<their_open_email>``."""
     from openexecutive.delegation.ghostwriter import one_line
-    from openexecutive.integrations.email_poller import sender_new_text
+    from openexecutive.integrations.email_poller import readable_text
     from openexecutive.utils.prompt_blocks import no_tags, scrub_block_line
 
-    body = sender_new_text(getattr(message, "text", "") or "")[:max_body_chars]
+    body = readable_text(
+        getattr(message, "text", "") or "", getattr(message, "subject", "") or "", max_chars=max_body_chars,
+    )
     others = len({*getattr(message, "to", []), *getattr(message, "cc", [])})
     header = [
         f"From: {one_line(getattr(message, 'from_name', '') or '', 80)} "
@@ -264,7 +286,22 @@ def render_email(
     if earlier.strip():
         theirs = no_tags("\n".join(scrub_block_line(line, "</their_last_email>") for line in earlier.splitlines()))
         turn = f"<their_last_email>\n{theirs.strip()}\n</their_last_email>\n\n{turn}"
+    if open_email.strip():
+        waiting = no_tags("\n".join(
+            scrub_block_line(line, "</their_open_email>") for line in open_email[:MAX_OPEN_CHARS].splitlines()
+        ))
+        turn = f"<their_open_email>\n{waiting.strip()}\n</their_open_email>\n\n{turn}"
     return turn
+
+
+def open_email_text(payload: dict[str, Any]) -> str:
+    """What ``render_email`` shows of an open reply card's email: its
+    subject, words and files."""
+    from openexecutive.delegation.ghostwriter import one_line
+
+    lines = [f"Subject: {one_line(str(payload.get('subject') or ''), 200)}"]
+    words = str(payload.get("they_wrote") or "").strip()
+    return "\n".join([*lines, "", words[:MAX_OPEN_CHARS]]) if words else lines[0]
 
 
 async def _call_model(model: str, turn: str) -> dict[str, Any]:
@@ -295,16 +332,17 @@ def classifier_model() -> str:
 
 async def classify(
     message: Any, *, relation: str, addressed: Addressing | None = None, earlier: str = "",
-    model: str | None = None,
+    model: str | None = None, open_email: str = "",
 ) -> Verdict | None:
     """The verdict on ``message``, or None when there is none to trust (the
     call failed or returned something malformed). ``earlier`` is the
-    person's own last email in the thread (``their_last_words``). Never
-    raises."""
+    person's own last email in the thread (``their_last_words``);
+    ``open_email`` the sender's email still waiting on them
+    (``open_email_text``). Never raises."""
     try:
         payload = await _call_model(
             model or classifier_model(),
-            render_email(message, relation=relation, addressed=addressed, earlier=earlier),
+            render_email(message, relation=relation, addressed=addressed, earlier=earlier, open_email=open_email),
         )
     except Exception:
         logger.warning("delegation.inbox: classifying an email failed", exc_info=True)
@@ -320,6 +358,7 @@ async def classify(
         needs_reply=needs_reply, kind=str(kind), confidence=max(0.0, min(1.0, float(confidence))),
         asked_of_them=payload.get("asked_of_them") is True,
         asked_names=_asked_names(payload.get("asked_names")),
+        continues_open=bool(open_email.strip()) and payload.get("continues_open") is True,
     )
 
 

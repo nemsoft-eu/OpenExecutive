@@ -67,9 +67,9 @@ search, with no notice (its results arrive encrypted inside the model's own
 response, so nothing can check them or go before them; ``mark``). A Gmail search's list of ids, a Gmail message
 Gmail authenticated as a teammate's, or a calendar read naming only the team
 is not even checked. Under Hands-off (``trust``), on the principal's own
-turn, nothing but mail from someone not in People marks it, and an attachment
-or synced excerpt the check flagged (the model read it before its check, so
-no notice could reach it first; Balanced holds it too). A flagged read is
+turn, nothing but mail from someone not in People marks it, and a read the
+check flagged drops the rest of the turn to Balanced (``_flag``), which holds
+it. A flagged read is
 remembered for the person at every level (``TurnOutside.flags``,
 ``pending_flags``: the web chat shows it only as the reason on a held step's
 card, since a flag that held nothing changes nothing the person sees), it
@@ -122,8 +122,8 @@ APP = "app"
 SENDER = "sender"
 # A read of one of the company's own Drive items (``vet_reads``).
 COMPANY = "company"
-# What the owner's own authenticated mail quotes or forwards: other people's
-# words, whoever passed them on (``integrations.email_poller._principal_email_text``).
+# What proven mail from someone on the team quotes or forwards: other people's
+# words, whoever passed them on (``integrations.email_poller._proven_email_text``).
 QUOTED = "quoted"
 # A read of the owner's own mailbox or notes (Act as me): checked like any
 # read (``check_mail_read``), but it decides the Act as me lockdown
@@ -134,11 +134,17 @@ MAIL = "mail"
 # keeps these after reading outside content because the person is the one
 # asking, but here the one asking is the sender.
 SENDER_WITHHELD_TOOLS: frozenset[str] = frozenset({
+    # The team's own activity feed (orchestrator/activity_tools.py).
+    "list_my_activity",
     "message_person",
     "send_discord_dm",
     "send_slack_dm",
     "send_telegram_message",
     "remove_watchlist_entry",
+    # A watch on the person's own inbox runs after their own mail was read
+    # (``lockdown.own_inbox_watch``); the sender may not set or change one.
+    "add_watchlist_entry",
+    "tune_watchlist_entry",
 })
 
 # The headings ``knowledge.retriever.retrieve`` puts over synced excerpts: a
@@ -280,7 +286,7 @@ class TurnOutside:
     # Reads waiting for their check (``mark_pending``, ``settle``): source and
     # content.
     pending: list[tuple[str, Any]] = field(default_factory=list)
-    # Checks made this turn (``content_scan.MAX_PER_TURN``).
+    # Checks made this turn, a long text's pieces each (``content_scan.checks_a_turn``).
     scans: int = 0
     # What the check flagged: source, categories and which item it was, in
     # words ("", or a mail's subject and sender) (``content_scan``, ``_flag``).
@@ -326,6 +332,10 @@ def begin_turn(
     state.mode = outside_mode.for_turn(session)
     if getattr(session, "sender_off_team", False) is True:
         state.sources.add(SENDER)
+        if getattr(session, "sender_gave_orders", False) is True:
+            # The mail being answered tries to give orders: flagged as a read
+            # the check flagged would be, so Balanced holds its replies too.
+            _flag(state, SENDER, ("ignore_rules",))
     # A file or a synced page carries whoever wrote it, not the speaker: it is
     # checked like any other read (``mark_pending``), so Careful holds the
     # turn at once and Balanced once the check flags it.
@@ -565,6 +575,7 @@ _SOURCE_WORDS: dict[str, str] = {
     SYNCED: "A synced document",
     APP: "Something I read in a connected app",
     MAIL: "An email I read",
+    SENDER: "The email I'm answering",
 }
 
 # Put before a read's result under Hands-off when the check couldn't read it:
@@ -598,12 +609,25 @@ _LEFT_OUT = "(left out)"
 
 def _flag(
     state: TurnOutside, source: str, categories: tuple[str, ...], what: str = "", evidence: str = "",
+    *, read: bool = True,
 ) -> None:
     """Remember a flag for the person (``pending_flags``) and log it, with
-    which item it was, so the person can find and check it."""
+    which item it was, so the person can find and check it.
+
+    Hands-off is for the person's own words (``outside_mode.for_turn``): a
+    flagged read is someone else's words trying to steer the turn, so from
+    here to the end of the turn it runs at Balanced, as a turn whose words
+    may be someone else's does. The next message starts at its own level.
+    Reads checked before the flag keep what Hands-off made of them; the
+    flagged read itself marks the turn, so its writes still wait. ``read``:
+    the flagged words reach the model; a mail-list entry taken out before it
+    reads them (``check_mail_read``) is flagged but drops nothing."""
     from openexecutive.audit import log_event
+    from openexecutive.orchestrator import outside_mode
     from openexecutive.orchestrator.content_scan import describe
 
+    if read and state.mode == outside_mode.TRUST:
+        state.mode = outside_mode.OUTSIDERS
     state.flags.append((source, categories, what))
     log_event(
         "content_flagged",
@@ -675,11 +699,12 @@ def mark_pending(source: str, content: Any) -> None:
 async def _check(state: TurnOutside, content: Any) -> Any:
     from openexecutive.orchestrator import content_scan
 
-    if state.scans >= content_scan.MAX_PER_TURN:
+    cost = content_scan.checks_for(content)
+    if state.scans + cost > content_scan.checks_a_turn():
         # Past the budget a read goes unchecked, and it holds like content
         # too big to check: otherwise the read after the budget is a way past.
         return content_scan.TOO_BIG
-    state.scans += 1
+    state.scans += cost
     return await content_scan.scan(content)
 
 
@@ -687,9 +712,10 @@ async def _check_list(state: TurnOutside, entries: list[Any]) -> Any:
     """``_check`` for a list of entries, in one call (``content_scan.scan_list``)."""
     from openexecutive.orchestrator import content_scan
 
-    if state.scans >= content_scan.MAX_PER_TURN:
+    cost = content_scan.checks_for("\n".join(content_scan._as_text(e) for e in entries))
+    if state.scans + cost > content_scan.checks_a_turn():
         return content_scan.TOO_BIG
-    state.scans += 1
+    state.scans += cost
     return await content_scan.scan_list(entries)
 
 
@@ -1120,7 +1146,7 @@ async def check_mail_read(pinned: Any, result: Any) -> tuple[Any, str]:
             for n in sorted(flagged):
                 _flag(
                     state, MAIL, tuple(verdict.categories), _mail_label(entries[n]),
-                    getattr(verdict, "evidence", ""),
+                    getattr(verdict, "evidence", ""), read=False,
                 )
             if state.mode == outside_mode.ASK:
                 pinned.mail_held = True
@@ -1441,15 +1467,15 @@ def is_own_onedrive_read(call_input: Any) -> bool:
 
 def outside_allows_mcp_call(call_input: Any) -> bool:
     """The gateway calls a turn that read outside content may still make:
-    the reads another AI app may make (``MCP_CLIENT_MCP_TOOLS``, the Google
+    the reads another AI app may make (``READ_ONLY_MCP_TOOLS``, the Google
     and Microsoft 365 reads) and a OneDrive file read. No write of any kind."""
     from openexecutive.orchestrator.schedule_tools import (
         is_onedrive_file_read,
-        mcp_client_allows_mcp_tool,
+        read_only_allows_mcp_tool,
     )
 
     named = call_input.get("name") if isinstance(call_input, dict) else None
-    return mcp_client_allows_mcp_tool(named) or is_onedrive_file_read(call_input)
+    return read_only_allows_mcp_tool(named) or is_onedrive_file_read(call_input)
 
 
 def answers_off_team_mail() -> bool:

@@ -26,12 +26,11 @@ one tick per run, chain the next.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,16 +47,13 @@ from openexecutive.knowledge.confluence_client import (
     ssl_verify,
 )
 from openexecutive.knowledge.confluence_storage import storage_to_markdown
-from openexecutive.knowledge.loader import ingest_text_sync
 from openexecutive.knowledge.notion_sync import infer_domain
 from openexecutive.knowledge.store import ChromaDBStore
-from openexecutive.memory.episodic import insert_scheduled_action
+from openexecutive.knowledge.sync_source import SyncSource
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_KIND = "confluence_sync_scan"
-HEARTBEAT_CHANNEL = "__internal__"
-HEARTBEAT_CHANNEL_REF = "confluence_sync"
 HEARTBEAT_INTENT = "Confluence space sync — incremental page ingest into isolated collection."
 
 _MAX_PAGE_CHARS = 200_000
@@ -84,37 +80,22 @@ def _docs_dir() -> Path:
     return path
 
 
-def load_state() -> dict[str, Any]:
-    path = _state_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    if not isinstance(data.get("pages"), dict):
-        data["pages"] = {}
-    return data
-
-
-def save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def reset_local_state(*, profile_path: Path | None = None) -> None:
-    """Drop the page records so the next tick re-ingests. Call it whenever
-    the Confluence collection is wiped (fixture load/reset, client-slot
-    rebuild), or leftover records skip every unchanged page as current."""
-    path = (
-        Path(profile_path).parent / "confluence_sync_state.json"
-        if profile_path is not None
-        else _state_path()
-    )
-    path.unlink(missing_ok=True)
+SOURCE = SyncSource(
+    "confluence",
+    noun="page",
+    id_field="confluence_page_id",
+    id_comment=_PAGE_ID_COMMENT,
+    collections=(ChromaDBStore.CONFLUENCE_COLLECTION,),
+    safe_id=sanitize_page_id,
+    state_path=lambda: _state_path(),
+    docs_dir=lambda: _docs_dir(),
+    heartbeat_intent=HEARTBEAT_INTENT,
+    lingering="pages removed or restricted stay indexed until reconciliation runs",
+)
+load_state = SOURCE.load_state
+save_state = SOURCE.save_state
+reset_local_state = SOURCE.reset_local_state
+purge_page = SOURCE.purge
 
 
 def _safe_title(title: str) -> str:
@@ -130,18 +111,6 @@ def _safe_title(title: str) -> str:
 def slugify(title: str, page_id: str) -> str:
     slug = _SLUG_RE.sub("-", title.lower()).strip("-")[:60] or "page"
     return f"confluence-{page_id}-{slug}.md"
-
-
-def _safe_filename(name: str) -> str | None:
-    candidate = Path(str(name)).name
-    if candidate.startswith("confluence-") and candidate.endswith(".md"):
-        return candidate
-    return None
-
-
-def _record(state: dict[str, Any], page_id: str) -> dict[str, Any]:
-    raw = state.get("pages", {}).get(page_id)
-    return raw if isinstance(raw, dict) else {}
 
 
 def _is_current(recorded: dict[str, Any], page: ConfluencePage) -> bool:
@@ -288,7 +257,7 @@ async def _fetch_tick(
         if page.id in restricted or page.id in undecided:
             continue
         fetch.visible_ids.add(page.id)
-        if _is_current(_record(state, page.id), page):
+        if _is_current(SOURCE.record(state, page.id), page):
             stats["skipped"] += 1
             continue
         dirty.append(page)
@@ -339,44 +308,6 @@ async def _fetch_tick(
 # ---------------------------------------------------------------------------
 
 
-def _build_file_index() -> dict[str, list[Path]]:
-    """Map each synced page id to its on-disk file(s), in one directory pass."""
-    index: dict[str, list[Path]] = {}
-    for path in _docs_dir().glob("confluence-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:2000]
-        except OSError:
-            continue
-        found = _PAGE_ID_COMMENT.search(head)
-        if found:
-            index.setdefault(found.group(1), []).append(path)
-    return index
-
-
-def purge_page(
-    page_id: str,
-    store: ChromaDBStore,
-    state: dict[str, Any] | None = None,
-    file_index: dict[str, list[Path]] | None = None,
-) -> bool:
-    """Remove one synced page's text file, chunks and state record."""
-    pid = sanitize_page_id(page_id)
-    if not pid:
-        logger.warning("confluence_sync: refuse to purge unsafe page id %r", page_id)
-        return False
-    pages = state.setdefault("pages", {}) if state is not None else {}
-    filename = _safe_filename(str(_record(state or {}, pid).get("filename") or ""))
-    store.delete_documents(ChromaDBStore.CONFLUENCE_COLLECTION, {"confluence_page_id": pid})
-    if filename:
-        (_docs_dir() / filename).unlink(missing_ok=True)
-    index = file_index if file_index is not None else _build_file_index()
-    for path in index.get(pid, []):
-        path.unlink(missing_ok=True)
-    pages.pop(pid, None)
-    logger.info("confluence_sync: purged page %s", pid)
-    return True
-
-
 def reconcile_missing_pages(
     visible_ids: set[str],
     store: ChromaDBStore,
@@ -388,16 +319,14 @@ def reconcile_missing_pages(
     restricted. With ``spaces``, only pages on record in those spaces are
     considered (the spaces whose listing completed); orphan files are then
     left for a full reconcile. Blocking I/O: run it via ``asyncio.to_thread``."""
-    file_index = _build_file_index()
-    pages = state.get("pages", {})
-    gone = {
-        p for p, rec in pages.items()
-        if p not in visible_ids
-        and (spaces is None or (isinstance(rec, dict) and rec.get("space") in spaces))
-    }
     if spaces is None:
-        gone |= {p for p in file_index if p not in visible_ids and p not in pages}
-    return sum(purge_page(pid, store, state, file_index=file_index) for pid in sorted(gone))
+        return SOURCE.reconcile(visible_ids, store, state)
+    return SOURCE.reconcile(
+        visible_ids,
+        store,
+        state,
+        only=lambda rec: isinstance(rec, dict) and rec.get("space") in spaces,
+    )
 
 
 def purge_restricted_pages(
@@ -409,7 +338,7 @@ def purge_restricted_pages(
     targets = sorted(p for p in state.get("pages", {}) if p in restricted_ids)
     if not targets:
         return 0
-    file_index = _build_file_index()
+    file_index = SOURCE.build_file_index()
     return sum(purge_page(pid, store, state, file_index=file_index) for pid in targets)
 
 
@@ -419,40 +348,15 @@ def _ingest_page_sync(
     """Write the page's Markdown under docs/confluence/ and re-index its
     chunks. Empty text leaves no chunks (a page with nothing readable)."""
     title = _safe_title(page.title)
-    filename = slugify(title, page.id)
-    store.delete_documents(ChromaDBStore.CONFLUENCE_COLLECTION, {"confluence_page_id": page.id})
-    for path in _build_file_index().get(page.id, []):
-        path.unlink(missing_ok=True)
-    if not text.strip():
-        return 0
-    header = f"<!-- confluence_page_id: {page.id} -->\n\n# {title}\n\n"
-    body = (header + text).strip()[:_MAX_PAGE_CHARS]
-    (_docs_dir() / filename).write_text(body + "\n", encoding="utf-8")
-    return ingest_text_sync(
-        body,
+    return SOURCE.write_and_index(
+        page.id,
+        title,
+        slugify(title, page.id),
+        text,
         store,
-        source_name=f"confluence/{filename}",
         domain=infer_domain(title),
-        collection=ChromaDBStore.CONFLUENCE_COLLECTION,
-        extra_metadata={
-            "confluence_page_id": page.id,
-            "type": "confluence",
-            "title": title,
-            "space": page.space,
-            "url": page.url,
-            "synced_at": synced_at,
-        },
-    )
-
-
-def _note_reconcile_skip(state: dict[str, Any], cause: str) -> None:
-    raw = state.get("reconcile_skips")
-    skips = (raw if isinstance(raw, int) else 0) + 1
-    state["reconcile_skips"] = skips
-    logger.warning(
-        "confluence_sync: skipping reconciliation — %s (%d consecutive skip(s); pages "
-        "removed or restricted stay indexed until reconciliation runs)",
-        cause, skips,
+        max_chars=_MAX_PAGE_CHARS,
+        metadata={"title": title, "space": page.space, "url": page.url, "synced_at": synced_at},
     )
 
 
@@ -473,7 +377,7 @@ async def _apply_tick(
         purge_restricted_pages, fetch.restricted_ids, store, state
     )
     if fetch.incomplete:
-        _note_reconcile_skip(state, f"listing incomplete ({fetch.incomplete})")
+        SOURCE.note_reconcile_skip(state, f"listing incomplete ({fetch.incomplete})")
         # Spaces that did list in full still reconcile, unless one came back
         # empty with pages on record (the same blank-listing caution).
         on_record = {
@@ -490,7 +394,7 @@ async def _apply_tick(
     elif not fetch.listed and known:
         # Only an empty listing is suspect. Pages listed but all restricted
         # are purged: what became restricted must leave the knowledge base.
-        _note_reconcile_skip(
+        SOURCE.note_reconcile_skip(
             state,
             f"the spaces listed 0 pages while {len(known)} are on record "
             "(refusing a mass purge on a blank listing)",
@@ -527,23 +431,15 @@ async def _apply_tick(
     if fetch.error:
         state["last_error"] = fetch.error
     elif stats["failed"]:
-        state["last_error"] = _partial_failure_message(stats["failed"])
+        state["last_error"] = SOURCE.partial_failure(stats["failed"])
     else:
         state.pop("last_error", None)
     save_state(state)
 
 
-def _partial_failure_message(failed: int) -> str:
-    return (
-        f"{failed} page{'' if failed == 1 else 's'} could not be synced. "
-        "Check the server logs."
-    )
-
-
 # One tick at a time per process, shared by the scheduler heartbeat and any
 # manual run, like drive_sync. A caller that finds it held skips (``busy``).
 _RUN_LOCK = asyncio.Lock()
-_last_finished_at: datetime | None = None
 
 
 def is_syncing() -> bool:
@@ -551,17 +447,7 @@ def is_syncing() -> bool:
 
 
 def last_finished_at() -> datetime | None:
-    return _last_finished_at
-
-
-def _record_error(message: str) -> None:
-    """Keep a short, user-facing reason the last tick failed (never a trace)."""
-    try:
-        state = load_state()
-        state["last_error"] = message
-        save_state(state)
-    except Exception:
-        logger.exception("confluence_sync: could not record the last error")
+    return SOURCE.last_finished_at
 
 
 def build_client(settings: Settings) -> tuple[ConfluenceClient, httpx.AsyncClient]:
@@ -593,20 +479,12 @@ async def run_confluence_sync(
 ) -> dict[str, int]:
     """One sync tick. Returns counts: seen / updated / skipped / restricted /
     failed / purged / capped (plus ``busy`` when a tick is already running)."""
-    if _RUN_LOCK.locked():
-        logger.info("confluence_sync: a tick is already running — skipping")
-        return {"busy": 1}
-    global _last_finished_at
-    async with _RUN_LOCK:
-        try:
-            return await _run_confluence_sync_locked(
-                store=store, client=client, now=now, reconcile_only=reconcile_only
-            )
-        except Exception:
-            _record_error("The last sync failed unexpectedly. Check the server logs.")
-            raise
-        finally:
-            _last_finished_at = datetime.now(UTC)
+    return await SOURCE.run(
+        _RUN_LOCK,
+        lambda: _run_confluence_sync_locked(
+            store=store, client=client, now=now, reconcile_only=reconcile_only
+        ),
+    )
 
 
 async def _run_confluence_sync_locked(
@@ -642,7 +520,7 @@ async def _run_confluence_sync_locked(
             client, http = build_client(settings)
         except Exception:
             logger.exception("confluence_sync: cannot set up the Confluence client")
-            _record_error(
+            SOURCE.record_error(
                 "Could not set up the Confluence connection. Check CONFLUENCE_SSL_VERIFY."
             )
             stats["failed"] += 1
@@ -678,17 +556,7 @@ async def _run_confluence_sync_locked(
 
 def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) -> int:
     """Remove every locally synced Confluence page (text files, chunks, state)."""
-    current = state if state is not None else load_state()
-    file_index = _build_file_index()
-    purged = 0
-    for pid in set(current["pages"]) | set(file_index):
-        purged += purge_page(str(pid), store, current, file_index=file_index)
-    for path in _docs_dir().glob("confluence-*.md"):
-        path.unlink(missing_ok=True)
-    store.delete_confluence_docs()
-    current["pages"] = {}
-    save_state(current)
-    return purged
+    return SOURCE.purge_all(store, state, store.delete_confluence_docs)
 
 
 # ---------------------------------------------------------------------------
@@ -696,47 +564,13 @@ def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) 
 # ---------------------------------------------------------------------------
 
 
-def _heartbeat_pending(db_path: Path | None = None) -> bool:
-    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
-
-    resolved = _resolve_db_path(db_path)
-    if not resolved.exists():
-        return False
-    with _get_conn(resolved) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM scheduled_actions "
-            "WHERE kind = ? AND status IN ('pending', 'running') LIMIT 1",
-            (HEARTBEAT_KIND,),
-        ).fetchone()
-    return row is not None
-
-
-def _enqueue(run_at: datetime, db_path: Path | None) -> int | None:
-    try:
-        action_id = insert_scheduled_action(
-            run_at=run_at.isoformat(),
-            channel=HEARTBEAT_CHANNEL,
-            channel_ref=HEARTBEAT_CHANNEL_REF,
-            intent_text=HEARTBEAT_INTENT,
-            kind=HEARTBEAT_KIND,
-            db_path=db_path,
-        )
-    except Exception:
-        logger.exception("confluence_sync: failed to enqueue the heartbeat")
-        return None
-    logger.info("confluence_sync: next scan at %s (id=%d)", run_at.isoformat(), action_id)
-    return action_id
-
-
 def bootstrap_confluence_sync_scan(db_path: Path | None = None) -> int | None:
-    if _heartbeat_pending(db_path):
-        return None
-    return _enqueue(datetime.now(UTC) + timedelta(minutes=1), db_path)
+    return SOURCE.bootstrap(db_path)
 
 
 def enqueue_next_confluence_sync_scan(
     *, after: datetime | None = None, db_path: Path | None = None
 ) -> int | None:
-    base = (after or datetime.now(UTC)).astimezone(UTC)
-    minutes = get_settings().confluence_sync_interval_minutes
-    return _enqueue(base + timedelta(minutes=minutes), db_path)
+    return SOURCE.enqueue_next(
+        get_settings().confluence_sync_interval_minutes, after=after, db_path=db_path
+    )

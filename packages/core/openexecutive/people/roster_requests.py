@@ -56,7 +56,10 @@ ALERT_TAG_PREFIX = "roster_request:"
 
 # Held messages kept per request; later ones only bump ``message_count``.
 MAX_HELD_MESSAGES = 10
-PREVIEW_CHARS = 280
+# How much of a held message the card shows: the whole of any ordinary
+# message (a request for a quote with its items, budget and date), so the
+# person deciding sees what was asked. Only a very long one is cut.
+PREVIEW_CHARS = 4000
 # A declined sender is not raised again for this long.
 DECLINE_QUIET_DAYS = 30
 # Longest display name kept (after sanitising).
@@ -297,14 +300,18 @@ def sanitize_display_name(raw: object) -> str:
 
 
 def _clean_preview(raw: object) -> str:
-    """The first ``PREVIEW_CHARS`` of a held message, one line, printable."""
+    """A held message as the card shows it: printable, its paragraphs kept
+    (one blank line between them at most, spaces in a line collapsed), cut
+    only past ``PREVIEW_CHARS``."""
     if not isinstance(raw, str):
         return ""
     text = "".join(
-        ch if unicodedata.category(ch)[0] != "C" else " " for ch in raw
+        ch if ch == "\n" or unicodedata.category(ch)[0] != "C" else " "
+        for ch in raw.replace("\r\n", "\n").replace("\r", "\n")
     )
-    text = " ".join(text.split())
-    return text if len(text) <= PREVIEW_CHARS else text[: PREVIEW_CHARS - 1] + "…"
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return text if len(text) <= PREVIEW_CHARS else text[: PREVIEW_CHARS - 1].rstrip() + "…"
 
 
 # The only shapes a sender reference may take. It is shown to the principal

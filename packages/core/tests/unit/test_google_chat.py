@@ -23,7 +23,9 @@ from openexecutive.orchestrator.content_trust import wrap_untrusted
 def _no_history_db(monkeypatch: pytest.MonkeyPatch) -> None:
     """Turns keep no history in the shared default DB."""
     monkeypatch.setattr(gc_module, "_load_history", lambda _sid: [])
-    monkeypatch.setattr(gc_module, "_save_turn", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "openexecutive.integrations.channel_turn.save_turn", lambda **k: True
+    )
 
 
 def _make_settings(configured: bool = True) -> Any:
@@ -215,7 +217,7 @@ def test_process_calls_alert_pipeline_with_correct_fields(monkeypatch: pytest.Mo
         lambda event: recorded.append(event),
     )
     monkeypatch.setattr("openexecutive.knowledge.retriever.retrieve", lambda **_: "")
-    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda: "")
+    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda **_: "")
 
     profile = SimpleNamespace(is_empty=lambda: True)
     monkeypatch.setattr(
@@ -260,7 +262,7 @@ def test_process_sends_error_reply_on_executive_failure(monkeypatch: pytest.Monk
     """If Executive.chat() raises, an error message is sent via send_reply."""
     monkeypatch.setattr("openexecutive.alerts.pipeline.schedule_evaluation", lambda _: None)
     monkeypatch.setattr("openexecutive.knowledge.retriever.retrieve", lambda **_: "")
-    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda: "")
+    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda **_: "")
 
     profile = SimpleNamespace(is_empty=lambda: True)
     monkeypatch.setattr(
@@ -437,7 +439,7 @@ def _run_with_attachments(
     monkeypatch.setattr("openexecutive.alerts.pipeline.schedule_evaluation", lambda _: None)
     monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
     monkeypatch.setattr("openexecutive.knowledge.retriever.retrieve", lambda **_: "")
-    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda: "")
+    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda **_: "")
     monkeypatch.setattr(
         "openexecutive.onboarding.profile_builder.load_or_create_profile",
         lambda: SimpleNamespace(is_empty=lambda: True),
@@ -711,7 +713,8 @@ def test_the_inbound_row_carries_the_senders_people_id(
             )
         )
 
-    assert looked_up == ["pat@x.com"]
+    # Only ever by the address Google gave for the sender.
+    assert set(looked_up) == {"pat@x.com"}
     [inbound] = [d for kind, d in rows if kind == "integration_inbound"]
     assert inbound["sender_person_id"] == expected
 
@@ -720,19 +723,20 @@ def _run_turn(monkeypatch: pytest.MonkeyPatch, store: dict, seen: list, text: st
     monkeypatch.setattr("openexecutive.alerts.pipeline.schedule_evaluation", lambda _e: None)
     monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
     monkeypatch.setattr("openexecutive.knowledge.retriever.retrieve", lambda **_: "")
-    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda: "")
+    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda **_: "")
     monkeypatch.setattr(
         "openexecutive.onboarding.profile_builder.load_or_create_profile",
         lambda: SimpleNamespace(is_empty=lambda: True),
     )
     monkeypatch.setattr(gc_module, "_load_history", lambda sid: list(store.get(sid, [])))
 
-    def save(sid: str, _name: str, _person: Any, _session: Any, said: str, reply: str) -> None:
-        store.setdefault(sid, []).extend(
-            [{"role": "user", "content": said}, {"role": "assistant", "content": reply}]
+    def save(*, session_id: str, user_text: str, assistant_text: str, **_: Any) -> bool:
+        store.setdefault(session_id, []).extend(
+            [{"role": "user", "content": user_text}, {"role": "assistant", "content": assistant_text}]
         )
+        return True
 
-    monkeypatch.setattr(gc_module, "_save_turn", save)
+    monkeypatch.setattr("openexecutive.integrations.channel_turn.save_turn", save)
 
     async def fake_chat(**kw: Any) -> str:
         seen.append((kw["session"].session_id, list(kw["session"].conversation_history)))
@@ -841,7 +845,7 @@ def test_rows_before_the_session_follow_the_senders_turn(
 # ---------------------------------------------------------------------------
 
 
-def _tap_event(*, alone: bool = True, user_type: str = "HUMAN", data: str = "card:12:a") -> dict:
+def _tap_event(*, alone: bool = True, user_type: str = "HUMAN", data: str = "card:12:a:0000beef") -> dict:
     space: dict[str, Any] = {"name": "spaces/DM1", "spaceType": "DIRECT_MESSAGE"}
     if alone:
         space["singleUserBotDm"] = True
@@ -881,9 +885,9 @@ def test_a_tap_in_the_apps_own_dm_is_taken(monkeypatch: pytest.MonkeyPatch, clie
         "cardsV2": [],
     }
     [(space, message, data, user, *_creds)] = checked
-    assert (space, message, data, user) == ("spaces/DM1", "spaces/DM1/messages/C1", "card:12:a", "users/111")
+    assert (space, message, data, user) == ("spaces/DM1", "spaces/DM1/messages/C1", "card:12:a:0000beef", "users/111")
     [tap] = taps
-    assert tap["data"] == "card:12:a" and tap["person"] is pat and tap["shown"] == "Meeting to book"
+    assert tap["data"] == "card:12:a:0000beef" and tap["person"] is pat and tap["shown"] == "Meeting to book"
     assert tap["message_name"] == "spaces/DM1/messages/C1"
     assert tap["space_name"] == "spaces/DM1"
     assert tap["user_name"] == "users/111"
@@ -936,8 +940,8 @@ def test_a_tap_on_something_else_is_left_alone(monkeypatch: pytest.MonkeyPatch, 
 
 def test_the_older_tap_shape_is_read_too() -> None:
     """A classic event may carry the button's data as ``action.parameters``."""
-    body = {"action": {"actionMethodName": "oe_card", "parameters": [{"key": "card", "value": "card:7:s"}]}}
-    assert gc_module._tapped(body) == "card:7:s"
+    body = {"action": {"actionMethodName": "oe_card", "parameters": [{"key": "card", "value": "card:7:s:0000beef"}]}}
+    assert gc_module._tapped(body) == "card:7:s:0000beef"
     assert gc_module._tapped({"action": {"actionMethodName": "oe_card"}}) is None
 
 
@@ -966,16 +970,19 @@ def test_a_confirmed_tap_is_decided_and_its_card_rewritten(monkeypatch: pytest.M
     rows: list[dict] = []
     pat = SimpleNamespace(id=3)
 
-    async def resolve(decision_id: int, who: Any, *, approve: bool, allow: bool = False) -> str:
+    async def resolve(decision_id: int, who: Any, *, approve: bool, allow: bool = False, shown_at: str | None = None, shown: str | None = None) -> str:
         resolved.append((decision_id, who, approve, allow))
         return "Approved."
 
     monkeypatch.setattr(channel_cards, "resolve", resolve)
+    # The card as its message shows it (no ledger in this test).
+    monkeypatch.setattr(channel_cards, "card_text", lambda decision_id: "The card")
+    monkeypatch.setattr(channel_cards, "version", lambda decision_id, text: "0000beef")
     monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: rows.append(k.get("details") or {}))
     monkeypatch.setattr(gc_module, "update_card", lambda *a: updated.append(a))
 
     asyncio.run(gc_module._decide_tap(
-        data="card:12:a", person=pat, shown="Meeting to book", space_name="spaces/DM1",
+        data="card:12:a:0000beef", person=pat, shown="Meeting to book", space_name="spaces/DM1",
         message_name="spaces/DM1/messages/C1", user_name="users/111",
         service_account_file="/k.json", service_account_email=None,
     ))
@@ -1006,7 +1013,7 @@ class _FakeChat:
 _OUR_CARD = {
     "sender": {"type": "BOT"},
     "text": "Meeting to book\n\nWorking on it…",
-    "cardsV2": gc_module._card_buttons(12, ("Approve", "Skip")),
+    "cardsV2": gc_module._card_buttons(12, (("Approve", "card:12:a:0000beef"), ("Skip", "card:12:s:0000beef"))),
 }
 _PAT = [{"member": {"name": "users/111", "type": "HUMAN"}}, {"member": {"name": "users/app", "type": "BOT"}}]
 
@@ -1016,7 +1023,7 @@ _PAT = [{"member": {"name": "users/111", "type": "HUMAN"}}, {"member": {"name": 
     [
         (_OUR_CARD, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1", "Meeting to book"),
         ({**_OUR_CARD, "sender": {"type": "HUMAN"}}, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1", None),
-        ({**_OUR_CARD, "cardsV2": gc_module._card_buttons(13, ("Approve", "Skip"))}, {"singleUserBotDm": True},
+        ({**_OUR_CARD, "cardsV2": gc_module._card_buttons(13, (("Approve", "card:13:a:0000beef"), ("Skip", "card:13:s:0000beef")))}, {"singleUserBotDm": True},
          _PAT, "spaces/DM1/messages/C1", None),
         (_OUR_CARD, {"singleUserBotDm": False}, _PAT, "spaces/DM1/messages/C1", None),
         (_OUR_CARD, {"singleUserBotDm": True}, [{"member": {"name": "users/222", "type": "HUMAN"}}],
@@ -1032,14 +1039,14 @@ def test_chat_itself_confirms_a_tap(
         patch.object(gc_module, "_build_credentials", return_value="creds"),
         patch("googleapiclient.discovery.build", return_value=_FakeChat(message, space, members)),
     ):
-        assert gc_module.verify_tap("spaces/DM1", message_name, "card:12:a", "users/111", None) == expected
+        assert gc_module.verify_tap("spaces/DM1", message_name, "card:12:a:0000beef", "users/111", None) == expected
 
 
 def test_a_check_chat_cant_answer_is_a_no() -> None:
     with (
         patch.object(gc_module, "_build_credentials", side_effect=RuntimeError("no creds")),
     ):
-        assert gc_module.verify_tap("spaces/DM1", "spaces/DM1/messages/C1", "card:12:a", "users/111", None) is None
+        assert gc_module.verify_tap("spaces/DM1", "spaces/DM1/messages/C1", "card:12:a:0000beef", "users/111", None) is None
 
 
 def test_a_cards_words_cannot_hide_a_link() -> None:
@@ -1052,7 +1059,7 @@ def test_a_card_is_sent_with_its_buttons() -> None:
         patch.object(gc_module, "_build_credentials", return_value="creds"),
         patch("googleapiclient.discovery.build", return_value=service),
     ):
-        gc_module.send_card("spaces/DM1", "spaces/DM1/threads/T", 12, "Meeting to book", ("Approve", "Skip"), None)
+        gc_module.send_card("spaces/DM1", "spaces/DM1/threads/T", 12, "Meeting to book", (("Approve", "card:12:a:0000beef"), ("Skip", "card:12:s:0000beef")), None)
 
     kwargs = service.spaces.return_value.messages.return_value.create.call_args.kwargs
     assert kwargs["parent"] == "spaces/DM1"
@@ -1061,7 +1068,7 @@ def test_a_card_is_sent_with_its_buttons() -> None:
     assert body["thread"] == {"name": "spaces/DM1/threads/T"}
     buttons = body["cardsV2"][0]["card"]["sections"][0]["widgets"][0]["buttonList"]["buttons"]
     assert [b["text"] for b in buttons] == ["Approve", "Skip"]
-    assert [b["onClick"]["action"]["parameters"][0]["value"] for b in buttons] == ["card:12:a", "card:12:s"]
+    assert [b["onClick"]["action"]["parameters"][0]["value"] for b in buttons] == ["card:12:a:0000beef", "card:12:s:0000beef"]
     assert {b["onClick"]["action"]["function"] for b in buttons} == {"oe_card"}
 
 
@@ -1075,13 +1082,13 @@ def test_the_replys_cards_follow_it_only_in_the_apps_own_dm(
         "openexecutive.integrations.channel_cards._dm_proves_taps", lambda channel: channel == "google_chat"
     )
     monkeypatch.setattr("openexecutive.integrations.channel_cards.card_text", lambda _i: "Meeting to book")
-    monkeypatch.setattr("openexecutive.integrations.channel_cards.card_buttons", lambda _i: ("Approve", "Skip"))
+    monkeypatch.setattr("openexecutive.integrations.channel_cards.card_options", lambda i, shown: (("Approve", f"card:{i}:a:0000beef"), ("Skip", f"card:{i}:s:0000beef")))
     sent: list[tuple] = []
     monkeypatch.setattr(gc_module, "send_card", lambda *a: sent.append(a))
     monkeypatch.setattr("openexecutive.alerts.pipeline.schedule_evaluation", lambda _e: None)
     monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
     monkeypatch.setattr("openexecutive.knowledge.retriever.retrieve", lambda **_: "")
-    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda: "")
+    monkeypatch.setattr("openexecutive.memory.episodic.format_for_prompt", lambda **_: "")
     monkeypatch.setattr(
         "openexecutive.onboarding.profile_builder.load_or_create_profile",
         lambda: SimpleNamespace(is_empty=lambda: True),
@@ -1115,5 +1122,281 @@ def test_the_replys_cards_follow_it_only_in_the_apps_own_dm(
 
     assert (seen["cards"] is not None) is one_on_one
     assert ("Approve and Skip buttons" in seen["channel_context_block"]) is one_on_one
-    assert sent == ([("spaces/DM1", "spaces/DM1/threads/T", 12, "Meeting to book", ("Approve", "Skip"), None, None)]
+    assert sent == ([("spaces/DM1", "spaces/DM1/threads/T", 12, "Meeting to book", (("Approve", "card:12:a:0000beef"), ("Skip", "card:12:s:0000beef")), None, None)]
                     if one_on_one else [])
+
+
+# -- posting to a space (announcements, department rooms) ----------------------
+
+
+def _space_list(monkeypatch: pytest.MonkeyPatch, spaces: list[dict[str, Any]]) -> MagicMock:
+    service = MagicMock()
+    service.spaces.return_value.list.return_value.execute.return_value = {"spaces": spaces}
+    monkeypatch.setattr(gc_module, "_build_credentials", lambda *a: object())
+    monkeypatch.setattr("googleapiclient.discovery.build", lambda *a, **k: service)
+    return service
+
+
+def test_group_spaces_lists_the_apps_spaces_and_marks_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_CHAT_PROJECT_NUMBER", "123456789012")
+    monkeypatch.setenv("GOOGLE_CHAT_DEFAULT_SPACE", "spaces/ALL")
+    service = _space_list(monkeypatch, [
+        {"name": "spaces/ALL", "displayName": "Everyone"},
+        {"name": "spaces/OPS"},
+        {"name": "users/123", "displayName": "Not a space"},
+    ])
+    assert gc_module.group_spaces() == [
+        {"space": "spaces/ALL", "title": "Everyone", "announce": True},
+        {"space": "spaces/OPS", "title": "", "announce": False},
+    ]
+    assert service.spaces.return_value.list.call_args.kwargs["filter"] == 'spaceType = "SPACE"'
+
+
+def test_announce_space_is_the_default_else_the_only_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_CHAT_DEFAULT_SPACE", "spaces/DEFAULT")
+    assert gc_module.announce_space() == "spaces/DEFAULT"
+    monkeypatch.delenv("GOOGLE_CHAT_DEFAULT_SPACE")
+    one = [{"space": "spaces/ONLY", "title": "", "announce": False}]
+    monkeypatch.setattr(gc_module, "group_spaces", lambda **_: one)
+    assert gc_module.announce_space() == "spaces/ONLY"
+    monkeypatch.setattr(gc_module, "group_spaces", lambda **_: one + [{"space": "spaces/TWO", "title": "", "announce": False}])
+    assert gc_module.announce_space() is None
+
+
+def test_post_to_space_posts_only_in_the_apps_group_spaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(gc_module, "send_reply", lambda space, thread, text, *a: sent.append((space, thread, text)))
+    monkeypatch.setattr(gc_module, "group_spaces", lambda **_: [{"space": "spaces/ALL", "title": "Everyone", "announce": True}])
+    gc_module.post_to_space("spaces/ALL", "Q3 plan shipped: <https://evil.example|the plan>")
+    # Link markup made inert: no words shown over a link that goes elsewhere.
+    assert sent == [("spaces/ALL", "", "Q3 plan shipped: \u2039https://evil.example|the plan>")]
+    assert gc_module.space_title("spaces/ALL") == "Everyone"
+    # A DM or a space the app isn't in is refused.
+    for space in ("spaces/DM1", "spaces/ALL/../x"):
+        with pytest.raises(ValueError):
+            gc_module.post_to_space(space, "nope")
+    assert len(sent) == 1
+
+
+def test_a_listing_is_reused_for_posts_and_cards_but_not_for_a_new_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gc_module, "_spaces_cache", None)
+    listings: list[int] = []
+    rows = [{"space": "spaces/ALL", "title": "Everyone", "announce": True}]
+
+    def _list() -> list[dict[str, Any]]:
+        listings.append(1)
+        return [dict(r) for r in rows]
+
+    monkeypatch.setattr(gc_module, "_list_spaces", _list)
+    monkeypatch.setattr(gc_module, "send_reply", lambda *a: None)
+    assert gc_module.known_spaces() is None  # nothing at hand: a card never asks
+    gc_module.post_to_space("spaces/ALL", "one")
+    gc_module.post_to_space("spaces/ALL", "two")
+    assert len(listings) == 1
+    assert gc_module.known_spaces() == rows
+    rows.append({"space": "spaces/NEW", "title": "New", "announce": False})
+    gc_module.post_to_space("spaces/NEW", "three")  # not in the cached listing: asked again
+    assert len(listings) == 2
+
+
+def test_a_malformed_default_space_never_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OE_GOOGLE_CHAT_APP", raising=False)
+    monkeypatch.setenv("GOOGLE_CHAT_DEFAULT_SPACE", "AAAA123")
+    monkeypatch.setattr(gc_module, "group_spaces", lambda **_: [{"space": "spaces/ONLY", "title": "", "announce": False}])
+    assert gc_module.announce_space() is None
+
+
+def test_a_card_that_still_waits_is_rewritten_with_its_new_buttons(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a switch (or a tap on an older copy), the card shows its new
+    words with buttons the next tap is checked against: the same data on
+    the message as the tap will carry."""
+    from openexecutive.integrations import channel_cards
+
+    options = (("Send from Ada, cc me", "card:12:a:1234abcd"), ("Send from me", "card:12:x:1234abcd"),
+               ("Skip", "card:12:s:1234abcd"))
+
+    async def tap(tapped: Any, who: Any) -> Any:
+        return channel_cards.Tapped("Changed who it goes from. Check it, then send it.", "Reply from Ada", options)
+
+    monkeypatch.setattr(channel_cards, "tap", tap)
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+    service = MagicMock()
+    with (
+        patch.object(gc_module, "_build_credentials", return_value="creds"),
+        patch("googleapiclient.discovery.build", return_value=service),
+    ):
+        asyncio.run(gc_module._decide_tap(
+            data="card:12:x:0000beef", person=SimpleNamespace(id=3), shown="Reply from you", space_name="spaces/DM1",
+            message_name="spaces/DM1/messages/C1", user_name="users/111",
+            service_account_file="/k.json", service_account_email=None,
+        ))
+    kwargs = service.spaces.return_value.messages.return_value.patch.call_args.kwargs
+    assert kwargs["name"] == "spaces/DM1/messages/C1"
+    assert kwargs["body"]["text"] == "Reply from Ada\n\nChanged who it goes from. Check it, then send it."
+    buttons = kwargs["body"]["cardsV2"][0]["card"]["sections"][0]["widgets"][0]["buttonList"]["buttons"]
+    assert [b["text"] for b in buttons] == [label for label, _ in options]
+    assert [b["onClick"]["action"]["parameters"][0]["value"] for b in buttons] == [data for _, data in options]
+
+
+@pytest.mark.parametrize(
+    ("message", "space", "members", "message_name", "expected"),
+    [
+        (_OUR_CARD, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1",
+         ("card:12:a:0000beef", "Meeting to book\n\nWorking on it…")),
+        ({**_OUR_CARD, "sender": {"type": "HUMAN"}}, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1", None),
+        ({**_OUR_CARD, "cardsV2": []}, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1", None),
+        (_OUR_CARD, {"singleUserBotDm": False}, _PAT, "spaces/DM1/messages/C1", None),
+        (_OUR_CARD, {"singleUserBotDm": True}, [{"member": {"name": "users/222", "type": "HUMAN"}}],
+         "spaces/DM1/messages/C1", None),
+        (_OUR_CARD, {"singleUserBotDm": True}, _PAT, "spaces/OTHER/messages/C1", None),
+    ],
+    ids=["ours", "not-the-apps", "no-buttons-left", "not-a-dm-alone", "someone-else", "another-space"],
+)
+def test_chat_itself_confirms_which_card_a_message_quotes(
+    message: dict, space: dict, members: list[dict], message_name: str, expected: tuple[str, str] | None
+) -> None:
+    with (
+        patch.object(gc_module, "_build_credentials", return_value="creds"),
+        patch("googleapiclient.discovery.build", return_value=_FakeQuoteChat(message, space, members, message_name)),
+    ):
+        assert gc_module.quoted_card(
+            "spaces/DM1", message_name, "users/111", "spaces/DM1/messages/R1", "make it shorter", None,
+        ) == expected
+
+
+class _FakeQuoteChat(_FakeChat):
+    """``_FakeChat``, where the reply quoting the card reads as ``said``."""
+
+    def __init__(self, message: dict, space: dict, members: list[dict], quoted: str, said: dict | None = None) -> None:
+        super().__init__(message, space, members)
+        self._said = said if said is not None else {
+            "text": "<users/999> make it shorter", "sender": {"name": "users/111"},
+            "quotedMessageMetadata": {"name": quoted},
+        }
+
+    def spaces(self) -> Any:
+        inner = super().spaces()
+        card = inner.messages()
+        return SimpleNamespace(
+            messages=lambda: SimpleNamespace(
+                get=lambda name: SimpleNamespace(execute=lambda: self._said) if name.endswith("/R1") else card.get(name),
+            ),
+            get=inner.get,
+            members=inner.members,
+        )
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        {"text": "send it", "sender": {"name": "users/111"}, "quotedMessageMetadata": {"name": "spaces/DM1/messages/C1"}},
+        {"text": "make it shorter", "sender": {"name": "users/222"},
+         "quotedMessageMetadata": {"name": "spaces/DM1/messages/C1"}},
+        {"text": "make it shorter", "sender": {"name": "users/111"},
+         "quotedMessageMetadata": {"name": "spaces/DM1/messages/C9"}},
+    ],
+    ids=["other-words", "someone-elses", "quotes-another"],
+)
+def test_words_on_a_card_count_only_as_chat_has_the_message(said: dict) -> None:
+    """The event's body isn't bound to Google's token: the quoting message
+    is read from Chat too, and must be the person's, quote the card and say
+    those words."""
+    fake = _FakeQuoteChat(_OUR_CARD, {"singleUserBotDm": True}, _PAT, "spaces/DM1/messages/C1", said)
+    with (
+        patch.object(gc_module, "_build_credentials", return_value="creds"),
+        patch("googleapiclient.discovery.build", return_value=fake),
+    ):
+        assert gc_module.quoted_card(
+            "spaces/DM1", "spaces/DM1/messages/C1", "users/111", "spaces/DM1/messages/R1", "make it shorter", None,
+        ) is None
+
+
+def test_only_a_reply_quotes_a_card() -> None:
+    assert gc_module._quoted_name({"quotedMessageMetadata": {"name": "spaces/DM1/messages/C1"}}) == "spaces/DM1/messages/C1"
+    assert gc_module._quoted_name({"quotedMessageMetadata": {"name": "x", "quoteType": "FORWARD"}}) == ""
+    assert gc_module._quoted_name({}) == ""
+
+
+def _say_here(monkeypatch: pytest.MonkeyPatch, said: Any, found: tuple[str, str] | None = ("card:12:a:0000beef", "Reply to Ada\n\nOr tell me")) -> dict[str, list[Any]]:
+    from openexecutive.integrations import channel_cards
+
+    calls: dict[str, list[Any]] = {"say": [], "update": [], "reply": []}
+    monkeypatch.setattr(gc_module, "quoted_card", lambda *a: found)
+
+    async def say(card: Any, who: Any, text: str) -> Any:
+        calls["say"].append((card, who, text))
+        return said
+
+    monkeypatch.setattr(channel_cards, "say", say)
+    monkeypatch.setattr(channel_cards, "takes_words", lambda decision_id: True)
+    monkeypatch.setattr(gc_module, "update_card", lambda *a: calls["update"].append(a))
+    monkeypatch.setattr(gc_module, "send_reply", lambda *a: calls["reply"].append(a))
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+    return calls
+
+
+def test_a_reply_quoting_a_card_is_said_on_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.integrations import channel_cards
+
+    again = channel_cards.Tapped("I made it shorter.", "Reply to Ada\nShort", (("Send from me", "card:12:a:1111beef"),))
+    calls = _say_here(monkeypatch, again)
+    person = SimpleNamespace(id=3)
+    assert asyncio.run(gc_module._say_on_card(
+        "make it shorter", person, "spaces/DM1", "spaces/DM1/threads/T", "spaces/DM1/messages/C1", "users/111",
+        "spaces/DM1/messages/R1", None, None,
+    ))
+    assert calls["say"] == [(channel_cards.Choice(12, "a", "0000beef"), person, "make it shorter")]
+    # The card as it reads now, with its buttons and how to say more.
+    assert calls["update"] == [("spaces/DM1/messages/C1", f"Reply to Ada\nShort\n\n{channel_cards.TELL_ME}", None, None, 12,
+                                (("Send from me", "card:12:a:1111beef"),))]
+    assert calls["reply"] == [("spaces/DM1", "spaces/DM1/threads/T", "I made it shorter.", None, None)]
+
+
+def test_a_go_said_on_a_quoted_card_leaves_it_with_its_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.integrations import channel_cards
+
+    calls = _say_here(monkeypatch, channel_cards.Tapped("Done. I sent it.", settled=True),
+                      found=("card:12:a:0000beef", f"Reply to Ada\n\n{channel_cards.TELL_ME}"))
+    assert asyncio.run(gc_module._say_on_card(
+        "send it", SimpleNamespace(id=3), "spaces/DM1", "", "spaces/DM1/messages/C1", "users/111",
+        "spaces/DM1/messages/R1", None, None,
+    ))
+    assert calls["update"] == [("spaces/DM1/messages/C1", "Reply to Ada\n\nDone. I sent it.", None, None)]
+
+
+def test_a_quote_chat_doesnt_confirm_or_a_card_that_takes_no_words_is_an_ordinary_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _say_here(monkeypatch, None, found=None)
+    args = ("hi", SimpleNamespace(id=3), "spaces/DM1", "", "spaces/DM1/messages/C1", "users/111",
+            "spaces/DM1/messages/R1", None, None)
+    assert not asyncio.run(gc_module._say_on_card(*args))
+    assert calls["say"] == []
+    calls = _say_here(monkeypatch, None)
+    assert not asyncio.run(gc_module._say_on_card(*args))
+    assert calls["update"] == [] and calls["reply"] == []
+
+
+def test_words_quoting_a_card_in_the_apps_own_dm_skip_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    said: list[tuple[Any, ...]] = []
+
+    async def say_on_card(*a: Any) -> bool:
+        said.append(a)
+        return True
+
+    monkeypatch.setattr(gc_module, "_say_on_card", say_on_card)
+    monkeypatch.setattr("openexecutive.people.store.find_person_by_email", lambda _e, **_k: SimpleNamespace(id=3))
+    answered: list[Any] = []
+
+    async def answer(**kw: Any) -> None:
+        answered.append(kw)
+
+    monkeypatch.setattr(gc_module, "_answer", answer)
+    common = dict(sender_name="Pat", space_name="spaces/DM1", thread_name="spaces/DM1/threads/T",
+                  message_name="spaces/DM1/messages/M", service_account_file=None, service_account_email=None,
+                  sender_email="pat@acme.com", direct=True, quoted="spaces/DM1/messages/C1", user_name="users/111")
+    asyncio.run(_process_and_reply(message_text="make it shorter", one_on_one=True, **common))
+    assert len(said) == 1 and said[0][0] == "make it shorter" and answered == []
+    # Anywhere but the app's own DM, it is an ordinary message.
+    asyncio.run(_process_and_reply(message_text="make it shorter", one_on_one=False, **common))
+    assert len(said) == 1 and len(answered) == 1

@@ -16,7 +16,6 @@ export function greeting(firstName: string | undefined, now: Date = new Date()):
  * panels, or another route. */
 export type SummaryTarget =
   | { kind: "needsYou" }
-  | { kind: "doneForYou" }
   | { kind: "panel"; panel: "handled" | "people" | "departments" | "inFlight" | "monitoring" }
   | { kind: "href"; href: string };
 
@@ -106,36 +105,186 @@ export function daysUntil(iso: string | null | undefined, now: Date = new Date()
 
 export type ChipTone = "rose" | "amber" | "neutral";
 
-/** The one status chip a collapsed proposal card shows: its deadline when it
- * has one (overdue in red), else "Likely stale" when the review says so, else
- * how long it has waited. The full chip row shows when the card is opened. */
-export function proposalStatusChip(
-  p: { due_at?: string | null; review_verdict?: string; created_at: string },
-  now: Date = new Date(),
-): { label: string; tone: ChipTone } | null {
-  const dueIn = daysUntil(p.due_at, now);
-  if (dueIn != null) {
-    if (dueIn < 0) return { label: "Overdue", tone: "rose" };
-    return { label: dueIn === 0 ? "Due today" : `Due in ${dueIn}d`, tone: "amber" };
-  }
-  if ((p.review_verdict ?? "") === "likely_stale") return { label: "Likely stale", tone: "amber" };
-  const age = ageLabel(p.created_at, now);
-  return age ? { label: `${age} old`, tone: "neutral" } : null;
+/** Home's headline, in the Executive's words: what needs you first, then
+ *  what it handled in the last day and what it's watching. `lead` is the
+ *  part Home colors (and, when something needs you, the link to Needs you).
+ *  `clear` says nothing needs you and nothing is off track: with a goal at
+ *  risk or someone waiting on an answer (`offTrack`), it says only that
+ *  nothing needs you, never "All clear". */
+export function homeHeadline(
+  needsYou: number,
+  done: number,
+  watching: number,
+  offTrack: boolean = false,
+): { lead: string; rest: string; clear: boolean } {
+  const none = needsYou <= 0;
+  const clear = none && !offTrack;
+  const lead = clear
+    ? "All clear."
+    : none
+      ? "Nothing needs you."
+      : needsYou === 1
+        ? "One thing needs you."
+        : `${needsYou} things need you.`;
+  const did =
+    done > 0 && watching > 0
+      ? `I handled ${done} since yesterday and I'm watching ${watching} for you.`
+      : done > 0
+        ? `I handled ${done} since yesterday.`
+        : watching > 0
+          ? `I'm watching ${watching} ${plural(watching, "thing", "things")} for you.`
+          : "";
+  return { lead, rest: [clear ? "Nothing needs you." : "", did].filter(Boolean).join(" "), clear };
 }
 
-/** Home's summary: what needs you, then what I did for you today. Each
- *  phrase opens its section; an empty list means all clear. */
-export function homeSummary(needsYou: number, done: number): SummaryPart[] {
-  const parts: SummaryPart[] = [];
-  if (needsYou > 0)
-    parts.push({
-      text: `${needsYou} ${plural(needsYou, "thing needs", "things need")} you`,
-      target: { kind: "needsYou" },
-    });
-  if (done > 0)
-    parts.push({
-      text: `I did ${done} ${plural(done, "thing", "things")} for you today`,
-      target: { kind: "doneForYou" },
-    });
-  return parts;
+/** Whether something is off track that isn't an item in Needs you: a
+ *  department with a goal at risk or off track or an answer it waits on, or
+ *  a person waiting on one. Home doesn't say "All clear" then. */
+export function teamOffTrack(
+  departments: { at_risk_count?: number; off_track_count?: number; awaiting_count?: number }[],
+  people: { awaiting_count?: number }[],
+): boolean {
+  return (
+    departments.some((d) => (d.at_risk_count ?? 0) > 0 || (d.off_track_count ?? 0) > 0 || (d.awaiting_count ?? 0) > 0) ||
+    people.some((p) => (p.awaiting_count ?? 0) > 0)
+  );
+}
+
+/** Hand me something's rows: the suggested asks that have words, trimmed,
+ *  each once, the first few. Anything else the server sends (not a list, a
+ *  blank, a non-string) yields no row. */
+export const HAND_ASKS_MAX = 4;
+export function handAsks(prompts: unknown, max: number = HAND_ASKS_MAX): string[] {
+  if (!Array.isArray(prompts)) return [];
+  const asks: string[] = [];
+  for (const p of prompts) {
+    const text = typeof p === "string" ? p.trim() : "";
+    if (text && !asks.includes(text)) asks.push(text);
+  }
+  return asks.slice(0, max);
+}
+
+/** The first word of a name, as Home says it ("Waiting on Alex"). */
+function firstName(full: string): string {
+  return full.trim().split(/\s+/)[0] ?? "";
+}
+
+/** Home's line for what waits on teammates: who (first names, in the order
+ *  their items come, two named and the rest counted) and what (the first
+ *  item, and how many more). `line` is the same in one line, for the web's
+ *  at-a-glance row. Null when nothing waits on anyone else. */
+export function waitingOnTeam(
+  team: { headline: string; routed_to_person_id?: number | null }[],
+  people: { id: number; full_name: string }[],
+): { title: string; detail: string; line: string } | null {
+  if (team.length === 0) return null;
+  // Each person once, in the order their items come.
+  const waited: { id: number; full_name: string }[] = [];
+  // An item whose person isn't on the list still waits on someone.
+  let unnamed = false;
+  for (const p of team) {
+    const who = people.find((x) => x.id === p.routed_to_person_id);
+    if (!who || !firstName(who.full_name)) unnamed = true;
+    else if (!waited.some((x) => x.id === who.id)) waited.push(who);
+  }
+  // First names, or the whole name for two people who share one.
+  const names = waited.map((w) => {
+    const first = firstName(w.full_name);
+    return waited.some((x) => x.id !== w.id && firstName(x.full_name) === first) ? w.full_name.trim() : first;
+  });
+  const others = names.length - 2;
+  // Who is left after the names it says: a count when it knows them all.
+  const rest = unnamed ? "others" : others > 0 ? `${others} ${others === 1 ? "other" : "others"}` : "";
+  const named = names.slice(0, 2);
+  const whom =
+    names.length === 0
+      ? team.length === 1
+        ? "someone else"
+        : "teammates"
+      : rest
+        ? `${named.join(", ")} and ${rest}`
+        : named.join(" and ");
+  const title = `Waiting on ${whom}`;
+  const first = (team[0]?.headline ?? "").trim();
+  const more = team.length - 1;
+  const detail = more > 0 ? (first ? `${first}, and ${more} more` : `${team.length} things`) : first;
+  const line = team.length === 1 ? (first ? `${title}: ${first}` : title) : `${team.length} waiting on ${whom}`;
+  return { title, detail, line };
+}
+
+/** Home's row for what changed on the watches: one change says what it is,
+ *  with where it was noticed under it (the card's `noticed`); several are
+ *  counted, with the first under them. `line` is the same in one line, for
+ *  the web's at-a-glance row. Null when nothing changed. */
+export function watchingRow(
+  signals: { headline: string; view?: { noticed?: string } | null }[],
+): { title: string; detail: string; line: string } | null {
+  if (signals.length === 0) return null;
+  const first = (signals[0]?.headline ?? "").trim();
+  if (signals.length === 1) {
+    const title = first || "Something changed on what I'm watching";
+    return { title, detail: signals[0]?.view?.noticed ?? "", line: title };
+  }
+  const title = `${signals.length} things changed on what I'm watching`;
+  const more = signals.length - 1;
+  return { title, detail: first ? `${first}, and ${more} more` : "", line: title };
+}
+
+/** What a teammate's waiting card carries that Home's Waiting on list reads:
+ *  its title, when it came, and how its held step opens (the server's
+ *  `card_details.top`). */
+export interface WaitingItem {
+  headline: string;
+  created_at: string;
+  view?: { top?: Record<string, string> | null } | null;
+}
+
+/** "today", "1 day", "5 days": how long something has waited. */
+export function waitedFor(iso: string | null | undefined, now: Date = new Date()): string {
+  const t = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(t)) return "";
+  const days = Math.floor(Math.max(0, now.getTime() - t) / 86_400_000);
+  return days === 0 ? "today" : `${days} ${days === 1 ? "day" : "days"}`;
+}
+
+/** One row of Home's Waiting on list: the job in words, who started it,
+ *  why it waits ("Waits: it's about money") and how long. */
+export function waitingRow(
+  item: WaitingItem,
+  now: Date = new Date(),
+): { title: string; started: string; because: string; age: string } {
+  const top = item.view?.top ?? {};
+  const because = (top.because ?? "").trim();
+  return {
+    title: (top.title ?? "").trim() || item.headline.trim(),
+    started: (top.started ?? "").trim(),
+    because: because ? `Waits: ${because}` : "",
+    age: waitedFor(item.created_at, now),
+  };
+}
+
+/** The line under Home's "Waiting on …" heading: that it needs nothing from
+ *  the reader, whose OK it waits for, and how old the oldest is. */
+export function waitingNote(
+  team: { created_at: string; routed_to_person_id?: number | null }[],
+  people: { id: number; full_name: string }[],
+  now: Date = new Date(),
+): string {
+  if (team.length === 0) return "";
+  const ids = new Set(team.map((p) => p.routed_to_person_id ?? null));
+  const one = ids.size === 1 ? people.find((x) => x.id === [...ids][0]) : undefined;
+  const who = one ? firstName(one.full_name) || one.full_name.trim() : "";
+  const it = team.length === 1 ? "it" : "these";
+  const whose = who
+    ? `${who} has to OK ${it}.`
+    : ids.size === 1
+      ? `${team.length === 1 ? "It waits" : "They wait"} for someone else's OK.`
+      : `Each waits for its person's OK.`;
+  const oldest = team
+    .map((p) => p.created_at)
+    .reduce((a, b) => (Date.parse(b) < Date.parse(a) ? b : a));
+  const age = waitedFor(oldest, now);
+  const since =
+    age === "" ? "" : age === "today" ? " Since today." : team.length === 1 ? ` Waiting ${age}.` : ` Oldest ${age}.`;
+  return `Nothing for you to do. ${whose}${since}`;
 }

@@ -7,6 +7,7 @@ import Chat from "@/components/Chat";
 import { getSession, getSessionMessages, type ChatMessage, type SessionSummary } from "@/lib/api";
 import { sessionTitle } from "@/lib/sessionChannel";
 import { PageSpinner } from "@/components/ui/Spinner";
+import { usePageCrumb } from "@/components/shell/PageCrumb";
 
 type Loaded =
   | { id: string; state: "ok"; session: SessionSummary; messages: ChatMessage[] }
@@ -41,6 +42,7 @@ export default function SharedChatPage() {
 
   const current = loaded && loaded.id === id ? loaded : null;
   const chat = current?.state === "ok" ? current : null;
+  usePageCrumb(chat ? sessionTitle(chat.session) : null);
 
   return (
     <div className="flex flex-col h-full bg-surface text-fg">

@@ -1,0 +1,17 @@
+id: greeting_001
+domain: greeting
+description: "A plain hello gets a short greeting back, not a status report or a presence check."
+company_context:
+  name: Larkfield Partners
+  stage: Bootstrapped
+  industry: Accounting practice
+  headcount: 6
+query: "Hello"
+no_routing: true
+expected_topics:
+  - greets_them_back
+quality_criteria:
+  brief: true
+  sounds_like_a_colleague_saying_hello: true
+  does_not_list_open_cards_or_pending_items: true
+  does_not_answer_with_a_presence_line_like_here: true

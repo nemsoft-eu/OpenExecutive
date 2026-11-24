@@ -257,6 +257,24 @@ def test_cancel_and_move_their_own(roster: SimpleNamespace) -> None:
     assert episodic.get_scheduled_action(two).run_at == when.isoformat()  # type: ignore[union-attr]
 
 
+def test_a_move_with_no_offset_is_on_the_companys_clock(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"Move it to noon on Friday" in New York is noon there, not noon UTC."""
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("America/New_York")
+    monkeypatch.setattr("openexecutive.memory.workspace_settings.get_user_timezone", lambda: zone)
+    action = _followup("s-1")
+    noon = (datetime.now(zone) + timedelta(days=3)).replace(hour=12, minute=0, second=0, microsecond=0)
+    out = _call(ct.handle_move_followup,
+                {"action_id": action, "run_at": noon.replace(tzinfo=None).isoformat()},
+                _web(roster.principal))
+    assert out["status"] == "moved"
+    stored = episodic.get_scheduled_action(action).run_at  # type: ignore[union-attr]
+    assert datetime.fromisoformat(stored) == noon
+
+
 def test_someone_elses_followup_is_refused(roster: SimpleNamespace) -> None:
     other = _followup("someone-else")
     assert _call(ct.handle_cancel_followup, {"action_id": other}, _web(roster.principal))["status"] == "refused"

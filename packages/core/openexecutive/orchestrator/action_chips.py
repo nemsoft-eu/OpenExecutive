@@ -19,6 +19,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from openexecutive.memory import workspace_settings
 from openexecutive.orchestrator import tool_labels
 
 logger = logging.getLogger(__name__)
@@ -89,8 +90,6 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "save_my_email_attachment",
     # Act as me: a reminder to the speaker alone
     "remind_me",
-    # Act as me: a watch on the speaker's own mailbox for an awaited email
-    "watch_for_email",
     # Act as me: a card of actions left for the speaker to approve
     "propose_actions",
     # Meetings: booked, or proposed on an approval card
@@ -103,6 +102,24 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "open_in_app",
 })
 
+
+def _integration_name(integration: str) -> str:
+    """A broadcast tool's integration as people say it ("Google Chat")."""
+    return {"google_chat": "Google Chat"}.get(integration, integration.capitalize())
+
+
+def _person_name(person_id: Any) -> str:
+    """The name on People for ``person_id``, or "" (never a raw id on a
+    chip). Never raises."""
+    if not isinstance(person_id, int) or isinstance(person_id, bool):
+        return ""
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+        return str(getattr(person, "full_name", "") or "").strip()[:80] if person is not None else ""
+    except Exception:
+        return ""
 
 def _parse_result(tool_result: str) -> dict[str, Any] | None:
     """Best-effort JSON parse of a tool handler's string result.
@@ -140,14 +157,12 @@ def _humanize_iso(iso_ts: str) -> str:
     back to the raw ISO string if parsing fails — the chip is best-
     effort, never blocking.
     """
-    try:
-        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
+    # A time with no offset is the company's time, as the tools that
+    # store it read it (workspace_settings.company_time).
+    dt = workspace_settings.company_time(iso_ts)
+    if dt is None:
         return iso_ts
-    if dt.tzinfo is None:
-        # Treat naive timestamps as UTC — matches the convention used by
-        # schedule_followup / suggest_workflow callers that normalize to UTC.
-        dt = dt.replace(tzinfo=UTC)
+    dt = dt.astimezone(workspace_settings.get_user_timezone())
     delta_s = (dt - datetime.now(UTC)).total_seconds()
     if delta_s < 0:
         return "just now"
@@ -364,15 +379,6 @@ def summarize_action(
         summary = f"Reminder set for {when}" if when else "Reminder set"
         payload["summary"] = f"{summary}: {text}" if text else summary
         payload["target"] = None
-    elif tool_name == "watch_for_email":
-        # Only a stored watch earns a chip; the address stays out of it.
-        if (parsed or {}).get("status") != "watching":
-            return None
-        days = (parsed or {}).get("days")
-        payload["summary"] = (
-            f"Watching your inbox for that email for {days} days" if days else "Watching your inbox for that email"
-        )
-        payload["target"] = None
     elif tool_name == "propose_actions":
         # A card carried out on its own (allowed in training) says what it did.
         if (parsed or {}).get("status") == "done_on_its_own":
@@ -419,9 +425,8 @@ def summarize_action(
             payload["decision_id"] = decision_id
     elif tool_name == "message_person":
         pid = tool_input.get("person_id")
-        payload["summary"] = (
-            f"Messaged person #{pid}" if pid is not None else "Messaged a person"
-        )
+        name = _person_name(pid)
+        payload["summary"] = f"Messaged {name}" if name else "Messaged a person"
         payload["target"] = str(pid) if pid is not None else None
         if isinstance(pid, int):
             payload["link"] = f"/people/{pid}"
@@ -583,7 +588,7 @@ def summarize_action(
         payload["link"] = "/company-profile"
     elif tool_name == "create_alert":
         # Only an alert handed to review gets a chip: "ask_in_reply" and
-        # "sender_has_open_card" raised nothing. Review may still drop it, so
+        # "person_has_open_card" raised nothing. Review may still drop it, so
         # the chip doesn't promise a card. The tool's title field is
         # "subject" (alert_tools.CREATE_ALERT_TOOL); kept cards land on Home.
         if parsed is not None and parsed.get("status") != "alert_scheduled":
@@ -630,7 +635,7 @@ def summarize_action(
         slug = tool_input.get("department_slug", "")
         integration = tool_input.get("integration", "")
         if slug and integration:
-            payload["summary"] = f"Posted to {slug} on {integration.capitalize()}"
+            payload["summary"] = f"Posted to {slug} on {_integration_name(integration)}"
         elif slug:
             payload["summary"] = f"Posted to {slug}"
         else:
@@ -641,7 +646,7 @@ def summarize_action(
     elif tool_name == "send_company_broadcast":
         integration = tool_input.get("integration", "")
         payload["summary"] = (
-            f"Broadcast to company on {integration.capitalize()}"
+            f"Broadcast to company on {_integration_name(integration)}"
             if integration else "Broadcast to company"
         )
         payload["target"] = integration or None
@@ -670,7 +675,10 @@ def summarize_action(
         payload["link"] = link
     elif tool_name == "save_workflow":
         status = (parsed or {}).get("status")
-        name = str((parsed or {}).get("name") or "").replace("_", " ")
+        from openexecutive.workflows import workflow_label
+
+        key = str((parsed or {}).get("name") or "")
+        name = workflow_label(key) if key else ""
         if status == "waiting_for_approval":
             payload["summary"] = "Waiting for your OK: a change to a workflow"
             # The chat shows the card itself under its message, by this id.
@@ -687,13 +695,16 @@ def summarize_action(
         if isinstance(link, str) and link and status != "waiting_for_approval":
             payload["link"] = f"/jobs/{link}"
     elif tool_name == "run_workflow":
-        wf = str(tool_input.get("workflow", "")).replace("_", " ")
+        from openexecutive.workflows import workflow_label
+
+        key = str(tool_input.get("workflow") or "")
+        wf = workflow_label(key) if key else ""
         run_id = (parsed or {}).get("run_id")
         awaiting = (parsed or {}).get("status") == "awaiting_human"
         if wf and awaiting:
             payload["summary"] = f"Started {wf} — awaiting sign-off"
         elif wf:
-            payload["summary"] = f"Ran {wf} workflow"
+            payload["summary"] = f"Ran {wf}"
         else:
             payload["summary"] = "Ran a workflow"
         payload["target"] = tool_input.get("workflow") or None

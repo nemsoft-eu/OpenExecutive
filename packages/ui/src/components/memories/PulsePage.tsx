@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { readLastVisit, writeLastVisit } from "@/lib/memoryChanges";
 import { isMemoryView, pulseViewFor, type PulseView } from "@/lib/pulseView";
-import RhythmSection, { FollowUpsCard, RecentActivity } from "./CadenceSection";
+import { RecentActivity } from "./CadenceSection";
 import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import KnowsOverview from "./KnowsOverview";
 import MemoryList from "./MemorySection";
@@ -14,6 +14,7 @@ import { ComingUp, DoneForYou, FocusedScreen } from "./PulseOverview";
 import { ValueScreen } from "./ValueSection";
 import HeldBack from "@/components/briefing/HeldBack";
 import { getHeldBack, type HeldBackItem } from "@/lib/api";
+import { scheduleHref } from "@/lib/schedule";
 
 // The Memory page (it was Pulse): what the Executive knows and what it does.
 // Two tabs. What it knows: About you, About the company, What you taught it,
@@ -23,14 +24,10 @@ import { getHeldBack, type HeldBackItem } from "@/lib/api";
 // (lib/pulseView.ts). What it learned about the signed-in person is theirs
 // alone; its switches stay in Settings → About you.
 
-const SCREENS: Record<Exclude<PulseView, "overview" | "does">, { title: string; description: string }> = {
+const SCREENS: Record<Exclude<PulseView, "overview" | "does" | "schedule">, { title: string; description: string }> = {
   value: {
     title: "Done for you",
     description: "What the Executive did for you, counted from the record.",
-  },
-  schedule: {
-    title: "Schedule",
-    description: "Everything the Executive will do on its own, soonest first.",
   },
   activity: {
     title: "Activity",
@@ -81,11 +78,18 @@ export default function PulsePage() {
     if (wanted === "people") router.replace("/settings/memory");
   }, [router, wanted]);
 
+  // Its schedule is one page now, under Work: older links land there.
+  const toSchedule = view === "schedule";
+  useEffect(() => {
+    if (toSchedule) router.replace(scheduleHref());
+  }, [router, toSchedule]);
+
   // Moving between the overview and a screen starts at the top.
   useEffect(() => {
     top.current?.scrollIntoView({ block: "start" });
   }, [view]);
 
+  if (toSchedule) return null;
   return (
     <div ref={top} className="max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6">
       {view === "overview" || view === "does" ? (
@@ -93,14 +97,8 @@ export default function PulsePage() {
       ) : (
         <FocusedScreen
           {...SCREENS[view]}
-          backHref={view === "schedule" || view === "activity" || view === "value" ? "/memories?tab=does" : "/memories"}
+          backHref={view === "activity" || view === "value" ? "/memories?tab=does" : "/memories"}
         >
-          {view === "schedule" && (
-            <div className="space-y-5">
-              <RhythmSection />
-              <FollowUpsCard />
-            </div>
-          )}
           {view === "activity" && <RecentActivity />}
           {view === "value" && <ValueScreen />}
           {isMemoryView(view) && <MemoryList view={view} />}

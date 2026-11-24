@@ -32,6 +32,95 @@ class FeatureSpec:
     # natively and OpenRouter parses one for any model; a self-hosted
     # OpenAI-compatible server usually cannot (LOCAL_PDF_INPUT says it can).
     supports_pdf_input: bool = True
+    # The most output a request may ask for (``max_tokens``); None = no cap.
+    # A self-hosted server can refuse a request whose prompt plus
+    # ``max_tokens`` exceeds its context (LOCAL_MAX_OUTPUT_TOKENS).
+    max_output_tokens: int | None = None
+
+
+# The most one answer may write: every Executive round, the committee
+# revision and a specialist's analysis. Claude takes it; every other model
+# gets at most NON_CLAUDE_MAX_OUTPUT_TOKENS, and a self-hosted one
+# LOCAL_MAX_OUTPUT_TOKENS. An Executive round that reaches it carries on in
+# the next round (orchestrator/executive.py, CUT_OFF_NOTE), so a long file or
+# answer is written in parts rather than stopped.
+MAX_OUTPUT_TOKENS = 32_000
+
+# The most a specialist's analysis may write (the owner's choice, 11-18).
+# The Executive's own answers keep MAX_OUTPUT_TOKENS.
+SPECIALIST_MAX_TOKENS = 8_000
+
+
+# What a non-Claude model is asked to write at most. Hosted models cap their
+# output at different limits (gpt-4o at 16,384) and refuse a larger request.
+# 16,000 is what the PDF reader and the fixture generator already ask of them,
+# so the cap never lowers a request those callers made before.
+NON_CLAUDE_MAX_OUTPUT_TOKENS = 16_000
+
+
+# How much each model can hold (its context window, in tokens). Claude from
+# 4.7 on, and every Claude 5, holds 1,000,000; older Claude is taken at
+# 200,000 (4.6 serves 1M only where a deployment turns it on). Another
+# hosted model is taken at 128,000 (gpt-4o's window, and the smallest of the
+# hosted models offered); a self-hosted one holds LOCAL_CONTEXT_TOKENS.
+CLAUDE_CONTEXT_TOKENS = 1_000_000
+OLDER_CLAUDE_CONTEXT_TOKENS = 200_000
+NON_CLAUDE_CONTEXT_TOKENS = 128_000
+
+# Claude ids and OpenRouter slugs with their version (``claude-opus-5-5``,
+# ``anthropic/claude-haiku-4.5``, ``claude-sonnet-4-6-20260115``).
+_CLAUDE_VERSION_RE = re.compile(
+    r"^(?:anthropic/)?claude-[a-z]+-(?P<major>\d{1,3})(?:[-.](?P<minor>\d{1,2}))?(?:-\d{8})?$"
+)
+
+# What one turn's reads may fill: a share of the model's window, the rest
+# left for the instructions, the conversation and the answer. Counted at 3
+# characters a token, under what English text takes (about 4), so a dense
+# read (figures, code, another language) still fits.
+_READ_SHARE = 0.4
+_CHARS_PER_TOKEN = 3
+
+# The most one turn's reads add up to, whatever the window (the owner's
+# choice, 11-18). At it the turn writes its answer from what it has.
+MAX_TURN_READ_CHARS = 200_000
+
+
+def context_tokens(model: str, *, local_models: Any = (), local_context_tokens: int = 0) -> int:
+    """How many tokens ``model`` can hold.
+
+    ``local_models`` / ``local_context_tokens`` are the self-hosted models
+    and what their server holds (LOCAL_MODELS, LOCAL_CONTEXT_TOKENS).
+    """
+    if local_context_tokens and model in local_models:
+        return local_context_tokens
+    m = _CLAUDE_VERSION_RE.match(model.lower())
+    if m is None:
+        return NON_CLAUDE_CONTEXT_TOKENS
+    major, minor = int(m.group("major")), int(m.group("minor") or 0)
+    if major >= 5 or (major == 4 and minor >= 7):
+        return CLAUDE_CONTEXT_TOKENS
+    return OLDER_CLAUDE_CONTEXT_TOKENS
+
+
+@dataclass(frozen=True)
+class ReadingLimits:
+    """How much a turn may read, in characters, from its model's window.
+
+    ``per_read`` is one part of one read (a file, a page, a tool's answer):
+    a longer one comes back in parts. ``per_turn`` is what all of a turn's
+    reads may add together, since each stays in the prompt for the rest of
+    the turn. ``window_tokens`` is the model's whole window (0: unknown).
+    """
+
+    per_read: int
+    per_turn: int
+    window_tokens: int = 0
+
+
+def reading_limits(window_tokens: int) -> ReadingLimits:
+    """The reading limits for a model that holds ``window_tokens``."""
+    per_turn = min(int(window_tokens * _READ_SHARE) * _CHARS_PER_TOKEN, MAX_TURN_READ_CHARS)
+    return ReadingLimits(per_read=per_turn // 2, per_turn=per_turn, window_tokens=window_tokens)
 
 
 # Claude models that reject a forced ``tool_choice`` (``any`` or a named
@@ -128,6 +217,7 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
         and spec.supports_web_search
         and spec.supports_tool_use
         and spec.supports_pdf_input
+        and _fits_output_cap(spec, kwargs)
     ):
         # Fast path: nothing to strip.
         return kwargs
@@ -151,7 +241,15 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
     if not spec.supports_pdf_input:
         _replace_documents(out)
 
+    if not _fits_output_cap(spec, out):
+        out["max_tokens"] = spec.max_output_tokens
+
     return out
+
+
+def _fits_output_cap(spec: FeatureSpec, kwargs: dict[str, Any]) -> bool:
+    asked = kwargs.get("max_tokens")
+    return spec.max_output_tokens is None or not isinstance(asked, int) or asked <= spec.max_output_tokens
 
 
 def _strip_cache_control(kwargs: dict[str, Any]) -> None:

@@ -71,6 +71,8 @@ def test_save_persists_with_matching_token() -> None:
     assert out["name"] == "weekly_watch"
     assert out["deep_link"].endswith("/jobs/weekly_watch")
     assert dynamic_store.get_definition("weekly_watch") is not None
+    # No schedule, said in so many words.
+    assert out["schedule"].startswith("none")
 
 
 def test_save_rejects_token_mismatch() -> None:
@@ -188,6 +190,56 @@ def test_chat_saves_tool_workflow_switched_off(scheduled: list[str]) -> None:
     assert scheduled == []
 
 
+def test_a_tool_workflow_the_person_asked_for_saves_switched_on(
+    scheduled: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Their own ask in chat is the yes: no review card, no second switch."""
+    monkeypatch.setattr(wat, "_person_asked", lambda: True)
+    d = _with_cadence(_action_definition())
+    assert "requires_review" not in _draft(d)
+    out = _save(d, wat._canonical_token(d))
+    assert out["status"] == "saved", out
+    stored = dynamic_store.get_definition("weekly_watch")
+    assert stored is not None and stored.is_active is True
+    assert scheduled == ["weekly_watch"]
+
+
+def test_who_asked_fails_closed_without_a_person() -> None:
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    token = current_session.set(None)
+    try:
+        assert wat._person_asked() is False
+    finally:
+        current_session.reset(token)
+
+
+def test_who_asked_fails_closed_after_any_outside_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page read this turn can be the one asking, flagged or not."""
+    from types import SimpleNamespace
+
+    from openexecutive.memory import history_chat
+    from openexecutive.orchestrator import outside_content
+    from openexecutive.orchestrator.schedule_tools import current_session
+    from openexecutive.people import store as people_store
+
+    monkeypatch.setattr(wat, "_session_caller_id", lambda: 7)
+    monkeypatch.setattr(people_store, "get_person", lambda _pid: SimpleNamespace(kind="team"))
+    monkeypatch.setattr(history_chat, "verified_speaker", lambda *_a: True)
+    token = current_session.set(SimpleNamespace())  # type: ignore[arg-type]
+    try:
+        for state, asked in (
+            (None, True),
+            (outside_content.TurnOutside(), True),
+            (outside_content.TurnOutside(sources={"web"}), False),
+            (outside_content.TurnOutside(pending=[("web", "text")]), False),
+        ):
+            monkeypatch.setattr(outside_content, "current", lambda s=state: s)
+            assert wat._person_asked() is asked
+    finally:
+        current_session.reset(token)
+
+
 def test_under_hands_off_a_tool_workflow_saves_switched_on(
     scheduled: list[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -243,6 +295,26 @@ def test_analysis_workflow_still_saves_active_and_schedules(scheduled: list[str]
     stored = dynamic_store.get_definition("weekly_watch")
     assert stored is not None and stored.is_active is True
     assert scheduled == ["weekly_watch"]
+    # The schedule leads the result, so the after-reply check sees it
+    # however long the definition the call was given.
+    assert out["schedule"] == stored.cadence
+    from openexecutive.orchestrator import claim_check
+
+    raw = json.dumps(out)
+    line = claim_check.render_calls([(claim_check.call_label("save_workflow", {"definition": d}), raw)])
+    assert stored.cadence in line
+
+
+def test_a_schedule_that_could_not_be_queued_says_so(
+    scheduled: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.workflows import dynamic_cadence
+
+    monkeypatch.setattr(dynamic_cadence, "schedule_dynamic_workflow_cadence", lambda _defn: None)
+    d = _with_cadence(_valid_definition())
+    out = _save(d, wat._canonical_token(d))
+    assert out["status"] == "saved"
+    assert "not queued" in out["schedule"]
 
 
 def test_analysis_workflow_drafted_off_reports_pending(scheduled: list[str]) -> None:

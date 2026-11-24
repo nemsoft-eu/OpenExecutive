@@ -20,5 +20,6 @@ if _spec is None or _spec.loader is None:
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 cli = _mod.cli
+print_reply = _mod.print_reply
 
-__all__ = ["cli"]
+__all__ = ["cli", "print_reply"]

@@ -14,17 +14,50 @@
  * focus or periodic refresh rather than polling forever. */
 export const NARRATIVE_REPOLL_DELAYS_MS = [4_000, 10_000, 20_000] as const;
 
-/** How often an open, visible Briefing re-pulls /today on its own. */
-export const BRIEFING_REFRESH_INTERVAL_MS = 5 * 60_000;
+/** How often an open, visible Briefing re-pulls /today on its own, so a
+ * card answered on another device leaves Home within a minute. */
+export const BRIEFING_REFRESH_INTERVAL_MS = 60_000;
 
-/** A tab coming back to the foreground refreshes at most this often. */
-export const FOCUS_REFRESH_MIN_GAP_MS = 60_000;
+/** A tab or window coming back to the foreground refreshes at most this often. */
+export const FOCUS_REFRESH_MIN_GAP_MS = 10_000;
 
 /** The delay before re-poll number `attempt` (0-based), or null when the
  * page should stop polling. */
 export function narrativeRepollDelay(attempt: number): number | null {
   if (!Number.isInteger(attempt) || attempt < 0) return null;
   return NARRATIVE_REPOLL_DELAYS_MS[attempt] ?? null;
+}
+
+/** How often the open Briefing checks whether its timed refresh is due. */
+export const BRIEFING_TICK_MS = 15_000;
+
+/** Whether a timed check should re-pull /today: a minute since the last
+ * pull of any kind (focus, Approve or timed), so no change waits longer
+ * than a minute and a tick never follows another refresh closely. */
+export function shouldRefreshOnTick(lastFetchMs: number, nowMs: number): boolean {
+  return nowMs - lastFetchMs >= BRIEFING_REFRESH_INTERVAL_MS;
+}
+
+/** Orders overlapping pulls of /today: `begin` numbers a pull as it starts,
+ * and `accept` says whether its answer may be shown when it lands. An answer
+ * older than one already shown is dropped (it would put old counts back); an
+ * older one still shows while the newer pull hasn't landed or has failed.
+ * `changedHere` drops every pull already under way, for a change made on the
+ * page itself (a dismissed row) that those answers would undo. */
+export function newestAnswer(): { begin(): number; accept(seq: number): boolean; changedHere(): void } {
+  let started = 0;
+  let shown = 0;
+  return {
+    begin: () => ++started,
+    accept: (seq) => {
+      if (seq <= shown) return false;
+      shown = seq;
+      return true;
+    },
+    changedHere: () => {
+      shown = started;
+    },
+  };
 }
 
 /** Whether a tab that just became visible should re-pull /today. */

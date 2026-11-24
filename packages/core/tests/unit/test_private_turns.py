@@ -42,6 +42,14 @@ CONTACT_EMAIL = "jordan@acme.example"
 
 
 @pytest.fixture(autouse=True)
+def _careful_holds_no_asked_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite pins Approvals to Careful (tests/conftest.py), which holds
+    every acting step a turn asks for (take_the_lead._asked_hit); these
+    tests are about other checks, so that hold stays out."""
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     # Every store and the audit log on one tmp file: nothing here may touch
     # (or depend on) the shared ./episodic_memory.db.
@@ -181,6 +189,8 @@ def test_a_private_alert_is_audited_privately(
     with _turn(_teammate_web(roster)):
         asyncio.run(handle_create_alert({"subject": "Server down", "body": "..."}))
     assert [e.private for e in events] == [True, False]
+    # Raised by the Executive itself: a review that makes no decision keeps it.
+    assert all(e.from_executive for e in events)
     assert _private_flags() == {"Alert: Jordan asked about pricing": True}
     # The teammate's own turn: its row is theirs.
     owned = _audit().query(owned_by=roster.teammate, only_owned=True)
@@ -1509,6 +1519,30 @@ def test_load_mcp_server_on_a_private_turn_is_told_not_dropped(roster: SimpleNam
     gateway.load_mcp_server.assert_awaited_once()
 
 
+@pytest.mark.parametrize("tool", ["run_python_job", "find_in_app"])
+def test_a_step_only_the_turn_reads_never_waits_on_a_card(roster: SimpleNamespace, tool: str) -> None:
+    # A run nobody is chatting in (doing what an email asks) calls a step
+    # whose result only that turn reads: by the time anyone could tap
+    # Approve, the turn is over. It is told, and no card is made.
+    from openexecutive.orchestrator import executive as executive_module
+
+    handler = AsyncMock(return_value=json.dumps({"stdout": "the rest"}))
+    session = Session(session_id="inbox:t1", unattended=True, caller_person_id=roster.principal)
+    tool_use = SimpleNamespace(type="tool_use", id="tu-1", name=tool, input={"file": "mail:abc#1"})
+    with (
+        patch.dict(executive_module._ALL_SKILL_HANDLERS, {tool: handler}),
+        patch("openexecutive.orchestrator.levels.hold_many", side_effect=AssertionError("no card")),
+        # The tests have no sandbox (python_job.available).
+        patch("openexecutive.workflows.python_job.available", return_value=True),
+    ):
+        provider = _run_loop(session, [tool_use])
+    handler.assert_not_awaited()
+    result = json.loads(provider.calls[1]["messages"][-1]["content"][0]["content"])
+    assert "can't wait on a card" in result["error"]
+    rows = [e for e in _audit().query(event_type="tool_invocation", limit=100) if e.details.get("held")]
+    assert len(rows) == 1 and rows[0].details["card"] is False
+
+
 # --- MCP tools: Google Workspace reads and the gated Gmail send only --------
 
 
@@ -1656,8 +1690,14 @@ def test_a_private_turn_runs_reads_and_mail_to_the_owner_and_cards_the_rest(
         "google_workspace__send_gmail_message",
     ]
     assert called[1][1]["to"] == OWNER_EMAIL
-    # Everything that reaches someone else waits on an Approve card.
+    # Everything that reaches someone else waits on an Approve card; a
+    # fetch, whose page only the turn would read, is not run and the turn is
+    # told (a card approved after the turn ended would show it to no one).
+    fetch = 2 + [tool for tool, _ in _REFUSED_CALLS].index("fetch__fetch")
     for i in [*range(2, n), n + 2]:
+        if i == fetch:
+            assert "can't wait on a card" in json.loads(results[f"tu-{i}"])["error"]
+            continue
         assert _held(results[f"tu-{i}"]), results[f"tu-{i}"]
     assert all(e.private for e in _audit().query(limit=1000))
 
@@ -1785,6 +1825,7 @@ def test_a_private_turn_opens_a_onedrive_file_and_nothing_else_with_download_byt
 
 
 def test_a_normal_turn_offers_and_runs_them_unchanged(roster: SimpleNamespace) -> None:
+    from openexecutive.browser import tools as browser_tools
     from openexecutive.orchestrator import executive as executive_module
     from openexecutive.orchestrator.content_trust import PRINCIPAL_ONLY_TOOLS
     from openexecutive.orchestrator.executive import _ALL_SKILL_TOOLS, SPECIALIST_TOOLS
@@ -1822,6 +1863,9 @@ def test_a_normal_turn_offers_and_runs_them_unchanged(roster: SimpleNamespace) -
             CHAT_TOOL_DEFINITION,
             LIST_SAVED_TOOLS_DEFINITION,
             SHOW_PROGRESS_TOOL,
+            # A web chat turn of someone on the People list gets the browser
+            # (built in, see openexecutive.browser.tools).
+            *({"name": n} for n in browser_tools.TOOLS),
         ]
         # No sandbox in the tests (python_job.available).
         if t["name"] != "run_python_job"

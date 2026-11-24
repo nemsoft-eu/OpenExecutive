@@ -307,13 +307,7 @@ PACKAGE = Path(openexecutive.__file__).resolve().parent
 
 # Modules exempt from the guard below, each with the reason. Keep this short:
 # an entry is a place the usage view can silently under-count.
-_EXEMPT: dict[str, str] = {
-    "architecture/generator.py": (
-        "no runtime caller: architecture/__init__.py exports it for re-authoring, "
-        "but the /architecture page serves the hand-authored prebuilt JSON and "
-        "nothing calls generate_section outside tests"
-    ),
-}
+_EXEMPT: dict[str, str] = {}
 
 
 def _is_model_call(node: ast.Call) -> bool:

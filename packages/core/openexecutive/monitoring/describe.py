@@ -27,9 +27,12 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from openexecutive.monitoring import mailbox
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
     MODE_ACTIVE,
+    MODE_DRY_RUN,
+    SOURCE_KIND_MAILBOX,
     TRIGGER_ONLY_BIG,
     WatchlistItem,
     is_valid_cadence,
@@ -125,7 +128,12 @@ SYSTEM = (
     "- page_watch: one web page changing (pricing, careers). target is its URL.\n"
     "- query: a standing web search for news no single feed carries. target is "
     "the search, e.g. 'Acme Corp layoffs OR funding'. It costs money every "
-    "check, so use daily or weekly for it.\n\n"
+    "check, so use daily or weekly for it.\n"
+    "- mailbox: email arriving in the person's own inbox. target is what to "
+    "watch for in a few plain words, e.g. 'sign-up emails' or 'Pat's reply'. "
+    "trigger.from lists sender addresses (only ones the person wrote), "
+    "trigger.keywords lists words the subject or sender must contain; set at "
+    "least one. Use real_time for it.\n\n"
     "Rules:\n"
     "- Never invent a URL. Use a URL only when the person wrote it. When they "
     "want news, a page or a status page and gave no URL, use query instead.\n"
@@ -141,6 +149,9 @@ SYSTEM = (
     "- cadence: how often they want to hear. real_time only when they ask for "
     "right away; otherwise 15min for stocks and status pages, daily for "
     "searches, pages and feeds, unless they said otherwise.\n"
+    "- mode: dry_run (Watch quietly: only in their brief, never a card) only "
+    "when they ask to hear about it only in the brief or quietly; otherwise "
+    "leave it out.\n"
     "- display_label: a short name for what is watched, e.g. 'Initech' or "
     "'Stripe status'.\n"
     "- notes: one short line on why, in their words, when they said why.\n"
@@ -158,7 +169,7 @@ def _tool() -> dict[str, Any]:
     from openexecutive.orchestrator.watchlist_tools import ADD_WATCHLIST_ENTRY_TOOL
 
     chat = ADD_WATCHLIST_ENTRY_TOOL["input_schema"]["properties"]
-    keep = ("signal_type", "target", "display_label", "cadence", "notes")
+    keep = ("signal_type", "target", "display_label", "cadence", "mode", "notes")
     properties: dict[str, Any] = {k: dict(chat[k]) for k in keep}
     properties["trigger"] = {
         "type": "object",
@@ -167,6 +178,7 @@ def _tool() -> dict[str, Any]:
             "abs_change_pct_gte": {"type": "number"},
             "keywords": {"type": "array", "items": {"type": "string"}},
             "forms": {"type": "array", "items": {"type": "string"}},
+            "from": {"type": "array", "items": {"type": "string"}},
             TRIGGER_ONLY_BIG: {"type": "boolean"},
         },
     }
@@ -296,6 +308,8 @@ def clean_trigger(signal_type: str, raw: object) -> dict[str, Any]:
     but stock, whose own threshold already says how big."""
     if not isinstance(raw, dict):
         return {}
+    if signal_type == SOURCE_KIND_MAILBOX:
+        return mailbox.clean_trigger(raw)
     if signal_type == "stock":
         pct = raw.get("abs_change_pct_gte")
         if isinstance(pct, bool) or not isinstance(pct, int | float):
@@ -352,13 +366,17 @@ async def build_draft(payload: dict[str, Any]) -> WatchDraft:
         if not ok:
             raise DescribeError("invalid", "That link can't be watched. Use a public web address.")
 
-    cadence = _str(payload.get("cadence"), 20) or ("daily" if signal_type == "query" else "15min")
+    default_cadence = {"query": "daily", SOURCE_KIND_MAILBOX: "real_time"}.get(signal_type, "15min")
+    cadence = _str(payload.get("cadence"), 20) or default_cadence
     if not is_valid_cadence(cadence):
-        cadence = "daily" if signal_type == "query" else "15min"
-    mode = MODE_ACTIVE
+        cadence = default_cadence
+    # Watch quietly when they asked for the brief only; else it tells them.
+    mode = MODE_DRY_RUN if payload.get("mode") == MODE_DRY_RUN else MODE_ACTIVE
 
     label = _str(payload.get("display_label"), _LABEL_MAX)
     trigger = clean_trigger(signal_type, payload.get("trigger"))
+    if signal_type == SOURCE_KIND_MAILBOX and not trigger:
+        raise DescribeError("invalid", "Say who the email is from or a word in its subject.")
 
     # The rss check fetches the feed: a page with no feed becomes a
     # page_watch, a dead one is refused, the same as on create.
@@ -384,7 +402,7 @@ async def build_draft(payload: dict[str, Any]) -> WatchDraft:
         mode=mode,
         notes=_str(payload.get("notes"), _NOTES_MAX),
         watching=watching_line(signal_type, target, label),
-        tell_you_when=trigger_line(signal_type, trigger),
+        tell_you_when=trigger_line(signal_type, trigger) + (", only in your brief" if mode == MODE_DRY_RUN else ""),
         how_often=checks_line(signal_type, cadence),
     )
 
@@ -448,6 +466,8 @@ def watching_line(signal_type: str, target: str, label: str = "") -> str:
         return f"The {label} page" if label else f"The page at {_site(target)}"
     if signal_type == "query":
         return "The web for \u201c" + target + "\u201d"
+    if signal_type == SOURCE_KIND_MAILBOX:
+        return f"Email for {label or target}"
     return label or target
 
 
@@ -477,7 +497,23 @@ def _trigger_base(signal_type: str, trigger: dict[str, Any], quoted: str, mentio
         return "The page changes" + (" and mentions " + quoted if quoted else "")
     if signal_type == "query":
         return f"A new result turns up{mention}"
+    if signal_type == SOURCE_KIND_MAILBOX:
+        # It reads the Executive's inbox, and theirs when it is connected.
+        senders = [str(a) for a in trigger.get(mailbox.FROM_KEY) or [] if str(a).strip()]
+        if senders:
+            line = _join_or(senders) + " emails the Executive or you"
+            return line + (" about " + quoted if quoted else "")
+        return "An email that mentions " + quoted + " reaches the Executive or you" if quoted else (
+            "An email reaches the Executive or you"
+        )
     return "Something new turns up"
+
+
+def quiet_line(item: Any) -> str:
+    """An email watch's "nothing by" day, as the watch list says it
+    ("Ping if nothing by Wed Nov 25"), else empty."""
+    day = mailbox.quiet_by(item) if mailbox.is_mailbox(item) else None
+    return f"Ping if nothing by {day:%a %b} {day.day}" if day else ""
 
 
 # The row's own cadence in minutes (monitoring.pipeline._CADENCE_MINUTES).
@@ -495,12 +531,22 @@ def _every(minutes: int) -> str:
     return f"every {max(1, minutes)} minutes"
 
 
-def checks_line(signal_type: str, cadence: str) -> str:
-    """How often the watch is really checked, in words: its own cadence,
+def check_minutes(signal_type: str, cadence: str) -> int:
+    """How many minutes apart the watch is really checked: its own cadence,
     never faster than its source allows (the scan's rule)."""
     source = get_source_for_kind(signal_type)
     floor = source.default_poll_interval_minutes if source is not None else 15
-    return f"It checks {_every(max(floor, _CADENCE_MINUTES.get(cadence, 0)))}."
+    return max(floor, _CADENCE_MINUTES.get(cadence, 0))
+
+
+def checks_every(signal_type: str, cadence: str) -> str:
+    """How often the watch is checked, in words: "once a day"."""
+    return _every(check_minutes(signal_type, cadence))
+
+
+def checks_line(signal_type: str, cadence: str) -> str:
+    """How often the watch is really checked, as a sentence."""
+    return f"It checks {checks_every(signal_type, cadence)}."
 
 
 _TITLE_MAX = 60
@@ -543,6 +589,9 @@ def watch_title(item: WatchlistItem) -> str:
         ) or _site(target)
     elif kind == "page_watch":
         title = (label if not label or _ends_with(label, "page") else f"{label} page") or _site(target)
+    elif kind == SOURCE_KIND_MAILBOX:
+        name = label or target
+        title = name[:1].upper() + name[1:]
     else:
         title = label or target
     title = title or item.slug.replace("-", " ")
@@ -550,6 +599,7 @@ def watch_title(item: WatchlistItem) -> str:
 
 
 __all__ = [
+    "quiet_line",
     "DESCRIBE_PER_HOUR",
     "TEXT_MAX_CHARS",
     "DescribeError",

@@ -3,7 +3,7 @@
 import Link from "next/link";
 
 import type { DoneRow } from "@/lib/api";
-import { doneLink, statusLabel } from "@/lib/doneForYou";
+import { asTagTone, doneLink, statusLabel } from "@/lib/doneForYou";
 import { whenLabel } from "@/lib/pulseView";
 
 import { buttonClass } from "../ui/Button";
@@ -11,10 +11,18 @@ import { buttonClass } from "../ui/Button";
 // Done for you on Home: what the Executive did or is doing for you in the
 // last day (GET /today `done_for_you`). A card you approved is one row whose
 // chip changes in place from Working on it to Done (or Didn't work, with
-// Try again); what it did on its own follows. Nothing here waits on you, so
+// Try again); what it did on its own follows. Each row's tag says whose name
+// it went out in. Nothing here waits on you, so
 // none of it is in Needs you. The full list is Memory's activity.
 
 export const DONE_FOR_YOU_ID = "done-for-you";
+
+// "Sent as you" reads in the accent, anything in the Executive's name warm.
+function asTagClass(tag: string): string {
+  return asTagTone(tag) === "you"
+    ? "bg-accent/10 text-accent"
+    : "bg-amber-500/10 text-amber-800 dark:text-amber-300";
+}
 const SHOWN = 5;
 
 const CHIP: Record<DoneRow["status"], string> = {
@@ -49,6 +57,11 @@ export default function DoneForYou({
               <div className="min-w-0 flex-1">
                 <p className="text-[15px] text-fg break-words">{row.title}</p>
                 {row.detail && <p className="text-sm text-fg-muted break-words">{row.detail}</p>}
+                {row.as_tag && (
+                  <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${asTagClass(row.as_tag)}`}>
+                    {row.as_tag}
+                  </span>
+                )}
               </div>
               {when && <span className="text-xs tabular-nums text-fg-muted">{when}</span>}
               <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${CHIP[row.status]}`}>

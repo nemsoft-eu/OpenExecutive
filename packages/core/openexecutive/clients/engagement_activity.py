@@ -111,10 +111,16 @@ def gather_engagement_activity(
         copied = "facts_meta" in tables and conn.execute(
             "SELECT 1 FROM facts_meta WHERE key = 'decisions_copied_to_facts'"
         ).fetchone() is not None
+        # The team's decisions only. A parked slot from before private
+        # decisions has no such column, and none to leave out.
+        fact_cols = (
+            {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()} if copied else set()
+        )
+        team_only = " AND private_to_person_id IS NULL" if "private_to_person_id" in fact_cols else ""
         source = (
             "(SELECT created_at AS timestamp, CASE WHEN department != '' THEN department "
             "ELSE 'general' END AS domain, statement AS summary, outcome FROM facts "
-            "WHERE decision = 1 AND status = 'active')"
+            f"WHERE decision = 1 AND status = 'active'{team_only})"
             if copied else "decisions"
         )
         if copied or "decisions" in tables:

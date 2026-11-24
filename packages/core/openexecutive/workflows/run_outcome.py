@@ -45,6 +45,21 @@ _MAX_LINE = 160
 _TITLE_NOISE = re.compile(r"\s*(\(.*\)|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2})\s*$")
 
 
+# What a run's log title says about how it started, never shown to anyone.
+HOW_IT_STARTED: tuple[str, ...] = (
+    "(periodic)", "(post-onboarding auto-fire)", "(chat-tool fire)",
+)
+
+
+def shown_title(title: str) -> str:
+    """A run's title as people read it: without the note on how it started
+    ("Post-mortem (chat-tool fire)" reads "Post-mortem")."""
+    for note in HOW_IT_STARTED:
+        if title.endswith(note):
+            return title[: -len(note)].rstrip() or title
+    return title
+
+
 def has_write_up(artifact: str | None) -> bool:
     """Whether the run kept a write-up worth opening."""
     return (artifact or "").strip() not in _EMPTY_ARTIFACTS
@@ -88,8 +103,8 @@ def outcome_line(run: dict[str, Any]) -> str | None:
     if name == "department_check_in":
         return _check_in_line(artifact)
     if name == "weekly_review":
-        return _weekly_line(artifact) or _first_sentence(artifact)
-    return _first_sentence(artifact)
+        return _weekly_line(artifact) or first_sentence(artifact)
+    return first_sentence(artifact)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +180,7 @@ def _weekly_line(artifact: str) -> str | None:
     return None
 
 
-def _first_sentence(artifact: str) -> str | None:
+def first_sentence(artifact: str) -> str | None:
     """The first line of prose in a write-up, without its Markdown."""
     for raw in artifact.splitlines():
         line = raw.strip()

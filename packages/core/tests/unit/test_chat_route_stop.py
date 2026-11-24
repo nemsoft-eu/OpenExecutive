@@ -529,3 +529,39 @@ def test_registry_is_released_when_the_session_load_fails(
         )
 
     assert chat_route._active_stops == {}, "the stop entry was stranded"
+
+
+def test_stop_during_a_rewrite_keeps_the_first_reply(
+    temp_db: Path, patched_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stopped after a rewrite began but before it wrote a word: the first
+    reply is saved, and goes back on the page before `stopped`."""
+    from openexecutive.orchestrator import executive as exec_mod
+
+    class _RewritingExecutive:
+        _THINKING = exec_mod.Executive._THINKING
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def stream_chat(self, **_kwargs: Any) -> Any:
+            yield "I saved the plan."
+            yield {"type": "rewrite"}
+            chat_route._request_stop(CLIENT_ID, "local")
+            await asyncio.sleep(30)
+            yield "never reached"
+
+    monkeypatch.setattr(exec_mod, "Executive", _RewritingExecutive)
+
+    resp = _client().post(
+        "/chat", json={"message": "save the plan", "client_turn_id": CLIENT_ID}
+    )
+    events = _events(resp.text)
+    types = [e.get("type") for e in events]
+    assert "stopped" in types
+    kept = [i for i, e in enumerate(events) if e.get("type") == "chunk" and e["content"] == "I saved the plan."]
+    assert len(kept) == 2 and types.index("rewrite") < kept[1] < types.index("stopped")
+
+    rows = _all_sessions(temp_db)
+    saved = session_store.load_messages(rows[0]["session_id"])
+    assert saved[1]["content"] == "I saved the plan."

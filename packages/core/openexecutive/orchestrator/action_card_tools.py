@@ -13,12 +13,8 @@ their Handle it for me and Approvals let go (``action_cards.run_on_its_own``):
 carried out at once, with the daily cap bounding it, and below Hands-off
 reaching only people settled on their roster.
 
-A turn another AI app asked to act (``Session.mcp_client_may_act``) is
-offered this tool alone of Act as me's, with no mailbox: what reaches another
-person (a message, an invite) is proposed here instead of sent. Its speaker
-is the caller the API verified (``Session.caller_person_id``), with Act as me
-on. Such a card follows the same rule, and below Hands-off it also waits
-when the turn read outside text (``outside_content.read_outside``) or mail.
+A turn another AI app asked (``Session.from_mcp_client``) is the signed-in
+person's own and gets this tool the same way; the card names the app.
 """
 from __future__ import annotations
 
@@ -107,55 +103,18 @@ def _error(message: str) -> str:
     return json.dumps({"error": message})
 
 
-def _ai_app_speaker(session: Any) -> tuple[Any, Any] | str:
-    """``(person, pinned)`` for a turn another AI app asked to act, or the
-    refusal: the caller the API verified, on the roster, with Act as me on
-    (a card is approved, and carried out, under Act as me)."""
-    from openexecutive.delegation.settings import can_delegate, is_enabled, turn_delegation
-    from openexecutive.orchestrator.people_tools import _is_verified_speaker_surface
-    from openexecutive.people.store import get_person
-
-    pinned = turn_delegation(session)
-    caller = getattr(session, "caller_person_id", None)
-    try:
-        person = get_person(int(caller)) if isinstance(caller, int) and not isinstance(caller, bool) else None
-    except Exception:
-        logger.warning("propose_actions: couldn't read the speaker", exc_info=True)
-        person = None
-    if pinned is None or person is None or person.id is None or not _is_verified_speaker_surface(session):
-        return _error(
-            "I can't tell who this is for, so I can't leave a card. Tell the person "
-            "to do it in Open Executive itself. Do not retry."
-        )
-    if not can_delegate(person) or not is_enabled(person.id):
-        return _error(
-            "Cards need As you on for them, and it is off. Tell the person to do "
-            "it in Open Executive itself. Do not retry."
-        )
-    return person, pinned
-
-
 async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
     from openexecutive.audit import rows_via
     from openexecutive.delegation import action_cards
     from openexecutive.integrations.channel_cards import card_here, card_text, shows_cards
-    from openexecutive.orchestrator import outside_content
     from openexecutive.orchestrator.delegation_tools import _writer
-    from openexecutive.orchestrator.schedule_tools import current_session, mcp_client_acting
+    from openexecutive.orchestrator.schedule_tools import current_session
 
     session = current_session.get()
-    # Another AI app asked, and may act: the card follows their Handle it for me.
-    ai_app = mcp_client_acting(session)
-    if ai_app:
-        found = _ai_app_speaker(session)
-        if isinstance(found, str):
-            return found
-        person, pinned = found
-    else:
-        writer = _writer(PROPOSE_ACTIONS)
-        if isinstance(writer, str):
-            return writer
-        person, pinned = writer.person, writer.pinned
+    writer = _writer(PROPOSE_ACTIONS)
+    if isinstance(writer, str):
+        return writer
+    person, pinned = writer.person, writer.pinned
     if getattr(pinned, "action_cards", 0) >= action_cards.CARDS_PER_TURN:
         return _error(f"That's {action_cards.CARDS_PER_TURN} cards this turn. Put the rest on one of them.")
     checked = action_cards.check(tool_input.get("actions"), person, now=datetime.now(UTC))
@@ -166,20 +125,14 @@ async def handle_propose_actions(tool_input: dict[str, Any]) -> str:
         unshown = await action_cards.describe_save_files(checked, getattr(session, "session_id", None))
     if unshown is not None:
         return _error(unshown)
-    via = (rows_via() or "an AI app") if ai_app else None
+    # Asked from another AI app: the card says which.
+    via = (rows_via() or "an AI app") if getattr(session, "from_mcp_client", False) is True else None
     try:
         if len(action_cards.open_cards(person.id)) >= action_cards.OPEN_CARDS_MAX:
             return _error(f"They already have {action_cards.OPEN_CARDS_MAX} cards waiting. Ask them to clear some first.")
         pinned.action_cards = getattr(pinned, "action_cards", 0) + 1
         # Handle it for me on and Approvals above Careful: carried out now.
         on_its_own = action_cards.on_its_own_refusal(person, checked, now=datetime.now(UTC)) is None
-        # From an AI app, below Hands-off, a turn that read outside text (a
-        # document, a web page, mail) never sends on its own: its words may
-        # be that text's.
-        if ai_app and on_its_own and not action_cards.hands_off() and (
-            outside_content.read_outside() or getattr(pinned, "touched_mail", False) is True
-        ):
-            on_its_own = False
         decision_id = action_cards.propose(
             person, checked, str(tool_input.get("why") or ""),
             session_id=getattr(session, "session_id", None), on_its_own=on_its_own,

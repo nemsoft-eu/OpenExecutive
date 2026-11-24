@@ -98,12 +98,3 @@ export function peopleText(total: number, toFollowUp: number): string {
   return `${counted(total, "person", "people")}, all clear`;
 }
 
-// The watchlist, with the new signals when there are any.
-export function watchingText(watched: number, signals: number): string {
-  const sig = counted(signals, "new signal", "new signals");
-  if (watched > 0) {
-    const w = `Watching ${counted(watched, "thing", "things")}`;
-    return signals > 0 ? `${w}, ${sig}` : w;
-  }
-  return sig;
-}

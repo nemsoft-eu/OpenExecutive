@@ -89,6 +89,7 @@ from openexecutive.delegation.gmail import (
     clean_header,
     credential_path,
     html_to_text,
+    mailbox_of,
     normalize_email,
 )
 
@@ -581,6 +582,11 @@ class DelegateOutlook:
         self._sent_folder = ""
 
     @property
+    def mailbox(self) -> str:
+        """The address this mailbox sends from (``gmail.mailbox_of``)."""
+        return mailbox_of(self.email, directory=self._directory)
+
+    @property
     def personal(self) -> bool:
         cred = self._credential or load_credential(self.email, directory=self._directory)
         return bool(cred and cred.personal)
@@ -699,7 +705,7 @@ class DelegateOutlook:
         return self._sent_folder
 
     def _parse(self, raw: object) -> MailMessage:
-        return parse_message(raw if isinstance(raw, dict) else {}, self._sent_folder, self.email)
+        return parse_message(raw if isinstance(raw, dict) else {}, self._sent_folder, self.mailbox)
 
     @staticmethod
     def _directory_address(me: dict[str, Any]) -> str:
@@ -917,7 +923,7 @@ class DelegateOutlook:
         for raw in data.get("value") or []:
             if not isinstance(raw, dict) or not valid_id(raw.get("id")):
                 continue
-            if _address(raw.get("from"))[1] == self.email:
+            if _address(raw.get("from"))[1] == self.mailbox:
                 continue
             out.append((str(raw["id"]), str(raw.get("conversationId") or "")))
         return out
@@ -958,6 +964,31 @@ class DelegateOutlook:
                 "$expand": _EXPAND,
             })
         return [self._parse(m) for m in data.get("value") or [] if isinstance(m, dict)]
+
+    async def received_since(
+        self, after: datetime, *, before: datetime | None = None, limit: int = 25,
+    ) -> list[MailMessage]:
+        """Mail that reached the inbox since ``after`` (and before
+        ``before``, when given), Focused and Other, not the person's own,
+        newest first, at most ``limit`` (capped at 50). An email watch
+        reads this, a page at a time."""
+        def stamp(when: datetime) -> str:
+            return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        window = f"receivedDateTime ge {stamp(after)}"
+        if before is not None:
+            window += f" and receivedDateTime lt {stamp(before)}"
+        async with self._client() as client:
+            await self._sent_folder_id(client)
+            data = await self._get(client, "/mailFolders/inbox/messages", {
+                "$filter": window,
+                "$orderby": "receivedDateTime desc",
+                "$top": max(1, min(int(limit), 50)),
+                "$select": _SELECT,
+                "$expand": _EXPAND,
+            })
+        parsed = [self._parse(m) for m in data.get("value") or [] if isinstance(m, dict)]
+        return [m for m in parsed if normalize_email(m.from_addr) != self.mailbox]
 
     async def get_message(self, message_id: str) -> MailMessage:
         if not valid_id(message_id):

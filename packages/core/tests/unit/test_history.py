@@ -235,3 +235,58 @@ def test_everyone_keeps_notes_until_they_turn_it_off(monkeypatch: pytest.MonkeyP
     assert h.people_keeping_notes() == []
     h.set_person_settings(2, by="t", reply_notes=True)
     assert h.people_keeping_notes() == [2]
+
+
+def test_shown_summary_puts_you_in_front_of_the_verb() -> None:
+    from openexecutive.memory.history import shown_summary
+
+    assert shown_summary("Said the Android review is complete.") == "You said the Android review is complete."
+    assert shown_summary("Promised Dana the deck by Friday") == "You promised Dana the deck by Friday"
+    assert shown_summary("Dana Lee asked for the deck") == "Dana Lee asked for the deck"
+    assert shown_summary("") == ""
+    assert shown_summary("Fred asked for the deck") == "Fred asked for the deck"
+    assert shown_summary("Ahmed confirmed the scans") == "Ahmed confirmed the scans"
+    assert shown_summary("Was asked by Dana for the deck") == "Was asked by Dana for the deck"
+    assert shown_summary("Promised Ted the deck") == "You promised Ted the deck"
+    assert shown_summary("Ahmed Khan confirmed the scans") == "Ahmed Khan confirmed the scans"
+    assert shown_summary("Ted and Dana agreed on price") == "Ted and Dana agreed on price"
+    assert shown_summary("Fred will send the deck Friday") == "Fred will send the deck Friday"
+    assert shown_summary("Seed round closes Friday") == "Seed round closes Friday"
+    assert shown_summary("Confirmed the scans come Friday") == "You confirmed the scans come Friday"
+    assert shown_summary("Expected revenue is $2M for Q4") == "Expected revenue is $2M for Q4"
+    assert shown_summary("Updated pricing goes out Friday") == "Updated pricing goes out Friday"
+    assert shown_summary("Had promised Dana the deck by Friday") == "You had promised Dana the deck by Friday"
+    assert shown_summary("Were told the launch slips a week") == "You were told the launch slips a week"
+    assert shown_summary("Rose will send the deck") == "Rose will send the deck"
+    assert shown_summary("Sent, signed and returned the NDA") == "You sent, signed and returned the NDA"
+    assert shown_summary("Set of slides is due Friday") == "Set of slides is due Friday"
+    assert shown_summary("Won Kim confirmed the scans") == "Won Kim confirmed the scans"
+    assert shown_summary("Clarified the start date with Dana") == "You clarified the start date with Dana"
+    assert shown_summary("Thanked Dana for the intro") == "You thanked Dana for the intro"
+    assert shown_summary("Sent signed contract to Dana") == "You sent signed contract to Dana"
+    assert shown_summary("Shared finished deck with Kyle") == "You shared finished deck with Kyle"
+
+
+
+def test_the_executive_reads_a_correction_in_note_form() -> None:
+    from openexecutive.memory.history import note_form, shown_summary
+
+    assert note_form("You told Dana the deck comes Monday.") == "Told Dana the deck comes Monday."
+    assert note_form("You said Dana it might slip") == "Said Dana it might slip"
+    assert note_form("Shipped Friday, not Monday") == "Shipped Friday, not Monday"
+    assert note_form("Your deck is late") == "Your deck is late"
+    assert note_form("you told Dana the deck comes Monday") == "Told Dana the deck comes Monday"
+    assert shown_summary("Advised Dana to wait") == "You advised Dana to wait"
+    assert note_form("") == ""
+
+
+def test_a_noun_that_reads_like_a_verb_is_left_alone() -> None:
+    from openexecutive.memory.history import shown_summary
+
+    assert shown_summary("Used car quote came in.") == "Used car quote came in."
+
+
+def test_a_correction_with_a_present_looking_verb_keeps_you() -> None:
+    from openexecutive.memory.history import note_form
+
+    assert note_form("You put Dana in charge of the launch.") == "You put Dana in charge of the launch."

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from openexecutive.orchestrator.executive import EMPTY_ROUND_NOTE, Executive
-from tests.unit.test_tool_result_cap import _FinalMsg, _ScriptedProvider, _TextBlock
+from tests.unit.test_reading import _FinalMsg, _ScriptedProvider, _TextBlock
 
 
 @pytest.fixture(autouse=True)

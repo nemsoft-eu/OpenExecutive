@@ -31,6 +31,11 @@ SOURCE_KIND_EDGAR = "edgar"
 # and emits a Signal when it changes vs the last poll; watches feed-less pages
 # (pricing, careers, leadership). Stateful (see monitoring.store page_watch_state).
 SOURCE_KIND_PAGE_WATCH = "page_watch"
+# One person's own inbox (Act as me's mailbox: Gmail or Outlook): tells them
+# every time an email comes in from a sender they named, or whose subject or
+# sender says one of their words. Private to that person
+# (``monitoring.mailbox``); never a company-wide watch.
+SOURCE_KIND_MAILBOX = "mailbox"
 
 # page_watch fetch-source marker. Every page_watch row is now fetched with the
 # keyless httpx fetcher; rows written before the xcrawl scrape path was removed
@@ -233,6 +238,10 @@ OUTCOME_SUPPRESSED_TRIAGE = "suppressed_triage"
 # configured floor (external_monitor_enrichment_min_relevance). Recorded, not
 # promoted — the gate is opt-in (default threshold 0.0 = off) until calibrated.
 OUTCOME_SUPPRESSED_LOW_RELEVANCE = "suppressed_low_relevance"
+# Captured + enriched, and the watch's notes (what the person told it, often
+# from a reply on one of its cards: monitoring/steer.py) say to skip a change
+# like this. Recorded, never promoted.
+OUTCOME_SUPPRESSED_BY_NOTES = "suppressed_by_notes"
 # Recorded on the FIRST poll of a feed-listing source (rss, edgar): every
 # entry already in the feed is persisted as "seen" so dedup covers it, but
 # nothing is promoted — the watch reports what changes from now on, not
@@ -247,11 +256,18 @@ OUTCOME_FAILED = "failed"
 # after the window folds every held change into ONE alert (the daily digest
 # for a busy page), and each held row then moves to ``alerted``.
 OUTCOME_HELD_DIGEST = "held_digest"
+# A watch set to Watch quietly (MODE_DRY_RUN, not a suggestion): never a card;
+# the change goes in the next brief instead (``EVENT_QUIET_FIND``).
+OUTCOME_HELD_BRIEF = "held_brief"
+# The audit row a quiet watch's find writes; the brief reads it as one of the
+# things it handled (briefing.brief_state.HANDLED_EVENT_KINDS).
+EVENT_QUIET_FIND = "watch_found_quietly"
 PAGE_WATCH_DIGEST_HOURS = 24
 
 _VALID_OUTCOMES = frozenset({
     OUTCOME_ALERTED,
     OUTCOME_HELD_DIGEST,
+    OUTCOME_HELD_BRIEF,
     OUTCOME_SUPPRESSED_BASELINE,
     OUTCOME_SUPPRESSED_STALE,
     OUTCOME_SUPPRESSED_DRY_RUN,
@@ -259,6 +275,7 @@ _VALID_OUTCOMES = frozenset({
     OUTCOME_SUPPRESSED_DUP,
     OUTCOME_SUPPRESSED_TRIAGE,
     OUTCOME_SUPPRESSED_LOW_RELEVANCE,
+    OUTCOME_SUPPRESSED_BY_NOTES,
     OUTCOME_FAILED,
 })
 

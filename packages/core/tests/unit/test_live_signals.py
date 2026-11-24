@@ -74,7 +74,7 @@ def test_bookkeeping_inbound_rows_stay_out(audit: AuditLogger) -> None:
     assert signals.is_empty()
 
 
-def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogger) -> None:
+def test_stuck_collects_blocked_replies_and_not_mail_that_merely_arrived(audit: AuditLogger) -> None:
     audit.log("integration_outbound_blocked",
               "Blocked outbound email to dana@x.com (tool=send_gmail_message field=to)",
               details={"tool": "send_gmail_message", "field": "to", "address": "dana@x.com"})
@@ -82,8 +82,8 @@ def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogge
               "Blocked a Google Workspace call as another account (tool=x)",
               details={"field": "user_google_email", "address": "other@x.com"})
     audit.log("integration_inbound",
-              "Accepted non-roster email from dana@x.com (reply blocked at outbound gate)",
-              details={"channel": "email", "from": "dana@x.com",
+              "Accepted email from leo@x.com, who isn't on the team",
+              details={"channel": "email", "from": "leo@x.com",
                        "outcome": "accepted_non_roster"})
     audit.log("integration_inbound", "Google Chat reply not delivered in spaces/B: quota",
               details={"channel": "google_chat"})
@@ -92,7 +92,8 @@ def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogge
 
     joined = "\n".join(signals.stuck)
     assert "email to dana@x.com was held at the outbound gate" in joined
-    assert "not on the roster" in joined
+    # Mail from outside the team that was answered is not stuck.
+    assert "leo@x.com" not in joined and "roster" not in joined
     assert "Google Chat reply not delivered" in joined
     assert "other@x.com" not in joined  # guard bookkeeping, not a held reply
     assert signals.inbound_total == 0

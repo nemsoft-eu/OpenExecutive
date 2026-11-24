@@ -97,8 +97,8 @@ LIST_DEPARTMENT_GOALS_TOOL: dict[str, Any] = {
 UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
     "name": "update_department_goal",
     "description": (
-        "Update a Goal's status, current-progress text, or "
-        "both — based on something the user just told you. Call this "
+        "Update a Goal's status, current-progress text, owner, or "
+        "several — based on something the user just told you. Call this "
         "when the user reports concrete progress on (or a setback to) a "
         "tracked Goal: 'we shipped the billing migration' (likely a "
         "current update + bump to on_track), 'lost the Acme deal' "
@@ -147,6 +147,14 @@ UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
                     "'cutover complete'). Overwrites the prior value. Omit to "
                     "leave unchanged. Must supply at least one of `status` or "
                     "`current`."
+                ),
+            },
+            "owner_person_id": {
+                "type": "integer",
+                "description": (
+                    "Optional. Who owns the goal from now on: a teammate's id "
+                    "from list_people (someone on the team, never a contact). "
+                    "Use when the user says who owns it now ('Jordan owns it')."
                 ),
             },
             "rationale": {
@@ -387,11 +395,30 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
 
     status_in = tool_input.get("status")
     current_in = tool_input.get("current")
-    if status_in is None and current_in is None:
+    owner_in = tool_input.get("owner_person_id")
+    if status_in is None and current_in is None and owner_in is None:
         return _bad(
-            "must supply at least one of `status` or `current`",
+            "must supply at least one of `status`, `current` or `owner_person_id`",
             department_slug=slug, goal_id=goal_id,
         )
+    owner_id: int | None = None
+    if owner_in is not None:
+        from openexecutive.people import store as people_store
+
+        try:
+            if isinstance(owner_in, bool):
+                raise TypeError("owner_person_id must be an integer")
+            owner_id = int(owner_in)
+        except (TypeError, ValueError):
+            return _bad("owner_person_id must be an integer", department_slug=slug, goal_id=goal_id)
+        owner = people_store.get_person(owner_id)
+        # A goal is owned by someone on the team, never an outside contact
+        # (as on the Goals page).
+        if owner is None or owner.archived or owner.kind != "team":
+            return _bad(
+                "owner_person_id must be someone on the team (list_people)",
+                department_slug=slug, goal_id=goal_id,
+            )
 
     if status_in is not None and status_in not in _VALID_GOAL_STATUSES:
         return _bad(
@@ -402,11 +429,14 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
     # Marking a goal done takes it out of every review, so nothing regrades
     # a wrong call. Only the principal makes it, as with a new goal.
     if status_in == "done" and not _principal_asked():
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
         return _bad(
             "refused: only the principal can mark a goal done, and this request "
             "did not come from a conversation that confirms it is them. Tell "
-            "whoever asked that the principal needs to do it — on the Goals "
-            "page, or by asking in the web app or their own Slack or Discord.",
+            "whoever asked, plainly, that the principal can do it on the Goals "
+            "page, or by asking in the web app or their own Slack or Discord. "
+            f"{PASS_ON_NOTHING}",
             department_slug=slug, goal_id=goal_id, refused=True,
         )
 
@@ -440,17 +470,20 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         and status_in not in (None, "done")
         and not _principal_asked()
     ):
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
         return _bad(
             "refused: this goal is marked done, and only the principal can "
-            "reopen it. Tell whoever asked that the principal needs to do it — "
+            "reopen it. Tell whoever asked, plainly, that the principal can do it "
             "on the Goals page, or by asking in the web app or their own Slack "
-            "or Discord.",
+            f"or Discord. {PASS_ON_NOTHING}",
             department_slug=slug, goal_id=goal_id, refused=True,
         )
 
     # ---- Persist ----
     prior_status = existing.status
     prior_current = existing.current
+    prior_owner = existing.owner_person_id
     prior_updated_at = existing.updated_at
     now_iso = datetime.now(UTC).isoformat()
 
@@ -458,12 +491,21 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         # `update_goal` accepts an optional `last_reviewed_at` so we record
         # the chat-driven review in the same SQL transaction — single row
         # mutation, single Honcho mirror, single `updated_at` bump.
-        updated = dept_store.update_goal(
-            goal_id,
-            status=status_in if status_in is not None else None,
-            current=current_str,
-            last_reviewed_at=now_iso,
-        )
+        if owner_id is not None:
+            updated = dept_store.update_goal(
+                goal_id,
+                status=status_in if status_in is not None else None,
+                current=current_str,
+                last_reviewed_at=now_iso,
+                owner_person_id=owner_id,
+            )
+        else:
+            updated = dept_store.update_goal(
+                goal_id,
+                status=status_in if status_in is not None else None,
+                current=current_str,
+                last_reviewed_at=now_iso,
+            )
     except Exception as exc:
         logger.exception("update_department_goal: store.update_goal failed id=%s", goal_id)
         _audit(
@@ -493,6 +535,7 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         f"update_department_goal {slug or 'goal'}/{goal_id}: "
         f"{prior_status}->{new_status}"
         + ("" if current_str is None else " (current updated)")
+        + ("" if owner_id is None else f" (owner person {owner_id})")
     )
     _audit(
         "update_department_goal", "write", True, summary,
@@ -503,6 +546,8 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
             "to_status": new_status,
             "prior_current": prior_current,
             "new_current": current_str,
+            "prior_owner_person_id": prior_owner,
+            "owner_person_id": owner_id if owner_id is not None else prior_owner,
             "prior_updated_at": prior_updated_at,
             "rationale": rationale[:280],
         },
@@ -516,6 +561,7 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         "from_status": prior_status,
         "to_status": new_status,
         "current_updated": current_str is not None,
+        **({"owner_person_id": owner_id} if owner_id is not None else {}),
     })
 
 
@@ -641,11 +687,13 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
     # so only they set one: never an inbound email, a teammate, or a run
     # nobody is watching.
     if not _principal_asked():
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
         return _bad(
             "refused: only the principal can set a goal, and this request did "
             "not come from a conversation that confirms it is them. Tell whoever "
-            "asked that the principal needs to add it — in the web app, or by "
-            "asking there or in their own Slack or Discord.",
+            "asked, plainly, that the principal can add it in the web app, or by "
+            f"asking there or in their own Slack or Discord. {PASS_ON_NOTHING}",
             refused=True, **_caller_context(),
         )
 

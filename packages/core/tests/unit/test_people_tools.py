@@ -515,6 +515,18 @@ def test_refusal_is_audited(audit_calls: list[dict[str, Any]]) -> None:
     assert refused[0]["details"]["origin_channel"] == "discord"
 
 
+def test_a_refused_roster_change_is_passed_to_no_one() -> None:
+    """A teammate asking to add someone hears it plainly, and the refusal
+    tells the Executive to send nothing on their behalf: a message about it
+    would put their ask on the owner's list."""
+    teammate = people_store.upsert_person(full_name="Ben Teammate")
+    with _turn(Session(origin_channel="discord", caller_person_id=teammate)):
+        result = _call(handle_upsert_person, {"full_name": "Mallory"})
+    assert result["status"] == "refused"
+    assert "send nothing to anyone else on their behalf" in result["detail"]
+    assert "needs to make this change" not in result["detail"]
+
+
 def test_reading_the_roster_stays_open_to_everyone() -> None:
     teammate = people_store.upsert_person(full_name="Ben Teammate")
     with _turn(Session(origin_channel="slack", caller_person_id=teammate)):

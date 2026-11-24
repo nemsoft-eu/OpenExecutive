@@ -86,7 +86,7 @@ GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL=open-executive-chat@YOUR_PROJECT_ID.iam.gservi
 
    A ready-to-use avatar (brand-matched, 256×256 SVG) is included in this repo. Paste this URL into the **Avatar URL** field:
    ```
-   https://raw.githubusercontent.com/SenteLabsAI/OpenExecutive/main/docs/assets/chat-avatar.svg
+   https://raw.githubusercontent.com/ForeactLabs/OpenExecutive/main/docs/assets/chat-avatar.svg
    ```
    Google Chat accepts SVG URLs served from GitHub raw content directly.
 3. Under **Functionality**, enable:
@@ -123,6 +123,8 @@ GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL=open-executive-chat@YOUR_PROJECT_ID.iam.gservi
 # Option C (GCP-hosted) — same var as Option B, set to the SA attached to the compute resource
 GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL=open-executive-chat@YOUR_PROJECT_ID.iam.gserviceaccount.com
 ```
+
+Optional: `GOOGLE_CHAT_DEFAULT_SPACE=spaces/AAAA...` names the space company announcements go to (`send_company_broadcast` with `google_chat`). Without it, they go to the app's only space when it is in exactly one. A department posts to the space set as its **Google Chat space** in its settings. The app must be a member of the space either way.
 
 ---
 

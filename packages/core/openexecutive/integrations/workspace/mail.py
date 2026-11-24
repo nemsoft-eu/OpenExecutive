@@ -148,9 +148,13 @@ class MailProvider(Protocol):
         body: str,
         thread_id: str | None = None,
         html: bool = False,
+        cc: list[str] | None = None,
+        attachments: list[tuple[str, str, bytes]] | None = None,
+        bcc: list[str] | None = None,
     ) -> dict[str, Any]:
         """Arguments for `send_tool_name` — a message from ``mailbox``, plain
-        text unless ``html``."""
+        text unless ``html``, copied to ``cc``, blind-copied to ``bcc`` and
+        carrying ``attachments`` (name, mime type, bytes)."""
         ...
 
     def reply_block(self, msg: InboundMessage) -> str:

@@ -61,12 +61,12 @@ def _due_phrase(due_at: str | None) -> str:
     if not due_at:
         return ""
     try:
-        from openexecutive.attunement.open_loops import _user_tz
+        from openexecutive.memory.workspace_settings import get_user_timezone
 
         dt = datetime.fromisoformat(due_at)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
-        local = dt.astimezone(_user_tz())
+        local = dt.astimezone(get_user_timezone())
     except (ValueError, TypeError):
         return ""
     return f"{local:%A} {local.day} {local:%B}"

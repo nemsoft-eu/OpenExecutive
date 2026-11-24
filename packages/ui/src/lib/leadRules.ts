@@ -1,6 +1,6 @@
 import type { LeadRule, LeadRuleEffect, LeadRuleKind } from "@/lib/api";
 
-// Your rules (orchestrator/take_the_lead.py): the four kinds, each either
+// Your rules (orchestrator/take_the_lead.py): the five kinds, each either
 // Waits (always waits for your yes, on every level) or Goes (goes on its own
 // where the level would hold it), and the lines Delegate → Approvals shows.
 // Pure, so scripts/*.test.mjs can load it.
@@ -12,6 +12,23 @@ function money(v: string): string {
 }
 
 type Rule = Pick<LeadRule, "kind" | "value"> & { effect?: LeadRuleEffect };
+
+// The topics Balanced asks about (KINDS / KIND_LABELS in take_the_lead.py),
+// which a topic rule names. Each waits on Balanced until a Goes rule lets it
+// go; a Waits rule holds it on every level.
+export const TOPICS: { value: string; label: string }[] = [
+  { value: "money", label: "Money" },
+  { value: "contracts", label: "Contracts and legal" },
+  { value: "people_decisions", label: "Hiring and people decisions" },
+  { value: "delete", label: "Deleting or cancelling" },
+  { value: "share", label: "Sharing" },
+  { value: "someone_new", label: "Someone new" },
+  { value: "big_send", label: "Big sends" },
+];
+
+export function topicLabel(value: string): string {
+  return TOPICS.find((t) => t.value === value)?.label ?? value;
+}
 
 export const RULE_KINDS: {
   kind: LeadRuleKind;
@@ -40,6 +57,13 @@ export const RULE_KINDS: {
     placeholder: "example.com",
     describe: (v) => `Anything to someone at ${v}`,
     goes: (v) => `Anything only to people at ${v}`,
+  },
+  {
+    kind: "topic",
+    label: "A topic",
+    placeholder: "",
+    describe: (v) => `Anything about ${topicLabel(v).toLowerCase()}`,
+    goes: (v) => `Anything about ${topicLabel(v).toLowerCase()}`,
   },
   {
     kind: "words",

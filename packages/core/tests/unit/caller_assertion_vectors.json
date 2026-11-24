@@ -10,7 +10,7 @@
       "target": "/chat",
       "now_ms": 1790000000123,
       "jti": "AAAAAAAAAAAAAAAAAAAAAAAA",
-      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDAzMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEiLCJraWQiOiJyZmM4MDMyLXRlc3QxIiwia2luZCI6InVzZXIiLCJtIjoiUE9TVCIsInAiOiIvY2hhdCIsInN1YiI6Im9saXZpYUBjby5leGFtcGxlIn0.6wLIKW2fj3z4z1rbMTw2bzkaI_esp95mjov48SuI7EODlUnay9u68KcdJie33b4MxEeyatCs5yu6C2DxEM5sAw"
+      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDEyMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEiLCJraWQiOiJyZmM4MDMyLXRlc3QxIiwia2luZCI6InVzZXIiLCJtIjoiUE9TVCIsInAiOiIvY2hhdCIsInN1YiI6Im9saXZpYUBjby5leGFtcGxlIn0.xaaKu__9rkAERw6m8BA6dCqjBRTJNWxxNHJ0Rr_oZYSXqcYrj-oYs3a6Mg592htK7bVTAp4pK5P6N3sxwM4tBg"
     },
     {
       "kind": "operator",
@@ -19,16 +19,16 @@
       "target": "/audit/logs?limit=5&q=a+b",
       "now_ms": 1790000060999,
       "jti": "operator-vector-000001",
-      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDA5MCwiaWF0IjoxNzkwMDAwMDYwLCJqdGkiOiJvcGVyYXRvci12ZWN0b3ItMDAwMDAxIiwia2lkIjoicmZjODAzMi10ZXN0MSIsImtpbmQiOiJvcGVyYXRvciIsIm0iOiJHRVQiLCJwIjoiL2F1ZGl0L2xvZ3M_bGltaXQ9NSZxPWErYiIsInN1YiI6IiJ9.EPNm7fqDnFd8yToNG7ej4rU4LOLERjU8QIstAuz9A_c9GORaRPuzmqWVBaanMIu5w6J3OW4ybgRj-5VHFulnDA"
+      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDE4MCwiaWF0IjoxNzkwMDAwMDYwLCJqdGkiOiJvcGVyYXRvci12ZWN0b3ItMDAwMDAxIiwia2lkIjoicmZjODAzMi10ZXN0MSIsImtpbmQiOiJvcGVyYXRvciIsIm0iOiJHRVQiLCJwIjoiL2F1ZGl0L2xvZ3M_bGltaXQ9NSZxPWErYiIsInN1YiI6IiJ9.ZqB7WSu_8o4dJlcpXwnDdQNTgA5dmCPIJZCL656ypVTO0vnioYcpPoqjaLBmte2E7NQT7CQl9OCdrirN0w5wDQ"
     },
     {
       "kind": "user",
-      "email": "zoë@co.example",
+      "email": "zo\u00eb@co.example",
       "method": "DELETE",
       "target": "/documents/My%20Doc.pdf",
       "now_ms": 1790000120000,
       "jti": "unicode_vector_0000002",
-      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDE1MCwiaWF0IjoxNzkwMDAwMTIwLCJqdGkiOiJ1bmljb2RlX3ZlY3Rvcl8wMDAwMDAyIiwia2lkIjoicmZjODAzMi10ZXN0MSIsImtpbmQiOiJ1c2VyIiwibSI6IkRFTEVURSIsInAiOiIvZG9jdW1lbnRzL015JTIwRG9jLnBkZiIsInN1YiI6Inpvw6tAY28uZXhhbXBsZSJ9.yc36WbV97YZypG3QQuH9agW82u2svVDuAlFCnE40y8aK1QZYVqOGrkF0HvQJIpQ2JSflIQDmOOzMQ0uQ7MmPDw"
+      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDI0MCwiaWF0IjoxNzkwMDAwMTIwLCJqdGkiOiJ1bmljb2RlX3ZlY3Rvcl8wMDAwMDAyIiwia2lkIjoicmZjODAzMi10ZXN0MSIsImtpbmQiOiJ1c2VyIiwibSI6IkRFTEVURSIsInAiOiIvZG9jdW1lbnRzL015JTIwRG9jLnBkZiIsInN1YiI6Inpvw6tAY28uZXhhbXBsZSJ9.YIe4FzWwaD1plPZAZDjxycarjVphp4upD9vzPQpiVWaVtkd362G3N238KCoGAQ9MpTCJ8AMTV5jghq6VLfMCAA"
     },
     {
       "kind": "user",
@@ -38,7 +38,7 @@
       "now_ms": 1790000180000,
       "jti": "host_surface_vector_0003",
       "surface": "host",
-      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDIxMCwiaWF0IjoxNzkwMDAwMTgwLCJqdGkiOiJob3N0X3N1cmZhY2VfdmVjdG9yXzAwMDMiLCJraWQiOiJyZmM4MDMyLXRlc3QxIiwia2luZCI6InVzZXIiLCJtIjoiUE9TVCIsInAiOiIvY2hhdCIsInN1YiI6Im9saXZpYUBjby5leGFtcGxlIiwic3VyZmFjZSI6Imhvc3QifQ.UmAe5JH2ldXiYS4WQdk9D1QGTcloJwYxtP2PQoq2VAE8iXLOiYrzkc6fOvzlw0xUIsR2M6izKopyMgquxqaWBQ"
+      "token": "v1.eyJhdWQiOiJvcGVuZXhlY3V0aXZlLWFwaSIsImV4cCI6MTc5MDAwMDMwMCwiaWF0IjoxNzkwMDAwMTgwLCJqdGkiOiJob3N0X3N1cmZhY2VfdmVjdG9yXzAwMDMiLCJraWQiOiJyZmM4MDMyLXRlc3QxIiwia2luZCI6InVzZXIiLCJtIjoiUE9TVCIsInAiOiIvY2hhdCIsInN1YiI6Im9saXZpYUBjby5leGFtcGxlIiwic3VyZmFjZSI6Imhvc3QifQ.GZd3qpair4n8IsYTLqWIbgSpzIQcGIinP9WUldy3DfaoeyOaHIoXWLzLPaQCgsPrFdjO33VPVvXhpbeiVALcBg"
     }
   ]
 }

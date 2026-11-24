@@ -208,3 +208,12 @@ def test_only_the_table_is_markdown() -> None:
 def test_a_header_and_separator_of_different_widths_is_not_a_table() -> None:
     assert email_html.body_html("Bills:\n| Property | Amount |\n|---|\n| A | $1 |") is None
     assert email_html.has_table("| Property | Amount |\n|---|---|") is True
+
+
+def test_split_forward_finds_gmail_and_outlook_forwards() -> None:
+    gmail = "Hi Mel.\n\n---------- Forwarded message ---------\nFrom: Dana\nSubject: X\n\nBody"
+    assert email_html.split_forward(gmail) == ("Hi Mel.", gmail[gmail.index("----------"):])
+    outlook = "Hi Mel.\n\nOlivia\nFrom: Dana <d@x.example>\nSent: Monday\nTo: me\n\nBody"
+    assert email_html.split_forward(outlook) == ("Hi Mel.\n\nOlivia", outlook[outlook.index("From:"):])
+    # A "From:" line alone is part of the note.
+    assert email_html.split_forward("From: our team\nThanks") == ("From: our team\nThanks", "")

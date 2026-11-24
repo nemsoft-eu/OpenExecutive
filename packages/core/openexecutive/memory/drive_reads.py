@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -79,10 +79,16 @@ CREATE TABLE IF NOT EXISTS session_drive_searches (
 );
 CREATE INDEX IF NOT EXISTS idx_session_drive_searches
     ON session_drive_searches(session_id, person_id, query);
+CREATE TABLE IF NOT EXISTS drive_file_names (
+    file_id TEXT PRIMARY KEY,
+    name    TEXT NOT NULL,
+    seen_at TEXT NOT NULL
+);
 """
 
-# workspace-mcp output shapes (gdrive/drive_tools.py), as of 2.1.0. Since 2.0
+# workspace-mcp output shapes (gdrive/drive_tools.py), as of 2.4.2. Since 2.0
 # a search Drive did not finish ends in a WARNING line, which matches no item.
+# Since 2.4 an opened file's header names its Drive version after the type.
 _EMPTY_SEARCH_PREFIX = "No files found for '"
 _SEARCH_HEADER_RE = re.compile(r"^Found \d+ files for ")
 # workspace-mcp interpolates the file's name and type unescaped, so a name
@@ -100,7 +106,7 @@ _SEARCH_ITEM_RE = re.compile(
     r"(?:.*\sLink: (?P<link>\S+))?\s*$"
 )
 _CONTENT_RE = re.compile(
-    r'\AFile: "(?P<name>.*)" \(ID: (?P<id>[^,\s)]+), Type: (?P<mime>[^)]*)\)\n'
+    r'\AFile: "(?P<name>.*)" \(ID: (?P<id>[^,\s)]+), Type: (?P<mime>[^)]*?)(?:, Version: \d+)?\)\n'
     r"Link: (?P<link>\S*)\n\n--- CONTENT ---\n(?P<body>.*)\Z",
     re.DOTALL,
 )
@@ -410,3 +416,122 @@ def delete_session_drive_memory(session_id: str, db_path: Path | None = None) ->
             conn.execute("DELETE FROM session_drive_searches WHERE session_id = ?", (session_id,))
     except sqlite3.OperationalError:
         return
+
+
+# --------------------------------------------------------------------------- #
+# File names, for Approve cards
+# --------------------------------------------------------------------------- #
+# A file's name, read only from Drive's own answer about that one file,
+# asked for by its id: a sheet info read's first line "Spreadsheet: "Q4 plan"
+# (ID: …)" or an opened file's first line "File: "Q4 plan" (ID: …". The id
+# on that line must be the one the call asked for. Never a search or folder
+# listing (workspace-mcp writes names unescaped, so a file named with a line
+# break can forge another file's line), mail, a Doc's or a Sheet's content,
+# or a calendar: anyone can write "(ID: …)" there. An Approve card for a step
+# on that file then shows its name (``orchestrator.card_details``). Only
+# names and ids are kept, company-wide.
+_NAME_LINES: dict[str, tuple[str, re.Pattern[str]]] = {
+    "google_workspace__get_spreadsheet_info": (
+        "spreadsheet_id", re.compile(r'\ASpreadsheet: "(?P<name>[^\n]*)" \(ID: (?P<id>[A-Za-z0-9_-]{10,128})\)'),
+    ),
+    CONTENT_TOOL: (
+        "file_id", re.compile(r'\AFile: "(?P<name>[^\n]*)" \(ID: (?P<id>[A-Za-z0-9_-]{10,128}), Type: '),
+    ),
+}
+_MAX_NAMES_KEPT = 5000
+# A name older than this isn't shown: the file may have been renamed in Drive
+# since, and a card naming the wrong file is worse than "Open the sheet".
+_NAME_FRESH_FOR = timedelta(days=1)
+_FILE_ID_ARGS = ("file_id", "spreadsheet_id", "document_id", "presentation_id")
+_NEW_NAME_ARGS = ("name", "new_name", "title")
+
+
+def forget_renamed(arguments: dict[str, Any] | None, db_path: Path | None = None) -> None:
+    """A call that gives a file a new name (an update or rename through the
+    gateway) drops the name kept for it. Never raises."""
+    if not isinstance(arguments, dict) or not any(isinstance(arguments.get(k), str) for k in _NEW_NAME_ARGS):
+        return
+    ids = [arguments[k].strip() for k in _FILE_ID_ARGS if isinstance(arguments.get(k), str)]
+    path = _db_path(db_path)
+    if not ids or not path.exists():
+        return
+    try:
+        with episodic._get_conn(path) as conn:
+            conn.executemany("DELETE FROM drive_file_names WHERE file_id = ?", [(i,) for i in ids])
+    except sqlite3.OperationalError:
+        return
+    except Exception:
+        logger.warning("drive_reads: couldn't forget a renamed file", exc_info=True)
+
+
+def may_remember_names(session: Any) -> bool:
+    """Whether this call's file names may be kept company-wide: not on a
+    turn private to the principal, nor one that touched the speaker's own
+    mailbox. Background work (no session) may."""
+    if session is None:
+        return True
+    from openexecutive.delegation.settings import turn_touched_delegate_mail
+
+    return getattr(session, "private_to_principal", False) is not True and not turn_touched_delegate_mail(session)
+
+
+def remember_names(
+    tool_name: str, result_text: str, arguments: dict[str, Any] | None = None, db_path: Path | None = None,
+) -> int:
+    """Keep the name of the one file a Drive answer is about, when its id is
+    the one the call asked for; how many (0 or 1). Never raises."""
+    spec = _NAME_LINES.get(tool_name) if isinstance(tool_name, str) else None
+    if spec is None or not isinstance(result_text, str) or not isinstance(arguments, dict):
+        return 0
+    key, pattern = spec
+    m = pattern.match(result_text)
+    asked = arguments.get(key)
+    if m is None or not isinstance(asked, str) or m["id"] != asked.strip():
+        return 0
+    name = _clip(m["name"], _NAME_CHARS)
+    if not name:
+        return 0
+    found = {m["id"]: name}
+    try:
+        now = _now()
+        with episodic._get_conn(_db_path(db_path)) as conn:
+            _ensure_schema(conn)
+            conn.executemany(
+                "INSERT INTO drive_file_names (file_id, name, seen_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(file_id) DO UPDATE SET name = excluded.name, seen_at = excluded.seen_at",
+                [(fid, name, now) for fid, name in found.items()],
+            )
+            conn.execute(
+                "DELETE FROM drive_file_names WHERE file_id NOT IN "
+                "(SELECT file_id FROM drive_file_names ORDER BY seen_at DESC LIMIT ?)",
+                (_MAX_NAMES_KEPT,),
+            )
+    except Exception:
+        logger.warning("drive_reads: couldn't keep file names", exc_info=True)
+        return 0
+    return 1
+
+
+def name_of(file_id: str, db_path: Path | None = None) -> str:
+    """The name Drive's metadata gave ``file_id`` in the last day, or "".
+    Never raises."""
+    path = _db_path(db_path)
+    if not isinstance(file_id, str) or not file_id or not path.exists():
+        return ""
+    try:
+        with episodic._get_conn(path) as conn:
+            row = conn.execute(
+                "SELECT name, seen_at FROM drive_file_names WHERE file_id = ?", (file_id,)
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    except Exception:
+        logger.warning("drive_reads: couldn't read a file's name", exc_info=True)
+        return ""
+    if row is None:
+        return ""
+    try:
+        seen = datetime.fromisoformat(str(row[1]))
+    except ValueError:
+        return ""
+    return str(row[0]) if datetime.now(UTC) - seen <= _NAME_FRESH_FOR else ""

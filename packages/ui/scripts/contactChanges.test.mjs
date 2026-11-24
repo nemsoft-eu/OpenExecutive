@@ -2,11 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   addedByLine,
-  cardChanges,
   changeLine,
   contactActivityLines,
   keeperBlocked,
-  newlyAdded,
 } from "../src/lib/contactChanges.ts";
 
 const change = (extra = {}) => ({
@@ -50,17 +48,6 @@ test("an update says what it is now and where it came from", () => {
   });
   const alias = change({ action: "update", field: "email_alias", new_value: "priya@home.example" });
   assert.equal(changeLine(alias).detail, "Also writes from priya@home.example. You emailed them at this address.");
-});
-
-test("the card keeps suggestions and what wasn't cleared", () => {
-  const rows = [
-    change({ id: 1 }),
-    change({ id: 2, seen: true }),
-    change({ id: 3, status: "suggested", seen: false, person_id: null }),
-    change({ id: 4, status: "undone" }),
-  ];
-  assert.deepEqual(cardChanges(rows).map((c) => c.id), [1, 3]);
-  assert.deepEqual([...newlyAdded(rows)], [7]);
 });
 
 test("the switch says what it waits on", () => {
