@@ -429,7 +429,9 @@ async def _since_written(person: Any, payload: dict[str, Any], gmail: Any, now: 
     from openexecutive.delegation.reply_send import SendRefused, mailbox_ready
 
     email = normalize_email(str(person.email or ""))
-    client = await mailbox_ready(person, email, gmail)
+    # only ever a tap (send_approved_reply), so the inbox watcher's switch has
+    # no say, as for their own Send.
+    client = await mailbox_ready(person, email, gmail, on_its_own=False)
     try:
         own = {email, *await client.send_as_addresses()}
         thread = await client.get_thread(str(payload.get("thread_id") or ""))

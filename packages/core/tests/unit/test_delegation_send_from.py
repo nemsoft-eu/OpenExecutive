@@ -132,6 +132,21 @@ def test_send_goes_from_the_executive_with_them_on_cc(
     assert len(sends) == 1
 
 
+def test_a_tap_from_the_executive_sends_with_the_inbox_watcher_off(
+    db: Path, owner: Any, models: dict[str, Any], rewrites: list[str], sends: list[dict[str, Any]],
+) -> None:
+    """A tap is the person's own act whichever mailbox sends: the inbox
+    watcher's switch has no say over it, as for their own Send."""
+    mailbox, card = _card(owner)
+    _switch(card, mailbox, owner, True)
+    inbox.set_watch(owner.id, False, updated_by="test")
+    assert asyncio.run(send_approved_reply(
+        _fresh(card), caller=LOCAL, resolver=owner.id, gmail=mailbox, now=NOW + timedelta(minutes=30),
+        confirm=_seen(card),
+    )) == ""
+    assert len(sends) == 1
+
+
 def test_a_failed_send_leaves_the_card_waiting(
     db: Path, owner: Any, models: dict[str, Any], rewrites: list[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

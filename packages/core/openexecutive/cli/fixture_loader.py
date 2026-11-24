@@ -1170,10 +1170,10 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     _dump_workspace(backup_dir / "workspace.yaml")
 
     # ── 6. profile.yaml, written LAST ─────────────────────────────────────
-    # Its presence is what marks a snapshot as taken (has_snapshot, and the
-    # auto-snapshot gate in _load_from_dir), so a dump above that raises must
-    # leave no profile.yaml behind, or the next load would skip the snapshot
-    # and wipe the tables this one failed to save.
+    # Its presence is what marks a snapshot as taken (has_snapshot, and
+    # unload's precondition), so a dump above that raises must leave no
+    # profile.yaml behind, or unload would offer to restore a snapshot that
+    # was never completed.
     dst_profile = backup_dir / "profile.yaml"
     if src_profile.exists():
         shutil.copy2(src_profile, dst_profile)

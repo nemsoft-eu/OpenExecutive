@@ -16,13 +16,14 @@ import pytest
 from openexecutive.cli import fixture_loader
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
+from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.memory import episodic, honcho_client
 from openexecutive.people import store as people_store
 
 
-class _FakeStore:
-    RESEARCH_COLLECTION = "recent_research"
-    COMPANY_COLLECTION = "company_docs"
+class _FakeStore(ChromaDBStore):
+    """The real store's collection names (the sync modules read them at
+    import), with no vector store behind it."""
 
     def __init__(self, **_kw: object) -> None: ...
 
