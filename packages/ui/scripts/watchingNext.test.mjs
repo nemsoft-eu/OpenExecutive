@@ -18,5 +18,5 @@ test("says when it acts next in plain words", () => {
 test("the line joins what it does with when", () => {
   const at = new Date(2026, 10, 11, 9, 0).toISOString();
   assert.equal(watchingLine({ detail: "I follow up with Priya Nair", at }, now), "I follow up with Priya Nair tomorrow at 9 am");
-  assert.equal(watchingLine({ detail: "Standing job", at: null }, now), "Standing job");
+  assert.equal(watchingLine({ detail: "Standing work", at: null }, now), "Standing work");
 });

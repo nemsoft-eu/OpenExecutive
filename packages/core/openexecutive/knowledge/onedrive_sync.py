@@ -26,11 +26,10 @@ Locking, heartbeat and the network-then-local-write split are drive_sync's.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -49,12 +48,10 @@ from openexecutive.knowledge.drive_sync import (
     _REQUEST_PAUSE_S,
     _extract,
     _https_or_none,
-    _partial_failure_message,
     _safe_name,
     _Unreadable,
 )
 from openexecutive.knowledge.isolated import ParserBusy
-from openexecutive.knowledge.loader import ingest_text_sync
 from openexecutive.knowledge.notion_sync import infer_domain
 from openexecutive.knowledge.onedrive_client import (
     OneDriveClient,
@@ -64,13 +61,11 @@ from openexecutive.knowledge.onedrive_client import (
     parse_item_key,
 )
 from openexecutive.knowledge.store import ChromaDBStore
-from openexecutive.memory.episodic import insert_scheduled_action
+from openexecutive.knowledge.sync_source import SyncSource
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_KIND = "onedrive_sync_scan"
-HEARTBEAT_CHANNEL = "__internal__"
-HEARTBEAT_CHANNEL_REF = "onedrive_sync"
 HEARTBEAT_INTENT = "OneDrive folder sync — incremental file ingest into isolated collection."
 
 # Read as they are.
@@ -112,36 +107,23 @@ def _docs_dir() -> Path:
     return path
 
 
-def load_state() -> dict[str, Any]:
-    path = _state_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    if not isinstance(data.get("files"), dict):
-        data["files"] = {}
-    return data
-
-
-def save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def reset_local_state(*, profile_path: Path | None = None) -> None:
-    """Drop the file records so the next tick re-ingests. Call it whenever
-    the OneDrive collection is wiped (fixture load/reset, client-slot rebuild)."""
-    path = (
-        Path(profile_path).parent / "onedrive_sync_state.json"
-        if profile_path is not None
-        else _state_path()
-    )
-    path.unlink(missing_ok=True)
+SOURCE = SyncSource(
+    "onedrive",
+    noun="file",
+    id_field="onedrive_key",
+    id_comment=_KEY_COMMENT,
+    collections=(ChromaDBStore.ONEDRIVE_COLLECTION,),
+    safe_id=lambda key: key if parse_item_key(key) is not None else None,
+    state_path=lambda: _state_path(),
+    docs_dir=lambda: _docs_dir(),
+    heartbeat_intent=HEARTBEAT_INTENT,
+    lingering="files removed from the folders stay indexed until reconciliation runs",
+)
+load_state = SOURCE.load_state
+save_state = SOURCE.save_state
+reset_local_state = SOURCE.reset_local_state
+purge_file = SOURCE.purge
+reconcile_missing_files = SOURCE.reconcile
 
 
 def slugify(name: str, key: str) -> str:
@@ -149,18 +131,6 @@ def slugify(name: str, key: str) -> str:
     item_id = key.split(":", 1)[-1]
     short = re.sub(r"[^a-z0-9]", "", item_id.lower())[-10:] or "item"
     return f"onedrive-{short}-{slug}.md"
-
-
-def _safe_filename(name: str) -> str | None:
-    candidate = Path(str(name)).name
-    if candidate.startswith("onedrive-") and candidate.endswith(".md"):
-        return candidate
-    return None
-
-
-def _record(state: dict[str, Any], key: str) -> dict[str, Any]:
-    raw = state.get("files", {}).get(key)
-    return raw if isinstance(raw, dict) else {}
 
 
 def _is_current(recorded: dict[str, Any], item: OneDriveItem) -> bool:
@@ -264,7 +234,7 @@ async def _fetch_tick(
     dirty: list[OneDriveItem] = []
     for item in items:
         fetch.visible_keys.add(item.key)
-        if not is_supported(item) or _is_current(_record(state, item.key), item):
+        if not is_supported(item) or _is_current(SOURCE.record(state, item.key), item):
             stats["skipped"] += 1
             continue
         dirty.append(item)
@@ -303,89 +273,19 @@ async def _fetch_tick(
 # ---------------------------------------------------------------------------
 
 
-def _build_file_index() -> dict[str, list[Path]]:
-    index: dict[str, list[Path]] = {}
-    for path in _docs_dir().glob("onedrive-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:2000]
-        except OSError:
-            continue
-        found = _KEY_COMMENT.search(head)
-        if found:
-            index.setdefault(found.group(1), []).append(path)
-    return index
-
-
-def purge_file(
-    key: str,
-    store: ChromaDBStore,
-    state: dict[str, Any] | None = None,
-    file_index: dict[str, list[Path]] | None = None,
-) -> bool:
-    """Remove one synced file's text file, chunks and state record."""
-    if parse_item_key(key) is None:
-        logger.warning("onedrive_sync: refuse to purge unsafe key %r", key)
-        return False
-    files = state.setdefault("files", {}) if state is not None else {}
-    filename = _safe_filename(str(_record(state or {}, key).get("filename") or ""))
-    store.delete_documents(ChromaDBStore.ONEDRIVE_COLLECTION, {"onedrive_key": key})
-    if filename:
-        (_docs_dir() / filename).unlink(missing_ok=True)
-    index = file_index if file_index is not None else _build_file_index()
-    for path in index.get(key, []):
-        path.unlink(missing_ok=True)
-    files.pop(key, None)
-    logger.info("onedrive_sync: purged file %s", key)
-    return True
-
-
-def reconcile_missing_files(
-    visible_keys: set[str], store: ChromaDBStore, state: dict[str, Any]
-) -> int:
-    """Purge files (and orphan text files) no longer in the synced folders."""
-    file_index = _build_file_index()
-    gone = {k for k in state.get("files", {}) if k not in visible_keys}
-    gone |= {k for k in file_index if k not in visible_keys and k not in state["files"]}
-    return sum(purge_file(k, store, state, file_index=file_index) for k in sorted(gone))
-
-
 def _ingest_file_sync(
     item: OneDriveItem, text: str, store: ChromaDBStore, synced_at: str
 ) -> int:
     name = _safe_name(item.name)
-    filename = slugify(name, item.key)
-    store.delete_documents(ChromaDBStore.ONEDRIVE_COLLECTION, {"onedrive_key": item.key})
-    for path in _build_file_index().get(item.key, []):
-        path.unlink(missing_ok=True)
-    if not text.strip():
-        return 0
-    header = f"<!-- onedrive_key: {item.key} -->\n\n# {name}\n\n"
-    body = (header + text).strip()[:_MAX_FILE_CHARS]
-    (_docs_dir() / filename).write_text(body + "\n", encoding="utf-8")
-    return ingest_text_sync(
-        body,
+    return SOURCE.write_and_index(
+        item.key,
+        name,
+        slugify(name, item.key),
+        text,
         store,
-        source_name=f"onedrive/{filename}",
         domain=infer_domain(name),
-        collection=ChromaDBStore.ONEDRIVE_COLLECTION,
-        extra_metadata={
-            "onedrive_key": item.key,
-            "type": "onedrive",
-            "name": name,
-            "url": item.link,
-            "synced_at": synced_at,
-        },
-    )
-
-
-def _note_reconcile_skip(state: dict[str, Any], cause: str) -> None:
-    raw = state.get("reconcile_skips")
-    skips = (raw if isinstance(raw, int) else 0) + 1
-    state["reconcile_skips"] = skips
-    logger.warning(
-        "onedrive_sync: skipping reconciliation — %s (%d consecutive skip(s); files "
-        "removed from the folders stay indexed until reconciliation runs)",
-        cause, skips,
+        max_chars=_MAX_FILE_CHARS,
+        metadata={"name": name, "url": item.link, "synced_at": synced_at},
     )
 
 
@@ -401,9 +301,9 @@ async def _apply_tick(
     state = load_state()
     known = state["files"]
     if fetch.incomplete:
-        _note_reconcile_skip(state, f"listing incomplete ({fetch.incomplete})")
+        SOURCE.note_reconcile_skip(state, f"listing incomplete ({fetch.incomplete})")
     elif not fetch.visible_keys and known:
-        _note_reconcile_skip(
+        SOURCE.note_reconcile_skip(
             state,
             f"the folders listed 0 files while {len(known)} are on record "
             "(refusing a mass purge on a blank listing)",
@@ -437,14 +337,13 @@ async def _apply_tick(
 
     state["last_run"] = now.isoformat()
     if stats["failed"]:
-        state["last_error"] = _partial_failure_message(stats["failed"])
+        state["last_error"] = SOURCE.partial_failure(stats["failed"])
     else:
         state.pop("last_error", None)
     save_state(state)
 
 
 _RUN_LOCK = asyncio.Lock()
-_last_finished_at: datetime | None = None
 
 
 def is_syncing() -> bool:
@@ -452,16 +351,7 @@ def is_syncing() -> bool:
 
 
 def last_finished_at() -> datetime | None:
-    return _last_finished_at
-
-
-def _record_error(message: str) -> None:
-    try:
-        state = load_state()
-        state["last_error"] = message
-        save_state(state)
-    except Exception:
-        logger.exception("onedrive_sync: could not record the last error")
+    return SOURCE.last_finished_at
 
 
 async def run_onedrive_sync(
@@ -473,20 +363,10 @@ async def run_onedrive_sync(
 ) -> dict[str, int]:
     """One sync tick. Returns counts: seen / updated / skipped / failed / purged / capped
     (plus ``busy`` when another tick is already running in this process)."""
-    if _RUN_LOCK.locked():
-        logger.info("onedrive_sync: a tick is already running — skipping")
-        return {"busy": 1}
-    global _last_finished_at
-    async with _RUN_LOCK:
-        try:
-            return await _run_locked(
-                store=store, client=client, now=now, reconcile_only=reconcile_only
-            )
-        except Exception:
-            _record_error("The last sync failed unexpectedly. Check the server logs.")
-            raise
-        finally:
-            _last_finished_at = datetime.now(UTC)
+    return await SOURCE.run(
+        _RUN_LOCK,
+        lambda: _run_locked(store=store, client=client, now=now, reconcile_only=reconcile_only),
+    )
 
 
 async def _run_locked(
@@ -523,7 +403,7 @@ async def _run_locked(
             token = onedrive_token_provider(settings)
         except OneDriveCredentialMissing as exc:
             logger.warning("onedrive_sync: %s", exc)
-            _record_error(
+            SOURCE.record_error(
                 "Could not sign in to OneDrive: the Microsoft 365 launcher isn't installed. "
                 "See docs/onedrive_sync_setup.md."
             )
@@ -537,14 +417,14 @@ async def _run_locked(
             # clear reason, rather than as every folder failing to list.
             await client._token()
         except OneDriveCredentialMissing:
-            _record_error(
+            SOURCE.record_error(
                 "Microsoft refused the Executive's sign-in for OneDrive. Sign in to "
                 "Microsoft 365 again and allow access to files."
             )
             stats["failed"] += 1
             return stats
         except OneDriveAuthTransient:
-            _record_error("Could not get a Microsoft token; the next sync retries.")
+            SOURCE.record_error("Could not get a Microsoft token; the next sync retries.")
             stats["failed"] += 1
             return stats
         fetch = await _fetch_tick(
@@ -577,17 +457,7 @@ async def _run_locked(
 
 def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) -> int:
     """Remove every locally synced OneDrive file (text files, chunks, state)."""
-    current = state if state is not None else load_state()
-    file_index = _build_file_index()
-    purged = 0
-    for key in set(current["files"]) | set(file_index):
-        purged += purge_file(str(key), store, current, file_index=file_index)
-    for path in _docs_dir().glob("onedrive-*.md"):
-        path.unlink(missing_ok=True)
-    store.delete_onedrive_docs()
-    current["files"] = {}
-    save_state(current)
-    return purged
+    return SOURCE.purge_all(store, state, store.delete_onedrive_docs)
 
 
 def list_synced_files() -> dict[str, Any]:
@@ -628,7 +498,7 @@ def read_synced_file(key: str) -> dict[str, Any] | None:
     rec = load_state()["files"].get(key)
     if not isinstance(rec, dict):
         return None
-    filename = _safe_filename(str(rec.get("filename") or ""))
+    filename = SOURCE.safe_filename(str(rec.get("filename") or ""))
     if not filename:
         return None
     try:
@@ -649,47 +519,13 @@ def read_synced_file(key: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def _heartbeat_pending(db_path: Path | None = None) -> bool:
-    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
-
-    resolved = _resolve_db_path(db_path)
-    if not resolved.exists():
-        return False
-    with _get_conn(resolved) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM scheduled_actions "
-            "WHERE kind = ? AND status IN ('pending', 'running') LIMIT 1",
-            (HEARTBEAT_KIND,),
-        ).fetchone()
-    return row is not None
-
-
-def _enqueue(run_at: datetime, db_path: Path | None) -> int | None:
-    try:
-        action_id = insert_scheduled_action(
-            run_at=run_at.isoformat(),
-            channel=HEARTBEAT_CHANNEL,
-            channel_ref=HEARTBEAT_CHANNEL_REF,
-            intent_text=HEARTBEAT_INTENT,
-            kind=HEARTBEAT_KIND,
-            db_path=db_path,
-        )
-    except Exception:
-        logger.exception("onedrive_sync: failed to enqueue the heartbeat")
-        return None
-    logger.info("onedrive_sync: next scan at %s (id=%d)", run_at.isoformat(), action_id)
-    return action_id
-
-
 def bootstrap_onedrive_sync_scan(db_path: Path | None = None) -> int | None:
-    if _heartbeat_pending(db_path):
-        return None
-    return _enqueue(datetime.now(UTC) + timedelta(minutes=1), db_path)
+    return SOURCE.bootstrap(db_path)
 
 
 def enqueue_next_onedrive_sync_scan(
     *, after: datetime | None = None, db_path: Path | None = None
 ) -> int | None:
-    base = (after or datetime.now(UTC)).astimezone(UTC)
-    minutes = get_settings().onedrive_sync_interval_minutes
-    return _enqueue(base + timedelta(minutes=minutes), db_path)
+    return SOURCE.enqueue_next(
+        get_settings().onedrive_sync_interval_minutes, after=after, db_path=db_path
+    )

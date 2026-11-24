@@ -6,7 +6,7 @@
 // and a handful of presentational primitives (LivePulse, SectionHeading, etc.).
 
 import Icon, { type IconName } from "@/components/Icon";
-import type { ScheduledAction, WorkspaceMode } from "@/lib/api";
+import type { ScheduledAction } from "@/lib/api";
 
 export const DOMAINS = [
   "strategy",
@@ -44,14 +44,6 @@ export function formatRunAt(iso: string): { absolute: string; relative: string }
   const relative = deltaMs >= 0 ? `in ${unit}` : `${unit} ago`;
   return { absolute, relative };
 }
-
-export const STATUS_PILL: Record<string, string> = {
-  pending: "bg-sky-500/15 text-sky-500 border-sky-500/30",
-  running: "bg-amber-500/15 text-amber-500 border-amber-500/30",
-  done: "bg-emerald-500/15 text-emerald-500 border-emerald-500/30",
-  failed: "bg-red-500/15 text-red-500 border-red-500/30",
-  cancelled: "bg-surface-input/40 text-fg-muted border-line-strong/40",
-};
 
 export function EmptyState({ message }: { message: string }) {
   return (
@@ -145,18 +137,6 @@ export function groupByRhythm(
     groups[key].sort((x, y) => x.run_at.localeCompare(y.run_at));
   }
   return groups;
-}
-
-// Groups a solo workspace (one person, just for themselves) does not show:
-// it has no department check-ins, and no team whose replies are awaited.
-export const SOLO_HIDDEN_RHYTHMS: ReadonlySet<RhythmGroup> = new Set<RhythmGroup>([
-  "departments",
-  "awaiting",
-]);
-
-/** Whether a rhythm group is shown in this workspace mode. */
-export function showsRhythm(group: RhythmGroup, mode: WorkspaceMode): boolean {
-  return mode !== "solo" || !SOLO_HIDDEN_RHYTHMS.has(group);
 }
 
 // ---------------------------------------------------------------------------

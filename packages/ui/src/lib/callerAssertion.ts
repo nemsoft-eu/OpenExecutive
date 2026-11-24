@@ -12,9 +12,11 @@ import { createPrivateKey, randomBytes, sign, type KeyObject } from "node:crypto
 export const CALLER_ASSERTION_HEADER = "x-caller-assertion";
 export const ASSERTION_VERSION = "v1";
 export const ASSERTION_AUDIENCE = "openexecutive-api";
-// Short, so a captured assertion is soon worthless, and well under the API's
+// Short, so a captured assertion is soon worthless, yet long enough to outlast
+// a restart: a request that arrives while the instance restarts waits for it,
+// and must still be good when it gets there. Well under the API's
 // MAX_LIFETIME_S, so a slow clock on either side still leaves room.
-export const ASSERTION_LIFETIME_S = 30;
+export const ASSERTION_LIFETIME_S = 120;
 
 const KID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const SEED_RE = /^[A-Za-z0-9_-]{43}=?$/;

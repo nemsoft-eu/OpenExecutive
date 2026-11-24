@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
 
@@ -186,6 +186,75 @@ def _rename_session_in_background(
     task.add_done_callback(_rename_tasks.discard)
 
 
+# Steps approved from a chat that were still running when the turn was
+# stopped or ran out of time: they finish on their own (strong references,
+# as `_rename_tasks`).
+_approving_tasks: set[asyncio.Future[str]] = set()
+class _ApprovedNote(NamedTuple):
+    """What the turn reads about the card it approved."""
+
+    text: str
+
+
+# What the turn shows while an approved step runs.
+APPROVING_LABEL = "Doing what you approved…"
+
+
+async def _approve_card_in_turn(
+    card_id: int,
+    card_input: dict[str, Any] | None,
+    request: Request,
+    session: Any,
+    *,
+    stop_event: asyncio.Event | None,
+    deadline: float,
+    keepalive_s: float,
+) -> AsyncIterator[str | _ApprovedNote]:
+    """Approve a card from inside a chat turn's stream.
+
+    Yields SSE lines (an activity line first, then keepalives while the step
+    runs) and, last, the note the turn reads about it. Yields no note when
+    the turn was stopped, ran out of time or lost its page first: the step
+    carries on to its end on its own, and the turn's loop then ends as
+    stopped or timed out. A turn stopped before it began approves nothing.
+    """
+    from openexecutive.api.routes.decisions import HOST_APPROVE_NOTE, approve_in_chat
+
+    if session.from_host:
+        # A page in another app never approves a card (docs/auth.md): its
+        # turn only reads and advises, so the card stays as it is.
+        yield _ApprovedNote(HOST_APPROVE_NOTE)
+        return
+    if stop_event is not None and stop_event.is_set():
+        return
+    activity = {"type": "activity", "label": APPROVING_LABEL, "tool": "approve_card"}
+    yield f"data: {json.dumps(activity)}\n\n"
+    approving = asyncio.ensure_future(approve_in_chat(card_id, request, card_input))
+    stop_waiter = asyncio.ensure_future(stop_event.wait()) if stop_event is not None else None
+    try:
+        while not approving.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
+                break
+            if await request.is_disconnected():
+                break
+            wait_s = min(remaining, keepalive_s) if keepalive_s > 0 else remaining
+            waits: set[asyncio.Future[Any]] = {approving}
+            if stop_waiter is not None:
+                waits.add(stop_waiter)
+            await asyncio.wait(waits, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
+            if not approving.done() and not (stop_event is not None and stop_event.is_set()):
+                yield _SSE_KEEPALIVE
+    finally:
+        if stop_waiter is not None:
+            stop_waiter.cancel()
+        if not approving.done():
+            _approving_tasks.add(approving)
+            approving.add_done_callback(_approving_tasks.discard)
+    if approving.done():
+        yield _ApprovedNote(approving.result())
+
+
 def _stop_owner_key(request: Request, caller_person_id: int | None) -> str:
     """A stable identity for "who may stop this turn".
 
@@ -340,7 +409,22 @@ class _StreamStep(NamedTuple):
 _SSE_KEEPALIVE = ": keepalive\n\n"
 # The steps of a reply the other pages of a shared chat follow live
 # (``chat_live.turn_event``), besides its text and the thinking pings.
-_LIVE_STEPS = frozenset({"activity", "action_taken", "phase"})
+_LIVE_STEPS = frozenset({"activity", "action_taken", "phase", "rewrite"})
+# How long a cancelled step gets to unwind before the turn ends without it.
+STEP_UNWIND_S = 10.0
+
+
+def _stuck_step_ended(task: asyncio.Task[Any], turn_id: str) -> None:
+    """A step left running past its unwind has ended: say so, so anything it
+    did after its turn was saved shows in the logs."""
+    if task.cancelled():
+        logger.info("chat.stuck_step_ended turn_id=%s cancelled", turn_id)
+        return
+    exc = task.exception()
+    if exc is not None and not isinstance(exc, StopAsyncIteration):
+        logger.warning("chat.stuck_step_ended turn_id=%s error=%s", turn_id, type(exc).__name__)
+    else:
+        logger.info("chat.stuck_step_ended turn_id=%s", turn_id)
 
 
 async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> None:
@@ -360,17 +444,31 @@ async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> No
     if anext_task.done():
         return
     anext_task.cancel()
+    # Bounded: a step that never unwinds (something it awaits swallows the
+    # cancel) must not hold the turn past its deadline. It is left cancelled
+    # and the turn ends, saving what it wrote. An OUTER cancel (a disconnect;
+    # anyio re-delivers it until the body leaves its scope) wakes the wait
+    # early, so it waits again until the step is done or the bound passes.
+    # The outer cancel is already propagating from the `finally` that called
+    # us, so it continues on its way regardless.
+    until = time.monotonic() + STEP_UNWIND_S
+    while not anext_task.done():
+        left = until - time.monotonic()
+        if left <= 0:
+            break
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({anext_task}, timeout=left)
+    if not anext_task.done():
+        logger.warning("chat.stream_step_stuck turn_id=%s unwind_s=%s", turn_id, STEP_UNWIND_S)
+        anext_task.add_done_callback(lambda t: _stuck_step_ended(t, turn_id))
+        return
     try:
-        await anext_task
+        anext_task.result()
     except (asyncio.CancelledError, StopAsyncIteration):
-        # Deliberately not `suppress(BaseException)`: that would hide real
-        # cleanup errors. Catching CancelledError here can also swallow an
-        # OUTER cancel re-delivered during this await, but we are called from a
-        # `finally` while that cancellation is already propagating, so it
-        # continues on its way regardless — and the inner `cancel()` above has
-        # already been requested, which is the part that must not be skipped.
         pass
     except Exception:
+        # Deliberately not `suppress(BaseException)`: that would hide real
+        # cleanup errors.
         logger.exception("chat.stream_step_failed turn_id=%s", turn_id)
 
 
@@ -679,6 +777,18 @@ def _session_access(
     return "forbidden"
 
 
+def _turn_access(
+    request: Request, session_id: str, caller_person_id: int | None
+) -> tuple[SessionAccess, bool]:
+    """The one rule for who may write in ``session_id`` this turn: whoever may
+    use it (``_session_access``), or someone its owner shared it with
+    (``_shared_member``, then the second value is True)."""
+    access = _session_access(request, session_id, caller_person_id)
+    if access == "forbidden" and _shared_member(session_id, caller_person_id):
+        return "allowed", True
+    return access, False
+
+
 def _shared_member(session_id: str, caller_person_id: int | None) -> bool:
     """Whether the owner of web chat ``session_id`` shared it with this caller,
     who then reads it and writes in it with them (``session_store.set_shares``).
@@ -777,7 +887,9 @@ def _shared_chat_block(names: list[str], owner: str = "") -> str:
         "This is a shared chat in the web app. Everyone in it reads every "
         f"message and every reply: {', '.join(names)}. Each person's message "
         "starts with [Name] for who wrote it; answer whoever wrote the latest "
-        "one. Anything private to one of them (their own notes, mail or what "
+        "one. Speak to the group: \"you\" is whoever wrote the latest "
+        "message, and anyone else in the chat is named (never ask someone "
+        "to get, tell or loop in themselves). Anything private to one of them (their own notes, mail or what "
         "you remember about them) stays out of this chat unless they bring it "
         "up here themselves."
     )
@@ -935,49 +1047,6 @@ def _build_page_context_block(page_context: PageContext | None) -> str:
     return "\n".join(lines)
 
 
-def _seed_seen_channel_refs(session: Any, person_id: int | None) -> None:
-    """Record the caller's OWN channel addresses as seen on this session.
-
-    `schedule_followup` refuses to queue a send to a `(channel, channel_ref)`
-    the session has not seen — an anti-spam gate, and the reason an injected
-    "email this to attacker@evil" in an alert body cannot become a scheduled
-    send. The chat adapters populate it from the inbound message; nothing
-    populated it for a browser turn.
-
-    The gate was unreachable on web until `set_session` bound the session for
-    the whole stream, so it silently allowed ANY address; reachable, it reads
-    an empty set as "seen nothing" and refuses even the principal's own,
-    breaking "remind me tomorrow at 9am". Seeding the caller's own refs is
-    what makes the gate mean on web what it means everywhere else: you may
-    schedule to yourself, and to whatever this conversation actually used.
-
-    Replaces the set each turn, so it holds this turn's speaker's addresses
-    alone: in a shared chat, a teammate who speaks after the principal can't
-    schedule a message to the principal, and an address removed from the
-    roster stops being one.
-    """
-    session.seen_channel_refs = set()
-    if person_id is None:
-        return
-    try:
-        from openexecutive.people.store import get_person
-
-        person = get_person(person_id)
-    except Exception:
-        logger.warning("chat.seen_refs_seed_failed person_id=%s", person_id, exc_info=True)
-        return
-    if person is None:
-        return
-    for channel, ref in (
-        ("email", getattr(person, "email", None)),
-        ("slack_dm", getattr(person, "slack_user_id", None)),
-        ("discord_dm", getattr(person, "discord_user_id", None)),
-        ("telegram", getattr(person, "telegram_chat_id", None)),
-    ):
-        if ref:
-            session.seen_channel_refs.add((channel, str(ref)))
-
-
 def _resolve_caller_person_id(request: Request) -> int | None:
     """Resolve the calling Person from the `x-caller-email` header.
 
@@ -1003,15 +1072,82 @@ def _caller_is_principal_or_unclaimed(request: Request) -> bool:
     names no one, so it can't set up an install it doesn't own. Fails closed:
     if the roster cannot be read, the answer is no.
     """
+    from openexecutive.people import install_owner
     from openexecutive.people import store as people_store
 
     try:
+        who = api_caller.caller(request)
         if people_store.find_principal_person() is None:
-            return api_caller.caller(request).kind != "service"
+            # Unclaimed only on an install nobody has owned yet: once an owner
+            # is kept (``people.install_owner``), only they may set it up again.
+            owner = install_owner.get()
+            if owner is not None:
+                return who.defaults_to_principal or who.email == owner
+            return who.kind != "service"
+        if install_owner.away_from_own_company():
+            # A simulator company or a client is live, with its own principal:
+            # the install's owner still runs it and can switch back.
+            owner = install_owner.get() or install_owner.from_own_company_copy()
+            if owner is not None and who.email == owner:
+                return True
         return people_store.is_principal_or_self(_resolve_caller_person_id(request), None)
     except Exception:
         logger.exception("principal check failed — refusing the principal-only change")
         return False
+
+
+_READS = frozenset({"GET", "HEAD", "OPTIONS"})
+# The writes that replace the whole company: on an install with no principal
+# yet, whoever makes one is kept as its owner (``_install_owner_to_keep``).
+_SETS_UP = ("/reset", "/load", "/activate")
+
+
+def principal_writes(request: Request) -> Iterator[None]:
+    """Router dependency for routes whose writes replace or wipe the whole
+    company (the company simulator, client slots): a reset, a load, a switch
+    and the backup are the principal's, as the workspace settings and the
+    People list are (``_caller_is_principal_or_unclaimed``). Reads stay open.
+    The install's owner is kept once the write has gone through, never on
+    one that failed."""
+    if request.method in _READS:
+        yield
+        return
+    if not _caller_is_principal_or_unclaimed(request):
+        raise HTTPException(status_code=403, detail="Only the principal can change the company's saved data")
+    owner = _install_owner_to_keep(request)
+    yield
+    if owner:
+        from openexecutive.people import install_owner
+
+        try:
+            install_owner.remember(owner)
+        except Exception:
+            logger.warning("couldn't keep the install's owner", exc_info=True)
+
+
+def _install_owner_to_keep(request: Request) -> str | None:
+    """The address to keep as the install's owner once this write goes
+    through: the principal's, signed in as themselves, while their own
+    company is live, or on a roster with no principal yet the address of
+    whoever replaces the company (a reset, a load, a switch), not an
+    incidental write. With it kept, loading a simulator company or a client
+    can't lock them out of switching back (``people.install_owner``).
+    Never raises."""
+    from openexecutive.people import install_owner
+    from openexecutive.people import store as people_store
+
+    try:
+        email = api_caller.caller(request).email
+        principal = people_store.find_principal_person()
+        if principal is None:
+            mine = request.url.path.rstrip("/").endswith(_SETS_UP)
+        else:
+            mine = (principal.email or "").strip().lower() == email
+        if email and mine and not install_owner.away_from_own_company():
+            return email
+    except Exception:
+        logger.warning("couldn't tell the install's owner", exc_info=True)
+    return None
 
 
 async def _run_chat_turn(
@@ -1026,6 +1162,8 @@ async def _run_chat_turn(
     memory_text: str | None = None,
     turn_files: dict[str, bytes] | None = None,
     background: bool = False,
+    approve_card: int | None = None,
+    approve_input: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     """Shared streaming-chat handler for both the JSON and multipart routes.
 
@@ -1038,6 +1176,10 @@ async def _run_chat_turn(
     words, and its URLs are the ones the Executive may open. `turn_files`
     are the uploads as sent, which a Python job may take by name for this
     turn (workflows/turn_files.py).
+    `approve_card` is a card under a reply in this chat that the person
+    tapped Approve on (`approve_input`: its changed fields): it is approved
+    as its own button does (`decisions.approve_in_chat`), and this turn reads
+    what happened, so the Executive carries on with the ask.
     """
     from openexecutive.config import get_settings
     from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
@@ -1083,9 +1225,7 @@ async def _run_chat_turn(
     # Someone the owner shared this chat with, writing in it with them.
     member = False
     if requested_id is not None:
-        access = _session_access(request, requested_id, caller_person_id)
-        if access == "forbidden" and _shared_member(requested_id, caller_person_id):
-            access, member = "allowed", True
+        access, member = _turn_access(request, requested_id, caller_person_id)
         if access in ("forbidden", "orphaned"):
             # Someone else's chat, or an ownerless one nobody here can vouch
             # for (its starter was lost to a restart). Continue in a fresh
@@ -1165,6 +1305,15 @@ async def _run_chat_turn(
             _release_stop(client_turn_id, turn_id)
             raise
     try:
+        if requested_id is not None:
+            # Decided again once this turn holds the chat: the owner may have
+            # taken them out, deleted it, or someone else's first turn claimed
+            # the id while this one waited. Only an id that was unused before
+            # the wait may still be unused; a chat that existed and is gone
+            # now was deleted, and must not be recreated under this caller.
+            again = _turn_access(request, requested_id, caller_person_id)[0]
+            if not (again == "allowed" or (again == "missing" and access == "missing")):
+                raise HTTPException(status_code=404, detail="Session not found")
         session = await _get_or_create_session(requested_id, request)
         # A host origin's page writes only in a conversation it started or
         # already wrote in: one line from it holds the conversation read-only
@@ -1298,12 +1447,6 @@ async def _run_chat_turn(
     # In a shared chat ``turn_memory_text`` already holds the unlabelled
     # message, so both kinds of chat land on the same words.
     own_words = turn_memory_text if turn_memory_text is not None else message
-
-    # Let the caller schedule to their own addresses, and only theirs. Runs per
-    # turn rather than only on session creation: a newly-added address works
-    # without a fresh session, and in a shared chat each speaker gets their
-    # own set.
-    _seed_seen_channel_refs(session, caller_person_id)
 
     # Persist the session row immediately (idempotent INSERT OR IGNORE) so a
     # mid-turn failure never leaves a ghost in-memory session with no DB row.
@@ -1531,6 +1674,9 @@ async def _run_chat_turn(
         )
 
         full_response = ""
+        # The reply as it stood before the Executive wrote it again: it
+        # stands when the turn ends before the new one has a word.
+        first_reply = ""
         # Messages folded into this turn (POST /chat/add), filled once the
         # turn's inbox closes and persisted with it.
         added_texts: list[str] = []
@@ -1560,6 +1706,28 @@ async def _run_chat_turn(
             for evt in collector._events:
                 yield f"data: {json.dumps(collector.to_sse_dict(evt))}\n\n"
 
+            turn_page_block = page_context_block
+            if approve_card is not None:
+                # Approve tapped on a card under a reply: do the step inside
+                # the turn, so it shows as working and Stop and the turn's
+                # deadline hold while it runs (the step itself finishes on its
+                # own and its card says how it went).
+                approved: str | None = None
+                async for evt in _approve_card_in_turn(
+                    approve_card, approve_input, request, session,
+                    stop_event=stop_event,
+                    deadline=exec_t0 + timeout_s,
+                    keepalive_s=settings.chat_stream_keepalive_s,
+                ):
+                    if isinstance(evt, _ApprovedNote):
+                        approved = evt.text
+                    else:
+                        yield evt
+                if approved is not None:
+                    turn_page_block = "\n\n".join(
+                        part for part in (page_context_block, f"THE CARD THEY JUST APPROVED:\n{approved}") if part
+                    )
+
             logger.info("chat.executive_start turn_id=%s", turn_id)
 
             if committee_review:
@@ -1573,7 +1741,7 @@ async def _run_chat_turn(
                     attachment_blocks=attachment_blocks,
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
-                    page_context_block=page_context_block,
+                    page_context_block=turn_page_block,
                     turn_id=turn_id,
                     memory_text=own_words,
                     channel_context_block=shared_block,
@@ -1591,7 +1759,7 @@ async def _run_chat_turn(
                     attachment_blocks=attachment_blocks,
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
-                    page_context_block=page_context_block,
+                    page_context_block=turn_page_block,
                     turn_id=turn_id,
                     memory_text=own_words,
                     channel_context_block=shared_block,
@@ -1798,6 +1966,13 @@ async def _run_chat_turn(
                                 # A draft written again in this reply replaces
                                 # the earlier one's chip and card.
                                 action_chips[:] = drop_replaced([*action_chips, item])
+                            elif isinstance(item, dict) and item.get("type") == "rewrite":
+                                # The reply is written again whole: what
+                                # streamed so far is dropped here (the saved
+                                # reply) and by every page showing it.
+                                if full_response.strip():
+                                    first_reply = full_response
+                                full_response = ""
                             if (
                                 live_turn
                                 and isinstance(item, dict)
@@ -1870,8 +2045,26 @@ async def _run_chat_turn(
                     with contextlib.suppress(Exception):
                         await aclose()
 
+            if first_reply and not full_response.strip():
+                # Stopped, timed out or cut off after a rewrite began but
+                # before it wrote anything: the first reply stands, saved and
+                # back on every page showing it.
+                full_response = first_reply
+                kept_evt = {"type": "chunk", "content": first_reply, "session_id": session.session_id}
+                if live_turn:
+                    chat_live.turn_event(session.session_id, live_key, kept_evt)
+                if not client_disconnected:
+                    yield f"data: {json.dumps(kept_evt)}\n\n"
+
             if not turn_sources.is_empty():
                 answer_sources = turn_sources.payload()
+
+            # Whether the turn wanted the person's browser while it wasn't
+            # connected, taken on every path so a turn whose tab closed can't
+            # leave the card for the next one.
+            from openexecutive.browser import tools as browser_tools
+
+            browser_needed = browser_tools.take_needed(session)
 
             if client_disconnected:
                 # Connection is gone, so we can't yield anything more — but we
@@ -1902,6 +2095,15 @@ async def _run_chat_turn(
             if held_steps:
                 held_evt = {"type": "held_steps", "session_id": session.session_id, "steps": list(held_steps)}
                 yield f"data: {json.dumps(held_evt)}\n\n"
+            # The turn wanted the person's browser and it wasn't connected: a
+            # card under the reply to add the extension.
+            if browser_needed and not (stopped or timed_out):
+                needed_evt = {
+                    "type": "browser_needed",
+                    "session_id": session.session_id,
+                    "store_url": browser_tools.store_url(),
+                }
+                yield f"data: {json.dumps(needed_evt)}\n\n"
             # What the content check flagged this turn, in plain words
             # (orchestrator.content_scan): sent only with held steps, as the
             # reason on their card. A flag that held nothing changed nothing
@@ -1999,6 +2201,8 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
         page_context=body.page_context,
         client_turn_id=body.client_turn_id,
         memory_text=body.memory_text,
+        approve_card=body.approve_card,
+        approve_input=body.approve_input,
     )
 
 
@@ -2047,22 +2251,29 @@ async def _drain_background_turn(
     body: Any, session_id: str, on_finished: Callable[[bool], None] | None = None,
 ) -> None:
     """Run the turn's stream to its end. Its events have no reader; the turn
-    persists itself as it would for /chat. ``on_finished`` hears whether the
-    turn answered (False when it ended on an error event or raised)."""
-    answered = True
+    persists itself as it would for /chat, within its own deadline
+    (``_next_stream_step``, ``_cancel_stream_step``). ``on_finished`` always
+    hears whether the turn answered (False when it ended on an error event,
+    raised or was cancelled)."""
+    answered = False
     try:
         async with contextlib.aclosing(body) as events:
+            answered = True
             async for event in events:
                 if _is_error_event(event):
                     answered = False
     except Exception:
         answered = False
         logger.exception("chat.background_failed session_id=%s", session_id)
-    if on_finished is not None:
-        try:
-            on_finished(answered)
-        except Exception:
-            logger.exception("chat.background_on_finished_failed session_id=%s", session_id)
+    except asyncio.CancelledError:
+        answered = False
+        raise
+    finally:
+        if on_finished is not None:
+            try:
+                on_finished(answered)
+            except Exception:
+                logger.exception("chat.background_on_finished_failed session_id=%s", session_id)
 
 
 async def start_background_turn(
@@ -2609,15 +2820,46 @@ _FOLLOWUP_MAX_CHARS_PER_MESSAGE = 1500
 _FOLLOWUP_MAX_WORDS = 24
 
 
-def _build_followup_transcript(messages: list[dict[str, Any]]) -> str:
+def _build_followup_transcript(
+    messages: list[dict[str, Any]],
+    names: dict[int, str] | None = None,
+    reader: int | None = None,
+    owner: int | None = None,
+) -> str:
+    """The tail of the chat for the follow-up model. In a shared chat
+    (``names``, everyone in it by person id) each person's line carries their
+    name, and the transcript says it is a group chat and whose next message
+    to write: ``reader``'s, who is asking. A line saved without a sender is
+    ``owner``'s, as in ``_named_history``."""
+    group = bool(names) and len(names or {}) > 1
     lines: list[str] = []
     for m in messages[-_FOLLOWUP_MAX_MESSAGES:]:
-        speaker = "EXECUTIVE" if m.get("role") == "assistant" else "USER"
+        if m.get("role") == "assistant":
+            speaker = "EXECUTIVE"
+        elif group:
+            sender = m.get("sender_person_id")
+            sender = owner if sender is None else sender
+            speaker = (names or {}).get(sender, "") if isinstance(sender, int) else ""
+            speaker = speaker or "SOMEONE IN THE CHAT"
+        else:
+            speaker = "USER"
         text = str(m.get("content") or "").strip()
         if len(text) > _FOLLOWUP_MAX_CHARS_PER_MESSAGE:
             text = text[:_FOLLOWUP_MAX_CHARS_PER_MESSAGE] + " […]"
         lines.append(f"{speaker}: {text}")
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    if not group:
+        return body
+    everyone = ", ".join((names or {}).values())
+    who = (names or {}).get(reader, "") if reader is not None else ""
+    header = f"This is a group chat with the executive. People in it: {everyone}."
+    if who:
+        header += (
+            f" The USER is {who}: write {who}'s next message, in {who}'s own voice."
+            f" Never suggest {who} message, loop in or ask {who}; another person"
+            " in the chat is named, never called 'me'."
+        )
+    return f"{header}\n\n{body}"
 
 
 async def _generate_followup_via_llm(transcript: str) -> str | None:

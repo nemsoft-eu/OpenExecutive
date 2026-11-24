@@ -64,6 +64,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 MAX_RULES = 8
@@ -241,10 +243,7 @@ class _Evidence:
 # --------------------------------------------------------------------------- #
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def _now() -> datetime:

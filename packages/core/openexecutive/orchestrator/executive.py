@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
@@ -44,26 +45,27 @@ from openexecutive.memory.workspace_settings import (
 )
 from openexecutive.orchestrator import (
     app_control_catalog,  # noqa: F401  (fills the app tools' catalog)
+    app_links,
     claim_check,
-    department_gate,
+    content_scan,
     extensions,
     levels,
     outside_content,
     reply_card_tools,
     take_the_lead,
     tool_groups,
+    tool_images,
+    turn_live,
     turn_progress,
 )
 from openexecutive.orchestrator import pushback as pushback_mod
-from openexecutive.orchestrator.action_card_tools import (
-    ACTION_CARD_TOOL_HANDLERS,
-    ACTION_CARD_TOOLS,
-)
+from openexecutive.orchestrator import web_search_tool as web_searches
 from openexecutive.orchestrator.action_chips import summarize_action
 from openexecutive.orchestrator.activity_labels import (
     fallback_activity,
     summarize_activity,
 )
+from openexecutive.orchestrator.activity_tools import ACTIVITY_TOOL_HANDLERS, ACTIVITY_TOOLS
 from openexecutive.orchestrator.alert_tools import (
     CREATE_ALERT_TOOL,
     handle_create_alert,
@@ -90,10 +92,12 @@ from openexecutive.orchestrator.chat_search_tools import (
     CHAT_SEARCH_TOOL_HANDLERS,
     CHAT_SEARCH_TOOL_NAMES,
     CHAT_SEARCH_TOOLS,
+    recent_chats_block,
     search_person,
 )
 from openexecutive.orchestrator.content_trust import (
     principal_only_withheld,
+    principal_speaking,
 )
 from openexecutive.orchestrator.correction_tools import (
     CORRECTION_TOOL_HANDLERS,
@@ -122,6 +126,12 @@ from openexecutive.orchestrator.document_tools import (
 from openexecutive.orchestrator.fact_tools import (
     FACT_TOOL_HANDLERS,
     FACT_TOOLS,
+    own_chat_person,
+    private_owner,
+)
+from openexecutive.orchestrator.figure_tools import (
+    WORKED_OUT_TOOL_HANDLERS,
+    WORKED_OUT_TOOLS,
 )
 from openexecutive.orchestrator.file_tools import FILE_TOOL_HANDLERS, FILE_TOOLS
 from openexecutive.orchestrator.form_tools import (
@@ -157,6 +167,21 @@ from openexecutive.orchestrator.people_tools import (
     is_principal_on_verified_surface,
     turn_is_private_to_principal,
 )
+from openexecutive.orchestrator.reading import (
+    CUT_OFF_NOTE,
+    CUT_OFF_RESULT,
+    FULL_NOTE,
+    MAX_EMPTY_CUT_ROUNDS,
+    MAX_STEPS,
+    REPEAT_LIMIT,
+    REPEATING_NOTE,
+    STEPS_NOTE,
+    TurnReadingBudget,
+    apply_loop_cache_marker,
+    last_written_block,
+    says_something,
+    with_turn_limits,
+)
 from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOL_HANDLERS,
     RESEARCH_TOOLS,
@@ -171,19 +196,17 @@ from openexecutive.orchestrator.router import (
     route_parallel,
 )
 from openexecutive.orchestrator.schedule_tools import (
-    MCP_CLIENT_ACTING_WITHHELD_TOOLS,
-    MCP_CLIENT_WITHHELD_TOOLS,
     PRIVATE_TURN_WITHHELD_TOOLS,
+    READ_ONLY_WITHHELD_TOOLS,
     SCHEDULE_TOOL_HANDLERS,
     SCHEDULE_TOOLS,
     SHARED_CHAT_WITHHELD_TOOLS,
     UNATTENDED_WITHHELD_TOOLS,
     current_session,
     filter_tools_for_workspace_mode,
-    mcp_client_acting,
-    mcp_client_withholds,
-    mcp_rules_turn,
     private_turn_withholds,
+    read_only_turn,
+    read_only_withholds,
     shared_chat_withholds,
     tools_withheld_in_mode,
     withheld_tool_error,
@@ -201,6 +224,7 @@ from openexecutive.orchestrator.turn_inbox import (
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
+    speakers_own_row,
 )
 from openexecutive.orchestrator.web_fetch import SeenUrls, server_search_result_urls
 from openexecutive.orchestrator.web_search_tool import (
@@ -220,6 +244,8 @@ from openexecutive.orchestrator.workflow_run_tools import (
 )
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
+from openexecutive.providers.feature_gate import MAX_OUTPUT_TOKENS
+from openexecutive.providers.registry import reading_limits_for, sees_images
 from openexecutive.providers.translator import (
     OPENROUTER_CITATIONS_BLOCK,
     reasoning_replay_block,
@@ -230,14 +256,50 @@ from openexecutive.workflows.python_job import PYTHON_JOB_TOOL_HANDLERS, PYTHON_
 
 logger = logging.getLogger(__name__)
 
-# Set while ``Executive.chat`` collects a reply whole (an email or a chat
-# app's answer), so a claim-check retry rewrites it instead of adding a
-# correction after it.
-_COLLECTING: ContextVar[bool] = ContextVar("executive_collecting", default=False)
+
+# Bound by ``Executive.chat`` to a list that a round the model refused
+# (stop_reason "refusal") appends to, so the collected reply never sends what
+# the refused round began writing.
+_REFUSED: ContextVar[list[int] | None] = ContextVar("executive_refused", default=None)
+
+# What ``Executive.chat`` answers for a turn the model refused.
+REFUSED_REPLY = "I can't help with that one."
+
+
+def _with_refusal(collected: str, refused_chars: int) -> str:
+    """A collected reply whose last round the model refused: the earlier
+    rounds' text without the refused round's (its last ``refused_chars``),
+    then ``REFUSED_REPLY``."""
+    kept = collected[: max(0, len(collected) - refused_chars)].strip()
+    return f"{kept}\n\n{REFUSED_REPLY}" if kept else REFUSED_REPLY
 
 # The tools that read the speaker's own notes or earlier chats: private rows,
 # withheld from the process log, and checked like a mail read.
 _OWN_RECALL_TOOL_NAMES: frozenset[str] = HISTORY_TOOL_NAMES | CHAT_SEARCH_TOOL_NAMES
+
+
+def _own_tool_call(tu: dict[str, Any], handlers: Any) -> dict[str, Any] | None:
+    """A ``call_tool`` that names one of the turn's own built-in tools, as
+    that tool's call (same id), or None. Only a plain name the gateway can't
+    hold (no server prefix) with object arguments."""
+    if tu.get("name") != "call_tool" or not isinstance(tu.get("input"), dict):
+        return None
+    named = tu["input"].get("name")
+    if not isinstance(named, str) or not named or "__" in named or named in MCP_TOOL_NAMES:
+        return None
+    if named not in handlers:
+        return None
+    arguments = tu["input"].get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, RecursionError):
+            return None
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return None
+    return {**tu, "name": named, "input": arguments}
 
 
 def _private_to_principal(session: Any) -> bool:
@@ -323,215 +385,6 @@ def _trunc(value: Any, limit: int = 200) -> str:
     return f"{s[:limit]}…[truncated {len(s) - limit} chars]"
 
 
-# Smallest cap for which the never-exceeds-limit guarantee holds; mirrored
-# by the ge= bound on TOOL_RESULT_MAX_CHARS in config.py.
-_MIN_USEFUL_CAP = 1_000
-
-# Longest tool name echoed into a truncation marker. Real names are well
-# under this (the longest in the MCP surface is ~40 chars); the bound exists
-# so a model-supplied name cannot inflate the marker past its own budget.
-_TOOL_NAME_MARKER_MAX = 80
-# Once a turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS) is used up, a
-# further tool result still shows this much, so the model sees what it got.
-_TURN_BUDGET_FLOOR = 3_000
-
-# Results the turn's reading budget counts but never cuts (see
-# _turn_result_limit).
-_NEVER_CUT_BY_TURN_BUDGET = frozenset(
-    {step_script.RUN_SCRIPT_TOOL, tool_groups.OPEN_TOOLS, "search_tools"}
-)
-
-
-def _cap_tool_result(
-    text: Any, *, tool_name: str, limit: int, budget_spent: bool = False, full_reread_left: bool = False
-) -> Any:
-    """Bound one tool result before it enters the prompt.
-
-    A circuit breaker, not a routine clipper: the default budget is set so
-    it never fires on ordinary tool output. It exists because a single
-    unbounded result (a large document fetch) otherwise lands in the
-    context and is then re-sent on every remaining iteration of the tool
-    loop, which is the dominant token cost of a long turn.
-
-    The marker is load-bearing. Truncating silently is worse than not
-    truncating: the model reads the cut text as the whole answer and
-    confabulates the rest. Naming the tool and steering toward a
-    *narrower* re-request (rather than a retry, which would re-trigger
-    the cut and burn another iteration) is what makes the cut recoverable.
-
-    Non-``str`` results pass through untouched — every producer returns a
-    string today, and guessing at the size of some other type is not this
-    function's job.
-
-    ``limit`` is passed in rather than read here: ``get_settings()`` builds
-    a fresh ``Settings`` on every call, and this runs once per tool result.
-
-    Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
-    "never exceeds ``limit``" guarantee holds by reserving the marker
-    inside the budget, and the marker itself is ~280-850 chars — below
-    that floor there is no room for it and the guarantee breaks. The
-    config field enforces this with ``ge=1_000``.
-
-    ``budget_spent`` says the turn's reading budget, not this result's own
-    size, set ``limit``: the marker then says to answer from what the turn
-    has rather than read more, and never to edit from the cut text. With
-    ``full_reread_left`` it also offers the turn's one full re-read
-    (``_TurnReadingBudget``), so an edit the question asked for can still
-    be done from the whole document.
-    """
-    if not isinstance(text, str):
-        return text
-    if len(text) <= limit:
-        return text
-
-    # ``tool_name`` comes from the model's tool_use block, so it is
-    # attacker-influenceable via prompt injection. Two consequences:
-    #   * it is never passed through ``str.format`` — a name containing
-    #     braces would otherwise be interpreted as a field reference,
-    #     substituting our locals or raising and killing the turn;
-    #   * it is length-bounded, so the marker cannot outgrow the budget
-    #     it is supposed to fit inside.
-    safe_name = tool_name[:_TOOL_NAME_MARKER_MAX] if isinstance(tool_name, str) else "?"
-
-    def marker(shown: int, pct: int) -> str:
-        return (
-            f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
-            f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
-            "This is NOT the full result."
-            + (
-                # A narrower re-read would be cut the same way, so the
-                # budget note replaces the "ask again" advice.
-                " This question has already read as much as it can. Never "
-                "edit, rewrite or replace anything from this cut result."
-                + (
-                    " If you need this whole result to edit or rewrite it, "
-                    "call the tool again with exactly the same input: that "
-                    "repeat does not run the tool again, it brings back this "
-                    "same result in full (once per question)."
-                    if full_reread_left
-                    else " If you needed it to edit or rewrite something, say "
-                    "it was too long to work on here and offer to do it as "
-                    "its own request."
-                )
-                + " Otherwise answer from what you have, and say what you "
-                "could not read."
-                if budget_spent
-                else " To see more, call the tool again with a narrower "
-                "request — a page range, a section name, a query or filter — "
-                "rather than re-requesting the whole document."
-            )
-            + "]"
-        )
-
-    # Reserve the marker inside the budget so the capped result never
-    # exceeds ``limit``. Reserve against the widest form: ``shown`` can
-    # never exceed ``limit``, and ``pct`` can round up to 100 (three
-    # digits), so no real marker is longer than this one. With safe_name
-    # bounded, the reserve stays well under the config's 1_000 minimum.
-    shown = max(0, limit - len(marker(limit, 100)))
-    pct = round((len(text) - shown) * 100 / len(text))
-    logger.warning(
-        "tool_result truncated tool=%s original_chars=%d shown_chars=%d limit=%d",
-        safe_name, len(text), shown, limit,
-    )
-    return text[:shown] + marker(shown, pct)
-
-
-def _turn_result_limit(name: str, *, per_result: int, turn_budget: int, used: int) -> tuple[int, bool]:
-    """The cap for one tool result, given what the turn has already read.
-
-    Every tool result stays in the prompt for each later call of the turn,
-    so a turn that reads several long documents re-sends all of them on
-    every call. ``turn_budget`` (TOOL_RESULTS_TURN_MAX_CHARS; 0 = off)
-    bounds what a turn's results add together: once ``used`` reaches it, a
-    further result is cut to ``_TURN_BUDGET_FLOOR``. Returns (limit, whether
-    the budget rather than ``per_result`` set it). A specialist's analysis
-    is the answer itself, not a read, so it neither counts nor is cut by the
-    budget. A built tool's result counts but is never cut below
-    ``per_result``: it is already bounded (step_script), and it lists the
-    writes that already ran, which a short cut would hide and the model would
-    then repeat. Tool discovery (``open_tools``, ``search_tools``) is treated
-    the same way: its result is the schema for the next call, and a cut one
-    would leave the model unable to make it.
-    """
-    if turn_budget <= 0 or name == "consult_specialist":
-        return per_result, False
-    if name in _NEVER_CUT_BY_TURN_BUDGET:
-        return per_result, False
-    remaining = turn_budget - used
-    if remaining >= per_result:
-        return per_result, False
-    return min(per_result, max(_TURN_BUDGET_FLOOR, remaining)), True
-
-
-class _TurnReadingBudget:
-    """One turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS), with one
-    escape hatch.
-
-    ``_turn_result_limit`` decides the cap from what the turn has used. A
-    read cut by the budget may be the very document the question asks to
-    edit, and an edit from a cut read would drop everything past the cut.
-    So the turn gets one full re-read: when the model repeats a call the
-    budget cut, same tool and same input, the loop answers it with the
-    result it already has (``replay``), under the per-result cap, and never
-    runs the tool again. Replaying rather than re-running matters: the
-    budget cuts any tool's result, and a repeated write (an event, a
-    message) would happen twice. Once per turn, so the budget still bounds
-    the turn: at most one extra ``per_result``.
-    """
-
-    def __init__(self, *, per_result: int, turn_budget: int) -> None:
-        self.per_result = per_result
-        self.turn_budget = turn_budget
-        self.used = 0
-        # Full text of each result the budget cut, by call.
-        self._cut_results: dict[str, str] = {}
-        # tool_use ids answered by ``replay``: shown in full, not cut again.
-        self._replayed: set[str] = set()
-        self.full_reread_left = True
-
-    @staticmethod
-    def _key(name: str, tool_input: Any) -> str:
-        try:
-            return name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            return name + "\x00" + repr(tool_input)
-
-    def replay(self, tool_use: dict[str, Any]) -> str | None:
-        """The stored full result if ``tool_use`` repeats a call the budget
-        cut and the turn's one re-read is left; the caller then answers it
-        with this text instead of dispatching it. ``None`` otherwise."""
-        if not self.full_reread_left:
-            return None
-        full = self._cut_results.get(self._key(tool_use["name"], tool_use["input"]))
-        if full is None:
-            return None
-        self.full_reread_left = False
-        self._replayed.add(tool_use["id"])
-        return full
-
-    def cap(self, name: str, tool_input: Any, text: Any, tool_use_id: str = "") -> Any:
-        """``text`` capped for the prompt, counted against the budget."""
-        if tool_use_id and tool_use_id in self._replayed:
-            limit, budget_spent = self.per_result, False
-        else:
-            limit, budget_spent = _turn_result_limit(
-                name, per_result=self.per_result, turn_budget=self.turn_budget, used=self.used
-            )
-            if budget_spent and isinstance(text, str) and len(text) > limit:
-                self._cut_results[self._key(name, tool_input)] = text
-        content = _cap_tool_result(
-            text,
-            tool_name=name,
-            limit=limit,
-            budget_spent=budget_spent,
-            full_reread_left=self.full_reread_left,
-        )
-        if name != "consult_specialist" and isinstance(content, str):
-            self.used += len(content)
-        return content
-
-
 # The history breakpoint lives an hour: people answer in minutes, not
 # seconds, and a 5m entry would be gone before most next messages.
 _HISTORY_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
@@ -547,7 +400,7 @@ def _apply_history_cache_marker(
     stored as plain text and rebuilt identically every turn, so on the next
     message everything up to that point is a cache read, and only what is
     new (the last exchange, this turn's context) is written. Without it the
-    loop marker (``_apply_loop_cache_marker``) writes the whole history again
+    loop marker (``apply_loop_cache_marker``) writes the whole history again
     on every turn, because the previous turn's cached prefix ended inside
     that turn's own context and tool calls, which history does not keep.
 
@@ -659,68 +512,6 @@ def _clear_turn_marker(message: dict[str, Any] | None) -> None:
     for block in message.get("content") or []:
         if isinstance(block, dict):
             block.pop("cache_control", None)
-
-
-def _apply_loop_cache_marker(
-    messages: list[dict[str, Any]], start: int = 0
-) -> bool:
-    """Move the agent loop's intra-turn cache breakpoint to the newest
-    tool result, in place.
-
-    Without this the loop caches only the static tools+system prefix, so
-    every iteration re-sends the whole accumulated transcript at full
-    input price and ``cache_read_input_tokens`` stays pinned flat while
-    the prompt grows. Marking the newest tool result makes each iteration
-    read the previous iteration's write and extend it, so hits accrue.
-
-    The marker MOVES rather than accumulates: a per-iteration marker left
-    in place would reach ``max_iterations`` breakpoints and blow the
-    4-breakpoint API limit. Sweeping first also makes this idempotent and
-    self-healing — there is no bookkeeping index to drift out of sync.
-
-    Placement is the newest non-empty ``tool_result`` in a user message.
-    That is normally the last block of the last user message; when the
-    newest results are empty it falls back to the newest non-empty one
-    before them, so an all-empty iteration still gets a breakpoint. Only
-    the empty blocks then sit outside the cached prefix, which costs
-    nothing.
-
-    The marker must stay at the ``tool_result`` block's own top level:
-    ``providers.feature_gate._strip_cache_control`` removes markers one
-    level deep only, so a marker nested inside ``tool_result["content"]``
-    would survive the gate and reach a provider that rejects the field.
-
-    ``start`` bounds the sweep to messages this loop appended. The loop's
-    ``current_messages`` is a SHALLOW copy, so the caller still owns the
-    dicts before that index; without the bound a caller-supplied
-    ``tool_result`` would be mutated in place. Today no caller builds one,
-    but making that structural beats guarding it with a comment.
-    """
-    # Sweep every marker, and remember every markable block in order. The
-    # newest one wins, but keeping the whole list means an iteration whose
-    # last results are all empty falls back to the newest earlier result
-    # rather than shipping with no breakpoint at all — losing the marker
-    # costs the entire accumulated transcript at full price for that step.
-    markable: list[dict[str, Any]] = []
-    for msg in messages[start:]:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        is_user = msg.get("role") == "user"
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            block.pop("cache_control", None)
-            # An empty result carries nothing worth caching and risks an
-            # upstream 400 on the translated typed block. Non-str content
-            # (a typed/image result) is markable — it is real bytes in the
-            # prefix — but is left to the translator to render.
-            body = block.get("content")
-            if is_user and body:
-                markable.append(block)
-    if markable:
-        markable[-1]["cache_control"] = {"type": "ephemeral"}
-    return bool(markable)
 
 
 def _with_notice(result: Any, notice: str) -> Any:
@@ -845,9 +636,11 @@ _ALL_SKILL_TOOLS = [
     *DEPARTMENT_TOOLS,
     *DECISION_TOOLS,
     *FACT_TOOLS,
+    *WORKED_OUT_TOOLS,
     *DOCUMENT_TOOLS,
     *BROADCAST_TOOLS,
     *WATCHLIST_TOOLS,
+    *ACTIVITY_TOOLS,
     *RESEARCH_TOOLS,
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
@@ -878,9 +671,11 @@ _ALL_SKILL_HANDLERS = {
     **DEPARTMENT_TOOL_HANDLERS,
     **DECISION_TOOL_HANDLERS,
     **FACT_TOOL_HANDLERS,
+    **WORKED_OUT_TOOL_HANDLERS,
     **DOCUMENT_TOOL_HANDLERS,
     **BROADCAST_TOOL_HANDLERS,
     **WATCHLIST_TOOL_HANDLERS,
+    **ACTIVITY_TOOL_HANDLERS,
     **RESEARCH_TOOL_HANDLERS,
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
@@ -912,25 +707,32 @@ def builtin_tool_names() -> frozenset[str]:
     })
 
 
-def _private_tool_row(tool_name: str) -> bool:
+def _private_tool_row(tool_name: str, tool_input: Any = None, result: Any = None) -> bool:
     """Whether a tool's dispatch audit row is private to the principal: Act as
     me reads the speaker's own mailbox, and the fact tools' input quotes the
     principal verbatim and ties a fact to their chat session and turn, which
-    ``GET /memories/facts`` hides from everyone else."""
+    ``GET /memories/facts`` hides from everyone else. A kept figure
+    (``keep_figure``) is the speaker's own and may come from their mail."""
     return (
         tool_name in DELEGATION_TOOL_NAMES
         or tool_name in FACT_TOOL_HANDLERS
+        or tool_name in WORKED_OUT_TOOL_HANDLERS
         or tool_name in _OWN_RECALL_TOOL_NAMES
         # An installed extension's tool that quotes the speaker's own data
         # (orchestrator/extensions.py, private_row).
         or extensions.private_row(tool_name)
+        # A watch on the speaker's own inbox (watchlist_tools.speakers_own_row).
+        or speakers_own_row(tool_name, tool_input, result)
     )
 
 
-def _artifact_row_owner(tool_name: str) -> int | None:
-    """The person a document tool's dispatch row belongs to alone (its input
-    and result quote the speaker's own documents), else None."""
-    if tool_name not in DRAFT_ARTIFACT_TOOL_HANDLERS:
+def _artifact_row_owner(tool_name: str, tool_input: Any = None, result: Any = None) -> int | None:
+    """The person a dispatch row belongs to alone, else None: a document
+    tool's input and result quote the speaker's own documents, and a
+    watch-list call on their own inbox quotes their mail."""
+    if tool_name not in DRAFT_ARTIFACT_TOOL_HANDLERS and not speakers_own_row(
+        tool_name, tool_input, result
+    ):
         return None
     from openexecutive.orchestrator.artifact_records import current_viewer
 
@@ -1259,14 +1061,28 @@ def _emit_cache_event(
     )
 
 
-# Added after the tool results of the round before the last. The last round
-# is offered no tool (tool_choice none), so this is the turn's chance to
-# answer from what it has rather than run out of steps mid-task.
-LAST_ROUND_NOTE = (
-    "This is your last step for this message: no more tools can run. Write "
-    "your answer now from what you have gathered so far. If part of the "
-    "request is still undone, say briefly what is left, and that you can "
-    "carry on if they ask."
+# What the person sees for a round that was cut off: the step it was on was
+# writing something long, not the read before it.
+CUT_OFF_LABEL = "Writing it in shorter parts…"
+REPEATING_EMPTY_REPLY = (
+    "I stopped because the same step kept coming back the same way, and "
+    "nothing was ready to show yet."
+)
+STEPS_EMPTY_REPLY = (
+    "I've used all the steps I get for one message. Ask me to carry on and "
+    "I'll pick up the rest."
+)
+# A long web search can pause a round (``pause_turn``); at most this many
+# are carried on in one turn.
+MAX_PAUSES = 5
+FULL_EMPTY_REPLY = (
+    "I've read all I can hold for this one question. Ask me to carry on and "
+    "I'll pick up the rest."
+)
+# Said when it ends that way.
+EMPTY_CUTS_REPLY = (
+    "I kept running out of room before I could finish a step of this. "
+    "Ask me to carry on, or to do it in smaller steps."
 )
 
 
@@ -1279,6 +1095,28 @@ EMPTY_ROUND_NOTE = (
     "call again if you still need it, or answer from what you have."
 )
 
+async def _kept_if_unwritten(stream: AsyncIterator[Any], thinking: str) -> AsyncIterator[Any]:
+    """``stream`` as is, except that a ``rewrite`` whose new reply writes
+    nothing (an empty round, a stop or a cut-off before its first word)
+    streams the first reply again, so every reader (the saved reply, the web
+    and phone chats, an email or chat app) ends with words, never a blank."""
+    since: list[str] = []
+    before: list[str] = []
+    rewritten = False
+    async for item in stream:
+        if item == {"type": "rewrite"}:
+            # A second rewrite keeps the newest words anyone saw.
+            if "".join(since).strip():
+                before = since
+            since, rewritten = [], True
+        elif isinstance(item, str) and item != thinking:
+            since.append(item)
+        yield item
+    if rewritten and not "".join(since).strip() and before:
+        # Exactly as it streamed, so a reader can tell it from a new reply.
+        yield "".join(before)
+
+
 def _round_separator(tail: str, text: str) -> str:
     """What goes between the text already streamed (its last characters,
     ``tail``) and a new round's first ``text``: a paragraph break, less what
@@ -1288,6 +1126,127 @@ def _round_separator(tail: str, text: str) -> str:
     if tail.endswith("\n") or text.startswith("\n"):
         return "\n"
     return "\n\n"
+
+
+# Longest text before a tool call that is still a working note.
+WORKING_NOTE_MAX_CHARS = 300
+# A sentence that only says what it does next: how a working note reads
+# ("Now the live data.", "Let me check the folder.", "Checking the sheet
+# now."). Matched whole: a short sentence with no comma, colon or figure,
+# so a sentence that carries a finding ("Searching the CRM turned up
+# nothing.", "Now the bad news: Acme churned.") is never one.
+_NEXT_STEP_RE = re.compile(
+    r"^(?:(?:let me|let's) (?:check|look|pull|find|search|try|see|get|grab|open|read|dig)\b"
+    r"|now (?:to|for|on to|let me|i'll|i will)\b|next (?:to|let me|i'll|i will)\b"
+    r"|(?:now|next) the \w+(?: \w+)?[.!]?$|time to (?:check|look|search|pull|find|dig)\b"
+    r"|i'll (?:check|look|search|pull|find|try)\b|i will (?:check|look|search|pull|find|try)\b"
+    r"|(?:checking|looking|searching|pulling)\b.*\bnow[.!]?$)",
+    re.IGNORECASE,
+)
+# Longest sentence a working note's step can be.
+NEXT_STEP_MAX_CHARS = 80
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+# A call that only looks something up (whole name segments, as in "search_gmail_messages").
+_LOOKUP_CALL_RE = re.compile(
+    r"(?:^|_)(?:search|read|get|list|find|lookup|query|fetch|consult|retrieve|recall|open)(?:_|$)", re.IGNORECASE
+)
+# Calls that neither look nor act: they don't change what a round is.
+_NEUTRAL_CALLS = frozenset({"show_progress"})
+
+
+def _only_looks(tool_uses: list[dict[str, Any]]) -> bool:
+    """Whether every call a round made only looks something up: a connected
+    app's call (call_tool) or a group's (use_tool) by the tool it runs. A
+    round that also acts (a send, a save) wrote its text as part of the
+    answer ("Runway is 14 months." before the email with it)."""
+    names = []
+    for tu in tool_uses:
+        name = str(tu.get("name", ""))
+        given = tu.get("input")
+        if name in ("call_tool", "use_tool") and isinstance(given, dict):
+            name = str(given.get("name") or name)
+        if name not in _NEUTRAL_CALLS:
+            names.append(name)
+    return bool(names) and all(_LOOKUP_CALL_RE.search(n) for n in names)
+
+
+def _is_next_step(sentence: str) -> bool:
+    return (
+        len(sentence) <= NEXT_STEP_MAX_CHARS
+        and not any(c.isdigit() or c in ",:;" for c in sentence)
+        and _NEXT_STEP_RE.match(sentence) is not None
+    )
+
+
+def _less_notes(text: str) -> str | None:
+    """A round's text before its lookups without its working-note
+    sentences (``_is_next_step``), when it had any, else None. Only a line
+    or two with no list or table is looked at, so "Yes, Acme signed it. Let
+    me pull the signed copy." keeps its answer."""
+    note = text.strip()
+    if not note or len(note) > WORKING_NOTE_MAX_CHARS or "\n" in note or "|" in note:
+        return None
+    sentences = _SENTENCE_END_RE.split(note)
+    kept = [
+        s for s in sentences if not _is_next_step(s)
+    ]
+    if len(kept) == len(sentences):
+        return None
+    if not kept:
+        return ""
+    # Its paragraph break before it (the round's separator) stays.
+    return text[: len(text) - len(text.lstrip())] + " ".join(kept)
+
+
+def _without_notes(rounds: list[tuple[str, bool]]) -> str | None:
+    """The reply without its working notes, when it had any, else None.
+    ``rounds`` is each round's streamed text (its separator first) and
+    whether the round went on only to look something up (``_only_looks``,
+    and not the rest of a cut round's text). A note stays when no round
+    after it wrote anything: then it is all the reply there is."""
+    last_text = max((i for i, (text, _) in enumerate(rounds) if text.strip()), default=-1)
+    out = ""
+    changed = cut = False
+    for i, (text, looked) in enumerate(rounds):
+        rest = _less_notes(text) if looked and i < last_text else None
+        if cut and out.strip() and text and not out[-1:].isspace() and not text[:1].isspace():
+            # Text after a web search in the same round follows the note
+            # with nothing between; with the note gone it needs its break.
+            out += _round_separator(out[-2:], text)
+        cut = rest is not None
+        if rest is None:
+            out += text
+        else:
+            changed = True
+            out += rest
+    if not changed:
+        return None
+    return out.lstrip()
+
+
+def _round_parts(
+    lead: str, text: str, content: list[dict[str, Any]], looked: bool, carries_on: bool
+) -> list[tuple[str, bool]]:
+    """A round's text for ``_without_notes``, split where it ran a web
+    search: a web search runs inside the round, so the text before one was
+    written before a lookup, like the text before a lookup call. ``lead`` is
+    the round's separator, ``looked`` whether its calls only look
+    (``_only_looks``) and ``carries_on`` whether it starts with the rest of
+    a cut round's text."""
+    parts: list[str] = []
+    current = ""
+    for block in content:
+        if block.get("type") == "text":
+            current += str(block.get("text", ""))
+        elif block.get("type") == "server_tool_use" and block.get("name") == WEB_SEARCH_TOOL_NAME and current:
+            parts.append(current)
+            current = ""
+    if not parts or "".join(parts) + current != text:
+        return [(lead + text, looked)]
+    out = [(part, not (i == 0 and carries_on)) for i, part in enumerate(parts)]
+    out[0] = (lead + out[0][0], out[0][1])
+    out.append((current, looked))
+    return out
 
 
 class Executive:
@@ -1454,6 +1413,15 @@ class Executive:
             user_content_parts.append(
                 {"type": "text", "text": f"<drive_memory>\n{drive_memory}\n</drive_memory>"}
             )
+        # The speaker's own chats from the last two days, titles only
+        # (chat_search_tools.recent_chats_block), so "we did it earlier"
+        # reaches search_past_chats. Only where that tool is offered; per
+        # turn, so the user turn.
+        recent_chats = recent_chats_block(session)
+        if recent_chats:
+            user_content_parts.append(
+                {"type": "text", "text": f"<recent_chats>\n{recent_chats}\n</recent_chats>"}
+            )
         # The follow-ups this speaker scheduled that haven't gone out
         # (correction_tools.pending_followups_block), so a turn about the
         # thing one waits for closes it instead of leaving it to fire stale.
@@ -1463,6 +1431,15 @@ class Executive:
             user_content_parts.append(
                 {"type": "text", "text": f"<pending_followups>\n{followups}\n</pending_followups>"}
             )
+        # What this speaker asked for in the last day, in any chat or app,
+        # that went or waits on its card (take_the_lead.done_lately_block),
+        # so the same ask sent again in a new chat is that ask, not a second
+        # email or card. Changes with every step, so the user turn.
+        from openexecutive.orchestrator.take_the_lead import done_lately_block
+
+        lately = done_lately_block(session)
+        if lately:
+            user_content_parts.append({"type": "text", "text": f"<done_lately>\n{lately}\n</done_lately>"})
 
         # Attachment blocks (images) are inserted before the text message so
         # the model sees the visual context first, then the user's question.
@@ -1517,7 +1494,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -1706,7 +1682,9 @@ class Executive:
             if standing_facts is None:
                 # A SQLite read: off the event loop, like the other context.
                 standing_facts = await asyncio.to_thread(
-                    render_facts_for_prompt, query=_lookup_text(memory_text, user_message)
+                    render_facts_for_prompt, query=_lookup_text(memory_text, user_message),
+                    # Their own private decisions, in their own chat only.
+                    reader=own_chat_person(session),
                 )
             messages = self._build_messages(
                 session,
@@ -1753,12 +1731,11 @@ class Executive:
             consulted: list[str] = []
             turn_calls: list[tuple[str, str]] = []
             try:
-                async for item in self._stream_agent_loop(
+                async for item in _kept_if_unwritten(self._stream_agent_loop(
                     system_blocks,
                     messages,
                     model=effective_model,
                     search=search,
-                    max_iterations=max_iterations,
                     episodic_context=episodic_context,
                     debug_collector=debug_collector,
                     consulted_out=consulted,
@@ -1773,9 +1750,12 @@ class Executive:
                     # memory_text may have packed attachment text, mail or another
                     # session's backstory into user_message.
                     seen_url_text=(memory_text or "") if fetch_own_urls else "",
-                ):
+                ), self._THINKING):
                     if isinstance(item, str) and item != self._THINKING:
                         full_response += item
+                    elif item == {"type": "rewrite"}:
+                        # Written again whole: the history keeps only the new reply.
+                        full_response = ""
                     yield item
             finally:
                 outside_content.end_turn(outside_turn)
@@ -1806,7 +1786,7 @@ class Executive:
         # entry point (web stream, .chat() wrapper used by Discord / Slack
         # / Telegram / Email / Google Chat) flows through.
         # Only emit on real text — an empty response means the agent loop
-        # produced only tool_use blocks or hit max_iterations without text,
+        # produced only tool_use blocks and no text,
         # and an audit row for "" adds noise without signal.
         if full_response.strip():
             audit_log(
@@ -1888,6 +1868,7 @@ class Executive:
                     # surface verified the speaker is the principal.
                     workspace_mode=workspace_mode,
                     principal_verified=is_principal_on_verified_surface(session),
+                    private_to_person_id=private_owner(session),
                 )
             # Re-learn this speaker's working style once enough new
             # messages have arrived (paced and budgeted inside).
@@ -1929,16 +1910,19 @@ class Executive:
                     note_ask, own_text, session=session, person_id=person_id, calls=turn_calls,
                 )
 
-            # What it worked out (memory.worked_out): figures the reply worked
-            # out from what the turn read, kept for this person alone (private
-            # when the turn touched their mailbox).
-            from openexecutive.memory.worked_out import schedule_worked_out_pass
+            # What it worked out (memory.worked_out): the figures the
+            # Executive chose to keep this turn (keep_figure), checked against
+            # the reply now that it is written and kept for this person alone
+            # (private when the turn touched their mailbox).
+            from openexecutive.memory.worked_out import KEEP_TOOL, keep_turn_figures
 
             # Not from a turn the person wrote nothing in (``memory_text=""``,
             # e.g. an app's own ask): its numbers repeat what it was shown.
-            if own_text.strip():
-                schedule_worked_out_pass(full_response, turn_calls, session=session,
-                                         person_id=person_id, private=touched_mail)
+            # Most turns keep nothing: only a turn that called keep_figure
+            # opens the database.
+            if own_text.strip() and any(name == KEEP_TOOL for name, _ in turn_calls):
+                await asyncio.to_thread(keep_turn_figures, full_response, turn_calls, session=session,
+                                        person_id=person_id, private=touched_mail)
 
             # Mirror the completed exchange into Honcho so its server-side
             # extraction can update the peer card. Fire-and-forget; the
@@ -1982,7 +1966,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -2135,7 +2118,8 @@ class Executive:
         )
         if standing_facts is None:
             standing_facts = await asyncio.to_thread(
-                render_facts_for_prompt, query=_lookup_text(memory_text, user_message)
+                render_facts_for_prompt, query=_lookup_text(memory_text, user_message),
+                reader=own_chat_person(session),
             )
         messages = self._build_messages(
             session,
@@ -2192,13 +2176,16 @@ class Executive:
             own_words=memory_text,
         )
         turn_calls: list[tuple[str, str]] = []
+        # A refused draft goes to no review or revision: they could rewrite
+        # it into an answer.
+        draft_refused: list[int] = []
+        refusing = _REFUSED.set(draft_refused)
         try:
-            async for item in self._stream_agent_loop(
+            async for item in _kept_if_unwritten(self._stream_agent_loop(
                 system_blocks,
                 messages,
                 model=effective_model,
                 search=search,
-                max_iterations=max_iterations,
                 episodic_context=episodic_context,
                 debug_collector=debug_collector,
                 consulted_out=consulted,
@@ -2211,16 +2198,23 @@ class Executive:
                 principal_role_tag=principal_role_context(principal_role),
                 inbox=inbox,
                 seen_url_text=(memory_text or "") if fetch_own_urls else "",  # as in stream_chat
-            ):
+            ), self._THINKING):
                 # Swallow draft text and the THINKING sentinel — the user sees
                 # only the revised stream. Pass debug-event dicts through so the
                 # UI still gets specialist routing visibility.
                 if isinstance(item, str):
                     if item != self._THINKING:
                         draft += item
+                elif item == {"type": "rewrite"}:
+                    # The draft is written again whole: reviewers see only that.
+                    draft = ""
                 else:
                     yield item
         finally:
+            # Closed from another context (a client that went away), the
+            # token can't be reset there; the turn still ends.
+            with contextlib.suppress(ValueError):
+                _REFUSED.reset(refusing)
             outside_content.end_turn(outside_turn)
 
         draft_ms = round((time.monotonic() - t0) * 1000)
@@ -2231,11 +2225,11 @@ class Executive:
             len(draft),
         )
 
-        # If the draft came back empty (timeout, max_iterations, etc.) skip
+        # If the draft came back empty (a timeout, a turn that wrote nothing) skip
         # review — there is nothing to critique. Still emit the remaining
         # phase events so the UI's stepper completes; otherwise it stays
         # frozen on "drafting" until the connection closes.
-        if not draft.strip():
+        if draft_refused or not draft.strip():
             yield {
                 "type": "phase",
                 "phase": "reviewing",
@@ -2246,7 +2240,10 @@ class Executive:
                 "phase": "finalizing",
                 "session_id": session.session_id,
             }
-            fallback = "I was unable to complete the analysis. Please try again."
+            fallback = (
+                REFUSED_REPLY if draft_refused
+                else "I was unable to complete the analysis. Please try again."
+            )
             yield fallback
             session.add_user_message(user_message)
             for added_text in inbox.taken_texts() if inbox is not None else []:
@@ -2348,7 +2345,7 @@ class Executive:
         revision_final_msg: Any = None
         async with get_provider(effective_model).messages_stream(
             model=effective_model,
-            max_tokens=8192,
+            max_tokens=MAX_OUTPUT_TOKENS,
             system=system_blocks,  # type: ignore[arg-type]
             messages=revision_messages,  # type: ignore[arg-type]
         ) as stream:
@@ -2483,6 +2480,7 @@ class Executive:
                     speaker_text, final_response, person_id=person_id,
                     session_id=session.session_id, workspace_mode=workspace_mode,
                     principal_verified=is_principal_on_verified_surface(session),
+                    private_to_person_id=private_owner(session),
                 )
             from openexecutive.attunement.style import schedule_style_pass
 
@@ -2510,11 +2508,11 @@ class Executive:
                 )
 
             # What it worked out — see stream_chat.
-            from openexecutive.memory.worked_out import schedule_worked_out_pass
+            from openexecutive.memory.worked_out import KEEP_TOOL, keep_turn_figures
 
-            if own_text.strip():
-                schedule_worked_out_pass(final_response, turn_calls, session=session,
-                                         person_id=person_id, private=touched_mail)
+            if own_text.strip() and any(name == KEEP_TOOL for name, _ in turn_calls):
+                await asyncio.to_thread(keep_turn_figures, final_response, turn_calls, session=session,
+                                        person_id=person_id, private=touched_mail)
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale, and for why a turn private to the principal — or one
@@ -2847,7 +2845,6 @@ class Executive:
         # keeps the loop callable without one, which is how tests that exercise
         # unrelated parts of it (cache markers, tool-error isolation) drive it.
         search: WebSearchSelection | None = None,
-        max_iterations: int = 15,
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
         consulted_out: list[str] | None = None,
@@ -2923,24 +2920,15 @@ class Executive:
         # Python jobs need the sandbox the API image installs: without it the
         # tool is not offered (fixed per process, so the prefix stays stable).
         sandbox_missing = frozenset() if python_job.available() else frozenset({python_job.TOOL_NAME})
-        # Another AI app asking over Open Executive's MCP server
-        # (`Session.from_mcp_client`): it reads and advises, and nothing that
-        # sends, posts, books, schedules, runs or changes stored state is
-        # offered or run (`MCP_CLIENT_WITHHELD_TOOLS`) — a fixed set, so the
-        # variant keeps a stable tool prefix of its own. A scheduled run a
-        # teammate queued gets the same (`read_only_turn`): the runner sends
-        # what it writes. An AI app's turn that may act
-        # (`Session.mcp_client_may_act`) runs the speaker's own changes inside
-        # Open Executive and is denied the smaller fixed
-        # `MCP_CLIENT_ACTING_WITHHELD_TOOLS` instead; what reaches another
-        # person it proposes on an approval card (propose_actions, below).
-        mcp_client = mcp_rules_turn(current_session.get())
-        mcp_acting = mcp_client_acting(current_session.get())
-        mcp_client_withheld = (
-            (MCP_CLIENT_ACTING_WITHHELD_TOOLS if mcp_acting else MCP_CLIENT_WITHHELD_TOOLS)
-            if mcp_client
-            else frozenset()
-        )
+        # A turn that may only read and advise (`read_only_turn`: a page in
+        # another app, or a scheduled run a teammate queued, whose message the
+        # runner sends): nothing that sends, posts, books, schedules, runs or
+        # changes stored state runs without the owner's card
+        # (`READ_ONLY_WITHHELD_TOOLS`, `levels.READ_ONLY`). Another AI app's
+        # turn is the signed-in person's own: Approvals decides it like the
+        # web chat.
+        mcp_client = read_only_turn(current_session.get())
+        mcp_client_withheld = READ_ONLY_WITHHELD_TOOLS if mcp_client else frozenset()
         # A shared web chat someone other than its owner has written into
         # since the owner last did (`Session.others_spoke_last`): nothing
         # that sends to people or changes contacts (`SHARED_CHAT_WITHHELD_TOOLS`,
@@ -2950,6 +2938,10 @@ class Executive:
             and getattr(current_session.get(), "others_spoke_last", False) is True
         )
         shared_withheld = SHARED_CHAT_WITHHELD_TOOLS if others_spoke else frozenset()
+        # Someone on no People entry (an unmatched Google Chat sender, a web
+        # sign-in on nobody's entry) has no level of their own: everything
+        # they ask to send or change waits on the owner's card at every level.
+        unrostered = levels.unrostered_speaker(current_session.get())
         # A replay of a graded turn (memory.replay): nothing that runs a
         # script or a job, or changes the install; its acting tools are
         # faked below, after the gates.
@@ -2960,7 +2952,6 @@ class Executive:
         # notice runs (Hands-off) or waits on an Approve card.
         not_offered = sandbox_missing | replay_withheld
         withheld_tools = tools_withheld_in_mode(workspace_mode) | not_offered
-        turn_level = levels.turn_level(current_session.get())
         # Act as me: ghostwrite_email joins the toolkit only on a turn
         # pin_turn_delegation offered it to. Its own registry, never
         # _ALL_SKILL_TOOLS, and a per-turn handler map built from it — so on
@@ -2990,12 +2981,6 @@ class Executive:
             if ghostwrite_offered
             else {**_ALL_SKILL_HANDLERS, **search_handlers}
         )
-        # An AI app's turn that may act: of Act as me's tools, only the
-        # approval card (no mailbox), always offered so the variant's prefix
-        # is stable; its handler checks the speaker (action_card_tools).
-        if mcp_acting and not replaying:
-            delegation_tools = [*ACTION_CARD_TOOLS]
-            turn_handlers = {**turn_handlers, **ACTION_CARD_TOOL_HANDLERS}
         # Always in the loop: recall_history joins the same way, only on a
         # turn whose speaker may read their own notes here (history_tools).
         history_offered = (
@@ -3027,16 +3012,14 @@ class Executive:
         leading = bool(unattended_withheld) and take_the_lead.executive_on()
         if leading:
             turn_handlers = take_the_lead.gated_handlers(turn_handlers, source="scheduled")
-        # A team member's turn (not the principal's): every send or edit goes
-        # through their department's authority first (department_gate), as
-        # unattended work goes through the scheduler's and Take the lead's.
-        # The owner set those ranges for their people, so Hands-off (the
-        # owner's own trust in their Executive) doesn't waive them; a step
-        # outside a range is an Approve card for its approver.
-        seat = None if unattended_withheld else department_gate.speaker(current_session.get())
-        seat_session_id = getattr(current_session.get(), "session_id", None)
-        if seat is not None:
-            turn_handlers = department_gate.gated_handlers(turn_handlers, seat, session_id=seat_session_id)
+        # A step someone asked for on a turn that isn't the owner's own ask
+        # (a teammate, a contact's mail) also meets the owner's Waits rules,
+        # then In training, after Approvals.
+        asked_checks = not leading and not replaying and take_the_lead.asked_checks_apply(current_session.get())
+        if asked_checks:
+            turn_handlers = take_the_lead.asked_handlers(turn_handlers)
+        # A team member's turn runs like the owner's: Approvals decides each
+        # step (orchestrator.levels), and a held one is their own card.
         # A replay (memory.replay): outermost, so a tool that would send,
         # post, book, schedule, run or change stored state is recorded on the
         # session and answered "done" before any gate or handler sees it;
@@ -3063,20 +3046,31 @@ class Executive:
         fanout_hinted = False
         # Shallow copy — the caller owns every dict up to this index.
         caller_message_count = len(current_messages)
-        last_full_text = ""
         # The end of the text this turn has streamed so far, across rounds:
         # a round's text after an earlier round's (the model's words before a
         # tool call, then its answer) starts a new paragraph, so the two
         # never run together ("...stock.Yes. ITEM-1...").
         streamed_tail = ""
+        # Each round's streamed text (its separator first) and whether it went
+        # on only to look something up, since the reply was last written
+        # again: the working notes among them leave the reply at the end
+        # (_without_notes).
+        rounds: list[tuple[str, bool]] = []
+        # Web searches this turn has run: one budget for the whole turn
+        # (web_search_tool.turn_search_tool); spent_at is the count when the
+        # turn was told it had spent it.
+        searches_used = 0
+        spent_at: int | None = None
+        # Rounds a long web search paused (pause_turn), carried on.
+        pauses = 0
+        # Set by a round cut off mid-text: the next round's text carries it
+        # on, so that round alone gets no paragraph break before its text.
+        run_on = False
         specialists_consulted: list[str] = []
         synthesis_roster_size = 0
         # What this turn's tool results have put in the prompt so far: every
         # one is re-sent on each later call.
-        reading_budget = _TurnReadingBudget(
-            per_result=self._settings.tool_result_max_chars,
-            turn_budget=self._settings.tool_results_turn_max_chars,
-        )
+        reading_budget = TurnReadingBudget(reading_limits_for(model))
 
         # Every tool call this turn with the start of its result, for the
         # end-of-turn check that the reply claims nothing it didn't do
@@ -3087,10 +3081,20 @@ class Executive:
         # What the after-reply check reads (claim_check): each call with what
         # it was asked to do, since a result's first line rarely says it all.
         claim_calls: list[tuple[str, str]] = []
+        # Reply text of cut rounds the next round carries on: the claim
+        # check reads it with the round that finishes the reply.
+        cut_text = ""
+        # Cut rounds in a row that wrote nothing (MAX_EMPTY_CUT_ROUNDS).
+        empty_cuts = 0
         claim_checked = False
         # Set once the person asks to finish the work themselves: the next
         # round writes up what the turn has, and runs no tool.
         handing_over = False
+        # Set once the same call came back the same REPEAT_LIMIT times: the next
+        # round writes up what the turn has, and runs no tool, as on a hand-over.
+        repeating = False
+        # What a write-up that wrote nothing says: why it was asked for.
+        write_up_empty = REPEATING_EMPTY_REPLY
         # What the turn last showed the person (show_progress), so each call
         # adds to it, and the reads it made, counted once each for the card.
         shown_progress: turn_progress.Progress | None = None
@@ -3112,14 +3116,21 @@ class Executive:
             ):
                 yield item
 
-        for iteration in range(1, max_iterations + 1):
+        for iteration in itertools.count(1):
             logger.info(
-                "iter %d/%d", iteration, max_iterations,
+                "iter %d", iteration,
                 extra={"iter_marker": True},
             )
             full_text = ""
+            # The separator streamed before this round's text (_round_separator).
+            round_sep = 0
+            round_sep_text = ""
+            carries_on, run_on = run_on, False
             tool_uses: list[dict[str, Any]] = []
             response_content: list[dict[str, Any]] = []
+            # The content check's notice on each result this round, for every
+            # part of it (orchestrator.reading).
+            read_notices: dict[str, str] = {}
 
             # If specialists were already consulted, this is the synthesis pass.
             # Emit synthesis_start before text chunks begin streaming.
@@ -3191,20 +3202,23 @@ class Executive:
                 *client_tools[:-1],
                 {**client_tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}},
             ]
-            if search is not None and search.kind == "server":
-                tools_with_cache.append(search.tool)
+            # Server-side search only where the turn's selection says the
+            # provider runs it (select_web_search_tool), with upstream's one
+            # budget for the whole turn (turn_search_tool); the client-side
+            # SearXNG tool is already in the sorted client list above.
+            web_search_tool = (
+                web_searches.turn_search_tool()
+                if search is not None and search.kind == "server"
+                else None
+            )
+            if web_search_tool is not None:
+                tools_with_cache.append(web_search_tool)
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
-                max_tokens=8192,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 system=system_blocks,  # type: ignore[arg-type]
                 tools=tools_with_cache,  # type: ignore[arg-type,list-item]
                 messages=current_messages,  # type: ignore[arg-type]
-                # The last round runs no tool, so a turn that used up its
-                # steps still answers from what it gathered instead of
-                # ending on "unable to complete". The tools and system
-                # blocks stay cached; the messages are read uncached this
-                # once, as tool_choice changes. Only a turn at its cap pays it.
-                **({"tool_choice": {"type": "none"}} if iteration == max_iterations else {}),
             ) as stream:
                 async for event in stream:
                     if (
@@ -3214,11 +3228,13 @@ class Executive:
                         and hasattr(event.delta, "type")
                         and event.delta.type == "text_delta"
                     ):
-                        if not full_text and streamed_tail and event.delta.text:
+                        if not full_text and streamed_tail and event.delta.text and not carries_on:
                             separator = _round_separator(streamed_tail, event.delta.text)
                             if separator:
                                 yield separator
                                 streamed_tail = separator
+                                round_sep = len(separator)
+                                round_sep_text = separator
                         full_text += event.delta.text
                         streamed_tail = (streamed_tail + event.delta.text)[-2:]
                         yield event.delta.text
@@ -3280,8 +3296,17 @@ class Executive:
                     response_content.append(replay)
             if turn_sources is not None:
                 record_web_sources(turn_sources, final_msg.content)
-
-            last_full_text = full_text
+            rounds.extend(_round_parts(
+                round_sep_text,
+                full_text,
+                response_content,
+                final_msg.stop_reason == "tool_use" and not carries_on and _only_looks(tool_uses),
+                carries_on,
+            ))
+            # A web search is a look, like any read: the after-reply check
+            # sees it with the turn's other calls.
+            claim_calls.extend(web_searches.searched(response_content))
+            searches_used += web_searches.searches_run(response_content)
 
             if web_search_queries:
                 session_id = getattr(current_session.get(), "session_id", None)
@@ -3310,23 +3335,119 @@ class Executive:
                         },
                     )
 
-            if final_msg.stop_reason != "tool_use":
+            # Cut off at MAX_OUTPUT_TOKENS mid-answer: carry on rather than
+            # end the turn on half a step. A cut tool call is answered with
+            # CUT_OFF_RESULT below and never runs; cut text gets CUT_OFF_NOTE.
+            reading_budget.saw(getattr(final_msg, "usage", None))
+            cut_off = final_msg.stop_reason == "max_tokens"
+            # The call the round was still writing when it was cut off is the
+            # last one; its input is unfinished, so nothing reads or runs it.
+            # Only text and calls count as written: a reasoning block that a
+            # translated provider (OpenRouter, OpenAI) puts last is skipped.
+            # A call followed by text or by a call the provider dropped closed
+            # before the cut and runs. A translated provider lists text first,
+            # so its last call always counts as cut and is asked for again.
+            last_written = last_written_block(response_content)
+            # A cut round got somewhere when its cut fell in text (shown, and
+            # carried on) or a call closed before the cut (it runs). A round
+            # cut while writing its only call got nowhere, however much it
+            # wrote before it: that call never runs.
+            cut_in_call = last_written is not None and last_written.get("type") == "tool_use"
+            closed_calls = sum(b.get("type") == "tool_use" for b in response_content) - int(cut_in_call)
+            got_somewhere = closed_calls > 0 or (
+                last_written is not None and not cut_in_call and says_something(str(last_written.get("text", "")))
+            )
+            empty_cuts = empty_cuts + 1 if cut_off and not got_somewhere else 0
+            if empty_cuts > MAX_EMPTY_CUT_ROUNDS:
+                logger.warning("round %d: %d cut rounds in a row wrote nothing; ending the turn", iteration, empty_cuts)
+                yield ("\n\n" if streamed_tail else "") + EMPTY_CUTS_REPLY
+                return
+            if cut_off:
+                logger.warning(
+                    "round %d cut off at max_tokens=%d; carrying on", iteration, MAX_OUTPUT_TOKENS,
+                )
+                if not tool_uses:
+                    if not any(b.get("type") == "text" and str(b.get("text", "")).strip() for b in response_content):
+                        # Nothing was said: the step was writing something
+                        # long (a call the provider dropped whole).
+                        yield {"type": "activity", "label": CUT_OFF_LABEL, "tool": "", "iteration": iteration}
+                    if response_content:
+                        current_messages.append({"role": "assistant", "content": response_content})
+                    cut_text += "".join(
+                        str(b.get("text", "")) for b in response_content if b.get("type") == "text"
+                    )
+                    if reading_budget.window_full:
+                        # Another cut round would not fit the window: what
+                        # it wrote stays shown and the turn ends plainly.
+                        logger.warning("round %d cut off with the window full; ending the turn", iteration)
+                        yield ("\n\n" if streamed_tail else "") + FULL_EMPTY_REPLY
+                        return
+                    note: list[dict[str, Any]] = [{"type": "text", "text": CUT_OFF_NOTE}]
+                    current_messages.append({"role": "user", "content": note})
+                    # The next round carries on the cut text where it
+                    # stopped: no paragraph break between them
+                    # (_round_separator). A cut that streamed nothing keeps
+                    # the break after earlier rounds' text, and any round
+                    # after the next gets the break as usual.
+                    run_on = bool(full_text)
+                    continue
+            if (
+                final_msg.stop_reason == "pause_turn" and response_content and pauses < MAX_PAUSES
+                and not repeating and not handing_over
+            ):
+                # A long web search paused the round (the API's pause_turn):
+                # sent back as it is, it carries on where it stopped. It
+                # counts as a step; at most MAX_PAUSES in a turn. Past the
+                # turn's searches, it is told to write up instead.
+                pauses += 1
+                logger.info("round %d paused by a long web search; carrying on (%d)", iteration, pauses)
+                current_messages.append({"role": "assistant", "content": response_content})
+                if web_search_tool is not None and web_searches.spent(searches_used):
+                    current_messages.append(
+                        {"role": "user", "content": [{"type": "text", "text": web_searches.SEARCHES_OVER_NOTE}]},
+                    )
+                    repeating = True
+                    write_up_empty = web_searches.SEARCHES_EMPTY_REPLY
+                run_on = bool(full_text)
+                continue
+            if final_msg.stop_reason != "tool_use" and not cut_off:
                 # A reply with no tool call still gets the queued files and
                 # synced excerpts checked, so what they tried is flagged to
                 # the person (outside_content.settle).
                 await outside_content.settle()
+                if final_msg.stop_reason == "refusal":
+                    # The model refused: no claim check or retry round, and
+                    # a caller collecting the reply learns of it (_REFUSED).
+                    logger.warning("round %d refused by the model", iteration)
+                    refused = _REFUSED.get()
+                    if refused is not None:
+                        # How much of the collected text the refused round
+                        # wrote, its separator included.
+                        refused.append(round_sep + len(full_text))
+                    else:
+                        # A streamed reply (the web chat) ends on a plain
+                        # refusal, not on what the refused round began.
+                        yield ("\n\n" if streamed_tail else "") + REFUSED_REPLY
+                    return
                 # Do what it says: a reply that claims a change no call this
                 # turn made gets one more round to make it or say it can't.
-                if claim_checked or handing_over or iteration >= max_iterations:
-                    return
-                claim_checked = True
-                reply_text = "\n".join(
-                    str(b.get("text", "")) for b in response_content if b.get("type") == "text"
-                )
-                claim = await claim_check.unbacked_claim(
-                    claim_check.last_person_message(messages), reply_text, claim_calls,
-                )
+                claim: str | None = None
+                if not (claim_checked or handing_over or repeating):
+                    claim_checked = True
+                    reply_text = cut_text + "\n".join(
+                        str(b.get("text", "")) for b in response_content if b.get("type") == "text"
+                    )
+                    claim = await claim_check.unbacked_claim(
+                        claim_check.last_person_message(messages), reply_text, claim_calls,
+                    )
                 if claim is None:
+                    # The reply is the answer alone: a working note written
+                    # before a lookup ("Now the live data.") leaves it, on
+                    # every page and channel showing it (``rewrite``).
+                    clean = _without_notes(rounds)
+                    if clean is not None:
+                        yield {"type": "rewrite"}
+                        yield clean
                     return
                 audit_log(
                     "claim_check",
@@ -3339,40 +3460,54 @@ class Executive:
                     private=private_turn,
                 )
                 current_messages.append({"role": "assistant", "content": response_content})
-                # A collected reply (an email, a chat app) is read whole, so
-                # the retry writes the whole reply again and it replaces the
-                # first instead of trailing it as a correction.
-                rewrite = _COLLECTING.get()
-                if rewrite:
-                    yield {"type": "rewrite"}
+                # The retry writes the whole reply again and it replaces the
+                # first, never trailing it as a correction: a collected reply
+                # (an email, a chat app) drops it before it is sent, and the
+                # web chat swaps it out on ``rewrite``.
+                yield {"type": "rewrite"}
+                streamed_tail, rounds = "", []
                 nudge: list[dict[str, Any]] = [
-                    {"type": "text", "text": claim_check.nudge(claim, rewrite=rewrite)}
+                    {"type": "text", "text": claim_check.nudge(claim)}
                 ]
-                # The retry is the last round, which runs no tool: say so,
-                # so it says it can't rather than try a call it won't get.
-                if iteration == max_iterations - 1:
-                    nudge.append({"type": "text", "text": LAST_ROUND_NOTE})
                 current_messages.append({"role": "user", "content": nudge})
                 # The retry's text gets its paragraph break from
                 # _round_separator, like any other round's.
                 continue
 
-            # Handed over: the write-up asked for a tool anyway. Run nothing;
-            # what it wrote (if anything) is the reply.
-            if handing_over:
+            # Handed over (or repeating itself): the write-up asked for a tool
+            # anyway. Run nothing; what it wrote (if anything) is the reply.
+            if handing_over or repeating:
                 if not any(
                     b.get("type") == "text" and str(b.get("text", "")).strip()
                     for b in response_content
                 ):
-                    yield HAND_OVER_EMPTY_REPLY
+                    yield HAND_OVER_EMPTY_REPLY if handing_over else write_up_empty
                 return
 
+            cut_text = ""
             # open_tools is answered here; a use_tool call becomes the call it
             # stands for (same id), so every guard, handler, chip and audit
             # row below sees the tool's own name, as for a direct call.
             # show_progress is answered here too: nothing runs, and the chat
             # gets it before this round's activity label.
             group_results: dict[str, str] = {}
+            cut_id = (
+                tool_uses[-1]["id"]
+                if cut_off and tool_uses and last_written is not None
+                and last_written.get("type") == "tool_use"
+                and last_written.get("id") == tool_uses[-1]["id"]
+                else None
+            )
+            # The cut call's half-written input is never read: drop it from
+            # the history, which every later round sends again.
+            if cut_id is not None and last_written is not None:
+                last_written["input"] = {}
+            # Nothing below sees the cut call (no hand-over ask, no count of
+            # calls made): it only gets CUT_OFF_RESULT, after the others.
+            cut_results: list[dict[str, Any]] = []
+            if cut_id is not None:
+                tool_uses = [tu for tu in tool_uses if tu["id"] != cut_id]
+                cut_results.append({"type": "tool_result", "tool_use_id": cut_id, "content": CUT_OFF_RESULT})
             for i, tu in enumerate(tool_uses):
                 if tu["name"] == turn_progress.SHOW_PROGRESS:
                     result, progress_event, shown_progress = turn_progress.apply(
@@ -3393,9 +3528,16 @@ class Executive:
                         group_results[tu["id"]] = error or ""
                     else:
                         tool_uses[i] = call
-            # The turn's one full re-read of a result the reading budget cut
-            # is answered from that result, never by running the tool again
-            # (it may have been a write).
+                else:
+                    # A built-in tool asked for through the gateway
+                    # (call_tool name="create_alert") is that tool's own call,
+                    # checked by its own name: the gateway doesn't have it.
+                    own = _own_tool_call(tu, turn_handlers)
+                    if own is not None:
+                        tool_uses[i] = own
+            # A repeat of a call whose result came back in parts is answered
+            # with its next part, never by running the tool again (it may
+            # have been a write).
             for tu in tool_uses:
                 if tu["id"] not in group_results:
                     replayed = reading_budget.replay(tu)
@@ -3449,6 +3591,8 @@ class Executive:
                 is_script = tu["id"] in script_ids
                 if name in unattended_withheld:
                     return levels.UNATTENDED
+                if unrostered and (is_script or levels.acts(name, given)):
+                    return levels.STRANGER
                 if name in principal_withheld:
                     return levels.NOT_OWNER
                 if private_turn and (
@@ -3457,9 +3601,9 @@ class Executive:
                     return levels.PRIVATE
                 if mcp_client and (
                     name in mcp_client_withheld or is_script
-                    or (is_mcp and mcp_client_withholds(name, given, acting=mcp_acting))
+                    or (is_mcp and read_only_withholds(name, given))
                 ):
-                    return levels.AI_APP
+                    return levels.READ_ONLY
                 if others_spoke and (name in shared_withheld or (is_mcp and shared_chat_withholds(name, given))):
                     return levels.SHARED
                 return None
@@ -3535,10 +3679,13 @@ class Executive:
             for tu in mail_touched_uses:
                 noticed.setdefault(tu["id"], (tu, mail_why))
             for tu in outside_uses:
-                noticed.setdefault(tu["id"], (tu, levels.STRANGER if stranger else levels.OUTSIDE))
+                noticed.setdefault(tu["id"], (tu, levels.STRANGER if stranger else levels.outside_reason()))
             held_uses = [
                 (tu, reason) for tu, reason in noticed.values()
-                if levels.decide(reason, mode=turn_level) == levels.CARD
+                # The level now, not the turn's first: a flagged read drops
+                # Hands-off to Balanced for the rest of the turn
+                # (outside_content._flag).
+                if levels.decide(reason) == levels.CARD
                 and not levels.only_to_owner(tu["name"], tu["input"])
             ]
             held_ids = {tu["id"] for tu, _ in held_uses}
@@ -3629,7 +3776,8 @@ class Executive:
             try:
                 # The progress call is not what the round is doing.
                 round_work = [
-                    tu for tu in tool_uses if tu["name"] != turn_progress.SHOW_PROGRESS
+                    tu for tu in tool_uses
+                    if tu["name"] != turn_progress.SHOW_PROGRESS
                 ]
                 activity = summarize_activity(round_work, iteration=iteration)
                 # What the round read, by kind, for the card when the turn
@@ -3637,6 +3785,10 @@ class Executive:
                 reads = turn_reads.add(round_work)
                 if activity is not None and reads:
                     activity["reads"] = reads
+                if cut_id is not None:
+                    # The step was writing something long, not the call's own
+                    # kind of work (which never ran).
+                    activity = {**(activity or fallback_activity(iteration=iteration)), "label": CUT_OFF_LABEL}
             except Exception:
                 logger.warning(
                     "activity_label_failed iteration=%d", iteration, exc_info=True
@@ -3647,6 +3799,18 @@ class Executive:
             # label it saw captioning this round with the previous round's
             # work; an honest "Working…" beats a stale name.
             yield activity or fallback_activity(iteration=iteration)
+            # A step in their browser only they can do is asked in the chat
+            # they're typing in, with Done and Stop, before it runs
+            # (browser.tools.hand_over_asks).
+            try:
+                from openexecutive.browser import tools as browser_tools
+
+                for ask in browser_tools.hand_over_asks(
+                    tool_uses, getattr(current_session.get(), "session_id", None)
+                ):
+                    yield ask
+            except Exception:
+                logger.warning("hand_over_ask_failed iteration=%d", iteration, exc_info=True)
 
             # Signal that tool calls are in flight so the client can show progress.
             yield self._THINKING
@@ -3839,10 +4003,25 @@ class Executive:
                     logger.info("→ skill:%s  input=%s", tu["name"], _log_value(tu["name"], tu["input"]))
                 # return_exceptions=True: one crashing handler must not abort
                 # the whole turn. See `_tool_error_result`.
-                raw_skill_results = await asyncio.gather(
-                    *(turn_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses),
-                    return_exceptions=True,
-                )
+                # What a running tool says meanwhile (a workflow's steps)
+                # streams as it happens (orchestrator.turn_live).
+                # Bound only while the task is made (it copies the context),
+                # never across a yield.
+                feed = turn_live.Feed()
+                with feed.bound():
+                    skill_task = asyncio.ensure_future(asyncio.gather(
+                        *(
+                            with_turn_limits(reading_budget.limits, turn_handlers[tu["name"]](tu["input"]))
+                            for tu in skill_tool_uses
+                        ),
+                        return_exceptions=True,
+                    ))
+                # Closed here, so a turn that stops at a yield cancels the
+                # tools at once, not when the generator is collected.
+                async with contextlib.aclosing(feed.until(skill_task)) as live_events:
+                    async for live in live_events:
+                        yield live
+                raw_skill_results = skill_task.result()
                 for tu, raw in zip(skill_tool_uses, raw_skill_results, strict=True):
                     if isinstance(raw, BaseException):
                         # Cancellation is not a tool failure — `gather` captures
@@ -3878,9 +4057,9 @@ class Executive:
                             },
                             # Act as me reads the speaker's own mailbox; the
                             # fact tools carry the principal's own words.
-                            private=_private_tool_row(tu["name"])
+                            private=_private_tool_row(tu["name"], tu["input"])
                             or tu["name"] in DRAFT_ARTIFACT_TOOL_HANDLERS,
-                            private_to_person=_artifact_row_owner(tu["name"]),
+                            private_to_person=_artifact_row_owner(tu["name"], tu["input"]),
                         )
                         # Hand the model an error tool_result and move on. No
                         # chip: summarize_action must never see an exception.
@@ -3957,9 +4136,9 @@ class Executive:
                         },
                         # A document tool quotes the speaker's own
                         # documents: the row is theirs alone.
-                        private=_private_tool_row(tu["name"])
+                        private=_private_tool_row(tu["name"], tu["input"], result)
                         or tu["name"] in DRAFT_ARTIFACT_TOOL_HANDLERS,
-                        private_to_person=_artifact_row_owner(tu["name"]),
+                        private_to_person=_artifact_row_owner(tu["name"], tu["input"], result),
                     )
 
             if mcp_tool_uses and self._mcp_gateway is not None:
@@ -3968,10 +4147,8 @@ class Executive:
                 guarded_call_tool = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
-                    else department_gate.gated_call_tool(
-                        self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
-                    )
-                    if seat is not None
+                    else take_the_lead.asked_call_tool(self._mcp_gateway.call_tool)
+                    if asked_checks
                     else self._mcp_gateway.call_tool
                 ))
                 _mcp_dispatch = {
@@ -4094,10 +4271,8 @@ class Executive:
                 script_call = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
-                    else department_gate.gated_call_tool(
-                        self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
-                    )
-                    if seat is not None
+                    else take_the_lead.asked_call_tool(self._mcp_gateway.call_tool)
+                    if asked_checks
                     else self._mcp_gateway.call_tool
                 ))
                 # The Executive's own tools a script may call this turn: the
@@ -4134,7 +4309,11 @@ class Executive:
                         call_input["own"] = True
                     # Budgets for the whole turn: a direct call needs a
                     # tool_use each, a script could otherwise make thousands.
-                    cap = step_script.CHAT_OWN_TOOL_CAPS.get(tool) if own else None
+                    cap = (
+                        step_script.CHAT_OWN_TOOL_CAPS.get(tool)
+                        if own and not principal_speaking(current_session.get())
+                        else None
+                    )
                     if _counts.get("", 0) >= self._settings.chat_script_max_calls or (
                         cap is not None and _counts.get(tool, 0) >= cap
                     ):
@@ -4163,7 +4342,7 @@ class Executive:
                         probe_name, probe_input
                     ):
                         script_reason = (
-                            levels.STRANGER if outside_content.answers_off_team_mail() else levels.OUTSIDE
+                            levels.STRANGER if outside_content.answers_off_team_mail() else levels.outside_reason()
                         )
                     elif pinned_delegation is not None and mail_turn_withholds(
                         probe_name, probe_input, pinned=pinned_delegation
@@ -4171,7 +4350,7 @@ class Executive:
                         script_reason = levels.mail_reason()
                     if (
                         script_reason is not None
-                        and levels.decide(script_reason, mode=turn_level) == levels.CARD
+                        and levels.decide(script_reason) == levels.CARD
                         and not levels.only_to_owner(probe_name, probe_input)
                     ):
                         if isinstance(arguments, dict) and levels.carriable(tool, mcp=not own):
@@ -4188,7 +4367,7 @@ class Executive:
                     source = outside_content.source_of(probe_name, probe_input)
                     try:
                         if own:
-                            text = str(await _handlers[tool](arguments))
+                            text = str(await with_turn_limits(reading_budget.limits, _handlers[tool](arguments)))
                         else:
                             text = str(await _call({"name": tool, "arguments": arguments}))
                     except asyncio.CancelledError:
@@ -4257,12 +4436,12 @@ class Executive:
                             tools=None,
                             call=_script_call,
                             origin="chat",
-                            # Saving only while the principal speaks on a
-                            # verified, interactive surface: a saved tool
-                            # runs on whoever's turn calls it later.
+                            # Saving and running while someone on the team
+                            # (the principal or a teammate) speaks on a
+                            # verified, interactive surface: each call a
+                            # saved tool makes is checked on the turn that
+                            # runs it, by that turn's level.
                             may_save=not principal_withheld and not unattended_withheld,
-                            # Running one too: someone else's turn would run
-                            # the principal's recipe with inputs they chose.
                             may_run_saved=not principal_withheld and not unattended_withheld,
                             wall_clock_s=script_clock,
                             own_tools=script_own,
@@ -4370,7 +4549,8 @@ class Executive:
                             elif kind == "done":
                                 script_result, script_failed = payload
                     logger.info("← run_script  result=%s", _trunc(script_result))
-                    results_by_id[tu["id"]] = "".join(dict.fromkeys(notices)) + script_result
+                    read_notices[tu["id"]] = "".join(dict.fromkeys(notices))
+                    results_by_id[tu["id"]] = read_notices[tu["id"]] + script_result
                     # Agent Activity: the built tool as one card, with the
                     # calls it made (the result lists them, capped). Sent by
                     # the round's event replay below, like specialist events.
@@ -4426,6 +4606,17 @@ class Executive:
                 for evt in debug_collector._events[event_cursor:]:
                     yield debug_collector.to_sse_dict(evt)
 
+            # A picture a tool held (the browser's screenshot) comes off its
+            # answer first. The model sees it only when it can see images and
+            # the check below can read it too (text in a picture is outside
+            # content like any other); otherwise it gets the text alone.
+            images_by_id: dict[str, dict[str, Any]] = {}
+            for tu in tool_uses:
+                bare, image = tool_images.take(results_by_id.get(tu["id"]))
+                if image is not None:
+                    results_by_id[tu["id"]] = bare
+                    images_by_id[tu["id"]] = image
+            sees = bool(images_by_id) and sees_images(stream_model) and sees_images(content_scan.scan_model())
             # What this round read from outside reaches the model with its
             # results: from the next round on the turn is held.
             # The check sees each read's result first (orchestrator.content_scan):
@@ -4436,10 +4627,16 @@ class Executive:
             ]:
                 if tu["id"] not in held_ids and tu not in withheld_uses:
                     notice = await outside_content.mark_read(
-                        source, tu["input"], results_by_id.get(tu["id"], ""), self._mcp_gateway
+                        source,
+                        tu["input"],
+                        tool_images.content(
+                            results_by_id.get(tu["id"], ""), images_by_id.get(tu["id"]), sees=sees
+                        ),
+                        self._mcp_gateway,
                     )
                     if notice:
                         results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        read_notices[tu["id"]] = notice
             # The owner's own mail this round read is checked the same way,
             # and decides how much of the Act as me lockdown holds from the
             # next round on (delegation.lockdown.mail_lock_holds).
@@ -4455,6 +4652,9 @@ class Executive:
                     results_by_id[tu["id"]] = checked
                     if notice:
                         results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        # Before the content check's notice, as _with_notice
+                        # put them, so every later part carries both.
+                        read_notices[tu["id"]] = notice + read_notices.get(tu["id"], "")
                 # A script that ran beside the read may have read mail the
                 # loop never checks: the turn stays unvetted.
                 ran_script = any(
@@ -4481,20 +4681,39 @@ class Executive:
                 claim_calls.append(
                     (claim_check.call_label(tu["name"], tu["input"]), str(results_by_id.get(tu["id"], "")))
                 )
+            # A call that may have changed something drops the parts held
+            # from before it (orchestrator.reading).
+            reading_budget.ran(tool_uses)
             for tu in tool_uses:
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
-                    "content": reading_budget.cap(
-                        tu["name"],
-                        tu["input"],
-                        results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
-                        tu["id"],
+                    "content": tool_images.content(
+                        reading_budget.cap(
+                            tu["name"],
+                            tu["input"],
+                            app_links.for_model(results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}")),
+                            tu["id"],
+                            read_notices.get(tu["id"], ""),
+                        ),
+                        images_by_id.get(tu["id"]),
+                        sees=sees,
                     ),
                 }
                 if tu["id"] in error_tool_use_ids:
                     result_block["is_error"] = True
                 tool_results.append(result_block)
+            tool_results.extend(cut_results)
+            # Cut in text written after a call that closed: the call ran, and the
+            # next round carries the text on where it stopped.
+            if cut_off and last_written is not None and last_written.get("type") == "text":
+                tool_results.append({"type": "text", "text": CUT_OFF_NOTE})
+                run_on = True
+                # The claim check reads the cut text with the round that ends it.
+                last_call = max(n for n, blk in enumerate(response_content) if blk.get("type") == "tool_use")
+                cut_text = "".join(
+                    str(blk.get("text", "")) for blk in response_content[last_call + 1:] if blk.get("type") == "text"
+                )
             # Messages the person sent since the last round ride in this
             # round's user message, after the tool results (which must come
             # first). Only this loop's own, newest message changes, so the
@@ -4521,14 +4740,43 @@ class Executive:
                 # Audited by the inbox's owner (the web chat route), under
                 # the same privacy as the turn's own message.
                 yield {"type": "message_added", "ids": [m.id for m in added]}
-            # The last round has no step after it to write anything up in;
-            # its own reply stands, and the request is never taken.
-            if iteration < max_iterations and inbox is not None and inbox.take_hand_over():
+            if inbox is not None and inbox.take_hand_over():
                 tool_results.append({"type": "text", "text": HAND_OVER_NOTE})
                 handing_over = True
                 yield {"type": "handing_over"}
-            if iteration == max_iterations - 1 and not handing_over:
-                tool_results.append({"type": "text", "text": LAST_ROUND_NOTE})
+            for tu in tool_uses:
+                reading_budget.came_back(tu["name"], tu["input"], results_by_id.get(tu["id"], ""))
+            if not handing_over and reading_budget.repeating:
+                logger.warning("round %d: a call came back the same %d times; writing up", iteration, REPEAT_LIMIT)
+                tool_results.append({"type": "text", "text": REPEATING_NOTE})
+                repeating = True
+            elif not handing_over and not repeating and reading_budget.full:
+                logger.info("round %d: the turn has read all its model holds; writing up", iteration)
+                tool_results.append({"type": "text", "text": FULL_NOTE})
+                repeating = True
+                write_up_empty = FULL_EMPTY_REPLY
+            elif not handing_over and not repeating and iteration >= MAX_STEPS:
+                logger.info("round %d: the turn has run its %d steps; writing up", iteration, MAX_STEPS)
+                tool_results.append({"type": "text", "text": STEPS_NOTE})
+                repeating = True
+                write_up_empty = STEPS_EMPTY_REPLY
+            if web_search_tool is not None and web_searches.spent(searches_used) and not repeating:
+                if spent_at is None:
+                    # Spent: told once, and its other steps still run.
+                    tool_results.append({"type": "text", "text": web_searches.SEARCHES_SPENT_NOTE})
+                    spent_at = searches_used
+                elif searches_used > spent_at and not handing_over:
+                    # Searched again after being told: the next round writes
+                    # up with no more calls, so a turn's searches stay bounded
+                    # (the tool can't shrink without missing the cache).
+                    logger.info("round %d: searched past the turn's budget; writing up", iteration)
+                    tool_results.append({"type": "text", "text": web_searches.SEARCHES_OVER_NOTE})
+                    repeating = True
+                    write_up_empty = web_searches.SEARCHES_EMPTY_REPLY
+            if sees:
+                # Only the newest screenshots ride along: older ones would be
+                # sent again every round.
+                tool_images.drop_older(current_messages)
             if not tool_results:
                 logger.warning(
                     "round %d ended on %s with no tool call to answer; blocks=%s",
@@ -4539,14 +4787,11 @@ class Executive:
             # Bounded to the messages this loop appended: current_messages
             # is a shallow copy, so anything at a lower index is still owned
             # by the caller and must not be mutated.
-            if self._settings.enable_caching and _apply_loop_cache_marker(
+            if self._settings.enable_caching and apply_loop_cache_marker(
                 current_messages, caller_message_count
             ):
                 _clear_turn_marker(turn_marked)
                 turn_marked = None
-
-        logger.warning("max_iterations=%d reached — returning partial result", max_iterations)
-        yield last_full_text or "I was unable to complete the analysis. Please try again."
 
     async def chat(
         self,
@@ -4554,7 +4799,6 @@ class Executive:
         session: Session,
         retrieved_context: str = "",
         episodic_context: str = "",
-        max_iterations: int = 15,
         committee_review: bool = False,
         debug_collector: DebugCollector | None = None,
         attachment_blocks: list[dict[str, Any]] | None = None,
@@ -4568,8 +4812,15 @@ class Executive:
         standing_facts: str | None = None,
         fetch_own_urls: bool = False,
         cards: list[int] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         """Non-streaming chat — collects and returns the full response.
+        A turn the model refused ends on ``REFUSED_REPLY``.
+
+        ``on_progress``, when given, sees each ``activity`` and ``progress``
+        event as the turn runs (what the web chat's progress card shows),
+        for a caller with its own way of showing it, such as the steps on a
+        reply card while its work runs (``delegation.card_work``).
 
         ``cards``, when given, collects the ids of the approval cards the
         reply left (the ``decision_id`` on its ``action_taken`` events, as the
@@ -4610,7 +4861,6 @@ class Executive:
             "retrieved_context": retrieved_context,
             "episodic_context": episodic_context,
             "debug_collector": debug_collector,
-            "max_iterations": max_iterations,
             "attachment_blocks": attachment_blocks,
             "person_id": person_id,
             "co_present_person_ids": co_present_person_ids,
@@ -4644,8 +4894,9 @@ class Executive:
             else self.stream_chat(**common_kwargs)
         )
         result = ""
-        rewritten, before = False, ""
-        collecting = _COLLECTING.set(True)
+        rewritten = False
+        refused: list[int] = []
+        refusing = _REFUSED.set(refused)
         try:
             with turn_files.bind(offered or None) if offered else contextlib.nullcontext():
                 async for chunk in stream:
@@ -4653,16 +4904,25 @@ class Executive:
                         result += chunk
                     elif isinstance(chunk, dict) and chunk.get("type") == "rewrite":
                         # The next round writes the reply again.
-                        before, result, rewritten = result, "", True
+                        result, rewritten = "", True
+                    elif isinstance(chunk, dict) and chunk.get("type") in ("activity", "progress"):
+                        if on_progress is not None:
+                            on_progress(chunk)
                     elif cards is not None and isinstance(chunk, dict) and chunk.get("type") == "action_taken":
                         decision_id = chunk.get("decision_id")
                         if isinstance(decision_id, int) and not isinstance(decision_id, bool) and decision_id not in cards:
                             cards.append(decision_id)
         finally:
-            _COLLECTING.reset(collecting)
+            _REFUSED.reset(refusing)
         if rewritten:
-            # A retry that wrote nothing keeps the first reply.
-            result = result.lstrip() or before
+            # A retry that wrote nothing streams the first reply again
+            # (_kept_if_unwritten).
+            result = result.lstrip()
+        if refused:
+            # Nothing the refused round began ("You're") is sent. What the
+            # earlier rounds said stays (what their tools did), then a plain
+            # refusal.
+            result = _with_refusal(result, refused[-1])
         # A card named by its number ("card 220") tells the reader nothing:
         # name it by its headline, linked to it on Home (alerts.card_refs).
         # Private cards only when the principal reads it alone.

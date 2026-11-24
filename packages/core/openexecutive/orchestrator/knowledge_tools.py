@@ -22,8 +22,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# What the pass reads back: enough for a few matching passages.
-RESULT_CHARS = 4000
 _MAX_QUERY_CHARS = 300
 
 SEARCH_KNOWLEDGE_TOOL: dict[str, Any] = {
@@ -64,7 +62,8 @@ async def handle_search_knowledge(tool_input: dict[str, Any]) -> str:
         return json.dumps({"error": "The knowledge base couldn't be searched just now."})
     if not found.strip():
         return "Nothing in the knowledge base matches that."
-    return found[:RESULT_CHARS]
+    # All of it: the pass reads a long result in parts (orchestrator.rounds).
+    return found
 
 
 KNOWLEDGE_TOOL_HANDLERS: dict[str, Any] = {

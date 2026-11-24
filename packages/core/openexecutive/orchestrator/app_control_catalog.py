@@ -1,13 +1,17 @@
 """What chat can do in the app (``app_control``): chats, topics, documents,
-files, alerts, watch suggestions, workflows, memory, departments, skills and
-the person's own settings, plus links to screens.
+files, alerts, watch suggestions, workflows, memory, departments, skills,
+the person's own settings and the three checks (Approvals, Your rules, In
+training), plus links to screens.
 
 Each action calls the route its button calls (see ``app_control``), so this
 file is wiring: which route, what to send it, what to say after. An action
 whose route checks nothing about the caller (its page is the principal's) is
 ``principal_only``. What waits for a tap: deletes, shares, turning on
 something that sends as the person or lets more happen on its own, and
-approving a workflow's waiting step.
+approving a workflow's waiting step. A change to the checks that holds more
+(a lower level, a Waits rule, In training on) is done in the turn; one that
+lets more go on its own (a higher level, a Goes rule, removing a Waits rule,
+leaving training) waits for a tap, whatever the level.
 
 Not here on purpose: the person's notes ("Keep track of what happens") are
 private and read only through ``recall_history``, which marks the chat
@@ -19,9 +23,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
-from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
+from openexecutive.memory import workspace_settings
 from openexecutive.orchestrator.app_control import (
     Action,
     Item,
@@ -241,7 +246,7 @@ async def _ungroup_area(request: Any, area: str, value: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Documents (the Documents page) and uploaded files
+# Made for you (the /artifacts page) and uploaded files
 # --------------------------------------------------------------------------- #
 
 
@@ -349,12 +354,12 @@ async def _snooze_alert(request: Any, alert_id: str, value: str) -> str:
         raise Refused("That isn't an alert id.") from None
     if aid not in _trusted_alert_ids():
         raise Refused("I can only snooze a card you were shown here. Look it up with find_alerts first.")
-    try:
-        until = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        raise Refused("Give the time as an ISO date and time, e.g. 2026-10-20T09:00:00-04:00.") from None
+    until = workspace_settings.company_time(value)
+    if until is None:
+        raise Refused("Give the time as a date and time in the company's time zone, e.g. 2026-10-20T09:00.")
     alert = await _call(alerts.snooze_alert, aid, alerts.SnoozeBody(until=until), request)
-    when = until.astimezone(UTC).strftime("%b %-d, %H:%M UTC")
+    local = until.astimezone(workspace_settings.get_user_timezone())
+    when = f"{local:%b} {local.day}, {local:%H:%M} ({local.tzname()})"
     return f"Snoozed {_q(alert.headline)} until {when}"
 
 
@@ -384,7 +389,7 @@ async def _find_watch_suggestions(request: Any) -> list[Item]:
     from openexecutive.api.routes import watchlist
 
     out = []
-    for w in await _call(watchlist.list_watchlist):
+    for w in await _call(watchlist.list_watchlist, request):
         try:
             watchlist._pending_suggestion_or_409(w.slug)
         except Exception:
@@ -415,7 +420,7 @@ async def _decline_watch(request: Any, slug: str, value: str) -> str:
 async def _find_workflows(request: Any) -> list[Item]:
     from openexecutive.api.routes import workflows
 
-    defs = (await workflows.list_custom_workflows())["definitions"]
+    defs = (await workflows.list_custom_workflows(request))["definitions"]
     return [
         Item(id=d["name"], title=d.get("title") or d["name"], detail="on" if d.get("is_active") else "off")
         for d in defs
@@ -423,10 +428,9 @@ async def _find_workflows(request: Any) -> list[Item]:
 
 
 async def _workflow_title(name: str) -> str:
-    from openexecutive.api.routes import workflows
+    from openexecutive.workflows import workflow_label
 
-    found = await workflows.get_custom_workflow(name)
-    return str(found.get("title") or name)
+    return workflow_label(name)
 
 
 async def _turn_workflow(request: Any, name: str, on: bool) -> str:
@@ -443,11 +447,20 @@ async def _change_workflow(request: Any, name: str, value: str) -> str:
     return await workflow_change.run(request, name, value)
 
 
+async def _prepare_delete_workflow(request: Any, name: str, value: str) -> str:
+    """Refuse before a card is made: only its creator or the principal deletes it."""
+    from openexecutive.api.routes import workflows
+
+    if not workflows._may_delete(name, request):
+        raise Refused("Only the person who created this workflow or the principal can delete it.")
+    return value
+
+
 async def _delete_workflow(request: Any, name: str, value: str) -> str:
     from openexecutive.api.routes import workflows
 
     title = await _workflow_title(name)
-    await workflows.delete_custom_workflow(name)
+    await workflows.delete_custom_workflow(name, request)
     return f"Deleted the workflow {_q(title)}"
 
 
@@ -502,7 +515,7 @@ async def _find_memories(request: Any) -> list[Item]:
 
     items = [
         Item(id=f"decision:{d.id}", title=d.summary[:120], detail="decision")
-        for d in await _call(episodic.get_decisions)
+        for d in await _call(episodic.get_decisions, request)
     ]
     items += [
         Item(id=f"initiative:{i.id}", title=i.title[:120], detail=f"initiative, {i.status}")
@@ -510,7 +523,7 @@ async def _find_memories(request: Any) -> list[Item]:
     ]
     items += [
         Item(id=f"advice:{a.id}", title=(a.query_summary or a.advice_summary)[:120], detail="advice")
-        for a in await _call(episodic.get_advice_list)
+        for a in await _call(episodic.get_advice_list, request)
     ]
     return items
 
@@ -531,7 +544,7 @@ async def _edit_memory(request: Any, ref: str, value: str) -> str:
     elif kind == "initiative":
         await _call(episodic.patch_initiative, mid, episodic.InitiativeUpdate(summary=value))
     else:
-        await _call(episodic.patch_advice, mid, episodic.AdviceUpdate(advice_summary=value))
+        await _call(episodic.patch_advice, mid, episodic.AdviceUpdate(advice_summary=value), request)
     return f"Updated the {kind}"
 
 
@@ -541,10 +554,38 @@ async def _delete_memory(request: Any, ref: str, value: str) -> str:
     kind, mid = _memory_ref(ref)
     if kind == "decision":
         await _call(episodic.remove_decision, mid, request)
+    elif kind == "advice":
+        await _call(episodic.remove_advice, mid, request)
     else:
-        remove = {"initiative": episodic.remove_initiative, "advice": episodic.remove_advice}[kind]
-        await _call(remove, mid)
+        await _call(episodic.remove_initiative, mid)
     return f"Deleted the {kind} from memory"
+
+
+async def _find_decisions(request: Any) -> list[Item]:
+    """The decisions the speaker can share or take back: their own."""
+    from openexecutive.api.routes import episodic
+
+    return [
+        Item(
+            id=str(d.id), title=d.summary[:120],
+            detail="private to you" if d.private else "shared with the team",
+        )
+        for d in await _call(episodic.get_decisions, request)
+        if d.can_share or d.can_make_private
+    ]
+
+
+async def _share_decision(request: Any, item_id: str, shared: bool) -> str:
+    from openexecutive.api.routes import episodic
+
+    if not item_id.isdigit():
+        raise Refused("That isn't a decision id. Look it up with find_in_app.")
+    await _call(
+        episodic.share_decision_route, int(item_id), episodic.DecisionShare(shared=shared), request
+    )
+    if not shared:
+        return "Made the decision private: only they see it now"
+    return "Shared the decision with the team"
 
 
 async def _find_suggested_facts(request: Any) -> list[Item]:
@@ -634,10 +675,14 @@ _SETTINGS: dict[str, str] = {
     "urgent_through": "Let urgent things through quiet hours",
     "act_as_me": "As you",
     "inbox_drafts": "Draft replies to your inbox",
+    "as_you_training": "In training for As you",
+    "as_me_training": "In training for As me",
 }
 # Turning these on lets the Executive write as the person, or (inbox
 # replies, where Approvals lets them go) send as them.
 _WIDENING = frozenset({"act_as_me", "inbox_drafts"})
+# Turning these off lets more go on its own: In training holds everything.
+_TRAINING = frozenset({"as_you_training", "as_me_training"})
 
 
 async def _find_settings(request: Any) -> list[Item]:
@@ -659,6 +704,18 @@ async def _find_settings(request: Any) -> list[Item]:
         state = d.model_dump()
         items.append(Item(id="act_as_me", title=_SETTINGS["act_as_me"], detail="on" if state.get("enabled") else "off"))
         items.append(Item(id="inbox_drafts", title=_SETTINGS["inbox_drafts"]))
+        training = state.get("training") or {}
+        if "training" in training:
+            items.append(Item(id="as_you_training", title=_SETTINGS["as_you_training"],
+                              detail="on" if training.get("training") else "off"))
+    except Exception:
+        pass
+    try:
+        from openexecutive.api.routes import take_the_lead as lead_route
+
+        lead = await _call(lead_route.get_take_the_lead, request)
+        items.append(Item(id="as_me_training", title=_SETTINGS["as_me_training"],
+                          detail="on" if lead.training else "off"))
     except Exception:
         pass
     return items
@@ -706,18 +763,196 @@ async def _change_setting(request: Any, setting: str, value: str) -> str:
     on = _on(value)
     if setting == "act_as_me":
         await delegation.update_delegation(request, delegation.DelegationUpdate(enabled=on))
-    else:
+    elif setting == "inbox_drafts":
         await delegation.update_delegation_inbox(request, delegation.InboxUpdate(enabled=on))
+    elif setting == "as_you_training":
+        await _signed(delegation.update_delegation_training, request, delegation.TrainingUpdate(training=on))
+    else:
+        from openexecutive.api.routes import take_the_lead as lead_route
+
+        await _signed(lead_route.update_take_the_lead, request, lead_route.LeadUpdate(training=on))
     return f"Turned {label} {'on' if on else 'off'}"
 
 
 def _setting_needs_tap(setting: str, value: str) -> bool:
-    if setting not in _WIDENING:
+    if setting not in _WIDENING and setting not in _TRAINING:
         return False
     try:
-        return _on(value)
+        on = _on(value)
     except Refused:
         return True
+    # Turning As you on widens; turning In training off does.
+    return on if setting in _WIDENING else not on
+
+
+async def _signed(fn: Callable[..., Any], *args: Any) -> Any:
+    """Call a route that lets more go only for a signed request. From a chat
+    turn it refuses (``verified.from_chat``); say so in the words
+    ``app_control`` reads as "leave a card", so the person's tap does it."""
+    from fastapi import HTTPException
+
+    from openexecutive.delegation.verified import SIGNING_REQUIRED, in_chat_turn
+
+    try:
+        return await _call(fn, *args)
+    except HTTPException as exc:
+        # Only the route's refusal for want of a signed request: a 409 for
+        # anything else (a rule already there, a full list) says so as is.
+        signing = SIGNING_REQUIRED in str(exc.detail) or "signed sign-in" in str(exc.detail)
+        if exc.status_code == 409 and signing and in_chat_turn():
+            raise HTTPException(status_code=409, detail={"code": SIGNING_REQUIRED, "message": exc.detail}) from None
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Approvals and Your rules (Delegate, Approvals): the level and the rules
+# that decide what goes on its own (orchestrator.levels, take_the_lead)
+# --------------------------------------------------------------------------- #
+
+# The level's id → what the person calls it, from holding most to least.
+_LEVELS: dict[str, str] = {"ask": "Careful", "outsiders": "Balanced", "trust": "Hands-off"}
+APPROVALS_ID = "approvals"
+
+
+def _level_of(value: str) -> str:
+    v = " ".join(value.strip().lower().replace("-", " ").split())
+    for mode, name in _LEVELS.items():
+        if v in (mode, name.lower().replace("-", " ")):
+            return mode
+    raise Refused("Say Careful, Balanced or Hands-off.")
+
+
+async def _find_approvals(request: Any) -> list[Item]:
+    from openexecutive.api.routes import executive
+
+    out = await _call(executive.get_outside_content, request)
+    return [Item(id=APPROVALS_ID, title="Approvals", detail=_LEVELS.get(out.mode, out.mode))]
+
+
+async def _prepare_level(request: Any, item_id: str, value: str) -> str:
+    """The level's name, so the card says it plainly; Refused for anything else."""
+    return _LEVELS[_level_of(value)]
+
+
+async def _set_level(request: Any, item_id: str, value: str) -> str:
+    from fastapi import HTTPException
+
+    from openexecutive.api.routes import executive
+    from openexecutive.delegation.verified import SIGNING_REQUIRED, in_chat_turn
+    from openexecutive.orchestrator import outside_mode
+
+    mode = _level_of(value)
+    order = list(_LEVELS)
+    if in_chat_turn() and order.index(mode) > order.index(outside_mode.stored_mode()):
+        # Letting more go is the owner's tap, never the turn: a turn that
+        # began on Hands-off (or a level lowered since it began) would
+        # otherwise raise it again on its own.
+        raise HTTPException(status_code=409, detail={"code": SIGNING_REQUIRED, "message": "Raising Approvals takes your tap."})
+    await _call(executive.set_outside_content, request, executive.OutsideContentIn.model_validate({"mode": mode}))
+    return f"Set Approvals to {_LEVELS[mode]}"
+
+
+def _level_needs_tap(item_id: str, value: str) -> bool:
+    """A level that holds less than today's lets more go: it waits for a tap."""
+    from openexecutive.orchestrator import outside_mode
+
+    try:
+        new = _level_of(value)
+    except Refused:
+        return True
+    order = list(_LEVELS)
+    try:
+        return order.index(new) > order.index(outside_mode.stored_mode())
+    except Exception:
+        return True
+
+
+_RULE_KINDS = {"person": "person", "domain": "domain", "words": "words", "amount": "amount", "topic": "topic"}
+
+
+def _rule_parts(value: str) -> tuple[str, str]:
+    """``person: Dana``, ``domain: acme.com``, ``words: invoice``,
+    ``amount: 500``, ``topic: share`` → (kind, what), as the rule stores it."""
+    from openexecutive.orchestrator import take_the_lead
+
+    kind, sep, what = value.partition(":")
+    kind = kind.strip().lower()
+    if not sep or kind not in _RULE_KINDS or not what.strip():
+        raise Refused(
+            "Give the rule as person: <name or email>, domain: <example.com>, words: <words>, amount: <number> "
+            "or topic: <money, contracts, people_decisions, delete, share, someone_new or big_send>."
+        )
+    try:
+        return _RULE_KINDS[kind], take_the_lead.clean_rule(_RULE_KINDS[kind], what)
+    except take_the_lead.RuleError as exc:
+        raise Refused(str(exc)) from None
+
+
+async def _prepare_rule(request: Any, item_id: str, value: str) -> str:
+    """The rule as it will be stored, so the card shows what a tap adds."""
+    kind, what = _rule_parts(value)
+    return f"{kind}: {what}"
+
+
+async def _prepare_goes_rule(request: Any, item_id: str, value: str) -> str:
+    kind, what = _rule_parts(value)
+    if kind == "words":
+        raise Refused("A words rule can only wait for you.")
+    return f"{kind}: {what}"
+
+
+async def _find_rules(request: Any) -> list[Item]:
+    from openexecutive.api.routes import take_the_lead as lead_route
+    from openexecutive.orchestrator import take_the_lead
+
+    out = await _call(lead_route.get_take_the_lead, request)
+    return [
+        Item(
+            id=str(r.id),
+            # What it does is in the title, so a card to remove it says
+            # which of two rules about the same thing goes.
+            title=take_the_lead.rule_text(take_the_lead.Rule(
+                id=r.id, scope=take_the_lead.SCOPE_COMPANY, kind=r.kind, value=r.value, created_at="",
+                effect=r.effect,
+            )) + (" goes on its own" if r.effect == take_the_lead.EFFECT_GO else " always waits"),
+        )
+        for r in out.rules
+    ]
+
+
+async def _add_rule(request: Any, item_id: str, value: str, *, effect: str) -> str:
+    from openexecutive.api.routes import take_the_lead as lead_route
+    from openexecutive.orchestrator import take_the_lead
+
+    kind, what = _rule_parts(value)
+    await _signed(lead_route.add_company_rule, request, lead_route.RuleIn(kind=kind, value=what, effect=effect))
+    rule = take_the_lead.Rule(id=0, scope=take_the_lead.SCOPE_COMPANY, kind=kind, value=what, created_at="",
+                              effect=effect)
+    said = take_the_lead.rule_text(rule)
+    return f"Added a rule: {said} {'goes on its own' if effect == take_the_lead.EFFECT_GO else 'always waits'}"
+
+
+async def _remove_rule(request: Any, rule_id: str, value: str) -> str:
+    from openexecutive.api.routes import take_the_lead as lead_route
+
+    try:
+        number = int(rule_id)
+    except ValueError as exc:
+        raise Refused("That isn't one of your rules.") from exc
+    await _signed(lead_route.delete_company_rule, request, number)
+    return "Removed the rule"
+
+
+def _removing_needs_tap(rule_id: str, value: str) -> bool:
+    """Removing a Waits rule lets more go; removing a Goes rule holds more."""
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        rules = take_the_lead.list_rules([take_the_lead.SCOPE_COMPANY])
+    except Exception:
+        return True
+    found = next((r for r in rules if str(r.id) == rule_id), None)
+    return found is None or found.effect != take_the_lead.EFFECT_GO
 
 
 async def _check_inbox(request: Any, item_id: str, value: str) -> str:
@@ -743,7 +978,7 @@ async def _add_job(request: Any, item_id: str, value: str) -> str:
     from openexecutive.api.routes import take_the_lead as lead_route
 
     await _call(lead_route.add_job, request, lead_route.JobIn(text=value))
-    return f"Added the standing job {_q(' '.join(value.split()))}"
+    return f"Added to standing work: {_q(' '.join(value.split()))}"
 
 
 async def _stop_job(request: Any, job_id: str, value: str) -> str:
@@ -752,9 +987,9 @@ async def _stop_job(request: Any, job_id: str, value: str) -> str:
     try:
         number = int(job_id)
     except ValueError as exc:
-        raise Refused("That isn't one of the standing jobs.") from exc
+        raise Refused("That isn't on the standing work list.") from exc
     await _call(lead_route.stop_job, request, number)
-    return "Stopped the standing job"
+    return "Stopped that standing work"
 
 
 # --------------------------------------------------------------------------- #
@@ -773,27 +1008,34 @@ async def _nothing(request: Any) -> list[Item]:
     return []
 
 
+# Company memory, synced sources (a connection) and the whole Today board are
+# administration: the owner's alone. Everything else is open to anyone on the
+# team, and Approvals decides whether a change runs or waits.
 _KINDS = (
     Kind("chat", "chat", _find_chats),
     Kind("topic", "chat topic", _find_topics),
     Kind("topic_area", "topic area", _find_areas),
     Kind("document", "document", _find_documents),
-    Kind("file", "uploaded file", _find_files, principal_only=True),
+    Kind("file", "uploaded file", _find_files),
     Kind("source", "synced source", _find_sources, principal_only=True),
     Kind("alert", "card on Today", _find_alerts),
     Kind("alert_board", "the cards on Today", _nothing, principal_only=True, no_item=True),
-    Kind("watch_suggestion", "suggested watch", _find_watch_suggestions, principal_only=True),
-    Kind("workflow", "workflow", _find_workflows, principal_only=True),
+    Kind("watch_suggestion", "suggested watch", _find_watch_suggestions),
+    Kind("workflow", "workflow", _find_workflows),
     Kind("workflow_run", "workflow run", _find_runs),
     Kind("memory", "memory (decision, initiative or advice)", _find_memories, principal_only=True),
     Kind("suggested_fact", "suggested fact", _find_suggested_facts, principal_only=True),
-    Kind("department", "department", _find_departments, principal_only=True),
-    Kind("new_department", "new department", _nothing, principal_only=True, no_item=True),
-    Kind("skill", "skill", _find_skills, principal_only=True),
+    Kind("decision", "decision you made (private to you, or one you shared)", _find_decisions),
+    Kind("department", "department", _find_departments),
+    Kind("new_department", "new department", _nothing, no_item=True),
+    Kind("skill", "skill", _find_skills),
     Kind("setting", "setting", _find_settings),
+    Kind("approvals", "Approvals (the level for what goes on its own)", _find_approvals),
+    Kind("rule", "rule in Your rules", _find_rules),
+    Kind("new_rule", "new rule in Your rules", _nothing, no_item=True),
     Kind("inbox", "inbox", _nothing, no_item=True),
-    Kind("standing_job", "standing job (something As me keeps doing)", _find_jobs, principal_only=True),
-    Kind("new_standing_job", "new standing job", _nothing, principal_only=True, no_item=True),
+    Kind("standing_job", "standing work (something As me keeps doing)", _find_jobs),
+    Kind("new_standing_job", "new standing work", _nothing, no_item=True),
 )
 
 _ACTIONS = (
@@ -827,7 +1069,7 @@ _ACTIONS = (
     Action("sync_source", "source", "Sync a connected source now", _sync_source),
     # Alerts
     Action("snooze_alert", "alert", "Hide a card on Today until a time, when it comes back", _snooze_alert,
-           value="when it comes back, ISO 8601 with a zone, at most 30 days out"),
+           value="when it comes back, in the company's time zone (2026-10-20T09:00), at most 30 days out"),
     Action("clear_all_alerts", "alert_board", "Clear every card shown on Today", _clear_alerts, confirm=True,
            card="Clear every card on Today", prepare=_prepare_clear_all),
     # Watch suggestions
@@ -838,7 +1080,7 @@ _ACTIONS = (
            _fixed(_turn_workflow, True), confirm=True, card="Turn on the workflow {title}"),
     Action("turn_off_workflow", "workflow", "Turn a workflow off", _fixed(_turn_workflow, False)),
     Action("delete_workflow", "workflow", "Delete a workflow for good", _delete_workflow, confirm=True,
-           card="Delete the workflow {title}"),
+           card="Delete the workflow {title}", prepare=_prepare_delete_workflow),
     # Only a card save_workflow stages runs it (orchestrator.workflow_change).
     Action("change_workflow", "workflow", "Save a change to a workflow", _change_workflow, confirm=True,
            card="Change the workflow {title}", hidden=True),
@@ -854,6 +1096,10 @@ _ACTIONS = (
            value="what it should say now"),
     Action("delete_memory", "memory", "Delete a past decision, initiative or advice from memory", _delete_memory,
            confirm=True, card="Delete from memory: {title}"),
+    Action("share_decision", "decision", "Share a decision that is private to the speaker with the team",
+           _fixed(_share_decision, True), confirm=True, card="Share with the team: {title}"),
+    Action("unshare_decision", "decision", "Make a decision the speaker shared private to them again",
+           _fixed(_share_decision, False)),
     Action("approve_fact", "suggested_fact", "Approve a fact a teammate suggested", _fixed(_review_fact, True)),
     Action("decline_fact", "suggested_fact", "Decline a fact a teammate suggested", _fixed(_review_fact, False)),
     # Departments
@@ -869,14 +1115,37 @@ _ACTIONS = (
     # Settings
     Action("change_setting", "setting",
            "Change one of the person's own settings: quiet_hours (start-end or off), delivery "
-           "(instant or digest), urgent_through, act_as_me, inbox_drafts (on or off)",
+           "(instant or digest), urgent_through, act_as_me, inbox_drafts, as_you_training, "
+           "as_me_training (on or off)",
            _change_setting, confirm=_setting_needs_tap, value="the new value", card="Set {title} to {value}"),
+    # Approvals and Your rules: holding more is done now, letting more go waits.
+    Action("set_approvals_level", "approvals",
+           "Set Approvals, the one level for what goes on its own (use id \"approvals\")",
+           _set_level, confirm=_level_needs_tap, value="Careful, Balanced or Hands-off",
+           card="Set {title} to {value}", prepare=_prepare_level),
+    Action("add_waits_rule", "new_rule",
+           "Add a rule in Your rules that always waits for the person (use id \"new\")",
+           partial(_add_rule, effect="wait"), prepare=_prepare_rule,
+           value=(
+               "person: <name or email>, domain: <example.com>, words: <words>, amount: <number> "
+               "or topic: <money, contracts, people_decisions, delete, share, someone_new or big_send>"
+           )),
+    Action("add_goes_rule", "new_rule",
+           "Add a rule in Your rules that lets something go on its own (use id \"new\"; not for words)",
+           partial(_add_rule, effect="go"), confirm=True, prepare=_prepare_goes_rule,
+           value=(
+               "person: <name or email>, domain: <example.com>, amount: <number> "
+               "or topic: <money, contracts, people_decisions, delete, share, someone_new or big_send>"
+           ),
+           card="Add a rule that goes on its own: {value}"),
+    Action("remove_rule", "rule", "Remove a rule from Your rules", _remove_rule, confirm=_removing_needs_tap,
+           card="Remove the rule {title}"),
     # Standing jobs: each step for one still goes through Approvals.
     Action("add_standing_job", "new_standing_job",
-           "Give As me a standing job, something to keep doing in its own name (use id \"new\")",
+           "Give As me standing work, something to keep doing in its own name (use id \"new\")",
            _add_job, confirm=True, value="what to keep doing, in the person's words",
-           card="Give As me the standing job: {value}"),
-    Action("stop_standing_job", "standing_job", "Stop a standing job", _stop_job),
+           card="Give As me this standing work: {value}"),
+    Action("stop_standing_job", "standing_job", "Stop some standing work", _stop_job),
     Action("check_inbox_now", "inbox", "Check the person's inbox for emails to draft replies to now (use id \"inbox\")",
            _check_inbox),
 )
@@ -889,12 +1158,13 @@ _SCREENS = (
     ("notifications", "/settings/notifications", "Settings, Notifications"),
     ("act_as_me", "/settings/act-as-me", "Delegate, As you"),
     ("as_me", "/delegate#as-me", "Delegate, As me"),
+    ("approvals", "/delegate#approvals", "Delegate, Approvals"),
     ("memory_settings", "/settings/memory", "Settings, Memory"),
     ("people", "/people", "People"),
     ("departments", "/departments", "Departments"),
     ("goals", "/goals", "Goals"),
     ("watchlist", "/watchlist", "Watch list"),
-    ("documents", "/artifacts", "Documents"),
+    ("documents", "/artifacts", "Work, Made for you"),
     ("knowledge", "/knowledge", "Knowledge (uploaded files)"),
     ("memories", "/memories", "Memory"),
     ("skills", "/skills", "Skills"),

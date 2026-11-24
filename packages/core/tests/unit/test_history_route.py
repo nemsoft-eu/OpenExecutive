@@ -85,6 +85,26 @@ def test_each_person_sees_only_their_own(client: TestClient, ids: dict[str, int]
     _add(ids["teammate"])
     mine = client.get("/memories/history", headers=OWNER).json()
     assert len(mine["notes"]) == 1 and mine["notes"][0]["quote"] == "I'll send the price list on Friday"
+    # The note is the reader's own, so it reads "You told …".
+    assert mine["notes"][0]["summary"] == "You told Dana Lee the price list comes Friday."
+    # A correction is kept and shown exactly as typed (the Executive reads
+    # it in note form, history.note_form).
+    nid = mine["notes"][0]["id"]
+    client.patch(f"/memories/history/{nid}", json={"correction": "You said Dana it might slip to Monday."},
+                 headers=OWNER)
+    assert h.get_note(ids["principal"], nid).correction == "You said Dana it might slip to Monday."
+    assert client.get("/memories/history", headers=OWNER).json()["notes"][0]["correction"] == (
+        "You said Dana it might slip to Monday.")
+    out = client.patch(f"/memories/history/{nid}", json={"correction": "Shipped Friday, not Monday."},
+                       headers=OWNER)
+    assert out.status_code == 200
+    assert h.get_note(ids["principal"], nid).correction == "Shipped Friday, not Monday."
+    shown = client.get("/memories/history", headers=OWNER).json()["notes"][0]
+    assert shown["correction"] == "Shipped Friday, not Monday."
+    # Searching the words on screen finds it.
+    assert len(client.get("/memories/history?q=you told dana", headers=OWNER).json()["notes"]) == 1
+    # Only a leading "you" is dropped; on its own it is still a search word.
+    assert client.get("/memories/history?q=you", headers=OWNER).json()["notes"] == []
     # On for everyone on the team until they turn it off.
     assert mine["reply_notes"] is True and mine["effective_retention_days"] == 90
     assert mine["retention_choices"] == [30, 90, 365, None]
@@ -92,8 +112,8 @@ def test_each_person_sees_only_their_own(client: TestClient, ids: dict[str, int]
     assert mine["can_set_company_retention"] is True
     theirs = client.get("/memories/history", headers=TEAMMATE).json()
     assert len(theirs["notes"]) == 1 and theirs["notes"][0]["id"] != mine["notes"][0]["id"]
-    # A teammate keeps notes from chat without Act as me; email ones need it.
-    assert theirs["can_keep_notes"] is True and theirs["can_note_replies"] is False
+    # A teammate keeps notes from chat and from their own approved replies.
+    assert theirs["can_keep_notes"] is True and theirs["can_note_replies"] is True
     assert theirs["reply_notes"] is True
     assert theirs["can_set_company_retention"] is False
     assert client.get("/memories/history?q=venue", headers=OWNER).json()["notes"] == []

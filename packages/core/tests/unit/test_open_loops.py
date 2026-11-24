@@ -13,6 +13,7 @@ import pytest
 
 from openexecutive.attunement import open_loops
 from openexecutive.memory import episodic, session_store
+from openexecutive.orchestrator.session import Session
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.scheduler import nudge_engine
@@ -371,12 +372,29 @@ async def _list_as(caller: int | None, *, session_id: str = "s", web: bool = Fal
     from openexecutive.orchestrator.schedule_tools import current_session
     from openexecutive.orchestrator.session import Session
 
-    token = current_session.set(
-        Session(session_id=session_id, caller_person_id=caller, from_web_chat=web)
-    )
+    # The channel a chat app's adapter names, from its session id
+    # ("slack:dm:U1" is Slack, chat "U1"; "telegram:42" is Telegram, chat 42).
+    channel, _, rest = session_id.partition(":")
+    ref = rest.rpartition(":")[2] if channel != "telegram" else rest
+    token = current_session.set(Session(
+        session_id=session_id, caller_person_id=caller, from_web_chat=web, web_caller_signed_in=web,
+        origin_channel="" if web or not rest else channel, origin_channel_ref="" if web else ref,
+    ))
     try:
         args = {} if person_id is None else {"person_id": person_id}
         result: dict[str, Any] = json.loads(await handle_list_open_loops(args))
+        return result
+    finally:
+        current_session.reset(token)
+
+
+async def _list_as_session(session: Any) -> dict[str, Any]:
+    from openexecutive.orchestrator.open_loop_tools import handle_list_open_loops
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    token = current_session.set(session)
+    try:
+        result: dict[str, Any] = json.loads(await handle_list_open_loops({}))
         return result
     finally:
         current_session.reset(token)
@@ -386,7 +404,13 @@ def _owners(result: dict[str, Any]) -> set[int]:
     return {lp["owner_person_id"] for lp in result.get("open_loops", [])}
 
 
-async def test_list_tool_principal_sees_all_only_in_private(team: SimpleNamespace) -> None:
+async def test_list_tool_principal_sees_all_only_in_private(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.config import get_settings
+
+    # Telegram proves who sent a message only with its webhook secret set.
+    monkeypatch.setattr(type(get_settings()), "telegram_webhook_secret_valid", True)
     open_loops.open_loop(owner_person_id=team.sara, description="send the quote", due_at=datetime.now(UTC))
     open_loops.open_loop(owner_person_id=team.ben, description="send the plan", due_at=datetime.now(UTC))
     everyone = {team.sara, team.ben}
@@ -394,6 +418,12 @@ async def test_list_tool_principal_sees_all_only_in_private(team: SimpleNamespac
     assert _owners(await _list_as(team.principal, session_id="slack:dm:U_PAT")) == everyone
     assert _owners(await _list_as(team.principal, session_id="discord:dm:1")) == everyone
     assert _owners(await _list_as(team.principal, session_id="telegram:42")) == everyone
+    # A call with the Executive, private and verified by its app, is the same.
+    call = await _list_as_session(Session(
+        session_id="call-1", caller_person_id=team.principal, origin_channel="meeting",
+        origin_channel_ref="app:c1", private_chat=True, speaker_verified=True,
+    ))
+    assert _owners(call) == everyone
     # Shared surfaces: a list there is read by everyone present.
     for shared in ("slack:channel:C1:U_PAT", "slack:thread:C1:1.2", "discord:thread:9",
                    "telegram:-100", "email:thread-1", "google_chat:spaces/x:t"):
@@ -405,8 +435,40 @@ async def test_list_tool_teammate_sees_only_their_own(team: SimpleNamespace) -> 
     open_loops.open_loop(owner_person_id=team.ben, description="send the plan", due_at=datetime.now(UTC))
     assert _owners(await _list_as(team.sara, web=True)) == {team.sara}
     assert _owners(await _list_as(team.sara, session_id="slack:dm:U_SARA")) == {team.sara}
-    assert (await _list_as(team.sara, web=True, person_id=team.ben))["status"] == "refused"
-    assert (await _list_as(None, web=True))["status"] == "refused"
+    for hidden in (await _list_as(team.sara, web=True, person_id=team.ben), await _list_as(None, web=True)):
+        # Not an empty list: the result says another person's tasks are not shown.
+        assert hidden["open_loops"] == [] and hidden["status"] == "not_shown"
+        assert "private" in hidden["detail"]
+    assert "status" not in await _list_as(team.sara, web=True, person_id=team.sara)
+
+
+async def test_list_tool_keeps_a_private_task_to_its_two_people(team: SimpleNamespace) -> None:
+    """A task from Sara's own chat shows to Sara and to Ben, whom it is for,
+    and to no one else, the principal included; the result says others'
+    private tasks are private, and a lookup by id reads like no task."""
+    from openexecutive.orchestrator.open_loop_tools import handle_close_open_loop
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    private = open_loops.open_loop(
+        owner_person_id=team.ben, description="Sara Kim asked Ben Ortiz for: the Ortiz boxes",
+        due_at=datetime.now(UTC), private_to_person_id=team.sara,
+    )
+    open_loops.open_loop(owner_person_id=team.sara, description="Sara Kim committed to: call the landlord",
+                         due_at=datetime.now(UTC), private_to_person_id=team.sara)
+    assert _owners(await _list_as(team.sara, web=True)) == {team.sara}
+    assert _owners(await _list_as(team.ben, web=True)) == {team.ben}
+    # In a channel others read, neither Sara's nor Ben's list shows it.
+    for who in (team.sara, team.ben):
+        assert _owners(await _list_as(who, session_id="slack:channel:C1:U_X")) == set()
+    assert _owners(await _list_as(team.ben, session_id="slack:dm:U_BEN")) == {team.ben}
+    owner = await _list_as(team.principal, web=True)
+    assert owner["open_loops"] == [] and "never confirm or deny" in owner["private"]
+    token = current_session.set(Session(session_id="w", caller_person_id=team.principal,
+                                        from_web_chat=True, web_caller_signed_in=True))
+    try:
+        assert json.loads(await handle_close_open_loop({"loop_id": private}))["status"] == "not_found"
+    finally:
+        current_session.reset(token)
 
 
 async def test_paraphrased_loop_text_is_dropped(

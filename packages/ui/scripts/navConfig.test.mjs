@@ -43,7 +43,13 @@ test("solo swaps Company for You, which opens on Goals", () => {
 
 test("team hubs: Work and Company tabs", () => {
   const [work, company] = buildHubs();
-  assert.deepEqual(links(work.tabs), ["Tasks → /tasks", "Workflows → /jobs", "Documents → /artifacts", "Watch list → /watchlist"]);
+  assert.deepEqual(links(work.tabs), [
+    "Tasks → /tasks",
+    "Workflows → /jobs",
+    "Made for you → /artifacts",
+    "Watch list → /watchlist",
+    "Schedule → /schedule",
+  ]);
   assert.deepEqual(links(company.tabs), [
     "People → /people",
     "Goals → /goals",
@@ -215,6 +221,7 @@ test("the Settings hub: one tile per page, each with its own route", () => {
       "Your Executive → /settings/executive",
       "Notifications → /settings/notifications",
       "About you → /settings/memory",
+      "Browser → /settings/browser",
       "Workspace → /settings/workspace",
       "Advanced → /settings/advanced",
       "About → /settings/about",
@@ -258,7 +265,7 @@ test("every Settings page sits in a known group, and the hub lists the groups in
   assert.deepEqual(
     groupSettingsPages(SETTINGS_PAGES).map(({ group, pages }) => [group.label, pages.map((p) => p.label)]),
     [
-      ["You and your Executive", ["Your Executive", "Notifications", "About you"]],
+      ["You and your Executive", ["Your Executive", "Notifications", "About you", "Browser"]],
       ["Company", ["Workspace"]],
       ["More", ["Advanced", "About"]],
     ],

@@ -153,6 +153,27 @@ def test_handled_since_keeps_private_rows_for_the_principals_own_view(
     assert sorted(h["kind"] for h in both) == ["closed", "routed"]
 
 
+def test_handled_since_gives_one_persons_own_rows_only_to_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # What an email watch on Dana's own inbox found quietly is Dana's row:
+    # it reaches her own /today, never a brief or anyone else's view.
+    from openexecutive.audit import logger as audit_logger
+
+    al = audit_logger.AuditLogger(db_path=tmp_path / "audit.db")
+    al.initialize_db()
+    monkeypatch.setattr(audit_logger, "get_audit_logger", lambda: al)
+    al.log("alert_review_routed", "Routed 'Acme renewal' to Dana", actor="executive")
+    al.log("watch_found_quietly", "Found 'Offer from Acme'", actor="scheduler", private=True, private_to_person=7)
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    assert [h["kind"] for h in brief_state.handled_since(since)] == ["routed"]
+    assert [h["kind"] for h in brief_state.handled_since(since, include_private=True)] == ["routed"]
+    assert [h["kind"] for h in brief_state.handled_since(since, owned_by=8)] == ["routed"]
+    mine = brief_state.handled_since(since, owned_by=7)
+    assert sorted(h["kind"] for h in mine) == ["quiet_watch_found", "routed"]
+
+
 def test_fingerprint_moves_with_pending_watch_suggestions() -> None:
     since = datetime.now(UTC) - timedelta(hours=12)
     base = dict(today_data={"proposals": [], "departments": [], "people": []}, activity=[], handled=[], since=since)

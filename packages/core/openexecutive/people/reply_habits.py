@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal
 
 from openexecutive.people.models import Person
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +80,7 @@ class Suggestion:
     evidence: str
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def _ensure(conn: sqlite3.Connection) -> None:

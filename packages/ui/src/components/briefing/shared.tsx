@@ -30,19 +30,6 @@ export function olderThan(proposals: ProposalItem[], days: number, now: Date = n
     .map((p) => p.alert_id);
 }
 
-// Future-relative label for a pending run time ("in 8h"). Past/blank →
-// "soon" (the caller renders "overdue" separately via the backend flag).
-export function formatFuture(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "soon";
-  const mins = Math.round((then - Date.now()) / 60000);
-  if (mins <= 0) return "soon";
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `in ${hrs}h`;
-  return `in ${Math.round(hrs / 24)}d`;
-}
-
 export function formatRelTime(iso: string): string {
   try {
     const diff = new Date(iso).getTime() - Date.now();

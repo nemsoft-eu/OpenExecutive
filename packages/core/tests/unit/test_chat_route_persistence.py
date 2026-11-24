@@ -139,7 +139,7 @@ def test_resumed_session_sees_turns_saved_elsewhere(temp_db: Path, patched_deps:
         "Draft the board update",
         "Here is a draft.",
     ]
-    first.seen_channel_refs.add(("telegram", "42"))
+    first.speaker_verified = True
 
     # Two turns in the Telegram app, saved by its adapter.
     session_store.save_message(sid, "user", "Make it shorter")
@@ -154,7 +154,7 @@ def test_resumed_session_sees_turns_saved_elsewhere(temp_db: Path, patched_deps:
         "Shorter draft.",
     ]
     # The rest of the live session is kept.
-    assert ("telegram", "42") in again.seen_channel_refs
+    assert again.speaker_verified is True
 
 
 def test_resumed_session_keeps_live_history_when_the_store_cannot_be_read(

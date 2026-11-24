@@ -26,8 +26,8 @@ import { PageSpinner } from "@/components/ui/Spinner";
 // Delegate: one page, three tabs. As you (Act as me): what it writes and
 // sends in your name, from your own mailbox, and how you write. As me (Take
 // the lead): what it does in its own name without being asked. Approvals:
-// the one level for both, and your rules. In
-// training, on either side, holds everything for you first. Each tab shows
+// every check in one place, in the order they run (the level, your rules,
+// In training on either side). Each tab shows
 // where it stands (Your inbox, with In training while it is on; On; Balanced), so all three read at a glance.
 // What it does for you sits beside the page (to the right on a wide screen,
 // a sheet on a narrow one).
@@ -127,7 +127,7 @@ export default function DelegatePage() {
                   level={level}
                   side={
                     <>
-                      {settings.team && <TeamSection team={settings.team} onSettings={delegation.setSettings} />}
+                      {settings.team && <TeamSection team={settings.team} />}
                       {settings.handle_it?.enabled && <SentCard handleIt={settings.handle_it} />}
                     </>
                   }
@@ -148,13 +148,14 @@ export default function DelegatePage() {
             <Panel
               id={APPROVALS_ANCHOR}
               hidden={tab !== APPROVALS_ANCHOR}
-              lede="One setting for both As you and As me. It decides what goes on its own and what comes to you as an Approve card on Home, the same in the app, email and every chat app."
+              lede="What waits for your yes. Three checks, in this order, the same in the app, email and every chat app."
             >
               <BeforeAnythingCard
                 approvals={approvals}
                 lead={lead.lead}
+                leadState={lead.state}
                 setLead={lead.setLead}
-                disclosure={settings?.disclosure ?? null}
+                delegation={settings}
                 onDelegation={delegation.setSettings}
               />
             </Panel>

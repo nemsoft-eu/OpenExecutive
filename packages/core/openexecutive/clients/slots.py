@@ -31,6 +31,7 @@ Invariants:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from typing import Any
 from openexecutive.cli.fixture_loader import (
     _FIXTURE_OP_LOCK,
     _SAFE_NAME_RE,
+    forget_company_caches,
     get_fixture_status,
     snapshot_user_state,
 )
@@ -62,8 +64,12 @@ CLIENT_WORKSPACE_PREFIX = "openexec-client-"
 # Tables preserved verbatim across slot restores — operator-level state that
 # does not belong to any one client company. `executive_control` is the
 # global pause switch (scheduler/pause.py): activating a client must never
-# silently un-pause (or re-pause) the Executive.
-_GLOBAL_TABLES = ("generated_fixtures", "executive_control")
+# silently un-pause (or re-pause) the Executive. `eval_scenarios` are the
+# scenarios people wrote: the instance's, kept by a reset too. Each is in
+# ``memory.company_tables.COMPANY_INDEPENDENT_TABLES``, so no wipe touches it.
+# `install_owner` is who runs the install whichever company is live
+# (people/install_owner.py).
+_GLOBAL_TABLES = ("generated_fixtures", "executive_control", "eval_scenarios", "install_owner")
 
 # Engagement metadata lives in meta.json — deliberately OUTSIDE the swapped
 # client state, so the practice layer (cockpit, renewal awareness) can see
@@ -87,6 +93,10 @@ ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
 
 class ClientSlotError(ValueError):
     """Base error for slot operations (maps to HTTP 400)."""
+
+
+class ClientSnapshotError(ClientSlotError):
+    """The live company couldn't be saved before a switch (maps to HTTP 500)."""
 
 
 class ClientSlotNotFoundError(ClientSlotError):
@@ -327,13 +337,13 @@ async def _restore_slot_state(
 
     # 1. SQLite state — whole-DB restore (or factory wipe for blank slots),
     #    with operator-level tables carried across.
-    preserved = _dump_global_tables()
     if is_blank:
+        preserved = _dump_global_tables()
         _wipe_per_client_tables()
+        _ensure_schemas()
+        _restore_global_tables(preserved)
     else:
-        _restore_db_from_file(slot / "state.db")
-    _ensure_schemas()
-    _restore_global_tables(preserved)
+        restore_company_db(slot / "state.db")
     seeded: dict[str, Any] = {}
     if is_blank:
         # Generated (seed) slots carry people.yaml / departments.yaml /
@@ -369,6 +379,11 @@ async def _restore_slot_state(
 
     # 3. Vector state — rebuild the company collections from the restored dirs.
     docs_indexed = await _rebuild_vector_state(settings, app_state)
+
+    # 4. Caches of the outgoing company's rows (agent overrides, departments,
+    #    people) — here, so every path that restores a slot drops them,
+    #    the rotation's recovery included.
+    forget_company_caches()
 
     return {
         "display_name": profile.name,
@@ -408,6 +423,34 @@ def _seed_from_slot_files(settings: Any, slot: Path) -> dict[str, Any]:
     return out
 
 
+def restore_company_db(state_src: Path) -> None:
+    """Make a saved copy of the company database live, carrying the
+    operator-level rows (``_GLOBAL_TABLES``) across. Used by a client switch
+    and by unload, which puts the user's own saved database back."""
+    # The copy's queue is as it was when saved: a job running then ran here,
+    # and a job long past its time would fire late. Both are closed, never
+    # run, except a job whose handler is still going, which finishes and
+    # chains as usual; a recurring job among the closed ones is then seeded
+    # afresh at its next time (each seed skips a kind still pending). The
+    # scheduler is held throughout, so no tick claims from the copy before
+    # it is settled.
+    from openexecutive.memory.episodic import settle_restored_queue
+    from openexecutive.scheduler.runner import (
+        hold_claims,
+        in_flight_actions,
+        seed_recurring_jobs,
+    )
+
+    with hold_claims():
+        in_flight = in_flight_actions()
+        preserved = _dump_global_tables()
+        _restore_db_from_file(state_src)
+        _ensure_schemas()
+        _restore_global_tables(preserved)
+        if settle_restored_queue(_episodic_db_path(), in_flight=in_flight):
+            seed_recurring_jobs()
+
+
 def _restore_db_from_file(state_src: Path) -> None:
     """Replace the live DB's content with the slot copy via the backup API.
 
@@ -428,11 +471,13 @@ def _restore_db_from_file(state_src: Path) -> None:
 
 
 def _wipe_per_client_tables() -> None:
-    """Factory-wipe the per-company tables (blank-slot activation).
-
-    The list is ``memory.company_tables.PER_COMPANY_TABLES``, shared with the
-    factory reset and fixture load/unload. Existence-guarded.
-    """
+    """Factory-wipe the per-company tables (blank-slot activation): the same
+    wipe as a factory reset and fixture load/unload
+    (``memory.company_tables``), so a table added later is wiped here too.
+    The operator-level rows (``_GLOBAL_TABLES``) are company-independent, and
+    the caller carries them across as well. Workflows go too: the outgoing
+    company's are in its slot or in the user's snapshot, and a blank client
+    starts with none."""
     wipe_per_company_tables(_episodic_db_path(), keep=KEPT_ON_EVERY_SWAP)
 
 
@@ -451,7 +496,7 @@ def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:
             ).fetchone()
             if not exists:
                 continue
-            cursor = conn.execute(f"SELECT * FROM {table}")  # noqa: S608 — fixed allowlist
+            cursor = conn.execute(f'SELECT * FROM "{table}"')  # noqa: S608 — names from code constants
             cols = [d[0] for d in cursor.description]
             out[table] = (cols, cursor.fetchall())
     finally:
@@ -498,12 +543,14 @@ def _ensure_schemas() -> None:
     from openexecutive.agents.overrides import initialize_overrides_db
     from openexecutive.alerts.store import initialize_db as init_alerts
     from openexecutive.departments.store import initialize_db as init_departments
+    from openexecutive.evals.persistence import initialize_user_scenarios_db
     from openexecutive.fixtures.store import initialize_db as init_fixtures
     from openexecutive.knowledge.review_store import ReviewStore
     from openexecutive.memory.episodic import cancel_orphaned_talent_reminders
     from openexecutive.memory.episodic import initialize_db as init_episodic
     from openexecutive.memory.workspace_settings import init_workspace_settings_db
     from openexecutive.monitoring.store import initialize_db as init_monitoring
+    from openexecutive.people.install_owner import initialize_db as initialize_install_owner_db
     from openexecutive.people.store import initialize_db as init_people
     from openexecutive.scheduler.pause import initialize_pause_db
 
@@ -535,9 +582,12 @@ def _ensure_schemas() -> None:
     # A slot saved before workspace settings existed has no table; create it
     # so the slot reads as the defaults.
     init_workspace_settings_db(db_path)
-    # Before _restore_global_tables: a slot saved before the pause switch
-    # existed lacks the table, and the restore skips tables it can't find.
+    # Before _restore_global_tables: a slot saved before the pause switch or
+    # the eval scenarios existed lacks the table, and the restore skips
+    # tables it can't find.
     initialize_pause_db(db_path)
+    initialize_user_scenarios_db(db_path)
+    initialize_install_owner_db(db_path)
     ReviewStore.initialize_db(db_path)
     # Register shipped knowledge as trusted defaults too — without this a
     # freshly activated slot has an empty review_items table until the next
@@ -564,56 +614,15 @@ def _ensure_schemas() -> None:
 
 
 def _reseed_blank_defaults() -> None:
-    """Blank slot = factory state: the boot-time scheduled rows.
+    """Blank slot = factory state: the recurring jobs, from the one list a
+    reset and a restart also use (``scheduler.runner.seed_recurring_jobs``),
+    so the new client's Today page doesn't stay blank until a restart. No
+    departments are created: a blank slot starts with none, like a new
+    install, and a generated seed slot's own departments (if any) are picked
+    up by the cadence seed. Never raises."""
+    from openexecutive.scheduler.runner import seed_recurring_jobs
 
-    Mirrors ``reset_all_state`` step 5/5a — without these the new client's
-    Today page stays blank until the next process restart. Every call is
-    idempotent and individually guarded. No departments are created: a blank
-    slot starts with none, like a new install, and a generated seed slot's
-    own departments (if any) are picked up by the cadence bootstrap.
-    """
-    from openexecutive.config import get_settings
-
-    try:
-        from openexecutive.scheduler.runner import seed_principal_briefs
-
-        seed_principal_briefs()
-    except Exception:
-        logger.exception("client-slots: seed_principal_briefs failed")
-    try:
-        from openexecutive.departments.cadence import bootstrap_cadences
-
-        bootstrap_cadences()
-    except Exception:
-        logger.exception("client-slots: bootstrap_cadences failed")
-    settings = get_settings()
-    if settings.nudge_scan_enabled:
-        try:
-            from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
-
-            bootstrap_nudge_scan()
-        except Exception:
-            logger.exception("client-slots: bootstrap_nudge_scan failed")
-    if settings.external_monitor_enabled:
-        try:
-            from openexecutive.monitoring.pipeline import (
-                bootstrap_external_monitor_scan,
-            )
-
-            bootstrap_external_monitor_scan()
-        except Exception:
-            logger.exception("client-slots: bootstrap_external_monitor_scan failed")
-    if settings.watchlist_research_enabled:
-        try:
-            from openexecutive.monitoring.research.scheduler import (
-                bootstrap_watchlist_research_scan,
-            )
-
-            bootstrap_watchlist_research_scan()
-        except Exception:
-            logger.exception(
-                "client-slots: bootstrap_watchlist_research_scan failed"
-            )
+    seed_recurring_jobs()
 
 
 async def _rebuild_vector_state(settings: Any, app_state: Any | None) -> int:
@@ -852,6 +861,19 @@ async def create_client_slot(
             if errors:
                 raise ClientSlotError("Invalid bundle: " + "; ".join(errors))
 
+        if source == "current":
+            # The live state is your own company and this enters client mode:
+            # save all of it to _user_backup every time, so unload brings back
+            # this copy and not an older one. A failed snapshot stops before
+            # the slot exists, since unload would otherwise restore stale data.
+            try:
+                await asyncio.to_thread(snapshot_user_state, settings)
+            except Exception as exc:
+                logger.exception("client-slots: pre-create user snapshot failed")
+                raise ClientSnapshotError(
+                    "Couldn't save your company before switching. Nothing was changed."
+                ) from exc
+
         slot.mkdir(parents=True, exist_ok=True)
         _write_meta(
             slot,
@@ -862,19 +884,6 @@ async def create_client_slot(
         )
 
         if source == "current":
-            # Preserve the user's original company in _user_backup before
-            # entering client mode, so POST /fixtures/unload remains a working
-            # "exit client mode" path (the slot holds the same data, but
-            # unload restores from _user_backup specifically).
-            if not (
-                settings.company_profile_path.parent / "_user_backup" / "profile.yaml"
-            ).exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-create user snapshot failed"
-                    )
             saved = _save_slot_state(settings, slot)
             _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
             _set_honcho_client_workspace(slug)
@@ -955,16 +964,19 @@ async def activate_client_slot(
             else:
                 _save_slot_state(settings, previous_slot)
         else:
-            # Mirror the fixture switcher's first-load behavior: preserve the
-            # user's original company before replacing it. Best-effort — an
-            # empty environment has nothing worth snapshotting.
-            if not (settings.company_profile_path.parent / "_user_backup" / "profile.yaml").exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-activation user snapshot failed"
-                    )
+            # The live state is the user's own company (no client, no
+            # fixture): save all of it before it is replaced, every time, so
+            # unload brings back this copy and not an older one. The snapshot
+            # holds the whole database, so a blank switch's sweep loses
+            # nothing. A failed snapshot stops the switch, since the switch
+            # would replace data nothing has saved.
+            try:
+                await asyncio.to_thread(snapshot_user_state, settings)
+            except Exception as exc:
+                logger.exception("client-slots: pre-activation user snapshot failed")
+                raise ClientSnapshotError(
+                    "Couldn't save your company before switching. Nothing was changed."
+                ) from exc
 
         summary = await _restore_slot_state(settings, slot, app_state=app_state)
         _active_client_sentinel(settings).parent.mkdir(parents=True, exist_ok=True)

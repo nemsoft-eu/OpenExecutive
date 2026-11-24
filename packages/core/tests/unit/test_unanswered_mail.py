@@ -52,6 +52,11 @@ def audit_rows(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str
     return rows
 
 
+@pytest.fixture(autouse=True)
+def no_stale_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(email_poller, "_UNPROVEN_CAUSES", {})
+
+
 @pytest.fixture()
 def people(db: Path) -> SimpleNamespace:
     principal_id = people_store.upsert_person(
@@ -135,6 +140,122 @@ class TestTheCard:
         [card] = _cards()
         assert card.headline == "An email from Ann Teammate's address got no reply"
         assert "could not prove" in card.body
+
+
+def _raw_mime(auth_results: str, *extra: str, sender: str = "ann@example.com") -> str:
+    """A ``body_format="raw"`` read whose newest Authentication-Results is Gmail's."""
+    from openexecutive.integrations.fact_confirmation import _RAW_MIME_SEPARATOR
+
+    headers = [f"Authentication-Results: mx.google.com; {auth_results}", *extra, f"From: Ann <{sender}>"]
+    return "Message id: m1" + _RAW_MIME_SEPARATOR + "\n".join(headers) + "\n\nHi"
+
+
+class TestWhyUnproven:
+    """Observed: a teammate wrote from their company address through their
+    personal Gmail ("Send mail as"), and the card only said the mailbox
+    "could not prove they sent it", which left the owner with no idea why
+    or what fixes it."""
+
+    def _file(self, people: SimpleNamespace, raw: str, sender: Any = None) -> Any:
+        person = sender or people.teammate
+        email_poller._log_unconfirmed("m1", raw, person.email)
+        _note(Session(), person)
+        [card] = _cards()
+        return card
+
+    def test_mail_the_domain_did_not_sign_says_another_account_sent_it(
+        self, people: SimpleNamespace
+    ) -> None:
+        card = self._file(people, _raw_mime(
+            "dkim=pass header.i=@gmail.com; spf=pass smtp.mailfrom=ann.personal@gmail.com; "
+            "dmarc=none header.from=example.com"
+        ))
+
+        assert "example.com didn't sign it" in card.body
+        assert "Send mail as" in card.body
+        assert "If Ann Teammate sent it: send from the example.com mailbox itself" in card.body
+        # A domain with no DMARC record can be spoofed the same way.
+        assert "It may be forged" in card.body
+        assert card.suggested_action == "Check with Ann Teammate."
+
+    def test_a_failed_dmarc_check_says_it_may_be_forged(self, people: SimpleNamespace) -> None:
+        card = self._file(people, _raw_mime(
+            "spf=fail smtp.mailfrom=example.com; dmarc=fail (p=reject) header.from=example.com"
+        ))
+
+        assert "failed example.com's own sender check (DMARC)" in card.body
+        assert "may be forged" in card.body
+
+    def test_mail_a_group_resent_says_so(self, people: SimpleNamespace) -> None:
+        card = self._file(people, _raw_mime(
+            "dmarc=pass header.from=example.com", "List-Id: <team.example.com>"
+        ))
+
+        assert "mailing list or group" in card.body
+        assert "send to the Executive directly, not through the group" in card.body
+
+    def test_list_headers_never_hide_a_failed_check(self, people: SimpleNamespace) -> None:
+        # The sender writes List-Id; Gmail's failed verdict is what counts.
+        card = self._file(people, _raw_mime(
+            "dmarc=fail (p=none) header.from=example.com", "List-Id: <x.example.net>"
+        ))
+
+        assert "failed example.com's own sender check (DMARC)" in card.body
+        assert "mailing list" not in card.body
+
+    def test_list_headers_under_an_untrusted_stamp_say_nothing(self, people: SimpleNamespace) -> None:
+        raw = _raw_mime("dmarc=pass header.from=example.com", "List-Id: <x.example.net>")
+        card = self._file(people, raw.replace("mx.google.com", "mx.evil.test"))
+
+        assert "mailing list" not in card.body
+        assert "To fix it" not in card.body
+
+    def test_mail_the_domain_did_sign_is_not_called_unsigned(self, people: SimpleNamespace) -> None:
+        # The check failed for another reason (an unreadable first read, say).
+        card = self._file(people, _raw_mime(
+            "dkim=pass header.i=@example.com header.s=s1 header.b=abc; dmarc=none header.from=example.com"
+        ))
+
+        assert "didn't sign it" not in card.body
+
+    def test_the_principals_address_is_spoken_to_them(self, people: SimpleNamespace) -> None:
+        card = self._file(people, _raw_mime(
+            "dmarc=none header.from=example.com", sender="john@example.com"
+        ), sender=people.principal)
+
+        assert card.headline == "An email from your address got no reply"
+        assert "could not prove you sent it: example.com didn't sign it" in card.body
+        assert "If you sent it: send from the example.com mailbox itself" in card.body
+        assert "John Principal" not in card.body
+
+    def test_a_domain_that_isnt_a_hostname_keeps_the_plain_wording(self) -> None:
+        assert unanswered_mail._domain("ann@example.com") == "example.com"
+        assert unanswered_mail._domain("ann@**click here**") == ""
+        assert unanswered_mail._domain("ann@" + "a" * 300 + ".com") == ""
+
+    def test_a_cause_the_headers_dont_give_keeps_the_plain_wording(
+        self, people: SimpleNamespace
+    ) -> None:
+        # A stamp from a server the check doesn't trust says nothing.
+        raw = _raw_mime("dmarc=none header.from=example.com").replace("mx.google.com", "mx.evil.test")
+        card = self._file(people, raw)
+
+        assert "could not prove they sent it." in card.body
+        assert "To fix it" not in card.body
+
+    def test_the_cause_is_used_once(self, people: SimpleNamespace) -> None:
+        email_poller._log_unconfirmed("m1", _raw_mime("dmarc=none header.from=example.com"), "ann@example.com")
+        _note(Session(), people.teammate)
+
+        assert "m1" not in email_poller._UNPROVEN_CAUSES
+
+    def test_a_proven_sender_never_gets_a_cause(self, people: SimpleNamespace) -> None:
+        email_poller._log_unconfirmed("m1", _raw_mime("dmarc=none header.from=example.com"), "ann@example.com")
+        _note(_proven(), people.teammate)
+
+        [card] = _cards()
+        assert card.headline == "Ann Teammate is waiting on a reply"
+        assert "sign" not in card.body
 
 
 class TestAReply:

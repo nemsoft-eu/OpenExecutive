@@ -29,12 +29,10 @@ At most ``_MAX_CHILDREN`` children parse at once (OCR brings its own gate).
 A call waits at most ``_MAX_SLOT_WAIT_S`` for a slot, and the wait counts
 against its ``timeout``, so a call never outlasts the limit its caller set;
 one that gets no slot raises ``ParserBusy``, a ``WorkerStopped`` callers can
-treat as "try again later" rather than "this file is unreadable". Only when
-there is no usable interpreter at all (``FileNotFoundError`` /
-``PermissionError``) does ``func`` run in this process instead, as it did
-before isolation, and then without holding a slot. Any other failure to start a
-child (``ENOMEM``, ``EAGAIN``) is ``WorkerStopped``: that is the moment an
-in-process parse would hurt most.
+treat as "try again later" rather than "this file is unreadable". A child
+that can't be started at all (no usable interpreter, ``ENOMEM``, ``EAGAIN``)
+is ``WorkerStopped`` too: a file someone sent is never parsed in this
+process, where a bad one could take the whole server's memory.
 """
 from __future__ import annotations
 
@@ -80,11 +78,6 @@ _TOO_LARGE = "AnswerTooLarge"
 _MAX_CHILDREN = 2
 _MAX_SLOT_WAIT_S = 30.0
 _child_slots = threading.BoundedSemaphore(_MAX_CHILDREN)
-# _run_child's answer when no child process can be started at all.
-_NO_CHILD = object()
-
-_warned_spawn_failure = False
-
 
 class IsolatedError(RuntimeError):
     """The isolated call raised an exception the caller did not name.
@@ -131,6 +124,7 @@ def run_isolated(
     reraise: tuple[type[BaseException], ...] = (),
     slots: threading.Semaphore | None = None,
     max_wait: float | None = None,
+    file_limit: int | None = None,
 ) -> T:
     """Return ``func(*args)``, computed in a child process. Blocking — run it
     in a thread from async code.
@@ -139,7 +133,9 @@ def run_isolated(
     ``_MAX_CHILDREN`` one); OCR passes its own so a long OCR run never holds
     up the quick text-layer parses. ``max_wait`` caps the wait for a slot
     (default ``_MAX_SLOT_WAIT_S``); OCR, whose runs last minutes, waits
-    longer and sets ``timeout`` to cover the wait and the run."""
+    longer and sets ``timeout`` to cover the wait and the run. ``file_limit``
+    is the largest file the child may write (default: twice the answer
+    cap), for a call that hands its result back through a file."""
     if not enabled:
         return func(*args)
     gate = _child_slots if slots is None else slots
@@ -151,14 +147,9 @@ def run_isolated(
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
             raise ParserBusy(f"{func.__qualname__} found no free parser slot in time")
-        answer = _run_child(func, args, remaining, reraise)
+        return _run_child(func, args, remaining, reraise, file_limit)  # type: ignore[no-any-return]
     finally:
         gate.release()
-    if answer is _NO_CHILD:
-        # Outside the gate: an in-process parse cannot be timed out, and a
-        # hung one must not hold a slot the child processes need.
-        return func(*args)
-    return answer  # type: ignore[no-any-return]
 
 
 def _run_child(
@@ -166,11 +157,11 @@ def _run_child(
     args: tuple[Any, ...],
     timeout: float,
     reraise: tuple[type[BaseException], ...],
+    file_limit: int | None = None,
 ) -> Any:
-    """The child's answer, or ``_NO_CHILD`` when no child can be started."""
-    global _warned_spawn_failure
-
-    request = pickle.dumps((func.__module__, func.__qualname__, args), pickle.HIGHEST_PROTOCOL)
+    """The child's answer."""
+    limit = file_limit or 2 * _MAX_ANSWER_BYTES
+    request = pickle.dumps((func.__module__, func.__qualname__, args, limit), pickle.HIGHEST_PROTOCOL)
     name = func.__qualname__
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         try:
@@ -185,19 +176,9 @@ def _run_child(
             )
         except subprocess.TimeoutExpired as exc:
             raise WorkerStopped(f"{name} timed out after {timeout:.0f}s") from exc
-        except (FileNotFoundError, PermissionError) as exc:
-            # No usable interpreter: isolation is unavailable here, not
-            # failing, so parse the way this did before it existed.
-            if not _warned_spawn_failure:
-                _warned_spawn_failure = True
-                logger.warning(
-                    "isolated: could not start a parser process (%s); parsing in-process",
-                    type(exc).__name__,
-                )
-            return _NO_CHILD
         except OSError as exc:
-            # Out of memory or processes: parsing in this process now would
-            # be the worst place for it.
+            # No usable interpreter, or out of memory or processes: the file
+            # is not read rather than parsed in this process.
             raise WorkerStopped(f"{name} could not start a parser process ({exc})") from exc
         del request
 
@@ -241,17 +222,17 @@ def _main() -> int:
     sys.stdout = sys.stderr
     logging.disable(logging.CRITICAL)
     warnings.simplefilter("ignore")
+    module, qualname, args, limit = pickle.loads(sys.stdin.buffer.read())
     # Native code can still write to stderr, which is a file on disk: no file
-    # this process writes may pass twice the answer cap (SIGXFSZ ends it).
+    # this process writes may pass the limit the caller set, by default twice
+    # the answer cap (a write past it fails with "File too large").
     try:
         import resource
 
-        limit = 2 * _MAX_ANSWER_BYTES
         resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
     except (ImportError, ValueError, OSError):
         pass
 
-    module, qualname, args = pickle.loads(sys.stdin.buffer.read())
     func: Any = importlib.import_module(module)
     for part in qualname.split("."):
         func = getattr(func, part)

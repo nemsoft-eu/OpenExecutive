@@ -79,6 +79,8 @@ _MAX_DIFF_WORDS = 8_000
 # Bounds on the change summary written into the alert / persisted payload.
 _SUMMARY_SNIPPET_CHARS = 160
 _ADDED_TEXT_CHARS = 1_000
+# Each side of a "was … now …" line, so the whole line fits a summary.
+_CHANGE_SIDE_CHARS = 60
 # Headline links: an anchor counts when its text reads like a title (at
 # least this many words and characters), which leaves out menus, buttons
 # and "Read more". Bounded per page and per change.
@@ -162,7 +164,7 @@ class PageWatchSource:
 
         # Changed — summarise (one diff pass), advance the baseline, emit one Signal.
         old_snapshot = prior.get("text_snapshot") or ""
-        pct, added = _diff(old_snapshot, snapshot)
+        pct, added, changes = _diff(old_snapshot, snapshot)
         # NOTE: at-most-once. We advance the stored baseline here, before the
         # pipeline inserts the Signal. If the process dies between this write
         # and the insert, this one change is not re-emitted (the next poll sees
@@ -181,17 +183,25 @@ class PageWatchSource:
         new_links = new_headline_links(prior.get("links") or [], links)
         snippet = _without_links(added[:_SUMMARY_SNIPPET_CHARS].strip())
         label = item.config_json.get("label") or _host_label(item.target)
+        # Words replaced or removed say what the page used to say too.
+        rewrote = changes and not all(line.startswith("added ") for line in changes.splitlines())
         if new_links:
             titles = "; ".join(link["text"] for link in new_links[:3])
             more = len(new_links) - 3
             summary_detail = f"new: {titles}" + (f" (+{more} more)" if more > 0 else "")
+        elif rewrote:
+            lines = changes.splitlines()
+            # The rewrite, not an addition that happens to come first.
+            pick = next((line for line in lines if not line.startswith("added ")), lines[0])
+            first = _without_links(pick)[:_SUMMARY_SNIPPET_CHARS]
+            summary_detail = f"changed: {first}"
         elif snippet:
             summary_detail = f"new text: {snippet}"
         else:
             summary_detail = "text removed"
         readable = "\n".join(
             f"- {link['text']} ({link['url']})" for link in new_links[:_MAX_NEW_LINKS]
-        ) or added[:_ADDED_TEXT_CHARS]
+        ) or (changes if rewrote else added)[:_ADDED_TEXT_CHARS]
         return [Signal(
             watchlist_id=item.id or 0,
             source_kind=self.kind,
@@ -205,6 +215,7 @@ class PageWatchSource:
                 "change_summary": summary_detail,
                 "changed_pct": pct,
                 "added_text": added[:_ADDED_TEXT_CHARS],
+                "changes": changes[:_ADDED_TEXT_CHARS],
                 "new_links": new_links[:_MAX_NEW_LINKS],
                 # Read by capture-time enrichment as the signal's detail.
                 "summary": readable,
@@ -416,8 +427,14 @@ def html_to_text(body: bytes) -> str:
     return visible_text(markup)
 
 
-def _diff(old: str, new: str) -> tuple[int, str]:
-    """Return (percent-changed, added-text) in a single diff pass.
+def _diff(old: str, new: str) -> tuple[int, str, str]:
+    """Return (percent-changed, added-text, changes) in a single diff pass.
+
+    ``changes`` says what each change was, a line each: ``was "…" now "…"``
+    for replaced words, ``removed "…"`` and ``added "…"``. The added text
+    alone can't tell "only with written permission" turning into "without
+    needing permission" from a new sentence, so whoever reads the change
+    gets both sides.
 
     Word lists are capped at ``_MAX_DIFF_WORDS`` before the (O(N·M),
     autojunk-off) SequenceMatcher runs, so a high-entropy page can't make the
@@ -429,12 +446,26 @@ def _diff(old: str, new: str) -> tuple[int, str]:
     sm = difflib.SequenceMatcher(None, old_words, new_words, autojunk=False)
     pct = int(round((1.0 - sm.ratio()) * 100))
     chunks: list[str] = []
-    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-        if tag in ("insert", "replace"):
-            chunk = " ".join(new_words[j1:j2])
-            if chunk:
-                chunks.append(chunk)
-    return pct, " … ".join(chunks)
+    changes: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        was = " ".join(old_words[i1:i2])
+        now = " ".join(new_words[j1:j2])
+        if tag in ("insert", "replace") and now:
+            chunks.append(now)
+        # Each side is cut on its own, so a long passage never pushes the
+        # other side off a line that is cut later.
+        was, now = _side(was), _side(now)
+        if tag == "replace":
+            changes.append(f'was "{was}" now "{now}"')
+        elif tag == "delete" and was:
+            changes.append(f'removed "{was}"')
+        elif tag == "insert" and now:
+            changes.append(f'added "{now}"')
+    return pct, " … ".join(chunks), "\n".join(changes)
+
+
+def _side(text: str) -> str:
+    return text if len(text) <= _CHANGE_SIDE_CHARS else text[: _CHANGE_SIDE_CHARS - 1].rstrip() + "…"
 
 
 def _host_label(url: str) -> str:

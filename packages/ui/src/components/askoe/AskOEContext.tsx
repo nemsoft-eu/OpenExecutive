@@ -60,8 +60,9 @@ const ROUTE_GUIDE_MAP: Array<{ prefix: string; guideId: string; title: string }>
   { prefix: "/review", guideId: "review", title: "Review queue" },
   { prefix: "/tasks", guideId: "people", title: "Tasks" },
   { prefix: "/jobs", guideId: "jobs", title: "Workflows" },
-  { prefix: "/artifacts", guideId: "artifacts", title: "Documents" },
+  { prefix: "/artifacts", guideId: "artifacts", title: "Made for you" },
   { prefix: "/watchlist", guideId: "watchlist", title: "Watch list" },
+  { prefix: "/schedule", guideId: "pulse", title: "Schedule" },
   { prefix: "/departments", guideId: "departments", title: "Departments" },
   // Goals grouped by area — documented with Departments (an area is one).
   { prefix: "/goals", guideId: "departments", title: "Goals" },

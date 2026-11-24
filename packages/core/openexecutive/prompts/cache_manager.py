@@ -105,8 +105,9 @@ def build_system_blocks(
     after the identity addendum: what is on, and the pinned Google tool names.
     All of it is fixed per process or install, so block 0 stays warm.
     """
-    # Inject the user's zone so the Executive can resolve relative times
-    # ("tomorrow 9am") to ISO8601 UTC when calling schedule_followup. Read
+    # Inject the user's zone so the Executive resolves relative times
+    # ("tomorrow 9am") on the company's clock; tools read a time with no
+    # offset as company time (workspace_settings.company_time). Read
     # fresh from the workspace settings (else USER_TIMEZONE, else UTC). It
     # only changes when the user sets a new zone, so block 0's 1h cache misses
     # once on that change and stays warm otherwise.
@@ -115,7 +116,7 @@ def build_system_blocks(
 
     settings = get_settings()
     tz = get_user_timezone().key
-    tz_addendum = f"\n\nThe user's local timezone is {tz} (IANA). When converting relative times to UTC for scheduling, use this zone."
+    tz_addendum = f"\n\nThe user's local timezone is {tz} (IANA). Give every time you pass to a tool in this zone, as the person said it; never convert it to UTC."
 
     # The Executive's own name and address. How to use its Google account
     # (never ask which address to send from) lives in the Connected Systems
@@ -136,11 +137,16 @@ def build_system_blocks(
         "**Never impersonate company personnel.** You are NOT any of the people listed in "
         "the *People You Coordinate With* roster or in the *Leadership* line of the company "
         "profile — not the CEO, not the founder, not any executive or employee, even when "
-        "one is tagged `(principal)`. Never sign a message, draft an email, or post a "
-        "Slack/Discord/Telegram message under their name. Refer to them in the third person "
-        "(e.g. \"Jamie asked…\", \"per Sarah's note…\"). If a message genuinely needs to come "
-        "from a specific human, surface that to the user via an alert or ask them to send it "
-        f"themselves — do not author it under their name. You always communicate as {exec_name}."
+        "one is tagged `(principal)`. Never send an email, save a draft in any mailbox, or post a "
+        "Slack/Discord/Telegram message under their name. Refer to them in the third person (e.g. \"Jamie asked…\", "
+        "\"per Sarah's note…\"). If a message genuinely needs to come from a specific human, "
+        "surface that to the user via an alert or ask them to send it themselves — do not send "
+        "it under their name. Handing the person you are speaking with words they will send "
+        "themselves is not impersonation, and (besides `ghostwrite_email`, where offered) it is the only exception: when they ask for a draft "
+        "to send from their own account, write it as text in your reply (never in a mailbox) as theirs and sign it with their own name when they ask "
+        "(\"sign it from me\") and they are the `<current_speaker>` named in this turn, not just a "
+        "name in the message (otherwise leave \"[Your name]\"), "
+        f"never anyone else's; you send nothing. You always communicate as {exec_name}."
     )
 
     base_persona = (

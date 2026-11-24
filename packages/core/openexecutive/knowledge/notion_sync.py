@@ -16,11 +16,10 @@ Heartbeat lifecycle matches ``monitoring.pipeline`` /
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +28,11 @@ import httpx
 from openexecutive.config import Settings, get_settings
 from openexecutive.knowledge.loader import DOMAIN_MAP, ingest_text_sync
 from openexecutive.knowledge.store import ChromaDBStore
-from openexecutive.memory.episodic import insert_scheduled_action
+from openexecutive.knowledge.sync_source import SyncSource
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_KIND = "notion_sync_scan"
-HEARTBEAT_CHANNEL = "__internal__"
-HEARTBEAT_CHANNEL_REF = "notion_sync"
 HEARTBEAT_INTENT = "Notion wiki sync — incremental page ingest into isolated collection."
 
 NOTION_VERSION = "2022-06-28"
@@ -101,44 +98,32 @@ def _docs_dir() -> Path:
     return path
 
 
+# The second collection is where a version before the isolated one put Notion
+# chunks: a purge clears both.
+SOURCE = SyncSource(
+    "notion",
+    noun="page",
+    id_field="notion_page_id",
+    id_comment=_PAGE_ID_COMMENT,
+    collections=(ChromaDBStore.NOTION_COLLECTION, ChromaDBStore.COMPANY_COLLECTION),
+    safe_id=sanitize_notion_id,
+    index_id=sanitize_notion_id,
+    head_chars=4000,
+    state_path=lambda: _state_path(),
+    docs_dir=lambda: _docs_dir(),
+    heartbeat_intent=HEARTBEAT_INTENT,
+    lingering="revoked pages are not purged until reconciliation runs",
+)
+save_state = SOURCE.save_state
+reset_local_state = SOURCE.reset_local_state
+purge_page = SOURCE.purge
+reconcile_missing_pages = SOURCE.reconcile
+
+
 def load_state() -> dict[str, Any]:
-    path = _state_path()
-    if not path.exists():
-        return {"watermark": None, "pages": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"watermark": None, "pages": {}}
-    if not isinstance(data, dict):
-        return {"watermark": None, "pages": {}}
+    data = SOURCE.load_state()
     data.setdefault("watermark", None)
-    data.setdefault("pages", {})
-    if not isinstance(data["pages"], dict):
-        data["pages"] = {}
     return data
-
-
-def reset_local_state(*, profile_path: Path | None = None) -> None:
-    """Drop the on-disk pages/watermark file so the next tick re-ingests.
-
-    Call this whenever the Notion collection is wiped (fixture load/reset,
-    client-slot rebuild) — otherwise leftover page records skip every
-    still-shared page as 'already current'.
-    """
-    path = (
-        Path(profile_path).parent / "notion_sync_state.json"
-        if profile_path is not None
-        else _state_path()
-    )
-    path.unlink(missing_ok=True)
-
-
-def save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
 
 
 def rich_text_to_plain(rich: Any) -> str:
@@ -454,14 +439,6 @@ def _page_edited_after(page: dict[str, Any], watermark: str | None) -> bool:
     return bool(edited and edited > watermark)
 
 
-def _page_record(state: dict[str, Any], page_id: str) -> dict[str, Any]:
-    pages = state.get("pages")
-    if not isinstance(pages, dict):
-        return {}
-    raw = pages.get(page_id)
-    return raw if isinstance(raw, dict) else {}
-
-
 def _ingest_page_sync(
     page: dict[str, Any],
     markdown: str,
@@ -506,124 +483,15 @@ async def ingest_page(
     return await asyncio.to_thread(_ingest_page_sync, page, markdown, store)
 
 
-def _safe_filename(name: str) -> str | None:
-    candidate = Path(str(name)).name
-    if candidate.startswith("notion-") and candidate.endswith(".md"):
-        return candidate
-    return None
-
-
-def _build_file_index() -> dict[str, list[Path]]:
-    """One directory pass: map each synced page id to its on-disk file(s).
-
-    Reading every file head is the unavoidable cost of orphan detection;
-    building the index once per operation keeps ``purge_page`` /
-    ``reconcile_missing_pages`` from re-scanning the directory per page.
-    """
-    index: dict[str, list[Path]] = {}
-    for path in _docs_dir().glob("notion-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
-        except OSError:
-            continue
-        found = _PAGE_ID_COMMENT.search(head)
-        file_id = sanitize_notion_id(found.group(1)) if found else None
-        if file_id:
-            index.setdefault(file_id, []).append(path)
-    return index
-
-
-def purge_page(
-    page_id: str,
-    store: ChromaDBStore,
-    state: dict[str, Any] | None = None,
-    file_index: dict[str, list[Path]] | None = None,
-) -> bool:
-    """Remove one synced page's file, chunks, and state record.
-
-    ``file_index`` (from :func:`_build_file_index`) avoids a per-call
-    directory scan; direct callers may omit it and one is built here.
-    """
-    pid = sanitize_notion_id(page_id)
-    if not pid:
-        logger.warning("notion_sync: refuse to purge unsafe page id %r", page_id)
-        return False
-    meta: dict[str, Any] = {}
-    pages: dict[str, Any] | None = None
-    if state is not None:
-        raw_pages = state.setdefault("pages", {})
-        if not isinstance(raw_pages, dict):
-            state["pages"] = {}
-            raw_pages = state["pages"]
-        pages = raw_pages
-        raw = pages.get(pid)
-        if raw is None:
-            raw = pages.get(page_id)
-        if isinstance(raw, dict):
-            meta = raw
-    filename = _safe_filename(str(meta.get("filename") or ""))
-    docs = _docs_dir()
-    store.delete_documents(ChromaDBStore.NOTION_COLLECTION, {"notion_page_id": pid})
-    store.delete_documents(ChromaDBStore.COMPANY_COLLECTION, {"notion_page_id": pid})
-    if filename:
-        (docs / filename).unlink(missing_ok=True)
-    index = file_index if file_index is not None else _build_file_index()
-    for path in index.get(pid, []):
-        path.unlink(missing_ok=True)
-    if pages is not None:
-        pages.pop(pid, None)
-        pages.pop(page_id, None)
-    logger.info("notion_sync: purged page %s", pid)
-    return True
-
-
-def reconcile_missing_pages(
-    visible_ids: set[str],
-    store: ChromaDBStore,
-    state: dict[str, Any],
-) -> int:
-    """Purge pages (and orphan files) the integration no longer sees.
-
-    Blocking file and Chroma I/O throughout — callers on the event loop
-    must run this via ``asyncio.to_thread`` (the sync tick does).
-    """
-    pages = state.setdefault("pages", {})
-    if not isinstance(pages, dict):
-        state["pages"] = {}
-        pages = state["pages"]
-    file_index = _build_file_index()
-    stale = [pid for pid in list(pages) if sanitize_notion_id(str(pid)) not in visible_ids]
-    purged = 0
-    purged_ids: set[str] = set()
-    for pid in stale:
-        if purge_page(str(pid), store, state, file_index=file_index):
-            purged += 1
-            safe = sanitize_notion_id(str(pid))
-            if safe:
-                purged_ids.add(safe)
-    # Orphan files: on disk with a page-id comment but absent from state.
-    for file_id in list(file_index):
-        if (
-            file_id not in visible_ids
-            and file_id not in purged_ids
-            and purge_page(file_id, store, state, file_index=file_index)
-        ):
-            purged += 1
-    return purged
-
-
 def _remove_stale_page_files(page_id: str, keep: Path) -> None:
     keep_resolved = keep.resolve()
-    for path in _docs_dir().glob("notion-*.md"):
+    for path in SOURCE.build_file_index().get(page_id, []):
         try:
             if path.resolve() == keep_resolved:
                 continue
-            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
         except OSError:
             continue
-        found = _PAGE_ID_COMMENT.search(head)
-        if found and sanitize_notion_id(found.group(1)) == page_id:
-            path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
 
 
 def _clear_legacy_company_notion(store: ChromaDBStore) -> None:
@@ -641,25 +509,6 @@ class _TickFetch:
     # last_edited times of pages left unsynced (fetch failure / cap overflow),
     # which pin the watermark below them.
     unresolved_times: list[str] = field(default_factory=list)
-
-
-def _note_reconcile_skip(state: dict[str, Any], cause: str) -> None:
-    """Record and log one more consecutive tick without reconciliation.
-
-    Reconciliation is what purges pages whose sharing was revoked, so a
-    persistent skip streak means revoked content is lingering locally —
-    surface the streak length instead of logging each skip in isolation.
-    """
-    raw = state.get("reconcile_skips")
-    skips = (raw if isinstance(raw, int) else 0) + 1
-    state["reconcile_skips"] = skips
-    logger.warning(
-        "notion_sync: skipping reconciliation — %s "
-        "(%d consecutive skip(s); revoked pages are not purged until "
-        "reconciliation runs)",
-        cause,
-        skips,
-    )
 
 
 async def _fetch_tick(
@@ -692,7 +541,7 @@ async def _fetch_tick(
             continue
         fetch.visible_ids.add(page_id)
         edited = str(page.get("last_edited_time") or "")
-        recorded = _page_record(state, page_id)
+        recorded = SOURCE.record(state, page_id)
         if recorded.get("last_edited") == edited:
             stats["skipped"] += 1
             continue
@@ -762,13 +611,13 @@ async def _apply_tick(
 
     known = state.get("pages") if isinstance(state.get("pages"), dict) else {}
     if fetch.truncated:
-        _note_reconcile_skip(
+        SOURCE.note_reconcile_skip(
             state,
             f"page listing incomplete ({fetch.truncated}), "
             "so unseen pages must not be purged as missing",
         )
     elif not fetch.visible_ids and known:
-        _note_reconcile_skip(
+        SOURCE.note_reconcile_skip(
             state,
             f"search returned 0 pages while {len(known)} are on record "
             "(refusing a mass purge on a blank listing)",
@@ -832,28 +681,14 @@ async def _apply_tick(
     # A tick that skipped some pages still succeeded, but the knowledge page
     # should say so rather than show a clean sync.
     if stats["failed"]:
-        state["last_error"] = _partial_failure_message(stats["failed"])
+        state["last_error"] = SOURCE.partial_failure(stats["failed"])
     else:
         state.pop("last_error", None)
     save_state(state)
 
 
-def _partial_failure_message(failed: int) -> str:
-    return (
-        f"{failed} page{'' if failed == 1 else 's'} could not be synced. "
-        "Check the server logs."
-    )
-
-
 # One tick at a time per process — see the matching lock in drive_sync.
 _RUN_LOCK = asyncio.Lock()
-
-
-# When the last tick in this process ended, failed or not. ``last_run`` is
-# stamped only on success and with the tick's start time, so a manual-sync
-# cooldown keyed on it alone lets a failing or slow source be re-run
-# back-to-back.
-_last_finished_at: datetime | None = None
 
 
 def is_syncing() -> bool:
@@ -861,17 +696,7 @@ def is_syncing() -> bool:
 
 
 def last_finished_at() -> datetime | None:
-    return _last_finished_at
-
-
-def _record_error(message: str) -> None:
-    """Keep a short, user-facing reason the last tick failed (never a trace)."""
-    try:
-        state = load_state()
-        state["last_error"] = message
-        save_state(state)
-    except Exception:
-        logger.exception("notion_sync: could not record the last error")
+    return SOURCE.last_finished_at
 
 
 async def run_notion_sync(
@@ -883,20 +708,12 @@ async def run_notion_sync(
 ) -> dict[str, int]:
     """One sync tick. Returns counts: seen / updated / skipped / failed / purged / capped
     (plus ``busy`` when another tick is already running in this process)."""
-    if _RUN_LOCK.locked():
-        logger.info("notion_sync: a tick is already running — skipping")
-        return {"busy": 1}
-    global _last_finished_at
-    async with _RUN_LOCK:
-        try:
-            return await _run_notion_sync_locked(
-                store=store, client=client, now=now, reconcile_only=reconcile_only
-            )
-        except Exception:
-            _record_error("The last sync failed unexpectedly. Check the server logs.")
-            raise
-        finally:
-            _last_finished_at = datetime.now(UTC)
+    return await SOURCE.run(
+        _RUN_LOCK,
+        lambda: _run_notion_sync_locked(
+            store=store, client=client, now=now, reconcile_only=reconcile_only
+        ),
+    )
 
 
 async def _run_notion_sync_locked(
@@ -986,7 +803,7 @@ def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) 
     raw_pages = current.get("pages")
     pages = raw_pages if isinstance(raw_pages, dict) else {}
     ids = list(pages)
-    file_index = _build_file_index()
+    file_index = SOURCE.build_file_index()
     purged = 0
     purged_ids: set[str] = set()
     for pid in ids:
@@ -1013,39 +830,8 @@ def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) 
     return purged
 
 
-def _heartbeat_pending(db_path: Path | None = None) -> bool:
-    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
-
-    resolved = _resolve_db_path(db_path)
-    if not resolved.exists():
-        return False
-    with _get_conn(resolved) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM scheduled_actions "
-            "WHERE kind = ? AND status IN ('pending', 'running') LIMIT 1",
-            (HEARTBEAT_KIND,),
-        ).fetchone()
-    return row is not None
-
-
 def bootstrap_notion_sync_scan(db_path: Path | None = None) -> int | None:
-    if _heartbeat_pending(db_path):
-        return None
-    run_at = datetime.now(UTC) + timedelta(minutes=1)
-    try:
-        action_id = insert_scheduled_action(
-            run_at=run_at.isoformat(),
-            channel=HEARTBEAT_CHANNEL,
-            channel_ref=HEARTBEAT_CHANNEL_REF,
-            intent_text=HEARTBEAT_INTENT,
-            kind=HEARTBEAT_KIND,
-            db_path=db_path,
-        )
-        logger.info("notion_sync.bootstrap: heartbeat at %s (id=%d)", run_at.isoformat(), action_id)
-        return action_id
-    except Exception:
-        logger.exception("notion_sync.bootstrap: failed to enqueue heartbeat")
-        return None
+    return SOURCE.bootstrap(db_path)
 
 
 def enqueue_next_notion_sync_scan(
@@ -1053,23 +839,9 @@ def enqueue_next_notion_sync_scan(
     after: datetime | None = None,
     db_path: Path | None = None,
 ) -> int | None:
-    settings = get_settings()
-    base = (after or datetime.now(UTC)).astimezone(UTC)
-    run_at = base + timedelta(minutes=settings.notion_sync_interval_minutes)
-    try:
-        action_id = insert_scheduled_action(
-            run_at=run_at.isoformat(),
-            channel=HEARTBEAT_CHANNEL,
-            channel_ref=HEARTBEAT_CHANNEL_REF,
-            intent_text=HEARTBEAT_INTENT,
-            kind=HEARTBEAT_KIND,
-            db_path=db_path,
-        )
-        logger.info("notion_sync.enqueue_next: next scan at %s (id=%d)", run_at.isoformat(), action_id)
-        return action_id
-    except Exception:
-        logger.exception("notion_sync.enqueue_next: insert failed")
-        return None
+    return SOURCE.enqueue_next(
+        get_settings().notion_sync_interval_minutes, after=after, db_path=db_path
+    )
 
 
 def list_synced_pages() -> dict[str, Any]:
@@ -1087,7 +859,7 @@ def list_synced_pages() -> dict[str, Any]:
         safe = sanitize_notion_id(str(pid))
         if not safe or not isinstance(rec, dict):
             continue
-        filename = _safe_filename(str(rec.get("filename") or ""))
+        filename = SOURCE.safe_filename(str(rec.get("filename") or ""))
         url = rec.get("url")
         pages.append(
             {
@@ -1125,7 +897,7 @@ def read_synced_page(page_id: str) -> dict[str, Any] | None:
     rec = raw_pages.get(safe) if isinstance(raw_pages, dict) else None
     if not isinstance(rec, dict):
         return None
-    filename = _safe_filename(str(rec.get("filename") or ""))
+    filename = SOURCE.safe_filename(str(rec.get("filename") or ""))
     if filename is None:
         return None
     try:

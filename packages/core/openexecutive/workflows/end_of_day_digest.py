@@ -46,6 +46,13 @@ from openexecutive.workflows.base import (
 logger = logging.getLogger(__name__)
 
 
+def _delivered_to_principal() -> bool:
+    """Whether this run goes to the principal alone (the scheduler's
+    delivery to them)."""
+    from openexecutive.workflows.morning_brief import PRINCIPAL_DELIVERY
+
+    return bool(PRINCIPAL_DELIVERY.get())
+
 class EndOfDayDigestInput(BaseModel):
     period_label: str = Field(
         default="",
@@ -241,11 +248,10 @@ def _render_eod_context(
 
     if handled:
         parts.append("ALERTS I HANDLED TODAY (already done — report, don't ask):")
+        from openexecutive.briefing.brief_state import handled_line
+
         for h in handled[:15]:
-            parts.append(
-                f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: "
-                f"{str(h.get('summary', ''))[:140]}"
-            )
+            parts.append(handled_line(h))
         parts.append("")
 
     from openexecutive.briefing.brief_state import (
@@ -542,7 +548,10 @@ class EndOfDayDigestWorkflow(Workflow):
         mode = effective_workspace_mode(current_session.get())
 
         try:
-            today_response = today_route._build_today()
+            today_response = today_route._build_today(
+                # The principal's own chat cards only on their own delivery.
+                chat_reader=today_route.principal_id() if _delivered_to_principal() else None,
+            )
             today_data = today_response.model_dump()
             # Same exclusion as the morning brief: monitoring noise is not
             # "still pending" — it lives in the Monitoring lane on /today.
@@ -559,6 +568,8 @@ class EndOfDayDigestWorkflow(Workflow):
             # morning brief"), as for the morning brief and the header.
             activity_response = today_route._build_activity(
                 30, since=since, exclude_workflows=today_route.RHYTHM_WORKFLOWS,
+                # The principal's own items only on their own delivery.
+                viewer=today_route.principal_id() if _delivered_to_principal() else None,
             )
             activity = [item.model_dump() for item in activity_response.items]
         except Exception:
@@ -682,10 +693,10 @@ class EndOfDayDigestWorkflow(Workflow):
         )
 
         from openexecutive.briefing.narrative import brief_model, create_brief_text
-        from openexecutive.memory.facts import with_standing_facts
+        from openexecutive.memory.facts import brief_reader, with_standing_facts
 
         # A SQLite read: off the event loop the SSE streams share.
-        user_content = await asyncio.to_thread(with_standing_facts, _render_eod_context(
+        user_content = await asyncio.to_thread(with_standing_facts, reader=brief_reader(), user_content=_render_eod_context(
             period_label=period, today_data=today_data, activity=activity,
             since=since, handled=handled, mode=mode, owner_notes=owner_notes.text,
             conversation=conversation, live_lines=live_lines, coming_up=coming_up,

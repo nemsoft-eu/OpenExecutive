@@ -144,7 +144,7 @@ function CheckInPicker({
             </label>
           )}
           <label className={cls(LABEL_CLS, "flex-1 min-w-[10rem]")}>
-            Time (UTC)
+            Time (company time zone)
             <input
               type="time"
               step={60}
@@ -195,6 +195,7 @@ export default function DepartmentDetailPage() {
     slack_channel_id: "",
     discord_channel_id: "",
     telegram_chat_id: "",
+    google_chat_space: "",
     // One entity per line in the textarea; split + trimmed on save.
     watched_entities: "",
   });
@@ -222,6 +223,10 @@ export default function DepartmentDetailPage() {
   );
   const setTelegramGroup = useCallback(
     (id: string) => setSettingsForm((f) => (f.telegram_chat_id === id ? f : { ...f, telegram_chat_id: id })),
+    [],
+  );
+  const setGoogleChatSpace = useCallback(
+    (id: string) => setSettingsForm((f) => (f.google_chat_space === id ? f : { ...f, google_chat_space: id })),
     [],
   );
   const settingsTabsId = useId();
@@ -281,6 +286,7 @@ export default function DepartmentDetailPage() {
           slack_channel_id: d.config.slack_channel_id ?? "",
           discord_channel_id: d.config.discord_channel_id ?? "",
           telegram_chat_id: d.config.telegram_chat_id ?? "",
+          google_chat_space: d.config.google_chat_space ?? "",
           watched_entities: (d.config.watched_entities ?? []).join("\n"),
         });
       }
@@ -346,6 +352,7 @@ export default function DepartmentDetailPage() {
       slack_channel_id: dept.config.slack_channel_id ?? "",
       discord_channel_id: dept.config.discord_channel_id ?? "",
       telegram_chat_id: dept.config.telegram_chat_id ?? "",
+      google_chat_space: dept.config.google_chat_space ?? "",
       watched_entities: (dept.config.watched_entities ?? []).join("\n"),
     });
     setSettingsErr(null);
@@ -393,6 +400,7 @@ export default function DepartmentDetailPage() {
         slack_channel_id: settingsForm.slack_channel_id.trim() || null,
         discord_channel_id: settingsForm.discord_channel_id.trim() || null,
         telegram_chat_id: settingsForm.telegram_chat_id.trim() || null,
+        google_chat_space: settingsForm.google_chat_space.trim() || null,
         // Always sent: an emptied textarea clears the list.
         watched_entities: settingsForm.watched_entities
           .split("\n")
@@ -478,6 +486,7 @@ export default function DepartmentDetailPage() {
                     ...(dept.config.slack_channel_id ? [["Slack channel", channelName("slack", dept.config.slack_channel_id)]] : []),
                     ...(dept.config.discord_channel_id ? [["Discord channel", channelName("discord", dept.config.discord_channel_id)]] : []),
                     ...(dept.config.telegram_chat_id ? [["Telegram group", channelName("telegram", dept.config.telegram_chat_id)]] : []),
+                    ...(dept.config.google_chat_space ? [["Google Chat space", channelName("google_chat", dept.config.google_chat_space)]] : []),
                     ...((dept.config.watched_entities ?? []).length > 0
                       ? [["Watched entities", (dept.config.watched_entities ?? []).join(", ")]]
                       : []),
@@ -724,6 +733,18 @@ export default function DepartmentDetailPage() {
                           rawLabel="Telegram chat ID"
                           rawPlaceholder="-1001234567890"
                         />
+                        {(channelDirectory?.google_chat?.configured || settingsForm.google_chat_space) && (
+                          <ChatPicker
+                            label="Google Chat space"
+                            value={settingsForm.google_chat_space}
+                            onChange={setGoogleChatSpace}
+                            list={channelList("google_chat")}
+                            unavailableText="The Chat app isn't in any space yet."
+                            notListedHint="Not listed? Add the Chat app to the space."
+                            rawLabel="Google Chat space"
+                            rawPlaceholder="spaces/AAAA…"
+                          />
+                        )}
                       </div>
                     </>
                   )}

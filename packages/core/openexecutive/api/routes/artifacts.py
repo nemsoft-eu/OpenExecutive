@@ -51,7 +51,7 @@ and the text, nothing else, and not found for anything but a live link.
 """
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Annotated, Literal
@@ -95,11 +95,6 @@ _OFF_THE_PAGE: frozenset[str] = frozenset({"executive_reflection", "executive_re
 # Daily write-ups that pile up: one closed group at the bottom of the page.
 _BRIEFS: frozenset[str] = frozenset({"morning_brief", "end_of_day_digest"})
 _BRIEFS_LABEL = "Briefs and wrap-ups"
-# What a run's title says about how it started (workflows/, research_tools,
-# workflow_run_tools, onboarding).
-_HOW_IT_STARTED: tuple[str, ...] = (
-    "(periodic)", "(post-onboarding auto-fire)", "(chat-tool fire)",
-)
 _CHATS_LABEL = "From chats"
 
 # Chars of body shown as a card preview. Unrelated to _DEFAULT_LIMIT despite
@@ -199,7 +194,8 @@ async def download_artifact(
     """The artifact as a file. `?as=docx` exports a Markdown artifact to Word."""
     rec = _load(composite_id, request)
     try:
-        file = render_artifact_file(rec, as_)
+        # Off the event loop: a big sheet or document takes seconds to render.
+        file = await asyncio.to_thread(render_artifact_file, rec, as_)
     except ArtifactNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -379,23 +375,6 @@ def _mutate(action: Callable[[], ArtifactRecord]) -> ArtifactRecord:
 
 
 
-def workflow_label(name: str) -> str:
-    """A workflow's plain name, also for one switched off or deleted since
-    its runs were written: its title where one is known, else its key in
-    words ("weekly_laptop_restock" -> "Weekly laptop restock")."""
-    from openexecutive.workflows import get_workflow
-    from openexecutive.workflows.dynamic_store import get_definition
-
-    with contextlib.suppress(Exception):
-        return get_workflow(name).title
-    with contextlib.suppress(Exception):
-        defn = get_definition(name)
-        if defn is not None and defn.title.strip():
-            return defn.title.strip()
-    words = name.removeprefix("quick_").replace("_", " ").strip()
-    return words[:1].upper() + words[1:] if words else "Workflow"
-
-
 def _group(rec: ArtifactRecord, collection_label: str | None, labels: dict[str, str]) -> tuple[str, str]:
     """The Documents page group a record files under, and its name.
     `labels` caches workflow names across one list."""
@@ -406,6 +385,8 @@ def _group(rec: ArtifactRecord, collection_label: str | None, labels: dict[str, 
     if rec.source_label in _BRIEFS:
         return "briefs", _BRIEFS_LABEL
     if rec.source_label not in labels:
+        from openexecutive.workflows import workflow_label
+
         labels[rec.source_label] = workflow_label(rec.source_label)
     return f"wf:{rec.source_label}", labels[rec.source_label]
 
@@ -414,14 +395,10 @@ def _title(rec: ArtifactRecord) -> str:
     """A run's title without the note on how it started."""
     if rec.kind != "workflow":
         return rec.title
-    # The note on how a run started that the code appends to its name. Only
-    # these: "Report (Q1)" keeps its "(Q1)".
-    title = rec.title.rstrip()
-    for note in _HOW_IT_STARTED:
-        if title.endswith(note):
-            title = title[: -len(note)].rstrip()
-            break
-    return title or rec.title
+    # Only the note on how it started: "Report (Q1)" keeps its "(Q1)".
+    from openexecutive.workflows.run_outcome import shown_title
+
+    return shown_title(rec.title.rstrip()) or rec.title
 
 
 def _summary(

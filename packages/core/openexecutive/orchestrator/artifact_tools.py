@@ -63,8 +63,6 @@ _LIST_DEFAULT = 10
 _LIST_MAX = 25
 _LIST_SCAN = 200
 _LIST_PREVIEW_CHARS = 160
-_GET_DEFAULT_CHARS = 20_000
-_GET_MAX_CHARS = 60_000
 
 
 DRAFT_ARTIFACT_TOOL: dict[str, Any] = {
@@ -74,7 +72,7 @@ DRAFT_ARTIFACT_TOOL: dict[str, Any] = {
         "one-page web report, a Word document, a spreadsheet, or a link to "
         "something you created in one of the principal's connected apps. "
         "It belongs to the person you are talking with: it lands in their "
-        "'/today' review queue and on their Documents page with your "
+        "'/today' review queue and on their Made for you page with your "
         "rationale attached, and nobody else can open it. The result "
         "gives you its id and a link to share. It does NOT page or DM "
         "anyone. When the principal ASKS for a written deliverable, always "
@@ -236,8 +234,8 @@ GET_ARTIFACT_TOOL: dict[str, Any] = {
             "max_chars": {
                 "type": "integer",
                 "description": (
-                    f"Truncate the content to this many characters (default "
-                    f"{_GET_DEFAULT_CHARS}, max {_GET_MAX_CHARS})."
+                    "Optional: read only the first this many characters. "
+                    "Left out, the whole content comes back (a long one in parts)."
                 ),
             },
         },
@@ -278,7 +276,8 @@ async def handle_draft_artifact(tool_input: dict[str, Any]) -> str:
 
     fmt_name = str(tool_input.get("format") or "").strip().lower() or DEFAULT_FORMAT
     try:
-        built = build_artifact(fmt_name, tool_input)
+        # Off the event loop: a sheet at the cap takes seconds to check.
+        built = await asyncio.to_thread(build_artifact, fmt_name, tool_input)
     except ArtifactInputError as exc:
         return _err(str(exc))
 
@@ -302,7 +301,8 @@ async def handle_draft_artifact(tool_input: dict[str, Any]) -> str:
         severity = AlertSeverity.MEDIUM
 
     try:
-        alert_id = insert_alert(
+        alert_id = await asyncio.to_thread(
+            insert_alert,
             source="artifact",
             external_id=str(uuid.uuid4()),
             severity=severity.value,
@@ -394,13 +394,16 @@ async def handle_list_artifacts(tool_input: dict[str, Any]) -> str:
 
 async def handle_get_artifact(tool_input: dict[str, Any]) -> str:
     composite_id = str(tool_input.get("id") or "").strip()
-    max_chars = _clamp_int(tool_input.get("max_chars"), _GET_DEFAULT_CHARS, 200, _GET_MAX_CHARS)
+    asked = tool_input.get("max_chars")
     try:
-        rec = load_artifact(composite_id, viewer=current_viewer())
+        # Off the event loop, as the draft and download are: a sheet at the
+        # cap is tens of MB to read and parse.
+        rec = await asyncio.to_thread(load_artifact, composite_id, viewer=current_viewer())
     except (MalformedArtifactId, ArtifactNotFound) as exc:
         return _err(str(exc))
 
-    content = get_format(rec.format).display(rec.stored or "")
+    content = await asyncio.to_thread(get_format(rec.format).display, rec.stored or "")
+    max_chars = len(content) if asked is None else _clamp_int(asked, len(content), 200, max(200, len(content)))
     truncated = len(content) > max_chars
     result: dict[str, Any] = {
         "id": rec.id,
@@ -448,7 +451,7 @@ async def index_artifact(
         from openexecutive.knowledge.loader import ingest_text_sync
         from openexecutive.knowledge.store import ChromaDBStore
 
-        text = get_format(fmt_name).display(stored)[:_INDEX_CHARS]
+        text = (await asyncio.to_thread(get_format(fmt_name).display, stored))[:_INDEX_CHARS]
         await asyncio.to_thread(
             ingest_text_sync,
             f"{title}\n\n{text}",

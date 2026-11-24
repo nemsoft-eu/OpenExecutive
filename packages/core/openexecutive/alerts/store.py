@@ -4,8 +4,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,7 @@ from openexecutive.alerts.models import (
     Alert,
     MuteTopic,
 )
+from openexecutive.utils import db
 from openexecutive.utils.text_search import words_clause
 
 logger = logging.getLogger(__name__)
@@ -30,16 +30,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path, foreign_keys=True)
 
 
 def initialize_db(db_path: Path | None = None) -> None:
@@ -103,6 +94,15 @@ def initialize_db(db_path: Path | None = None) -> None:
             ("needs", "TEXT NOT NULL DEFAULT ''"),
             ("question", "TEXT NOT NULL DEFAULT ''"),
             ("choices", "TEXT NOT NULL DEFAULT '[]'"),
+            # The step Approve does, in a few words for its button ("Send
+            # the reply"). Written with ``suggested_action`` and cleared when
+            # that changes without one, so it never names an older step.
+            ("action_label", "TEXT NOT NULL DEFAULT ''"),
+            # Tidy-up (alerts.lifecycle.settle): when the Executive settled
+            # this card on its own, and why, in plain words. The reader's
+            # Tidied up list reads these; Undo (``reopen_alert``) clears them.
+            ("tidied_at", "TEXT"),
+            ("tidied_reason", "TEXT NOT NULL DEFAULT ''"),
         ):
             if col not in existing:
                 try:
@@ -140,6 +140,21 @@ def initialize_db(db_path: Path | None = None) -> None:
         from openexecutive.alerts.approvals import ensure_schema as ensure_approvals_schema
 
         ensure_approvals_schema(conn)
+        # Plans changed from a reply on the card (alerts/replan.py).
+        from openexecutive.alerts.replan import ensure_schema as ensure_replan_schema
+
+        ensure_replan_schema(conn)
+
+
+# An Approve button's words: a few, on one line.
+ACTION_LABEL_MAX = 40
+
+
+def clean_label(text: str) -> str:
+    """``text`` as a button's words: one line, no end stop, at most
+    ``ACTION_LABEL_MAX`` characters, else "" (the card keeps Approve)."""
+    label = " ".join(str(text or "").split()).rstrip(".!")
+    return label if 0 < len(label) <= ACTION_LABEL_MAX else ""
 
 
 def _now() -> str:
@@ -174,10 +189,19 @@ def insert_alert(
     needs: str = "",
     question: str = "",
     choices: list[str] | None = None,
+    action_label: str = "",
     db_path: Path | None = None,
 ) -> int | None:
-    """Insert a new alert. Returns alert id, or None if a duplicate was skipped."""
+    """Insert a new alert. Returns alert id, or None if a duplicate was skipped.
+    Every card then goes through the one card-per-topic check
+    (``alerts.one_card.place``): it may join an open card on its topic, and a
+    card that joined is closed and never sent (``dispatcher.dispatch_all``)."""
     tags = json.dumps(topic_tags or [])
+    # (source, external_id) names one upstream event, so a replay of it is
+    # skipped. A card with no upstream id (one the Executive raised outside
+    # a mail thread) is no replay of anything: it gets an id of its own, or
+    # every such card after the first from that source would be skipped.
+    external_id = str(external_id or "").strip() or f"card:{uuid.uuid4().hex}"
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
             """
@@ -185,8 +209,8 @@ def insert_alert(
                 (external_id, source, severity, headline, body, suggested_action,
                  topic_tags, dedup_key, status, created_at, routed_to_person_id,
                  artifact_format, artifact_url, artifact_link_label, supersedes_id,
-                 owner_person_id, needs, question, choices)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 owner_person_id, needs, question, choices, action_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 external_id,
@@ -207,11 +231,18 @@ def insert_alert(
                 needs,
                 question,
                 json.dumps(choices or []),
+                clean_label(action_label) if suggested_action.strip() else "",
             ),
         )
         if cursor.rowcount == 0:
             return None
-        return cursor.lastrowid
+        alert_id = cursor.lastrowid
+    if alert_id is not None:
+        # One card per topic, whatever wrote it (alerts.one_card).
+        from openexecutive.alerts import one_card
+
+        one_card.place(alert_id, db_path=db_path)
+    return alert_id
 
 
 def update_delivery(
@@ -379,6 +410,30 @@ def set_status(alert_id: int, status: str, db_path: Path | None = None) -> bool:
             "UPDATE alerts SET status = ? WHERE id = ?", (status, alert_id)
         )
         return cursor.rowcount > 0
+
+
+def set_status_if_open(alert_id: int, status: str, db_path: Path | None = None) -> bool:
+    """Move an alert to ``status`` only while it is still open (``unread`` or
+    ``read``). False when it is missing or was answered meanwhile."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET status = ? WHERE id = ? AND status IN ('unread', 'read')",
+            (status, alert_id),
+        )
+        return cursor.rowcount > 0
+
+
+def close_open_by_source(source: str, status: str, db_path: Path | None = None) -> int:
+    """Move every still-open (``unread`` or ``read``) alert of ``source`` to
+    ``status``. How many."""
+    if not _resolve_db_path(db_path).exists():
+        return 0
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET status = ? WHERE source = ? AND status IN ('unread', 'read')",
+            (status, source),
+        )
+        return cursor.rowcount
 
 
 def set_snoozed_until(
@@ -583,10 +638,13 @@ def update_alert_content(
     body: str | None = None,
     severity: str | None = None,
     suggested_action: str | None = None,
+    action_label: str | None = None,
     db_path: Path | None = None,
 ) -> bool:
     """Rewrite headline / body / severity / suggested_action in place (a
-    ``changed`` verdict, or a document's why once it found its use)."""
+    ``changed`` verdict, or a document's why once it found its use). A new
+    ``suggested_action`` takes ``action_label`` with it, or clears the old
+    one: a button never names a step the card no longer does."""
     sets: list[str] = []
     params: list[object] = []
     if headline is not None:
@@ -601,6 +659,8 @@ def update_alert_content(
     if suggested_action is not None:
         sets.append("suggested_action = ?")
         params.append(suggested_action)
+        sets.append("action_label = ?")
+        params.append(clean_label(action_label or "") if suggested_action.strip() else "")
     if not sets or not _resolve_db_path(db_path).exists():
         return False
     params.append(alert_id)
@@ -741,10 +801,59 @@ def reopen_alert(
             "UPDATE alerts SET status = 'unread', review_verdict = '', "
             "review_note = '', recommended_move = '', why_now = '', due_at = NULL, "
             "last_reviewed_at = NULL, superseded_by_alert_id = NULL, "
-            "snoozed_until = NULL, suggested_workflow = '', last_seen_at = ? WHERE id = ?",
+            "snoozed_until = NULL, suggested_workflow = '', tidied_at = NULL, "
+            "tidied_reason = '', last_seen_at = ? WHERE id = ?",
             (_now(), alert_id),
         )
         return True
+
+
+def stamp_tidied(
+    alert_ids: list[int], reason: str, *, at: str | None = None, db_path: Path | None = None
+) -> None:
+    """Mark cards the tidy-up settled (``alerts.lifecycle.settle``): when and
+    why, for the reader's Tidied up list."""
+    if not alert_ids or not _resolve_db_path(db_path).exists():
+        return
+    stamp = at or _now()
+    with _get_conn(db_path) as conn:
+        for start in range(0, len(alert_ids), 500):
+            chunk = alert_ids[start : start + 500]
+            conn.execute(
+                f"UPDATE alerts SET tidied_at = ?, tidied_reason = ? "  # noqa: S608 - placeholders only
+                f"WHERE id IN ({','.join('?' * len(chunk))})",
+                (stamp, reason[:300], *chunk),
+            )
+
+
+def list_tidied(
+    since: str,
+    *,
+    reader: int | None,
+    unrouted: bool,
+    unrouted_source: str = "",
+    limit: int = 500,
+    db_path: Path | None = None,
+) -> list[Alert]:
+    """Cards the tidy-up settled since ``since`` (ISO) and nobody has put
+    back, newest first: those routed to ``reader``, the unrouted ones when
+    ``unrouted`` (the principal's), and the unrouted ones of
+    ``unrouted_source`` (a teammate's own ask, which its readers decide),
+    and any of ``unrouted_source`` that ``reader`` raised.
+    Filtered before the limit, so one busy week for the team never crowds
+    out someone's own."""
+    if not _resolve_db_path(db_path).exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts WHERE tidied_at IS NOT NULL AND tidied_at >= ? "
+            "AND status != 'unread' AND ((? IS NOT NULL AND routed_to_person_id = ?) "
+            "OR (routed_to_person_id IS NULL AND (? OR source = ?)) "
+            "OR (? IS NOT NULL AND source = ? AND owner_person_id = ?)) "
+            "ORDER BY tidied_at DESC, id DESC LIMIT ?",
+            (since, reader, reader, 1 if unrouted else 0, unrouted_source, reader, unrouted_source, reader, limit),
+        ).fetchall()
+    return [_row_to_alert(r) for r in rows]
 
 
 def get_alert_by_external(
@@ -764,21 +873,6 @@ def get_alert_by_external(
             (source, external_id),
         ).fetchone()
     return _row_to_alert(row) if row else None
-
-
-def open_alerts_keyed(source: str, base_key: str, db_path: Path | None = None) -> list[Alert]:
-    """The ``unread`` alerts whose dedup key is ``base_key`` or
-    ``base_key#<n>``, oldest first: one sender's open cards, one per
-    matter (``orchestrator.alert_tools._one_card_per_sender``)."""
-    if not base_key or not _resolve_db_path(db_path).exists():
-        return []
-    with _get_conn(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM alerts WHERE source = ? AND status = 'unread' "
-            "AND (dedup_key = ? OR substr(dedup_key, 1, ?) = ?) ORDER BY created_at, id",
-            (source, base_key, len(base_key) + 1, base_key + "#"),
-        ).fetchall()
-    return [_row_to_alert(r) for r in rows]
 
 
 def has_open_alert(source: str, dedup_key: str, db_path: Path | None = None) -> bool:
@@ -843,7 +937,13 @@ def delete_alert(alert_id: int, db_path: Path | None = None) -> bool:
         return False
     with _get_conn(db_path) as conn:
         cursor = conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+    if deleted:
+        # What was said on it goes with it.
+        from openexecutive.alerts import card_talk
+
+        card_talk.forget(alert_id, db_path=db_path)
+    return deleted
 
 
 # --- Mute topics ---

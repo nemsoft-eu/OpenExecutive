@@ -59,6 +59,8 @@ class Row:
     at: str
     note: str = ""
     source: dict[str, Any] = field(default_factory=dict)
+    # A draft switched to go from the Executive: its Send says so.
+    from_executive: bool = False
 
 
 def _one_line(value: Any, limit: int = _TEXT_MAX) -> str:
@@ -233,6 +235,7 @@ def _mail_rows(principal: Any, since: datetime, now: datetime) -> list[Row]:
 def _draft_rows(principal: Any, since: datetime, now: datetime) -> list[Row]:
     from openexecutive.briefing.live_signals import _named, _only_to
     from openexecutive.delegation import drafts
+    from openexecutive.delegation.send_from import executive_name
     from openexecutive.memory import episodic
 
     if not episodic._resolve_db_path(None).exists():
@@ -252,8 +255,9 @@ def _draft_rows(principal: Any, since: datetime, now: datetime) -> list[Row]:
             who=_one_line(", ".join(_named(a, True) for a in d.to), 80) or "No one yet",
             subject=_one_line(d.subject, 120) or "(no subject)",
             at=at.isoformat(),
-            note="In your Drafts, not sent",
+            note=f"Goes from {executive_name()}, cc you" if d.from_executive else "In your Drafts, not sent",
             source={"kind": "mail", "thread_id": d.thread_id} if d.thread_id else {},
+            from_executive=d.from_executive,
         ))
     return out
 

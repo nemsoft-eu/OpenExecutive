@@ -231,7 +231,7 @@ def test_google_chat_turn_quotes_for_the_team_and_memory_keeps_their_words(on_ro
         stack.enter_context(patch.object(google_chat, "send_reply"))
         stack.enter_context(patch.object(google_chat, "_sender_on_roster", return_value=on_roster))
         stack.enter_context(patch.object(google_chat, "_load_history", return_value=[]))
-        stack.enter_context(patch.object(google_chat, "_save_turn"))
+        stack.enter_context(patch("openexecutive.integrations.channel_turn.save_turn"))
         asyncio.run(
             google_chat._process_and_reply(
                 message_text="Why?",

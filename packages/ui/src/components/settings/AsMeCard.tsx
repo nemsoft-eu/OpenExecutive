@@ -1,16 +1,16 @@
 "use client";
 
 import Link from "next/link";
+
+import ScheduleLink from "@/components/schedule/ScheduleLink";
 import { useEffect, useState, type FormEvent } from "react";
 
 import ExecutiveRunSwitch from "@/components/executive/ExecutiveRunSwitch";
 import SettingsCard from "@/components/settings/SettingsCard";
-import Switch from "@/components/Switch";
+import { TrainingLine } from "@/components/settings/TrainingStep";
 import {
   addLeadJob,
   getTakeTheLead,
-  removeLeadLearned,
-  setTakeTheLead,
   stopLeadJob,
   type OutsideContentMode,
   type TakeTheLead,
@@ -24,11 +24,12 @@ import { PageSpinner } from "@/components/ui/Spinner";
 // in one line. Standing jobs are what you asked it to keep doing; When I look
 // lists what makes it look. It has no switch of its own: Pause everything
 // (the same switch as Settings) stops it with everything else, and Approvals
-// decides each step. In training sits above Approvals: everything it would
-// do comes to you as a card on Home, with "Do this on its own next time";
-// what you allow is on the What it's learned list, with Remove. What you
-// approved three times unchanged is offered on Delegate → Approvals (Could go
-// on its own) and on its next card. The owner's alone: anyone else sees who
+// decides each step. In training is the last check: everything it would do
+// comes to you as a card on Home, with "Do this on its own next time"; its
+// switch and what you allowed are on Delegate → Approvals, and this tab
+// shows its state (TrainingLine). What you approved three times unchanged is
+// offered on Delegate → Approvals (Could go on its own) and on its next
+// card. The owner's alone: anyone else sees who
 // can change it.
 
 // What makes it look, besides its daily look before your brief
@@ -89,10 +90,6 @@ export default function AsMeCard({
     }
   };
 
-  // What it was allowed in its own name. The same table holds As you's
-  // allowances and writing examples (feature act_as_me), listed on As you.
-  const learned = lead ? lead.learned.filter((item) => item.feature !== "act_as_me") : [];
-
   const levelLine = level ? `Approvals is on ${APPROVALS_SENDS[level].label}. ${APPROVALS_LEADS[level]}` : "Approvals decides what waits for your yes.";
 
   const [job, setJob] = useState("");
@@ -116,7 +113,7 @@ export default function AsMeCard({
             <div className="min-w-0 flex-1">
               {state === "ready" && lead && (
                 <p className="text-[15px] font-semibold text-fg">
-                  {things(lead.done_today ?? 0)} done today, {lead.left_today ?? 0} left for you
+                  {things(lead.done_today ?? 0)} done today
                 </p>
               )}
               <p className="mt-1 text-sm text-fg-muted">
@@ -131,8 +128,9 @@ export default function AsMeCard({
 
         {state === "ready" && lead && (
           <SettingsCard
-            title="Standing jobs"
+            title="Standing work"
             description="Things you asked me to keep doing. Say it in chat or add one here. Each step still goes through Approvals."
+            action={<ScheduleLink kind="standing" />}
           >
             {jobs.length > 0 && (
               <ul className="mb-4 flex flex-col divide-y divide-line rounded-xl border border-line">
@@ -164,8 +162,8 @@ export default function AsMeCard({
                 value={job}
                 onChange={(event) => setJob(event.target.value)}
                 maxLength={200}
-                placeholder="Give me a standing job…"
-                aria-label="Give me a standing job"
+                placeholder="Give me standing work…"
+                aria-label="Give me standing work"
                 className="min-h-touch min-w-0 flex-1 rounded-full border border-line bg-surface px-4 text-[15px] text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none"
               />
               {job.trim() && (
@@ -195,77 +193,7 @@ export default function AsMeCard({
 
       <div className="flex min-w-0 flex-col gap-4">
         {state === "loading" && <PageSpinner />}
-        {state === "hidden" && (
-          <SettingsCard title="In training">
-            <p className="text-sm text-fg-muted">
-              Only the account owner can put the Executive in training or allow what it does on its own.
-            </p>
-          </SettingsCard>
-        )}
-        {state === "error" && (
-          <SettingsCard>
-            <p className="text-sm text-fg-muted">Couldn&apos;t load In training.</p>
-          </SettingsCard>
-        )}
-        {state === "ready" && lead && (
-          <SettingsCard
-            title="In training"
-            titleId="as-me-training-label"
-            description={
-              lead.training
-                ? "Everything it would do comes to you first as a card on Home, whatever Approvals says. Tick “Do this on its own next time” when you approve one."
-                : "Off: Approvals alone decides what waits for your yes."
-            }
-            action={
-              <Switch
-                checked={lead.training}
-                onChange={(next) => void run(() => setTakeTheLead({ training: next }))}
-                disabled={busy}
-                labelledBy="as-me-training-label"
-              />
-            }
-          >
-            {(lead.training || learned.length > 0) && (
-              <div>
-                <h3 className="text-[15px] font-semibold text-fg">What it&apos;s learned</h3>
-                <p className="mt-1 text-sm text-fg-muted">
-                  These go on their own, where Approvals lets them. Remove one and it asks again.
-                </p>
-                {learned.length === 0 ? (
-                  <p className="mt-3 text-sm text-fg-muted">Nothing yet.</p>
-                ) : (
-                  <ul className="mt-3 flex flex-col divide-y divide-line rounded-xl border border-line">
-                    {learned.map((item) => {
-                      const example = Object.values(item.example).join(" · ");
-                      return (
-                        <li key={item.id} className="flex min-h-touch items-center justify-between gap-3 px-4 py-2">
-                          <span className="min-w-0">
-                            <span className="block text-[15px] font-medium">{item.label}</span>
-                            <span className="mt-0.5 block text-[13px] leading-snug text-fg-muted line-clamp-2">
-                              Allowed {new Date(item.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-                              {item.uses > 0 ? ` · done ${item.uses} ${item.uses === 1 ? "time" : "times"} since` : ""}
-                              {example ? ` · like “${example}”` : ""}
-                            </span>
-                          </span>
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void run(() => removeLeadLearned(item.id))}
-                            className="flex-shrink-0 text-sm font-semibold text-accent hover:underline disabled:opacity-60"
-                            aria-label={`Remove ${item.label}`}
-                          >
-                            Remove
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-              </div>
-            )}
-            {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
-          </SettingsCard>
-        )}
+        {state === "ready" && lead && <TrainingLine side="me" on={lead.training} />}
 
         <SettingsCard
           title="Pause everything"

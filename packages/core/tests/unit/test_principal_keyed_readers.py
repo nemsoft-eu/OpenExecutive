@@ -83,6 +83,11 @@ _ALLOWED: frozenset[str] = frozenset({
     "memory/history_brief.py::owner_keeping_notes",
     # The principal's own dated commitments, for solo's DUE THIS WEEK.
     "attunement/open_loops.py::principal_due_soon",
+    # Added by the 2026-11-24 upstream sync. Private: the principal as a task
+    # reader, which sees their private tasks. The reflection prompt
+    # (render_for_reflection) uses it only on a one-principal roster; Take
+    # the lead's overdue-task watch is the owner's own look.
+    "attunement/open_loops.py::principal_reader",
     # Added by the 2026-10-26 upstream sync, each decided:
     # Private: the owner's raise / leave-out lines. Rendered only under
     # `own_private_ok` (the morning brief passes it as `brief_requests`, and

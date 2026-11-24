@@ -151,10 +151,6 @@ class Session:
     company_profile: CompanyProfile | None = None
     conversation_history: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
-    # (channel, channel_ref) pairs the Executive has seen during this session.
-    # Used by schedule_followup to refuse scheduling sends to refs the user
-    # never actually used — anti-spam guard.
-    seen_channel_refs: set[tuple[str, str]] = field(default_factory=set)
     # Mailbox message and thread ids this conversation was shown by a search
     # that left other teammates' mail out (or the inbound email it answers).
     # The model may reach the Executive's mailbox only by these
@@ -199,28 +195,11 @@ class Session:
     # `content_trust.principal_speaking`, as the web chat is.
     from_cli: bool = False
     # True only for a session minted by Open Executive's own MCP server
-    # (`mcp_server.ask_executive`): another AI app is asking, on behalf of
-    # `caller_person_id`. Such a turn reads and advises but never sends,
-    # posts, books, schedules, runs or changes anything: the chat loop
-    # neither offers nor runs `schedule_tools.MCP_CLIENT_WITHHELD_TOOLS`, Act
-    # as me, recall_history or extension tools, and of the gateway tools only
-    # the reads in `schedule_tools.MCP_CLIENT_MCP_TOOLS`. Never the
-    # principal's own surface for `content_trust.principal_speaking`.
+    # (`mcp_server.ask_executive`): another AI app is asking, signed in as
+    # `caller_person_id`. It is that person's own turn on a verified surface:
+    # Approvals decides each step as in the web chat, and every audit row and
+    # card it writes names the app (`audit.via_app`).
     from_mcp_client: bool = False
-    # Set with `from_mcp_client` when the request turned on "may act"
-    # (`mcp_server.ask_executive`: the `x-mcp-client-actions: on` header on a
-    # request the deployment's shared secret authenticated, or
-    # `MCP_CLIENT_ACTIONS` where no secret is configured). Such a turn runs
-    # the speaker's own changes inside Open Executive (alerts, open loops,
-    # follow-ups, the watch list, goals, decision outcomes, remembered facts,
-    # and company profile writes, never the roster, each under its own owner-only and
-    # person checks), counts as a verified surface for `caller_person_id`,
-    # and offers anything that reaches another person only as an approval
-    # card (`propose_actions`), which goes on its own only by the speaker's
-    # Handle it for me and Approvals (`action_cards.on_its_own_refusal`). It is still
-    # never offered `schedule_tools.MCP_CLIENT_ACTING_WITHHELD_TOOLS`, Act as
-    # me's mailbox tools, recall_history or extension tools.
-    mcp_client_may_act: bool = False
     # Set per turn by the web chat route when a host origin's page sent it
     # (`api.caller.from_host`: another app that frames Open Executive and may
     # call a short list of its routes, OE_HOST_ORIGINS, docs/auth.md), or
@@ -274,6 +253,10 @@ class Session:
     # calls (`schedule_tools._FIND_ALERTS_MAX_PER_TURN`). Reset per turn with
     # the trusted set.
     found_alert_ids: set[int] = field(default_factory=set)
+    # An AI app's answer_card turn: the one card it may touch, set by the
+    # server before the turn (``mcp_server.server.answer_card``). The trusted
+    # set holds only that card, and ``find_alerts`` widens nothing.
+    answering_card: int | None = None
     # Pending roster requests ("who is this new sender?") the server showed
     # this turn in its <roster_requests> block — the principal's own verified
     # turn only (`briefing.context.render_and_trust`). `resolve_roster_request`
@@ -335,11 +318,25 @@ class Session:
     # principal's) inbound email: only then does the turn read the mailbox as
     # that teammate (orchestrator.teammate_mail).
     email_sender_authenticated: bool = False
+    # Whether nobody but the sender and the Executive is on the inbound email
+    # (its To and Cc), so the conversation is theirs alone
+    # (``delegation.settings.private_conversation``). Set by the email poller.
+    email_one_on_one: bool = False
     # True when the inbound email this turn answers is from someone not in
     # People (a contact or a stranger): the whole turn counts as having read
     # outside content (``orchestrator.outside_content.SENDER``). Set by the
     # email poller only.
     sender_off_team: bool = False
+    # That mail itself looks like it gives the Executive orders or fishes for
+    # passwords (``roster_intake.looks_like_phishing``): the turn starts
+    # flagged, as if the content check had flagged a read, so below
+    # Hands-off its replies wait on a card. Set by the email poller only.
+    sender_gave_orders: bool = False
+    # How many steps this turn put on an Approve card (``note_step_held``).
+    steps_held: int = 0
+    # The thread of the inbound email this turn answers: its cards are about
+    # that thread (``alerts.one_card``). Set by the email poller only.
+    email_thread_id: str = ""
     # Act as me for the turn in progress (``delegation.settings.TurnDelegation``),
     # pinned at its start by ``pin_turn_delegation``: whether the speaker has
     # it on, whether ``ghostwrite_email`` is offered, and whether the turn has
@@ -372,6 +369,11 @@ class Session:
     # pinned to that turn's viewer, so what it drafts is theirs. An
     # ``artifact_records.Viewer``; None derives it from this session.
     documents_viewer: Any = None
+    # Who what this run makes is private to, for a step carried out from a
+    # card (``take_the_lead.carry_out``): ``fact_tools.private_owner`` of the
+    # turn that held it, so an approved step keeps what it makes to the same
+    # people as the turn itself would have. None: the team's.
+    private_to: int | None = None
     # Run as if the speaker had Act as me, against the mailbox it carries
     # (``delegation.settings.DelegationOverride``): an eval's or test's fake
     # one, or the person's own for the inbox's work turn
@@ -523,3 +525,15 @@ class Session:
             else:
                 history = history[1:]
         return history
+
+
+def note_step_held() -> None:
+    """Count a step the current turn put on an Approve card. Never raises."""
+    try:
+        from openexecutive.orchestrator.schedule_tools import current_session
+
+        session = current_session.get()
+        if isinstance(session, Session):
+            session.steps_held += 1
+    except Exception:  # noqa: BLE001 - a count only
+        pass

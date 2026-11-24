@@ -1,0 +1,12 @@
+id: charts_001
+domain: files
+description: "Asked for a chart without naming a tool, the Executive draws a real image (a Python job writing a PNG) and shows it in the answer as a markdown image, never a chart made of text characters"
+query: "Make a small bar chart of these monthly sales and tell me the best month: Jan 120, Feb 95, Mar 160, Apr 140."
+# Documentation for now: the runner judges the reply text.
+expected_tool_calls:
+  - run_python_job
+quality_criteria:
+  shows_the_chart_as_an_inline_markdown_image: true
+  does_not_draw_bars_with_text_characters: true
+  names_march_as_the_best_month_at_160: true
+  does_not_say_script_code_python_or_sandbox: true

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import unicodedata
@@ -12,6 +13,7 @@ from openexecutive.alerts.models import (
     AlertSeverity,
     TriageDecision,
 )
+from openexecutive.alerts.preferences import matches_mute
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.providers import get_provider
 
@@ -70,7 +72,16 @@ TRIAGE_TOOL: dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "The single concrete action the Executive will take on approval "
-                    "(first-person imperative, <= 1 sentence). Empty string if none."
+                    "(first-person imperative, <= 1 sentence). Empty string if none: "
+                    "a card with nothing to approve is for the reader to know, or asks them."
+                ),
+            },
+            "action_label": {
+                "type": "string",
+                "description": (
+                    "The Approve button's words: suggested_action in 2-5 words, a verb "
+                    "first, naming who or what (\"Reply to Dana\", \"Book the Leo call\", "
+                    "\"Check Stripe's pricing\"). Empty when suggested_action is empty."
                 ),
             },
             "topic_tags": {
@@ -215,9 +226,11 @@ class TriageAgent(BaseAgent):
         active_initiatives: list[Any] | None = None,
         client: anthropic.AsyncAnthropic | None = None,
     ) -> TriageDecision:
-        """Run triage and return a structured decision. Never raises — on
-        failure, returns a low-severity persisted-only decision so the event
-        still gets recorded."""
+        """Run triage and return a structured decision. Never raises. When
+        review makes no whole decision (the call failed, or its answer was
+        cut off or missing), a card the Executive raised itself is kept as
+        raised, unless a muted topic names it; any other event gets a
+        low-severity persisted-only decision so it is still recorded."""
         # The optional ``client`` parameter is a legacy hook for callers that
         # need to inject a specific Anthropic SDK instance (evals/runner.py
         # and a few unit tests). When unset, we route through the provider
@@ -236,7 +249,9 @@ class TriageAgent(BaseAgent):
         # ``messages_create`` — branch only on the call shape.
         create_kwargs: dict[str, Any] = {
             "model": self.effective_model(),
-            "max_tokens": 512,
+            # Room for the whole decision: a body of up to 2000 characters
+            # plus the headline, action and tags.
+            "max_tokens": 1536,
             "timeout": _TRIAGE_TIMEOUT,
             "system": self.effective_system_prompt(),
             "tools": [TRIAGE_TOOL],
@@ -251,34 +266,130 @@ class TriageAgent(BaseAgent):
                 message = await caller.messages_create(**create_kwargs)  # type: ignore[union-attr]
         except Exception:
             logger.exception("Triage LLM call failed for event %s", event.external_id)
-            return TriageDecision(
-                alert=False,
-                severity=AlertSeverity.LOW,
-                channels=[AlertChannel.PERSISTED],
-                headline=event.subject or event.title or event.source,
-                body=(event.body or "")[:280],
-                dedup_key=f"fallback-{event.source}-{event.external_id}",
-                reason_if_suppressed="triage_error",
-            )
+            return _no_decision(event, mute_patterns or [], "triage_error")
         log_model_usage(message, model=self.effective_model(), actor="triage")
 
+        # An answer cut off at max_tokens is a partial decision: its missing
+        # fields would read as "no card". If it got as far as saying to raise
+        # a card, the card shows in the event's own words; otherwise it is
+        # handled as no decision.
+        cut_off = getattr(message, "stop_reason", None) == "max_tokens"
         for block in message.content:
             if block.type == "tool_use" and block.name == "emit_alert_decision":
-                return _parse_decision(block.input)
+                if not cut_off:
+                    return _parse_decision(block.input)
+                if isinstance(block.input, dict) and block.input.get("alert") is True:
+                    said_tags = [str(t).lower() for t in block.input.get("topic_tags") or []]
+                    kept = _no_decision(event, mute_patterns or [], "cut_off", raise_it=True, tags=said_tags)
+                    return _with_partial_delivery(kept, block.input, event)
+                if isinstance(block.input, dict) and block.input.get("alert") is False:
+                    # It had decided not to raise it: that decision stands.
+                    return _parse_decision(block.input)
 
         logger.warning(
-            "Triage returned no tool_use for event %s — treating as low/persisted",
-            event.external_id,
+            "Triage gave no whole decision for event %s", event.external_id,
         )
+        return _no_decision(event, mute_patterns or [], "no_decision")
+
+
+def _no_decision(
+    event: AlertEvent, mute_patterns: list[str], why: str, *,
+    raise_it: bool = False, tags: list[str] | None = None,
+) -> TriageDecision:
+    """What stands when review made no decision. A card the Executive chose
+    to raise (``AlertEvent.from_executive``) is kept as raised: a review that
+    couldn't run never loses it, only a decision it made can. A muted topic
+    it names stays muted. Anything else is recorded quietly, as before, so
+    an outage doesn't turn every chat line and newsletter into a card.
+    ``raise_it`` is a cut-off review that had already said to raise one:
+    any event is kept then."""
+    headline = (event.subject or event.title or (event.body or "").strip().split("\n", 1)[0] or event.source)[:200]
+    # A kept card carries the tags a cut-off review gave, matched the way
+    # the pipeline matches a reviewed card's. The department or room it came
+    # from holds it back only when that very topic was muted ("mute this
+    # topic" stores department:<slug>), so a short mute never hits it.
+    topic_tags = [*(tags or [])]
+    own = set()
+    if event.department:
+        own.add(f"department:{event.department.lower()}")
+    if event.channel:
+        own.add(event.channel.lower())
+    # A cut-off review that said to raise it had seen the mutes: only its
+    # tags count then. With no review at all, the words stand in.
+    muted = (
+        matches_mute(topic_tags, mute_patterns)
+        or any(p.strip().lower() in own for p in mute_patterns)
+        or (not raise_it and _names_muted_topic(event, mute_patterns))
+    )
+    if muted:
+        why = "muted"
+    if (raise_it or event.from_executive) and not muted:
         return TriageDecision(
-            alert=False,
-            severity=AlertSeverity.LOW,
-            channels=[AlertChannel.PERSISTED],
-            headline=event.subject or event.title or event.source,
-            body=(event.body or "")[:280],
-            dedup_key=f"no-tool-{event.source}-{event.external_id}",
-            reason_if_suppressed="no_decision",
+            alert=True,
+            severity=AlertSeverity.MEDIUM,
+            channels=[AlertChannel.WEB, AlertChannel.PERSISTED],
+            headline=headline,
+            # Outside text the review never rewrote shows as a short preview.
+            body=(event.body or "")[: 2000 if event.from_executive else 280],
+            dedup_key=_kept_key(event),
+            topic_tags=topic_tags[:8],
         )
+    return TriageDecision(
+        alert=False,
+        severity=AlertSeverity.LOW,
+        channels=[AlertChannel.PERSISTED],
+        headline=headline,
+        body=(event.body or "")[:280],
+        dedup_key=f"{why}-{event.source}-{event.external_id}",
+        reason_if_suppressed=why,
+    )
+
+
+def _with_partial_delivery(kept: TriageDecision, raw: dict, event: AlertEvent) -> TriageDecision:
+    """A kept card keeps the severity and channels a cut-off review had
+    already given, so an urgent one is still delivered as urgent. A room or
+    company post only stays for a card the Executive raised: the kept card
+    shows the event's own words, and outside mail nobody finished reviewing
+    is not posted to a room."""
+    if not kept.alert:
+        return kept
+    said = _parse_decision(raw)
+    update: dict[str, Any] = {}
+    if str(raw.get("severity") or "").lower() in AlertSeverity._value2member_map_:
+        update["severity"] = said.severity
+    rooms = {AlertChannel.DEPARTMENT_CHANNEL, AlertChannel.COMPANY_BROADCAST}
+    channels = [c for c in said.channels if event.from_executive or c not in rooms]
+    if raw.get("channels") and channels != [AlertChannel.PERSISTED]:
+        # Web stays, so a room post missing its room (cut off before the
+        # slug) still leaves the card on Home.
+        update["channels"] = [*dict.fromkeys([AlertChannel.WEB, *channels])]
+        if any(c in rooms for c in channels):
+            update["department_slug"] = said.department_slug
+            update["broadcast_integration"] = said.broadcast_integration
+    return kept.model_copy(update=update) if update else kept
+
+
+def _kept_key(event: AlertEvent) -> str:
+    """The key a kept card folds on. ``create_alert`` needs no external id,
+    so without one the card's own words make the key: two different cards
+    never fold into one, and the same card raised again still does."""
+    if event.external_id:
+        return f"kept-{event.source}-{event.external_id}"
+    text = f"{event.source}\n{event.subject}\n{event.body}"
+    return f"kept:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _names_muted_topic(event: AlertEvent, mute_patterns: list[str]) -> bool:
+    """Whether a mute pattern is a word (or its plural) in the event's
+    subject or body: with no review there are no topic tags to match, so
+    the words stand in. "newsletter" holds "newsletters" back, but a short
+    mute like "ai" never hits "email" or "air"."""
+    text = f"{event.subject}\n{event.title or ''}\n{event.body}".lower()
+    return any(
+        p.strip() and re.search(rf"(?<!\w){re.escape(p.strip().lower())}(?:e?s)?(?!\w)", text)
+        for p in mute_patterns
+    )
+
 
 def _parse_decision(raw: dict) -> TriageDecision:
     """Tolerantly coerce the tool input into a TriageDecision."""
@@ -314,6 +425,7 @@ def _parse_decision(raw: dict) -> TriageDecision:
             headline=(raw.get("headline") or "")[:200],
             body=(raw.get("body") or "")[:2000],
             suggested_action=(raw.get("suggested_action") or "")[:500],
+            action_label=str(raw.get("action_label") or "")[:80],
             topic_tags=topic_tags[:8],
             dedup_key=(raw.get("dedup_key") or "")[:120],
             reason_if_suppressed=(raw.get("reason_if_suppressed") or "")[:200],

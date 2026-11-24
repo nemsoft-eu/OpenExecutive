@@ -1,6 +1,8 @@
 "use client";
 
 import Link from "next/link";
+
+import ScheduleLink from "@/components/schedule/ScheduleLink";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import Switch from "@/components/Switch";
@@ -26,6 +28,7 @@ import {
 import { suggestWatchSlug } from "@/lib/watchSlug";
 import { CADENCE_CHOICES, triggerInWords } from "@/lib/watchWords";
 import { PageSpinner } from "@/components/ui/Spinner";
+import { isImeComposing } from "@/lib/imeComposing";
 
 const fieldCls =
   "w-full px-3.5 py-2.5 text-[15px] rounded-xl bg-surface border border-line text-fg placeholder:text-fg-subtle focus:outline-none focus:ring-2 focus:ring-accent/40";
@@ -65,6 +68,11 @@ const SIGNAL_TYPES: { value: WatchlistSignalType; label: string; hint: string }[
     value: "query",
     label: "Web search",
     hint: "What to search for, e.g. Acme Corp layoffs OR restructuring OR funding",
+  },
+  {
+    value: "mailbox",
+    label: "Email",
+    hint: "What email to watch for, e.g. sign-up emails. It watches email to the Executive, and your own inbox when it's connected. Say who it's from or a word in its subject below.",
   },
 ];
 
@@ -225,8 +233,9 @@ function WatchCard({
           </div>
         )}
         {item.mode === "dry_run" && (
-          <div className="text-sm text-fg-subtle mt-1.5">Watching quietly</div>
+          <div className="text-sm text-fg-subtle mt-1.5">Only in your brief</div>
         )}
+        {item.quiet_line && <div className="text-sm text-fg-subtle mt-1.5">{item.quiet_line}</div>}
         {forLines(item).map((line) => (
           <div key={line} className="text-sm text-fg-subtle mt-1.5 truncate">
             {line}
@@ -393,13 +402,13 @@ function WatchForm({ initial, onCreated }: WatchFormProps) {
         />
       </div>
       <div>
-        <label htmlFor="watch-notes" className={labelCls}>Notes</label>
+        <label htmlFor="watch-notes" className={labelCls}>What I should know (optional)</label>
         <input
           id="watch-notes"
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
           maxLength={500}
-          placeholder="Why watch this?"
+          placeholder="Why watch this, or what to skip"
           className={fieldCls}
         />
       </div>
@@ -431,7 +440,9 @@ function WatchForm({ initial, onCreated }: WatchFormProps) {
                         signalType === "query" ||
                         signalType === "page_watch"
                       ? '{"keywords": ["layoffs", "downtime"]}'
-                      : "{}"
+                      : signalType === "mailbox"
+                        ? '{"from": ["pat@example.com"], "keywords": ["sign up"]}'
+                        : "{}"
               }
               rows={3}
               className={`${fieldCls} font-mono text-sm`}
@@ -585,7 +596,7 @@ function SetUpWatch({ onCreated }: { onCreated: (w: WatchlistItem) => void }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void ask();
+            if (e.key === "Enter" && !isImeComposing(e)) void ask();
           }}
           maxLength={500}
           placeholder="e.g. Tell me if Initech's stock moves more than 8%"
@@ -783,6 +794,7 @@ export default function WatchlistPage() {
                 News, prices, pages and filings the Executive keeps an eye on for you.
                 When something important changes, it tells you in your briefing.
               </p>
+              <ScheduleLink kind="watch" className="mt-1" />
             </div>
           </div>
 

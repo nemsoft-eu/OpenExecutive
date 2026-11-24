@@ -35,6 +35,10 @@ def _principals_own_turn(monkeypatch: pytest.MonkeyPatch) -> None:
         "openexecutive.orchestrator.executive.principal_only_withheld",
         lambda _s: frozenset(),
     )
+    # The suite pins Approvals to Careful (tests/conftest.py), which holds
+    # every acting step a turn asks for; these tests are about scripts, so
+    # Careful's hold on asked steps (take_the_lead._asked_hit) stays out.
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
 
 
 class _TextBlock:
@@ -122,11 +126,18 @@ def audit(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return rows
 
 
-def _run(provider: _ScriptedProvider, gateway: _Gateway) -> list[Any]:
+def _run(provider: _ScriptedProvider, gateway: _Gateway, *, owner_turn: bool = False) -> list[Any]:
+    """``owner_turn``: start the turn's outside-content record for the
+    owner's own web turn, as the chat route does."""
     exec_ = Executive(mcp_gateway=gateway)  # type: ignore[arg-type]
 
     async def go() -> list[Any]:
         items: list[Any] = []
+        if owner_turn:
+            from openexecutive.orchestrator import outside_content
+            from openexecutive.orchestrator.session import Session
+
+            outside_content.begin_turn(Session(from_web_chat=True), user_message="file the scans")
         with patch("openexecutive.orchestrator.executive.get_provider", return_value=provider):
             async for item in exec_._stream_agent_loop(
                 system_blocks=[],
@@ -453,7 +464,7 @@ def test_someone_elses_turn_is_not_offered_or_run_saved_tools(
     ])
     _run(provider, gateway)
     assert "can't wait on a card" in json.loads(_any_result(provider, "tu-l"))["error"]
-    assert "principal's own turns" in json.loads(_any_result(provider, "tu-r"))["error"]
+    assert "someone on the team" in json.loads(_any_result(provider, "tu-r"))["error"]
     assert gateway.calls == []
 
 
@@ -664,3 +675,54 @@ def test_no_nudge_for_a_short_list_or_without_scripts(monkeypatch: pytest.Monkey
 )
 def test_lists_many(text: str, many: bool) -> None:
     assert step_script.lists_many(text) is many
+
+
+def _hands_off(monkeypatch: pytest.MonkeyPatch, flagged: bool) -> list[str]:
+    """Hands-off, with the content check saying ``flagged`` of every read.
+    Returns the tools put on a card."""
+    from openexecutive.orchestrator import content_scan, levels, outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    verdict = content_scan.Verdict(flagged=True, categories=("send_data",)) if flagged else content_scan.CLEAN
+
+    async def says(content: object, *, model: str | None = None) -> Any:
+        return verdict
+
+    monkeypatch.setattr(content_scan, "scan", says)
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+    content_scan.reset()
+    held: list[str] = []
+
+    def hold(tool: str, tool_input: dict[str, Any], **_kw: Any) -> str:
+        held.append(tool)
+        return json.dumps({"status": "waiting"})
+
+    monkeypatch.setattr(levels, "hold", hold)
+    # The send's teammate-mail guard reads the roster: an empty one.
+    monkeypatch.setattr("openexecutive.people.store.list_people", lambda *a, **kw: [])
+    return held
+
+
+READ_THEN_SEND = """
+notes = fetch__fetch_url(url="https://notes.example/q3")
+google_workspace__send_gmail_message(to="x@new.example", subject="Figures", body="Q3 figures")
+"""
+
+
+def test_a_flagged_read_holds_a_send_later_in_the_same_script(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On Hands-off, a script that reads a planted line and then sends: the
+    # flag drops the rest of the turn to Balanced, so the send waits on a
+    # card even though the read and the send are one run_script call.
+    held = _hands_off(monkeypatch, flagged=True)
+    gateway = _Gateway()
+    _run(_script_turn(READ_THEN_SEND), gateway, owner_turn=True)
+    assert [c["name"] for c in gateway.calls] == ["fetch__fetch_url"]
+    assert held == ["google_workspace__send_gmail_message"]
+
+
+def test_a_clean_read_lets_the_same_script_send_on_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    held = _hands_off(monkeypatch, flagged=False)
+    gateway = _Gateway()
+    _run(_script_turn(READ_THEN_SEND), gateway, owner_turn=True)
+    assert [c["name"] for c in gateway.calls] == ["fetch__fetch_url", "google_workspace__send_gmail_message"]
+    assert held == []

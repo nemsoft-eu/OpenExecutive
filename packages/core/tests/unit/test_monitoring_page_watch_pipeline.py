@@ -234,3 +234,21 @@ async def test_planted_headline_links_never_reach_the_card(
     await mp.run_external_monitor_scan(db_path=db)
     new_line = next(line for line in promoted[0].body.splitlines() if line.startswith("New:"))
     assert "evil.example" not in new_line.split(" — ")[0]
+
+
+def test_a_digest_says_what_a_rewrite_replaced_and_what_was_only_added() -> None:
+    item = WatchlistItem(id=7, slug="p", signal_type="page_watch", target="https://x.example/terms")
+
+    def row(i: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"id": i, "captured_at": "2026-11-15T10:00:00+00:00", "severity_hint": "low",
+                "raw_payload": {"label": "Terms", **payload}}
+
+    rewrite = row(2, {"added_text": "without needing permission.",
+                      "changes": 'was "only with written permission." now "without needing permission."'})
+    signal, _ = mp._digest_signal(item, [rewrite, row(3, {"added_text": "Holiday sale"})])
+    assert 'changes: was "only with written permission." now "without needing permission."' in signal.normalized_summary
+    # A row from before both sides were kept, or one that only added, reads as new text.
+    signal, _ = mp._digest_signal(item, [row(1, {"added_text": "Holiday sale"})])
+    assert "new text: Holiday sale" in signal.normalized_summary
+    signal, _ = mp._digest_signal(item, [row(1, {"added_text": "Holiday sale", "changes": 'added "Holiday sale"'})])
+    assert "new text: Holiday sale" in signal.normalized_summary

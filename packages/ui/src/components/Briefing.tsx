@@ -17,7 +17,6 @@ import {
   getDelegation,
   getToday,
   rejectDecision,
-  reopenAlert,
   rerunWorkflowRun,
   snoozeAlert,
   type DoneRow,
@@ -25,21 +24,9 @@ import {
   type RightNowRow,
   type Today,
 } from "@/lib/api";
-import { greeting, homeSummary, type SummaryPart } from "@/lib/briefingSummary";
+import { greeting, homeHeadline, teamOffTrack, waitingNote, waitingOnTeam, watchingRow } from "@/lib/briefingSummary";
 import { cardFromSearch } from "@/lib/cardMentions";
 import { FIRST_RUN_LINKS } from "@/lib/firstRun";
-import { principalIdOf } from "@/lib/dueSoon";
-import {
-  counted,
-  departmentsText,
-  goalTotals,
-  goalsText,
-  peopleText,
-  realDepartments,
-  tasksText,
-  watchingText,
-} from "@/lib/glance";
-import { groupHandled } from "@/lib/handled";
 import {
   NEEDS_YOU_OLDER_AFTER_DAYS,
   ageAnchor,
@@ -50,39 +37,26 @@ import {
   splitOlder,
   waitedOnFirst,
 } from "@/lib/needsYou";
-import { BRIEFING_REFRESH_INTERVAL_MS, shouldRefreshOnFocus } from "@/lib/narrativeFreshness";
+import { BRIEFING_TICK_MS, newestAnswer, shouldRefreshOnFocus, shouldRefreshOnTick } from "@/lib/narrativeFreshness";
 import type { SnoozeChoice } from "@/lib/snooze";
 import InfoTip from "./InfoTip";
 import { ACTION_CARDS_TIP, ActionCardItem, useActionCards } from "./ActionCards";
 import { INVITE_CARDS_TIP, InviteCardItem, useInviteCards } from "./InviteCards";
 import { REPLIES_WAITING_TIP, ReplyCardItem, useReplyCards } from "./RepliesWaiting";
 import Icon from "./Icon";
-import {
-  HandledPanelBody,
-  InFlightPanelBody,
-  MonitoringPanelBody,
-  PracticeClientsPanelBody,
-} from "./briefing/AwarenessPanels";
-import DoneForYou, { DONE_FOR_YOU_ID } from "./briefing/DoneForYou";
+import { MonitoringPanelBody } from "./briefing/AwarenessPanels";
+import DoneForYou from "./briefing/DoneForYou";
 import { anyWorking } from "@/lib/doneForYou";
 import FirstWeekCard from "./briefing/FirstWeekCard";
-import { useGlance } from "./briefing/Glance";
 import { RightNowItem } from "./briefing/RightNow";
 import WaitingElsewhereRow from "./briefing/WaitingElsewhere";
+import HandMeSomething from "./briefing/HandMeSomething";
 import WatchingNext from "./briefing/WatchingNext";
-import { isHeldAction } from "./briefing/HeldActionCard";
-import { isLeadTraining } from "./briefing/LeadTrainingCard";
+import { WaitingOnTeam } from "./briefing/WaitingOnTeam";
 import ProposalCard from "./briefing/ProposalCard";
 import RequestGroupCard from "./briefing/RequestGroupCard";
 import { TONE_TEXT, type ContinueHandler } from "./briefing/shared";
-import {
-  ProjectsPanelBody,
-  WeeklyReviewPanelBody,
-  useActiveProjects,
-  useOpenLoops,
-  useWeeklyReview,
-} from "./briefing/SoloPanels";
-import { DepartmentsPanelBody, PeoplePanelBody } from "./briefing/TeamPanels";
+import { WeeklyReviewPanelBody, useWeeklyReview } from "./briefing/SoloPanels";
 import { buttonClass } from "./ui/Button";
 import SidePanel from "./ui/SidePanel";
 import { useWorkspace } from "./workspace/WorkspaceContext";
@@ -90,7 +64,6 @@ import { PageSpinner } from "@/components/ui/Spinner";
 
 // The card pieces stay importable from here for pages that show them alone.
 export { ProposalCard };
-export { DeptCard } from "./briefing/TeamPanels";
 
 // Home, the briefing: a greeting and one summary line, the Ask box, the
 // "Needs you" queue as large cards, then "At a glance": a row of count tiles —
@@ -106,16 +79,7 @@ const DONE_POLL_MAX_MS = 30 * 60 * 1000;
 
 const NEEDS_YOU_ID = "sec-needs-you";
 
-type PanelKey =
-  | "departments"
-  | "people"
-  | "inFlight"
-  | "handled"
-  | "monitoring"
-  | "team"
-  | "clients"
-  | "projects"
-  | "weeklyReview";
+type PanelKey = "monitoring" | "team" | "weeklyReview";
 
 interface Tile {
   key: string;
@@ -124,6 +88,8 @@ interface Tile {
   href?: string;
   // What it says, whole ("5 goals, 1 at risk").
   text: string;
+  // More on hover: where a watch's change was noticed.
+  hint?: string;
 }
 
 interface BriefingProps {
@@ -165,8 +131,6 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   const [olderNotice, setOlderNotice] = useState<string | null>(null);
   // The card just snoozed, for the "Snoozed until …" notice and its Undo.
   const [snoozed, setSnoozed] = useState<{ alertId: number; short: string } | null>(null);
-  // Handled-rail rows undone this session (keyed per row, see handledKey).
-  const [undoneRows, setUndoneRows] = useState<Set<string>>(new Set());
   // Which tile's side panel (or the brief) is open.
   const [openPanel, setOpenPanel] = useState<PanelKey | null>(null);
   const [askText, setAskText] = useState("");
@@ -178,13 +142,23 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   // the stale-but-still-usable view rather than erroring the briefing.
   const [mountedAt] = useState(() => Date.now());
   const lastFetchRef = useRef(mountedAt);
-  const refreshToday = useCallback(() => {
+  // Every pull of /today goes through here. An answer older than one already
+  // shown is dropped (a timed refresh overtaken by Approve's would put old
+  // counts back); an older answer still shows when the newer pull hasn't
+  // landed, so a slow first load isn't lost to a focus refresh.
+  const [pulls] = useState(newestAnswer);
+  const pullToday = useCallback(async () => {
     lastFetchRef.current = Date.now();
-    getToday().then(setToday).catch(() => { /* keep current view on failure */ });
-  }, []);
+    const seq = pulls.begin();
+    const t = await getToday();
+    if (pulls.accept(seq)) setToday(t);
+  }, [pulls]);
+  const refreshToday = useCallback(() => {
+    pullToday().catch(() => { /* keep current view on failure */ });
+  }, [pullToday]);
 
-  // Keep Home current when the tab comes back, and every few minutes while
-  // it is open.
+  // Keep Home current when the tab or window comes back (a card answered on
+  // another device meanwhile), and every minute while it is open.
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === "visible" && shouldRefreshOnFocus(lastFetchRef.current, Date.now())) {
@@ -192,11 +166,15 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
       }
     };
     document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
     const interval = setInterval(() => {
-      if (document.visibilityState === "visible") refreshToday();
-    }, BRIEFING_REFRESH_INTERVAL_MS);
+      if (document.visibilityState === "visible" && shouldRefreshOnTick(lastFetchRef.current, Date.now())) {
+        refreshToday();
+      }
+    }, BRIEFING_TICK_MS);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
       clearInterval(interval);
     };
   }, [refreshToday]);
@@ -216,12 +194,16 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
         refreshToday();  // re-sync narrative + counts (no chat nav to trigger it)
         return;
       }
-      // Its progress shows in Done for you, read from the server.
-      await approveAlert(proposal.alert_id);
+      // Its progress shows in Done for you, read from the server. The
+      // plan the card showed goes along, so a plan changed meanwhile is
+      // never the one carried out.
+      await approveAlert(proposal.alert_id, undefined, proposal.suggested_action || undefined);
       refreshToday();
     } catch (e) {
-      // Revert the optimistic removal on failure so the user can retry.
+      // Revert the optimistic removal on failure so the user can retry,
+      // and reload: the card may now show a changed plan.
       setActedAlertIds(prev);
+      refreshToday();
       console.error("Approve failed", e);
     }
   }, [actedAlertIds, refreshToday]);
@@ -240,6 +222,14 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   // Executive stops re-surfacing the same thread), and the user stays on
   // the briefing — no chat turn is seeded. On failure we revert the
   // optimistic removal so the user can see the card came back and retry.
+  // Cards closed along with another (a correction to a watch) leave now.
+  const handleClosed = useCallback((alertIds: number[]) => {
+    setActedAlertIds((prev) => {
+      const next = new Set(prev);
+      for (const id of alertIds) next.add(id);
+      return next;
+    });
+  }, []);
   const handleDismiss = useCallback(async (proposal: ProposalItem) => {
     const prev = actedAlertIds;
     setActedAlertIds(new Set(prev).add(proposal.alert_id));
@@ -247,7 +237,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
       // A roster request, a Take the lead training card or a held chat
       // action was already answered on its own card (which also clears the
       // companion alert): only hide it and re-sync.
-      if (proposal.roster_request || isLeadTraining(proposal) || isHeldAction(proposal)) {
+      if (proposal.view?.panel === "new_sender" || proposal.view?.panel === "lead" || proposal.view?.panel === "held") {
         refreshToday();
         return;
       }
@@ -330,23 +320,6 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
     }
   }, [actedAlertIds, refreshToday]);
 
-  // Undo an autonomous close from the Handled panel. The rail is rebuilt
-  // from the audit log on every fetch (the "closed" row persists after a
-  // reopen), so a 409 "already open" after a reload counts as done.
-  const handleReopen = useCallback(async (rowKey: string, alertId: number) => {
-    try {
-      await reopenAlert(alertId);
-      setUndoneRows((prev) => new Set(prev).add(rowKey));
-      refreshToday();
-    } catch (e) {
-      if (e instanceof Error && /409|already/i.test(e.message)) {
-        setUndoneRows((prev) => new Set(prev).add(rowKey));
-        return;
-      }
-      console.error("Reopen failed", e);
-    }
-  }, [refreshToday]);
-
   // Approve-with-edits: the user tweaked the draft and wants exactly what
   // they wrote sent (no rephrasing). Same server-side approval as Approve,
   // with the edited text carried verbatim.
@@ -378,12 +351,11 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
 
   useEffect(() => {
     let cancelled = false;
-    getToday()
-      .then((t) => { if (!cancelled) setToday(t); })
+    pullToday()
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, []);
+  }, [pullToday]);
 
   // Replies the Executive drafted in the owner's own mailbox (Act as me):
   // cards in Needs you. Empty for everyone else.
@@ -392,13 +364,6 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   const actionCards = useActionCards();
   // Meeting invites from people the caller knows, to accept or decline (Act as me).
   const inviteCards = useInviteCards();
-  // Solo's own sections load on their own, so their tiles can count them.
-  const principalId = solo ? principalIdOf(today?.people ?? []) : null;
-  const projects = useActiveProjects(solo);
-  // Due soon is the caller's own (the owner's, in solo).
-  const loopOwnerId = solo ? principalId : (today?.caller_person_id ?? null);
-  const openLoops = useOpenLoops(loopOwnerId);
-  const glance = useGlance(today !== null);
   const weeklyReview = useWeeklyReview(solo);
 
   // Hand an Ask-box question to chat as the user's own words.
@@ -439,49 +404,31 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   // What Right now's rows open: the email (and its reply card, shared with
   // Needs you). ✕ on a row clears it at once; the server keeps it out until
   // something newer lands on it.
+  // A pull already under way may predate the change, so its answer is dropped.
   const onDismissRow = useCallback((row: RightNowRow) => {
+    pulls.changedHere();
     setToday((t) => t && { ...t, right_now: (t.right_now ?? []).filter((r) => r.key !== row.key) });
     dismissRightNowRow(row.key)
-      .then((kept) => {
-        if (!kept) return getToday().then(setToday);
+      .then(() => {
+        // Any pull begun before the dismissal was saved may still carry the
+        // row, so drop those and show the board as it is now.
+        pulls.changedHere();
+        return pullToday();
       })
       .catch((e) => console.error("Dismissing a Right now row failed", e));
-  }, []);
+  }, [pulls, pullToday]);
   const onRowGone = useCallback((row: RightNowRow) => {
+    pulls.changedHere();
     setToday((t) => t && { ...t, right_now: (t.right_now ?? []).filter((r) => r.key !== row.key) });
-  }, []);
+  }, [pulls]);
   const rightNowActions = { replies, onContinue, onDismiss: onDismissRow, onGone: onRowGone };
 
   const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
 
   const departments = today?.departments ?? [];
-  const activeDepts = departments.filter((d) => d.goal_count > 0 || d.awaiting_count > 0);
-  // Only the departments with a problem (at risk / off track / awaiting)
-  // count as needing attention; healthy ones fold into a quiet toggle in
-  // the panel.
-  const attentionDepts = activeDepts.filter(
-    (d) => d.at_risk_count > 0 || d.off_track_count > 0 || d.awaiting_count > 0,
-  );
-  // The Departments tile counts only real departments, not the row that holds
-  // the goals with no department.
-  const activeRealDepts = realDepartments(activeDepts);
-  const attentionRealDepts = realDepartments(attentionDepts);
-  const goals = goalTotals(departments);
 
   // What waits on other pages (watch suggestions, …): one Needs you row each.
   const elsewhere = today?.waiting_elsewhere ?? [];
-
-  const isQuiet =
-    today !== null &&
-    elsewhere.length === 0 &&
-    today.proposals.length === 0 &&
-    replies.cards.length === 0 &&
-    actionCards.cards.length === 0 &&
-    inviteCards.cards.length === 0 &&
-    activeDepts.every((d) => d.at_risk_count === 0 && d.off_track_count === 0 && d.awaiting_count === 0) &&
-    today.people.every((p) => p.awaiting_count === 0);
-
-  const showPeople = !solo && (today?.people.length ?? 0) > 1;
 
   // Bucket proposals once so the summary line, the queue and the tiles work
   // off the same split. "Needs you" = action proposals routed to the caller,
@@ -505,15 +452,6 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   const mineIds = new Set(mineProposals.map((p) => p.alert_id));
   const otherProposals =
     callerId == null || solo ? [] : actionProposals.filter((p) => !mineIds.has(p.alert_id));
-  const handledOvernight = today?.handled_overnight ?? [];
-  const handledRows = groupHandled(handledOvernight);
-  const inFlight = today?.in_flight ?? [];
-  const practiceClients = today?.practice_clients ?? [];
-
-  // A team's Departments tile counts its departments at risk.
-  const deptAtRiskCount = solo
-    ? 0
-    : attentionRealDepts.filter((d) => d.at_risk_count > 0 || d.off_track_count > 0).length;
   // Waiting on the owner with no card (Right now's rows): listed in Needs you.
   const rightNowRows = today?.right_now ?? [];
   // What the Executive did or is doing for the viewer today.
@@ -533,92 +471,28 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
   const needsYouCount =
     rightNowRows.length + mineProposals.length + replies.cards.length + inviteCards.cards.length +
     actionCards.cards.length + elsewhere.length;
-  // Home's summary says only what its two lists hold; the rest (people,
-  // departments, under way, monitoring) is one quiet line at the bottom.
-  const summary: SummaryPart[] = today ? homeSummary(needsYouCount, doneRows.length) : [];
+  // Home's headline, in the Executive's words: what needs you, what it
+  // handled in the last day (what failed or is still running isn't) and
+  // what it's watching. The rest (people, departments, under way,
+  // monitoring) is one quiet line at the bottom.
+  const headline = homeHeadline(
+    needsYouCount,
+    doneRows.filter((r) => r.status === "done").length,
+    (today?.watching ?? []).length,
+    teamOffTrack(departments, today?.people ?? []),
+  );
 
-  // At a glance — one quiet line, only the items with something to show,
-  // what's yours first. Each item reads on its own: the line has no headings.
+  // The bottom line: only the counts that need you, each a link (the
+  // server's `to_act_on`: overdue tasks, goals at risk or never checked,
+  // people to follow up), then what waits on someone else on the team and
+  // what changed on the watches. Everything else is on track.
   const tiles: Tile[] = [];
   if (today) {
-    if (glance.actAsMe)
-      tiles.push({
-        key: "actAsMe",
-        href: "/settings/act-as-me",
-        text: `${glance.actAsMe} handled as you this week`,
-      });
-    const view = openLoops.view;
-    if (loopOwnerId != null && (openLoops.error || (view && (view.items.length > 0 || view.later > 0)))) {
-      const overdue = view?.items.filter((i) => i.overdue).length ?? 0;
-      tiles.push({
-        key: "dueSoon",
-        href: "/tasks",
-        text: view ? tasksText(view.items.length, overdue, view.later) : "Tasks",
-      });
-    }
-    if (goals.goals > 0)
-      tiles.push({ key: "goals", href: "/goals", text: goalsText(goals.goals, goals.atRisk, goals.unchecked) });
-    if (glance.workflows && glance.workflows.scheduled > 0)
-      tiles.push({
-        key: "workflows",
-        href: "/jobs",
-        text: `${counted(glance.workflows.scheduled, "workflow", "workflows")} on a schedule`,
-      });
-    // Watching: what's on the watchlist, with the signals waiting to be read.
-    const signals = monitoringProposals.length;
-    if ((glance.watching && glance.watching.watched > 0) || signals > 0)
-      tiles.push({
-        key: "watching",
-        ...(signals > 0 ? { panel: "monitoring" as const } : { href: "/watchlist" }),
-        text: watchingText(glance.watching?.watched ?? 0, signals),
-      });
-    if (handledRows.length > 0)
-      tiles.push({
-        key: "handled",
-        panel: "handled",
-        text: `${handledRows.length} handled since your last brief`,
-      });
-    if (solo) {
-      if (projects.error || (projects.projects && projects.projects.length > 0))
-        tiles.push({
-          key: "projects",
-          panel: "projects",
-          text: projects.projects
-            ? counted(projects.projects.length, "active project", "active projects")
-            : "Your projects",
-        });
-      if (weeklyReview)
-        tiles.push({ key: "weeklyReview", panel: "weeklyReview", text: "This week's review is ready" });
-    } else {
-      // Only once departments are set up: the goals with no department are on
-      // the Goals item.
-      if (activeRealDepts.length > 0)
-        tiles.push({
-          key: "departments",
-          panel: "departments",
-          text: departmentsText(
-            activeRealDepts.length,
-            attentionRealDepts.length,
-            deptAtRiskCount > 0,
-            activeRealDepts.filter((d) => (d.unchecked_count ?? 0) > 0).length,
-          ),
-        });
-      if (showPeople && today) {
-        const people = today.people;
-        const busy = people.filter((p) => p.status === "needs_reply" || p.status === "awaiting").length;
-        tiles.push({ key: "people", panel: "people", text: peopleText(people.length, busy) });
-      }
-    }
-    if (otherProposals.length > 0)
-      tiles.push({ key: "team", panel: "team", text: `${otherProposals.length} waiting on teammates` });
-    if (inFlight.length > 0)
-      tiles.push({ key: "inFlight", panel: "inFlight", text: `${inFlight.length} under way` });
-    if (practiceClients.length > 0)
-      tiles.push({
-        key: "clients",
-        panel: "clients",
-        text: counted(practiceClients.length, "parked client", "parked clients"),
-      });
+    for (const c of today.to_act_on ?? []) tiles.push({ key: c.key, href: c.href, text: c.text });
+    const watched = watchingRow(monitoringProposals);
+    if (watched) tiles.push({ key: "monitoring", panel: "monitoring", text: watched.line, hint: watched.detail || undefined });
+    if (solo && weeklyReview)
+      tiles.push({ key: "weeklyReview", panel: "weeklyReview", text: "This week's review is ready" });
   }
 
   // The Needs you queue: replies waiting first (they came in first, as their
@@ -741,6 +615,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
             onRerun={handleRerun}
             onApproveWithEdits={handleApproveWithEdits}
             onAnswer={handleAnswer}
+            onClosed={handleClosed}
             defaultBodyExpanded={emphasized}
             emphasized={emphasized}
           />
@@ -802,72 +677,48 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
     return () => ctrl.abort();
   }, [firstWeek]);
 
-  // In the first week the first-week card says what to start on, so the day
-  // isn't "quiet" even with nothing on the board yet.
-  const quietBanner =
-    isQuiet && activeDepts.length > 0 && !firstWeekCard ? (
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-emerald-500/25 bg-emerald-500/5 px-4 py-3">
-        <span className={`text-[15px] ${TONE_TEXT.emerald}`}>Quiet day — nothing needs your attention.</span>
-        {!solo && (
-          <Link href="/departments" className="text-sm font-medium text-accent hover:underline">
-            Set up a check-in →
-          </Link>
-        )}
-      </div>
-    ) : null;
-  const bannerSlot = banner ?? quietBanner;
+  // The headline says when the day is quiet, so there is no banner for it.
+  const bannerSlot = banner;
 
-  const onSummaryPart = (part: SummaryPart) => {
-    if (part.target.kind === "needsYou") {
-      document.getElementById(NEEDS_YOU_ID)?.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else if (part.target.kind === "doneForYou") {
-      document.getElementById(DONE_FOR_YOU_ID)?.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else if (part.target.kind === "panel") {
-      setOpenPanel(part.target.panel);
-    }
-  };
+  // In the first week, with nothing waiting, the line under the greeting
+  // points at the first-week card; otherwise the headline says how the day
+  // stands.
+  const startLine = needsYouCount === 0 && firstWeekCard ? "Your first week. Start below." : null;
+  const showHeadline = Boolean(today) && !startLine;
+  const hello = showHeader ? greeting(firstName) : "Today";
 
-  const panelFooterLink = (href: string, label: string) => (
-    <Link href={href} className={buttonClass("secondary", "md", "w-full sm:w-auto")}>
-      {label}
-    </Link>
-  );
 
   return (
     <div className="flex flex-col h-full bg-surface">
-      <main className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-10">
           <header className="mb-6">
-            <p className="text-sm font-medium text-fg-muted">{dateLabel}</p>
+            <p className="text-sm font-medium text-fg-muted">{showHeadline ? `${hello} · ${dateLabel}` : dateLabel}</p>
             <h1 className="mt-1 text-2xl sm:text-3xl font-bold tracking-tight text-fg">
-              {showHeader ? greeting(firstName) : "Today"}
+              {showHeadline ? (
+                <>
+                  {headline.clear ? (
+                    <span className={TONE_TEXT.emerald}>{headline.lead}</span>
+                  ) : needsYouCount === 0 ? (
+                    <span>{headline.lead}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        document.getElementById(NEEDS_YOU_ID)?.scrollIntoView({ behavior: "smooth", block: "start" })
+                      }
+                      className="cursor-pointer text-left font-bold tracking-tight text-accent hover:underline underline-offset-4"
+                    >
+                      {headline.lead}
+                    </button>
+                  )}
+                  {headline.rest ? ` ${headline.rest}` : ""}
+                </>
+              ) : (
+                hello
+              )}
             </h1>
-            {today && (
-              <p className="mt-2 text-base sm:text-lg text-fg-muted leading-snug">
-                {summary.length === 0
-                  ? firstWeekCard
-                    ? "Your first week. Start below."
-                    : "All clear — nothing needs you right now."
-                  : summary.map((part, i) => (
-                      <span key={part.text}>
-                        {part.target.kind === "href" ? (
-                          <Link href={part.target.href} className="hover:text-fg hover:underline underline-offset-4">
-                            {part.text}
-                          </Link>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => onSummaryPart(part)}
-                            className="cursor-pointer text-left hover:text-fg hover:underline underline-offset-4"
-                          >
-                            {part.text}
-                          </button>
-                        )}
-                        {i < summary.length - 1 ? ". " : "."}
-                      </span>
-                    ))}
-              </p>
-            )}
+            {today && startLine && <p className="mt-2 text-base sm:text-lg text-fg-muted leading-snug">{startLine}</p>}
           </header>
 
           {onContinue && (
@@ -876,7 +727,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
                 e.preventDefault();
                 submitAsk();
               }}
-              className="mb-6 flex items-center gap-2 rounded-2xl border border-line bg-surface-elevated p-2 pl-4 shadow-sm focus-within:border-accent/60 focus-within:ring-2 focus-within:ring-accent/20"
+              className="ask-box mb-6 flex items-center gap-2 rounded-2xl p-2 pl-4 transition-shadow"
             >
               <input
                 type="text"
@@ -1017,6 +868,14 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
                 </section>
               )}
 
+              {/* What waits on a teammate: its own short list, out of Needs
+                  you; a row opens the full cards. */}
+              <WaitingOnTeam
+                proposals={otherProposals}
+                people={today.people ?? []}
+                onOpen={() => setOpenPanel("team")}
+              />
+
               <DoneForYou
                 rows={doneRows}
                 onRetry={(row) => void handleRetryApproval(row)}
@@ -1025,49 +884,40 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
 
               <WatchingNext items={today?.watching ?? []} />
 
-              {/* Everything else, one quiet line: each opens its panel or page. */}
-              {tiles.length > 0 && (
-                <nav aria-label="More" className="mb-8 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-fg-muted">
+              {showHeadline && needsYouCount === 0 && onContinue && <HandMeSomething onPick={onContinue} />}
+
+              {/* Only what needs you, as links; then that the rest is on track. */}
+              {today && (
+                <nav aria-label="More" className="mb-8 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
                   {tiles.map((t) => {
-                    const text = t.text;
-                    const cls = "hover:text-fg hover:underline underline-offset-4";
+                    const cls = "font-medium text-accent hover:underline underline-offset-4";
                     const panel = t.panel;
                     return panel ? (
-                      <button key={t.key} type="button" onClick={() => setOpenPanel(panel)} aria-haspopup="dialog" className={cls}>
-                        {text}
+                      <button
+                        key={t.key}
+                        type="button"
+                        onClick={() => setOpenPanel(panel)}
+                        aria-haspopup="dialog"
+                        title={t.hint}
+                        className={cls}
+                      >
+                        {t.text}
                       </button>
                     ) : (
                       <Link key={t.key} href={t.href ?? "/"} className={cls}>
-                        {text}
+                        {t.text}
                       </Link>
                     );
                   })}
+                  <span className="ml-auto text-fg-muted">Everything else is on track</span>
                 </nav>
               )}
 
               <SidePanel
-                open={openPanel === "departments"}
-                onClose={() => setOpenPanel(null)}
-                title="Departments"
-                width="lg"
-                footer={panelFooterLink("/departments", "View all departments")}
-              >
-                <DepartmentsPanelBody departments={departments} onContinue={onContinue} />
-              </SidePanel>
-              <SidePanel
-                open={openPanel === "people"}
-                onClose={() => setOpenPanel(null)}
-                title="People"
-                width="lg"
-                footer={panelFooterLink("/people", "View all people")}
-              >
-                <PeoplePanelBody people={today.people} />
-              </SidePanel>
-              <SidePanel
                 open={openPanel === "team"}
                 onClose={() => setOpenPanel(null)}
-                title="Across the team"
-                subtitle="Waiting on someone else"
+                title={waitingOnTeam(otherProposals, today.people ?? [])?.title ?? "Waiting on someone else"}
+                subtitle={waitingNote(otherProposals, today.people ?? []) || undefined}
                 width="lg"
               >
                 <div className="space-y-4">
@@ -1085,6 +935,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
                       onRerun={handleRerun}
                       onApproveWithEdits={isPrincipalCaller ? handleApproveWithEdits : undefined}
                       onAnswer={isPrincipalCaller ? handleAnswer : undefined}
+                      onClosed={handleClosed}
                     />
                   ))}
                   {otherProposals.length === 0 && (
@@ -1095,18 +946,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
                   )}
                 </div>
               </SidePanel>
-              <SidePanel open={openPanel === "inFlight"} onClose={() => setOpenPanel(null)} title="Under way">
-                <InFlightPanelBody inFlight={inFlight} />
-              </SidePanel>
-              <SidePanel open={openPanel === "handled"} onClose={() => setOpenPanel(null)} title="Handled">
-                <HandledPanelBody
-                  items={handledOvernight}
-                  onReopen={handleReopen}
-                  undone={undoneRows}
-                  onJumpToAlert={jumpToAlert}
-                />
-              </SidePanel>
-              <SidePanel open={openPanel === "monitoring"} onClose={() => setOpenPanel(null)} title="Monitoring">
+              <SidePanel open={openPanel === "monitoring"} onClose={() => setOpenPanel(null)} title="What I'm watching">
                 <MonitoringPanelBody
                   proposals={monitoringProposals}
                   onContinue={onContinue}
@@ -1114,24 +954,8 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
                   onBulkDismiss={handleBulkDismiss}
                 />
               </SidePanel>
-              <SidePanel
-                open={openPanel === "clients"}
-                onClose={() => setOpenPanel(null)}
-                title="Across your clients"
-                footer={panelFooterLink("/clients", "Manage clients")}
-              >
-                <PracticeClientsPanelBody clients={practiceClients} />
-              </SidePanel>
               {solo && (
                 <>
-                  <SidePanel
-                    open={openPanel === "projects"}
-                    onClose={() => setOpenPanel(null)}
-                    title="Your projects"
-                    footer={panelFooterLink("/goals", "Goals")}
-                  >
-                    <ProjectsPanelBody state={projects} />
-                  </SidePanel>
                   {weeklyReview && (
                     <SidePanel
                       open={openPanel === "weeklyReview"}
@@ -1146,7 +970,7 @@ export default function Briefing({ onContinue, onOpenChat, showHeader = false, f
             </>
           )}
         </div>
-      </main>
+      </div>
     </div>
   );
 }

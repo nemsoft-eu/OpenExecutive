@@ -49,6 +49,7 @@ from openexecutive.evals.scenarios import (
     scenario_kind,
     validate_scenario_yaml,
 )
+from openexecutive.utils.public_errors import public_error
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -345,8 +346,8 @@ async def start_eval_run(request: Request) -> StreamingResponse:
 
         except Exception as exc:
             logger.exception("eval run failed run_id=%s kind=%s", run_id, kind)
-            fail_eval_run(run_id=run_id, error=str(exc))
-            yield _sse({"type": "error", "run_id": run_id, "message": str(exc)})
+            fail_eval_run(run_id=run_id, error=public_error(exc))
+            yield _sse({"type": "error", "run_id": run_id, "message": public_error(exc)})
         finally:
             _active_cancellations.pop(run_id, None)
 

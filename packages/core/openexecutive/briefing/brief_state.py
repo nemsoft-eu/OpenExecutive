@@ -102,6 +102,8 @@ HANDLED_EVENT_KINDS: dict[str, str] = {
     },
     "watchlist_research_added": "watching",
     "watchlist_auto_disabled": "stopped_watching",
+    # What a watch set to Watch quietly found: told here, never on a card.
+    "watch_found_quietly": "quiet_watch_found",
 }
 
 # The nudge audit summary opens with "[alert N] " so `alerts.review` can count
@@ -925,8 +927,24 @@ def carried_lines(
     return lines
 
 
+# Handled kinds whose summary carries a watched page's own words.
+_OUTSIDE_HANDLED_KINDS = frozenset({"quiet_watch_found"})
+
+
+def handled_line(h: dict[str, Any]) -> str:
+    """One handled row as a brief's prompt lists it. A quiet watch's find
+    is the page's own words, so it goes in as untrusted content."""
+    summary = str(h.get("summary", ""))[:140]
+    if h.get("kind") in _OUTSIDE_HANDLED_KINDS:
+        from openexecutive.orchestrator.content_trust import wrap_untrusted
+
+        summary = wrap_untrusted(summary, source="watched page")
+    return f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: {summary}"
+
+
 def handled_since(
-    since: datetime, limit: int = 20, *, include_private: bool = False
+    since: datetime, limit: int = 20, *, include_private: bool = False,
+    owned_by: int | None = None,
 ) -> list[dict[str, Any]]:
     """Completed autonomous moves recorded in the audit log since ``since``.
 
@@ -940,18 +958,24 @@ def handled_since(
     Rows private to the principal (one that names their contact, say) are
     left out unless ``include_private``: only the principal's own ``/today``
     asks for them. The briefs don't, as a written brief can be read by others.
+    One person's own rows (an email watch on their inbox, say) come only
+    with ``owned_by`` them: their own ``/today``.
     """
     try:
         from openexecutive.audit.logger import get_audit_logger
 
         logger_ = get_audit_logger()
         out: list[dict[str, Any]] = []
+        reads: list[dict[str, Any]] = [{"include_private": include_private}]
+        if owned_by is not None:
+            reads.append({"include_private": True, "owned_by": owned_by, "only_owned": True})
         for event_type, kind in HANDLED_EVENT_KINDS.items():
-            for ev in logger_.query(
-                event_type=event_type,
-                since=since.isoformat(),
-                limit=limit,
-                include_private=include_private,
+            for ev in (
+                ev
+                for read in reads
+                for ev in logger_.query(
+                    event_type=event_type, since=since.isoformat(), limit=limit, **read,
+                )
             ):
                 details = ev.details if isinstance(ev.details, dict) else {}
                 out.append({

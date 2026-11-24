@@ -29,6 +29,7 @@ import pytest
 
 import openexecutive
 from openexecutive.cli import fixture_loader
+from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.memory.company_tables import (
     COMPANY_INDEPENDENT_TABLES,
     KEPT_ON_EVERY_SWAP,
@@ -185,10 +186,8 @@ def test_the_wipe_never_creates_a_database(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-class _FakeStore:
-    RESEARCH_COLLECTION = "recent_research"
-    COMPANY_COLLECTION = "company_docs"
-    BUILTIN_COLLECTION = "builtin_knowledge"
+class _FakeStore(ChromaDBStore):
+    """The real store's collection names, with no vector store behind it."""
 
     def __init__(self, **_kw: object) -> None: ...
     def delete_company_docs(self) -> None: ...
@@ -443,16 +442,41 @@ def test_fixture_load_empties_every_per_company_table(env: Any) -> None:
 
 
 def test_fixture_unload_empties_every_per_company_table(env: Any) -> None:
-    """The demo's rows do not outlive the demo: unload restores only what the
-    backup's files carry, so everything the demo wrote elsewhere goes."""
+    """The demo's rows do not outlive the demo: unload puts the user's whole
+    saved database (state.db) back, carrying only the operator-level rows
+    (``slots._GLOBAL_TABLES``) across, so everything else the demo wrote goes,
+    the tables the fixture path keeps and the migration markers included."""
+    from openexecutive.clients import slots
+
     asyncio.run(fixture_loader.load_fixture("demo", env.settings))
     seeded = _seed_every_table(env.db)
-    asyncio.run(fixture_loader.unload_fixture(env.settings))
+    summary = asyncio.run(fixture_loader.unload_fixture(env.settings))
+    assert summary["database_restored"] is True
 
-    # workspace_settings comes back from the backup's workspace.yaml.
-    assert _surviving(env.db, seeded) == _expected_survivors(
-        seeded, KEPT_ON_EVERY_SWAP, KEPT_ON_FIXTURE_SWAP
-    ) - {"workspace_settings"}
+    assert _surviving(env.db, seeded) == set(slots._GLOBAL_TABLES) & set(seeded)
+
+
+def test_the_carried_operator_tables_are_company_independent() -> None:
+    """A client switch and unload carry ``_GLOBAL_TABLES`` across a restored
+    database; every wipe must leave them too."""
+    from openexecutive.clients import slots
+
+    assert set(slots._GLOBAL_TABLES) <= set(COMPANY_INDEPENDENT_TABLES)
+
+
+def test_the_wipe_empties_a_table_nobody_classified(tmp_path: Path) -> None:
+    """The wipe reads the tables from the database: one that shipped without
+    a classification is wiped, not leaked."""
+    db = tmp_path / "unclassified.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE brand_new_feature (note TEXT)")
+        conn.execute("CREATE TABLE app_migrations (name TEXT)")
+        conn.execute("INSERT INTO brand_new_feature VALUES ('old company')")
+        conn.execute("INSERT INTO app_migrations VALUES ('kept-marker')")
+    assert "brand_new_feature" not in PER_COMPANY_TABLES
+    assert wipe_per_company_tables(db) == {"brand_new_feature": 1}
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM app_migrations").fetchone()[0] == 1
 
 
 def test_fixture_load_drops_the_cached_council_overrides(env: Any) -> None:

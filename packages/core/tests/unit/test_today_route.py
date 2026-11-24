@@ -1846,6 +1846,7 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     survivor_id = _alert("Payout delay")
     dup_id = _alert("Payout delay (duplicate)")
     acked_id = _alert("SOC2 evidence request")
+    suggested_id = _alert("Competitor cut prices")
     alert_store.set_status(closed_id, "resolved")
     alert_store.set_status(acked_id, "ack")
     alert_store.set_status(undone_id, "dismissed")
@@ -1867,6 +1868,10 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     al.log("alert_review_escalated", "Escalated 'SOC2 evidence request' to high (sent)", actor="executive",
            details={"alert_id": acked_id, "headline": "SOC2 evidence request", "new_severity": "high",
                     "evidence": "auditor deadline Friday"})
+    al.log("alert_review_suggested_workflow", "Suggested Pricing Review for 'Competitor cut prices'",
+           actor="executive",
+           details={"alert_id": suggested_id, "headline": "Competitor cut prices",
+                    "workflow_name": "pricing_review", "workflow_title": "Pricing Review"})
     al.log("watchlist_research_added", "Started watching stock-acme — competitor ticker", actor="executive",
            details={"slug": "stock-acme", "rationale": "competitor ticker named on Sales"})
     al.log("alert_review_changed", "Updated 'Something' — rewritten", actor="executive",
@@ -1891,6 +1896,9 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     routed = rows["Q3 pricing page copy stale"]
     assert routed["target"] == "Dana Kim" and routed["outcome"] == "proposed"
     assert routed["status"] == "open"
+
+    # A suggested workflow is named by its title, never its key.
+    assert rows["Competitor cut prices"]["target"] == "Pricing Review"
 
     merged = rows["Payout delay (duplicate)"]
     assert merged["target"] == "Payout delay" and merged["superseded_by_alert_id"] == survivor_id
@@ -2482,8 +2490,9 @@ def test_rhythm_runs_stay_out_of_the_briefs_activity(
 
     _setup_isolated_db(tmp_path / "rhythm.db", monkeypatch)
     for run_id, name, title in [
-        ("a", "executive_reflection", "Executive Reflection 2026-09-28"),
+        ("a", "end_of_day_digest", "End of Day Digest 2026-09-28"),
         ("b", "competitive_teardown", "Teardown of Acme"),
+        ("c", "executive_reflection", "Executive Reflection 2026-09-28"),
     ]:
         persistence.create_run(run_id, name, title, {})
         persistence.complete_run(run_id, "x")
@@ -2494,9 +2503,12 @@ def test_rhythm_runs_stay_out_of_the_briefs_activity(
             10, exclude_workflows=today_route.RHYTHM_WORKFLOWS,
         ).items
     ]
-    assert "Looked back on the day" in rail
-    assert "Looked back on the day" not in brief
+    assert "Sent the end-of-day wrap-up" in rail
+    assert "Sent the end-of-day wrap-up" not in brief
     assert "Teardown of Acme" in brief
+    # The look back is never a row: it says nothing on its own, and what it
+    # did shows as rows of their own.
+    assert "Looked back on the day" not in rail
 
 
 def test_the_shared_header_never_quotes_the_principals_calendar(
@@ -3060,11 +3072,50 @@ def test_done_for_you_shows_an_approval_on_an_install_with_no_owner_yet(
     ]
 
 
+def test_done_for_you_names_an_approved_card_by_its_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card they approved reads as what they said yes to, with what its
+    own chat did; a card with no plan keeps its headline."""
+    from openexecutive.alerts import approvals
+    from openexecutive.memory import session_store
+
+    db = tmp_path / "approved_plan.db"
+    _setup_isolated_db(db, monkeypatch)
+    alert_store.insert_alert(
+        source="query", external_id="a-plan", severity="medium",
+        headline="Paper covers the launch", body="...", db_path=db,
+        suggested_action="Check the coverage and add it to the press log. Then tell Alex.",
+    )
+    alert_store.insert_alert(
+        source="system", external_id="a-bare", severity="medium",
+        headline="Renew the domain", body="...", db_path=db,
+    )
+    # What came of it is the chat's first answer, not a later ask in it.
+    chats = {"chat-1": [
+        {"role": "assistant", "content": "I added it to a new press log. Link: x"},
+        {"role": "user", "content": "Thanks, now draft the follow-up."},
+        {"role": "assistant", "content": "Here's a draft."},
+    ]}
+    monkeypatch.setattr(session_store, "load_messages", lambda sid, *a, **k: chats.get(sid, []))
+    for alert in alert_store.list_alerts(db_path=db):
+        claimed = approvals.claim(alert.id, approved_by_person_id=None, db_path=db)
+        assert claimed is not None
+        approvals.set_session(claimed.id, "chat-1" if alert.external_id == "a-plan" else "chat-9", db_path=db)
+        approvals.finish(claimed.id, approvals.STATUS_DONE, "Done.", db_path=db)
+    rows = [r for r in _make_client().get("/today").json()["done_for_you"] if r["kind"] == "approval"]
+    assert sorted((r["title"], r["detail"]) for r in rows) == [
+        ("Renew the domain", "Done."),
+        ("You approved: Check the coverage and add it to the press log.", "I added it to a new press log."),
+    ]
+
+
 def test_done_for_you_leaves_out_what_is_not_done_for_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cards raised, advice and decisions noted from their own chats stay out
-    of Done for you; what it did on its own is in."""
+    """Cards raised, advice, decisions noted from their own chats and
+    finished runs (a report: "Not a run day") stay out of Done for you; what
+    it did on its own is in."""
     db = tmp_path / "done_kinds.db"
     _setup_isolated_db(db, monkeypatch)
     now = datetime.now(UTC).isoformat()
@@ -3085,10 +3136,65 @@ def test_done_for_you_leaves_out_what_is_not_done_for_them(
     people_store.upsert_person(full_name="Sam", email="sam@example.com", db_path=db)
     client = _make_client()
     rows = client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
-    assert sorted(r["title"] for r in rows) == ["Reminded Sam about the invoice", "Wrote the weekly sales report"]
-    # What it did for the company isn't done for a teammate.
+    assert [r["title"] for r in rows] == ["Reminded Sam about the invoice"]
+    # Memory's What it does reads the same rows on their own.
+    assert client.get("/today/done", headers={"x-caller-email": "jordan@example.com"}).json() == rows
+    # A teammate gets what it did for the team too, less what it sent them
+    # (whose items reach whom is _build_activity's, stubbed here).
     theirs = client.get("/today", headers={"x-caller-email": "sam@example.com"}).json()["done_for_you"]
-    assert theirs == []
+    assert "Wrote the weekly sales report" not in {r["title"] for r in theirs}
+    assert "Reminded Sam about the invoice" not in {r["title"] for r in theirs}
+    assert client.get("/today/done", headers={"x-caller-email": "sam@example.com"}).json() == theirs
+
+
+def test_a_teammate_sees_the_teams_work_in_done_for_you_as_activity_shows_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A teammate's Done for you has what it did for the team, read as their
+    Activity reads it: no contact's name or subject, and never an item that
+    is the owner's own."""
+    from openexecutive.memory import session_store
+    from openexecutive.orchestrator import take_the_lead
+
+    db = tmp_path / "done_teammate.db"
+    _setup_isolated_db(db, monkeypatch)
+    owner_id = people_store.upsert_person(
+        full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db,
+    )
+    people_store.upsert_person(full_name="Sam Reyes", email="sam@example.com", db_path=db)
+    people_store.upsert_person(full_name="Riley Park", email="riley@example.com", kind="contact", db_path=db)
+    people_registry.invalidate()
+    send = "google_workspace__send_gmail_message"
+    take_the_lead.record(
+        scope=take_the_lead.SCOPE_EXECUTIVE, source="scheduled", tool=send, summary="Send gmail message",
+        status="done", mail=take_the_lead.mail_sent(send, {"to": "riley@example.com", "subject": "Pricing for Q3"}),
+    )
+    now = datetime.now(UTC).isoformat()
+    session_store.create_session("s-jordan", "pharmacy", now, caller_person_id=owner_id, db_path=db)
+    episodic.insert_scheduled_action(
+        run_at=now, channel="email", channel_ref="ops@example.com", intent_text="Check the prescription shipped",
+        originating_session_id="s-jordan", status="done", db_path=db,
+    )
+
+    client = _make_client()
+    sam = client.get("/today", headers={"x-caller-email": "sam@example.com"}).json()["done_for_you"]
+    assert [r["title"] for r in sam] == ["Sent an email"]
+    assert "Pricing" not in sam[0]["detail"]
+    # One that went to them too says who and what: they got it.
+    take_the_lead.record(
+        scope=take_the_lead.SCOPE_EXECUTIVE, source="scheduled", tool=send, summary="Send gmail message",
+        status="done",
+        mail=take_the_lead.mail_sent(send, {"to": ["riley@example.com", "sam@example.com"], "subject": "Launch notes"}),
+    )
+    mailed = [
+        r for r in client.get("/today", headers={"x-caller-email": "sam@example.com"}).json()["done_for_you"]
+        if "Launch notes" in r["title"]
+    ]
+    assert [r["title"] for r in mailed] == ["Emailed Riley Park and Sam Reyes: Launch notes"]
+    jordan = client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
+    titles = {r["title"] for r in jordan}
+    assert "Emailed Riley Park: Pricing for Q3" in titles
+    assert any("prescription" in t for t in titles)
 
 
 def test_an_email_it_sent_on_its_own_names_who_and_what_in_done_for_you(
@@ -3179,20 +3285,21 @@ def test_held_back_page_lines_are_the_principals_alone(
     assert client.get("/today/held-back", headers={"x-caller-email": "sam@example.com"}).json() == []
 
 
-# ── As me on Home: the result line, Watching next ─────────────────────────────
+# ── As me on Home: the result line, Following up ─────────────────────────────
 
 
 def test_done_for_you_says_how_why_and_what_came_of_what_it_did_as_me(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A row As me did reads "By email, as me · When <what woke it> ·
-    Sent"; a step for a standing job names the job instead; a message to
+    """A row As me did reads "When <what woke it>", tagged with whose name
+    it went out in ("Sent as …" for an email or message, "Done as …"
+    otherwise); a step for a standing job names the job instead; a message to
     someone who has answered says when."""
     from openexecutive.orchestrator import take_the_lead
 
     db = tmp_path / "done_line.db"
     _setup_isolated_db(db, monkeypatch)
-    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    jordan = people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
     riley = people_store.upsert_person(full_name="Riley Park", email="riley@example.com", db_path=db)
     people_registry.invalidate()
     send = "google_workspace__send_gmail_message"
@@ -3203,7 +3310,7 @@ def test_done_for_you_says_how_why_and_what_came_of_what_it_did_as_me(
             summary=take_the_lead.summarize(send, mail, mcp=True, quote=False), status="done",
             mail=take_the_lead.mail_sent(send, mail), outcome=take_the_lead.outcome_of(send, mail, "{}", mcp=True),
         )
-    job = take_the_lead.add_job("Keep the dealer onboarding moving", created_by="t")
+    job = take_the_lead.add_job("Keep the dealer onboarding moving", created_by=f"person:{jordan}")
     with take_the_lead.looking(take_the_lead.DAILY_LOOK):
         take_the_lead.focus_job(job.id)
         take_the_lead.record(
@@ -3217,17 +3324,34 @@ def test_done_for_you_says_how_why_and_what_came_of_what_it_did_as_me(
     episodic.mark_outbound_context_consumed(context_id)
 
     client = _make_client()
-    rows = {
+    done = [
+        r for r in client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
+        if r["kind"] == "took_the_lead"
+    ]
+    rows = {r["title"]: r["detail"] for r in done}
+    # An email's title already says it went; whose name is the row's tag.
+    assert rows["Emailed Riley Park: Cell warranty terms"] == "When the goal “Ramp gate” slipped · Sent"
+    tags = {r["title"]: r["as_tag"] for r in done}
+    assert tags["Emailed Riley Park: Cell warranty terms"].startswith("Sent as ")
+    assert tags["Messaged Riley Park"].startswith("Sent as ")
+    line = rows["Messaged Riley Park"]
+    assert "For your standing work: Keep the dealer onboarding moving" in line
+    assert "Riley answered at" in line
+    # A teammate's job never names itself to the owner.
+    take_the_lead.add_job("Chase my expense report", created_by="person:99")
+    other = take_the_lead.list_jobs(created_by="person:99")[0]
+    with take_the_lead.looking(take_the_lead.DAILY_LOOK):
+        take_the_lead.focus_job(other.id)
+        take_the_lead.record(
+            scope=take_the_lead.SCOPE_EXECUTIVE, source="reflection", tool="message_person",
+            summary="Messaged Sam", status="done", outcome="Sent",
+        )
+    again = {
         r["title"]: r["detail"]
         for r in client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["done_for_you"]
         if r["kind"] == "took_the_lead"
     }
-    assert rows["Emailed Riley Park: Cell warranty terms"] == (
-        "By email, as me · When the goal “Ramp gate” slipped · Sent"
-    )
-    line = rows["Messaged Riley Park"]
-    assert "For your standing job: Keep the dealer onboarding moving" in line
-    assert "Riley answered at" in line
+    assert "expense report" not in (again.get("Messaged Sam") or "")
     # The team's feed never carries the line.
     feed = client.get("/today/activity", headers={"x-caller-email": "jordan@example.com"}).json()["items"]
     assert all("lead_line" not in i for i in feed)
@@ -3258,22 +3382,23 @@ def test_done_for_you_says_how_why_and_what_came_of_what_it_did_as_me(
 def test_watching_next_lists_follow_ups_and_standing_jobs_and_stop_ends_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The owner sees every follow-up it will send and the standing jobs; a
-    teammate sees only what they asked for and can stop only that; Stop
+    """The owner sees the team's follow-ups and their own (never one a
+    teammate asked for) and the standing jobs; a teammate sees only what
+    they asked for and can stop only that; Stop
     cancels that one thing."""
     from openexecutive.orchestrator import take_the_lead
 
     db = tmp_path / "watching.db"
     _setup_isolated_db(db, monkeypatch)
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    jordan = people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
     priya = people_store.upsert_person(full_name="Priya Nair", email="priya@example.com", db_path=db)
     sam = people_store.upsert_person(full_name="Sam Lee", email="sam@example.com", db_path=db)
     people_registry.invalidate()
     soon = (datetime.now(UTC) + timedelta(hours=18)).isoformat()
     owners = episodic.insert_scheduled_action(
         run_at=soon, channel="slack_dm", channel_ref="U1", intent_text="Ask Priya about the partners' pre-read",
-        assigned_to_person_id=priya,
+        assigned_to_person_id=priya, created_by_person_id=jordan,
     )
     sams = episodic.insert_scheduled_action(
         run_at=soon, channel="slack_dm", channel_ref="U2", intent_text="Remind Priya about the venue",
@@ -3293,11 +3418,13 @@ def test_watching_next_lists_follow_ups_and_standing_jobs_and_stop_ends_one(
     client = _make_client()
     owner = {"x-caller-email": "jordan@example.com"}
     lines = client.get("/today", headers=owner).json()["watching"]
+    # Sam's follow-up is Sam's alone: the owner neither sees nor stops it.
     assert [(w["key"], w["kind"]) for w in lines] == [
-        (f"action:{owners}", "follow_up"), (f"action:{sams}", "follow_up"), (f"job:{job.id}", "standing_job"),
+        (f"action:{owners}", "follow_up"), (f"job:{job.id}", "standing_job"),
     ]
-    assert lines[0]["detail"] == "I follow up with Priya Nair" and lines[0]["at"] == soon
-    assert lines[2]["title"] == "Chase overdue tasks every morning"
+    assert client.post("/today/watching/stop", json={"key": f"action:{sams}"}, headers=owner).status_code == 404
+    assert lines[0]["detail"] == "I'll follow up with Priya Nair" and lines[0]["at"] == soon
+    assert lines[1]["title"] == "Chase overdue tasks every morning"
 
     teammate = {"x-caller-email": "sam@example.com"}
     assert [w["key"] for w in client.get("/today", headers=teammate).json()["watching"]] == [f"action:{sams}"]
@@ -3312,7 +3439,7 @@ def test_watching_next_lists_follow_ups_and_standing_jobs_and_stop_ends_one(
     assert client.post("/today/watching/stop", json={"key": f"action:{sams}"}, headers=teammate).json() == {
         "stopped": True,
     }
-    # Plumbing Watching next never lists can't be stopped from it.
+    # Plumbing Following up never lists can't be stopped from it.
     plumbing = episodic.insert_scheduled_action(
         run_at=soon, channel="__internal__", channel_ref="principal", intent_text="x", kind="ad_hoc",
     )
@@ -3357,6 +3484,9 @@ def test_today_says_why_a_booking_waits_and_who_waits_on_a_held_ask(
          {"tool": "send_email", "requested_by_person_id": 9, "requested_by": "Sam Okafor"})
     card("Waiting for your OK: save a file", "department_action",
          {"tool": "drive_save", "requested_by_person_id": 5, "requested_by": "Jordan Avery"})
+    # A teammate's ask a rule of yours held names them too.
+    card("Sam Okafor asked: Email Maya Chen", "take_the_lead_action",
+         {"tool": "send_email", "requested_by_person_id": 9, "requested_by": "Sam Okafor"})
 
     by_headline = {p["headline"]: p for p in _make_client().get("/today").json()["proposals"]}
     booking = by_headline["Approve meeting: Pricing review"]
@@ -3365,6 +3495,7 @@ def test_today_says_why_a_booking_waits_and_who_waits_on_a_held_ask(
     assert by_headline["Approve meeting: Older booking"]["waiting_because"] == ""
     assert booking["waiting_on"] == ""
     assert by_headline["Sam Okafor asked the Executive to: email Northgate"]["waiting_on"] == "Sam Okafor"
+    assert by_headline["Sam Okafor asked: Email Maya Chen"]["waiting_on"] == "Sam Okafor"
     own = by_headline["Waiting for your OK: save a file"]
     assert own["waiting_on"] == ""
     assert own["waiting_because"] == ""
@@ -3389,3 +3520,51 @@ def test_a_card_that_only_names_a_held_decision_does_not_read_it(
     )
     proposals = _make_client().get("/today").json()["proposals"]
     assert [p["waiting_on"] for p in proposals] == [""]
+
+
+def test_an_approved_department_step_is_in_its_approvers_done_for_you_only() -> None:
+    import json as _json
+    from types import SimpleNamespace
+
+    payload = {"tool": "google_workspace__send_gmail_message", "mcp": True,
+               "input": {"to": "dana@vendor.example", "subject": "Re: Dock", "body": "Hi Dana, noted."}}
+    step = SimpleNamespace(
+        id=7, status="approved_with_edit", resolver_person_id=1, department="logistics",
+        final_payload_json=_json.dumps(payload), proposed_payload_json="{}",
+        resolved_at="2026-11-14T14:01:39+00:00", created_at="2026-11-14T13:00:00+00:00",
+    )
+    item = today_route._department_action_done(step, 1)
+    assert item is not None and item.summary.endswith("(after a yes)")
+    assert item.summary.startswith("Email ") and "Hi Dana" not in item.summary
+    assert today_route._department_action_done(step, 5) is None  # someone else's yes
+    assert today_route._department_action_done(SimpleNamespace(**{**vars(step), "status": "rejected"}), 1) is None
+
+
+def test_a_teammates_broken_mailbox_is_on_their_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Everyone connects their own mailbox, so a teammate whose sign-in
+    broke sees its Reconnect row; the Executive's accounts stay the
+    principal's."""
+    from openexecutive.briefing import needs_reconnecting
+
+    db = tmp_path / "reconnect.db"
+    _setup_isolated_db(db, monkeypatch)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    people_store.upsert_person(full_name="Jordan", is_principal=True, email="jordan@example.com", db_path=db)
+    people_store.upsert_person(full_name="Sam Lee", email="sam@example.com", db_path=db)
+    people_registry.invalidate()
+
+    def mailbox_row(email: str | None, href: str) -> dict[str, object] | None:
+        if email != "sam@example.com":
+            return None
+        return {"key": "reconnect:mailbox", "title": "t", "count": 1, "href": href, "action": "Reconnect"}
+
+    monkeypatch.setattr(needs_reconnecting, "mailbox_row", mailbox_row)
+    monkeypatch.setattr(
+        needs_reconnecting, "account_rows",
+        lambda href: [{"key": "reconnect:google_workspace", "title": "g", "count": 1, "href": href, "action": "Reconnect"}],
+    )
+    client = _make_client()
+    sams = client.get("/today", headers={"x-caller-email": "sam@example.com"}).json()["waiting_elsewhere"]
+    assert [r["key"] for r in sams] == ["reconnect:mailbox"]
+    owners = client.get("/today", headers={"x-caller-email": "jordan@example.com"}).json()["waiting_elsewhere"]
+    assert [r["key"] for r in owners][:1] == ["reconnect:google_workspace"]

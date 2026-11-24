@@ -1,11 +1,14 @@
 import asyncio
+import logging
 import time
 from typing import Any
 
 from fastapi import APIRouter, Request
 
 from openexecutive.api.models import GatewayHealth, HealthResponse
+from openexecutive.utils.public_errors import public_error
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -125,10 +128,11 @@ async def honcho_health() -> dict[str, Any]:
             **base,
         }
     except Exception as exc:  # pragma: no cover - any honcho/network failure
+        logger.exception("honcho health probe failed")
         return {
             "status": "error",
             "error_type": type(exc).__name__,
-            "error_msg": str(exc)[:200],
+            "error_msg": public_error(exc),
             "latency_ms": int((time.monotonic() - t0) * 1000),
             **base,
         }

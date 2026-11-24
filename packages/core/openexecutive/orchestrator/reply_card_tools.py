@@ -3,7 +3,8 @@
 Offered only on that turn (``Session.reply_card_work``, started by
 ``delegation.card_work``), with Act as me's tools, so it is checked the same
 way (``_writer``: the pinned person and their mailbox). It changes the reply
-waiting on the person's own card, never sends it: the reply still goes from
+waiting on the person's own card, and who it goes from (``send_from``), never
+sends it: the reply still goes from
 its card (Send, or on its own when Approvals lets it).
 """
 from __future__ import annotations
@@ -37,7 +38,10 @@ UPDATE_REPLY_CARD_TOOL: dict[str, Any] = {
             },
             "body": {
                 "type": "string",
-                "description": "The whole reply in their voice, without a signature block. Omit to keep it.",
+                "description": (
+                    "The whole reply, written as your instructions say for who sends it now, without a "
+                    "signature block. With send_from, the card rewrites it once for the new sender. Omit to keep it."
+                ),
             },
             "artifact_ids": {
                 "type": "array",
@@ -47,7 +51,25 @@ UPDATE_REPLY_CARD_TOOL: dict[str, Any] = {
             "files": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Files from the email's own thread to attach, by handle (mail:<message_id>#<n>).",
+                "description": "Files from the email's own threads to attach, by handle (mail:<message_id>#<n>).",
+            },
+            "send_from": {
+                "type": "string",
+                "enum": ["executive", "me"],
+                "description": (
+                    "Only when they asked who it goes from: \"executive\" sends it from your own "
+                    "mailbox with them on cc (the card rewrites it as you writing for them), \"me\" "
+                    "from them again. The card still sends it; never send it yourself."
+                ),
+            },
+            "choices": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 3,
+                "description": (
+                    "Only when you couldn't finish: up to 3 short next steps the person can tap "
+                    "on the card (\"Try again\", \"Make it with what I read\")."
+                ),
             },
         },
         "required": ["note"],
@@ -106,10 +128,13 @@ async def _artifact_files(ids: list[str], since: datetime | None) -> list[tuple[
     return out
 
 
-async def _outside_the_thread(handles: list[str], mailbox: Any, thread_id: str) -> str:
+async def _outside_the_thread(handles: list[str], mailbox: Any, starts: dict[str, str]) -> str:
     """Why a mailbox file can't go with this reply, or "". Only the files of
-    the email's own thread can: a reply never carries other mail of theirs."""
+    the card's own threads can (``card_work.thread_starts``: its email's,
+    and on a thread that joined it, the joining email and after): a reply
+    never carries other mail of theirs."""
     from openexecutive.delegation.gmail import GmailError
+    from openexecutive.delegation.inbox import _parse
     from openexecutive.orchestrator import file_refs
 
     for handle in handles:
@@ -123,8 +148,13 @@ async def _outside_the_thread(handles: list[str], mailbox: Any, thread_id: str) 
             message = await mailbox.get_message(ref.value)
         except GmailError:
             return f"{ref}: couldn't read it from their mailbox"
-        if not thread_id or getattr(message, "thread_id", None) != thread_id:
+        thread = getattr(message, "thread_id", None)
+        if not thread or thread not in starts:
             return f"{ref}: only files from the email's own thread can go with this reply"
+        if starts[thread]:
+            came, since = _parse(str(getattr(message, "received_at", "") or "")), _parse(starts[thread])
+            if came is None or since is None or came < since:
+                return f"{ref}: only files from the email's own thread can go with this reply"
     return ""
 
 
@@ -215,7 +245,7 @@ async def handle_update_reply_card(tool_input: dict[str, Any]) -> str:
         files += rendered
     handles = _strings(tool_input.get("files"))
     if handles:
-        refused = await _outside_the_thread(handles, writer.mailbox, card_work.thread_of(card_id))
+        refused = await _outside_the_thread(handles, writer.mailbox, card_work.thread_starts(card_id))
         if refused:
             return _error(f"Nothing was changed: {refused}.")
         try:
@@ -223,13 +253,49 @@ async def handle_update_reply_card(tool_input: dict[str, Any]) -> str:
         except file_refs.RefError as exc:
             return _error(f"Nothing was changed: {exc}.")
         files += [(f.name, f.mime, f.data) for f in resolved.items]
+    # Who it goes from first, while the card still shows it being worked on:
+    # a Send tapped before the switch would otherwise go as the person.
+    sender = tool_input.get("send_from")
     body = tool_input.get("body")
+    body = body if isinstance(body, str) else ""
+    note = str(tool_input.get("note") or "")
+    switched_from: str | None = None
+    if sender in ("executive", "me"):
+        from openexecutive.delegation import send_from
+
+        try:
+            # What the card's save would turn down, before the switch changes it.
+            card_work.checked(note, files)
+        except SendRefused as refused:
+            return _error(f"Nothing was changed: {refused.message}")
+
+        try:
+            # The body was written for who sent it before: the switch writes
+            # it once for the new sender, told what this run did. None when it
+            # already went from them: the body goes on as written.
+            switched_from = await send_from.switch_for_work(
+                card_id, writer.person, executive=sender == "executive", gmail=writer.mailbox, words=body, done=note,
+            )
+        except SendRefused as refused:
+            return _error(f"Nothing was changed: who it goes from couldn't be switched: {refused.message}")
+    switched = switched_from is not None
+    if not body.strip():
+        switched_from = None
+    elif switched:
+        # Already on the card: the run still wrote the reply.
+        body = ""
     try:
         await card_work.apply(
-            card_id, writer.person, body=body if isinstance(body, str) else "",
-            note=str(tool_input.get("note") or ""), files=files, gmail=writer.mailbox,
+            card_id, writer.person, body=body, switched_from=switched_from,
+            note=note, files=files, gmail=writer.mailbox,
+            choices=card_work.clean_choices(tool_input.get("choices")),
         )
     except SendRefused as refused:
+        if switched:
+            return _error(
+                "Who it goes from was changed, and the reply was written again for them, but nothing else was: "
+                f"{refused.message}"
+            )
         return _error(f"Nothing was changed: {refused.message}")
     if artifact_ids:
         # Only the card's wording: it never stops the hand-back.

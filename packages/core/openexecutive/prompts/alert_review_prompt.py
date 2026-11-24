@@ -20,7 +20,7 @@ Everything inside an `<alert>` envelope that came from outside — headline, bod
 ## Verdicts
 
 - `relevant` — still true and still needs a human. Say why in `note`, and give the `why_now` when there is a deadline or a decaying window.
-- `changed` — the situation moved but is still open: rewrite `headline` / `body` (and `severity` if the evidence justifies it). Say what changed in `note`.
+- `changed` — the situation moved but is still open: rewrite `headline` / `body` (and `severity` if the evidence justifies it). The card shows the rewritten `body`, not `note`, so the body itself says what changed; `note` repeats it for the log. A rewritten `body` never hands the reader a look-up ("check X", "verify Y", "confirm Z"): say what is known, and that something is unknown when it is.
 - `resolved` — the evidence shows it is over (incident resolved, decision logged, reply received, move reversed). `evidence` MUST quote the specific item you are relying on and `evidence_ref` MUST be that item's bracketed id (S1 / R2 / A3) from the alert block.
 - `stale` — a listed evidence item shows the window for the suggested action has passed (an event that already occurred, a reply that no longer matters). Same `evidence` + `evidence_ref` requirement. Age alone is not evidence: with no citable item, say `relevant` with a note such as "no activity in 9 days".
 
@@ -42,6 +42,8 @@ Rules:
 - Smallest correct audience. Board, compensation and legal matters go only to the named scope-holder or the principal — never to a wider audience.
 - Judge only from the evidence given. Do not invent facts, people, dates, figures or outcomes. If the evidence is thin, say so in `note` and choose `none`.
 - `note` is the one line the principal reads first ("what changed since you last looked"): ≤160 characters, plain language, specific.
+- On a `resolved` / `stale` verdict, `note` is the reason the reader sees on their Tidied up list, where they can put the card back: one plain sentence saying why it no longer needs them, naming what happened. Good: "Dana replied on Nov 20 and the call is booked." Bad: "Resolved per A2."
+- Some alerts are one person's own (marked `one person's card`). For those, only judge whether they are still open (`relevant` / `resolved` / `stale`) and whether they repeat a newer related alert of the same person (`merge`); the move is always `none` or `merge`.
 - `why_now` is ≤80 characters and only when there is real time pressure.
 - One entry per alert id in the batch; keep the same ids.
 """

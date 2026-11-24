@@ -89,13 +89,13 @@ class _Provider:
             return SimpleNamespace(content=[SimpleNamespace(
                 type="tool_use", id="g0", name=cr.GRADE_TOOL["name"], input={"grades": self.grades},
             )])
-        self.calls.append(kw)
+        self.calls.append({**kw, "messages": list(kw["messages"])})
         uses = self.script.pop(0) if self.script else []
         content = [
             SimpleNamespace(type="tool_use", id=f"tu{i}", name=name, input=args)
             for i, (name, args) in enumerate(uses)
         ] or [SimpleNamespace(type="text", text="nothing")]
-        return SimpleNamespace(content=content)
+        return SimpleNamespace(content=content, stop_reason="tool_use" if uses else "end_turn")
 
 
 @pytest.fixture
@@ -261,6 +261,40 @@ def test_a_fact_is_saved_once_a_review(db: Path, roster: SimpleNamespace, provid
     first, second = _tool_results(provider)
     assert first["status"] == "ok"
     assert second["status"] == "noop" and "already saved" in second["detail"]
+
+
+def test_the_review_ends_once_it_has_made_its_changes(db: Path, roster: SimpleNamespace,
+                                                     provider: _Provider) -> None:
+    _record(roster.principal)
+    fact = {"statement": "The vendor email was sent already.", "source_quote": "I sent the vendor email already"}
+    provider.script = [
+        [("remember_fact", {**fact, "subject": f"Vendor email {i}"}) for i in range(cr.MAX_CHANGES)],
+        [("remember_fact", {**fact, "subject": "One more"})],
+    ]
+    _review(db)
+    assert len(provider.calls) == 1
+
+
+def test_a_review_that_fails_part_way_still_lists_its_changes(db: Path, roster: SimpleNamespace,
+                                                              provider: _Provider) -> None:
+    _record(roster.principal)
+    fact = {"subject": "Vendor email", "statement": "The vendor email was sent already.",
+            "source_quote": "I sent the vendor email already"}
+    provider.script = [[("remember_fact", fact)]]
+    calls = {"n": 0}
+    create = provider.messages_create
+
+    async def _then_fail(**kw: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 2:  # the grading call, the change, then the provider goes down
+            raise RuntimeError("provider down")
+        return await create(**kw)
+
+    provider.messages_create = _then_fail  # type: ignore[method-assign]
+    _review(db)
+    events = audit_logger.get_audit_logger().query(event_type="chat_review", all_owners=True)
+    failed = [e for e in events if "FAILED" in e.summary]
+    assert failed and failed[0].details["changes"] == ["remember_fact"]
 
 
 def test_a_change_without_their_words_is_refused(db: Path, roster: SimpleNamespace,

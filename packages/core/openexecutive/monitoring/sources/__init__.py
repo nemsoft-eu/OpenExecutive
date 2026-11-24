@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from openexecutive.monitoring.sources.base import Signal, Source
 from openexecutive.monitoring.sources.edgar import EdgarSource
+from openexecutive.monitoring.sources.mailbox import MailboxSource
 from openexecutive.monitoring.sources.page_watch import PageWatchSource
 from openexecutive.monitoring.sources.query import QuerySource
 from openexecutive.monitoring.sources.rss import RssSource
@@ -27,6 +28,7 @@ _REGISTRY: dict[str, Source] = {
     QuerySource.kind: QuerySource(),
     EdgarSource.kind: EdgarSource(),
     PageWatchSource.kind: PageWatchSource(),
+    MailboxSource.kind: MailboxSource(),
 }
 
 

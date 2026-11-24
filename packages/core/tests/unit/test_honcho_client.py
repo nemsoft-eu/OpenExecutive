@@ -297,12 +297,11 @@ def test_prefetch_rebuilds_client_per_event_loop(monkeypatch: pytest.MonkeyPatch
 # --------------------------------------------------------------------------- #
 
 
-def test_sync_turn_disabled_schedules_nothing_and_audits_disabled(
+def test_sync_turn_disabled_schedules_nothing_and_logs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HONCHO_ENABLED=false: sync_turn short-circuits — no background task is
-    scheduled and one peer_memory audit row lands with outcome=disabled.
-    Full-parity guard so the off path can't silently regress."""
+    scheduled and no peer_memory row is written for the no-op."""
     monkeypatch.setenv("HONCHO_ENABLED", "false")
     captured: list[dict[str, Any]] = []
 
@@ -314,9 +313,7 @@ def test_sync_turn_disabled_schedules_nothing_and_audits_disabled(
 
     assert not honcho_client._pending_sync_tasks
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    assert peer_rows[0]["details"]["op"] == "sync_turn"
-    assert peer_rows[0]["details"]["outcome"] == "disabled"
+    assert peer_rows == []  # a no-op writes no row
 
 
 def test_sync_turn_noop_without_person(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -497,9 +494,9 @@ def test_prefetch_emits_audit_log(monkeypatch: pytest.MonkeyPatch) -> None:
     assert details["response_chars"] == len("something useful")
 
 
-def test_prefetch_no_person_audits_no_person(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Skipping Honcho because person_id=None is still recorded — so audit
-    absence means 'code path never ran' instead of 'Honcho was down'."""
+def test_prefetch_no_person_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skipping Honcho because person_id=None writes no row: nothing was
+    called, and Honcho failures still log as timeout or error."""
     _enable(monkeypatch)
     captured: list[dict[str, Any]] = []
 
@@ -509,8 +506,7 @@ def test_prefetch_no_person_audits_no_person(monkeypatch: pytest.MonkeyPatch) ->
     with patch.object(honcho_client, "audit_log", _spy):
         asyncio.run(honcho_client.prefetch("q", person_id=None))
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    assert peer_rows[0]["details"]["outcome"] == "no_person"
+    assert peer_rows == []  # a no-op writes no row
 
 
 def _patched_client(fake: Any) -> Any:
@@ -644,7 +640,7 @@ def test_delete_workspace_disabled_noop(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert sdk_calls == [], "SDK delete_workspace must not be called when disabled"
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
+    assert len(peer_rows) == 1  # a skipped reset still logs
     assert peer_rows[0]["details"]["op"] == "workspace_reset"
     assert peer_rows[0]["details"]["outcome"] == "disabled"
 

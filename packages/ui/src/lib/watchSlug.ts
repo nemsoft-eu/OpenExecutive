@@ -11,6 +11,7 @@ const PREFIX: Record<string, string> = {
   edgar: "edgar",
   page_watch: "page",
   query: "search",
+  mailbox: "email",
 };
 
 const MAX_LEN = 61;

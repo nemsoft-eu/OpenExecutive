@@ -168,6 +168,18 @@
 }
 
 @layer utilities {
+  /* The box where you ask your Executive (Home's ask box and the chat's
+   * message box): the elevated surface, outlined in the accent with a soft
+   * glow, so it reads as the way to ask and to start a chat. */
+  .ask-box {
+    background-color: rgb(var(--surface-elevated));
+    border: 1.5px solid rgb(var(--accent));
+    box-shadow: 0 2px 10px rgb(var(--accent) / 0.18);
+  }
+  .ask-box:focus-within {
+    box-shadow: 0 0 0 3px rgb(var(--accent) / 0.2), 0 2px 10px rgb(var(--accent) / 0.18);
+  }
+
   .cursor-blink {
     animation: blink 1s step-end infinite;
   }

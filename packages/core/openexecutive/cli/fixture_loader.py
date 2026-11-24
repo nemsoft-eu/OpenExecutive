@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -80,6 +82,10 @@ while _REPO_ROOT.parent != _REPO_ROOT:
     _REPO_ROOT = _REPO_ROOT.parent
 
 FIXTURES_ROOT = _REPO_ROOT / "fixtures" / "companies"
+
+
+class FixtureSnapshotError(RuntimeError):
+    """Raised when the company couldn't be saved before a fixture load."""
 
 
 class FixtureNotFoundError(ValueError):
@@ -282,30 +288,23 @@ async def _load_from_dir(
             live_is_users = False
             logger.exception("fixture load: client save-back failed (continuing)")
 
-        # Auto-snapshot user state on first ever fixture load. Use the same
-        # condition as `has_snapshot` so a partial/failed snapshot directory
-        # (mkdir succeeded but profile.yaml never landed) does not permanently
-        # disable auto-snapshot. The sentinel guards the inverse: if a previous
-        # fixture is already active, current state is NOT the user's company.
-        backup_dir = _user_backup_dir(settings)
+        # Save the user's own company before the fixture replaces it: on the
+        # first load, and again on every load while the live state is still
+        # theirs, so unload never brings back an older copy. The sentinel
+        # guards the inverse: if a fixture is already active, the live state
+        # is NOT the user's company and the earlier snapshot stays.
+        # A failed snapshot stops the load: unload would otherwise bring back
+        # an older copy over the user's newer work.
         auto_snapshot_taken = False
-        if not (backup_dir / "profile.yaml").exists() and not sentinel.exists():
-            # Not best-effort: the load wipes every per-company table, so going
-            # ahead without a snapshot would leave unload nothing to restore.
-            # An empty environment snapshots fine (snapshot_user_state writes
-            # empty artifacts), so a failure here is a real one.
-            snapshot_user_state(settings)
-            auto_snapshot_taken = True
-        elif live_is_users and backup_dir.is_dir():
-            # An earlier snapshot is being reused (unload keeps _user_backup),
-            # but the workspace settings are the user's own right now and may
-            # have changed since — refresh them, or unload would restore
-            # stale ones (or, from a backup that predates workspace.yaml,
-            # none at all).
+        if live_is_users:
             try:
-                _dump_workspace(backup_dir / "workspace.yaml")
-            except Exception:
-                logger.exception("fixture load: refreshing the backed-up workspace settings failed")
+                await asyncio.to_thread(snapshot_user_state, settings)
+            except Exception as exc:
+                logger.exception("fixture load: snapshot before load failed")
+                raise FixtureSnapshotError(
+                    "Couldn't save your company before loading. Nothing was changed."
+                ) from exc
+            auto_snapshot_taken = True
 
         summary = await _apply_state_from_source(fixture_dir, settings)
 
@@ -434,8 +433,8 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     # ── 0b. Wipe every per-company table ──────────────────────────────────
     # From the one registry the blank client switch and the factory reset use
     # too (memory.company_tables), less what this path keeps (audit_log,
-    # workspace_settings, the knowledge review state) and the authored tables
-    # no swap wipes. The seeders below then write the source's rows back.
+    # workspace_settings, the knowledge review state). The seeders below then
+    # write the source's rows back.
     #
     # It runs before any file is swapped, so a failed wipe (a locked
     # database, a foreign key error) aborts with the outgoing company still
@@ -444,8 +443,8 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     # returns early when its file is missing or empty, and a fixture needs only
     # profile.yaml, so a wipe behind one would be skipped on exactly the loads
     # that still swap the company. Tables the source's files do not carry
-    # (chat history among them) stay empty: on unload the user's own rows come
-    # back only as far as _user_backup/'s files hold them.
+    # (chat history among them) stay empty; on unload the user's whole saved
+    # database (_user_backup/state.db) goes back over them.
     from openexecutive.memory.company_tables import (
         KEPT_ON_EVERY_SWAP,
         KEPT_ON_FIXTURE_SWAP,
@@ -551,6 +550,7 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
             "fixture: clear_research_run_history failed (non-fatal)"
         )
 
+    forget_company_caches()
     return {
         "display_name": profile.name,
         "profile": profile.model_dump(),
@@ -592,6 +592,25 @@ async def unload_fixture(settings: Any) -> dict[str, Any]:
             summary_client = None
 
         summary = await _apply_state_from_source(backup, settings)
+        if (backup / "state.db").exists():
+            # The whole saved database goes back over what the files above
+            # seeded, so every table is the user's again, not only the ones
+            # a fixture has. Same restore as a client switch.
+            # Only what isn't any company's stays as it is now: the
+            # operator-level rows a client switch carries (the eval scenarios
+            # people wrote among them). Everything else is the company's:
+            # workflows and the audit trail done while a demo or a client was
+            # live went with it, and the one-time migration markers stay the
+            # saved copy's own, since they describe the data saved with them.
+            from openexecutive.clients.slots import restore_company_db
+
+            await asyncio.to_thread(restore_company_db, backup / "state.db")
+            # Used up: the live data is the user's again and moves on from
+            # here, so a repeated unload must never roll it back to this copy.
+            # The next load or switch takes a fresh one.
+            (backup / "state.db").unlink()
+            forget_company_caches()
+            summary["database_restored"] = True
         if summary_client is not None:
             summary["client_saved"] = summary_client
 
@@ -678,7 +697,7 @@ def _reregister_surviving_user_knowledge(db_path: Path) -> int:
 
 
 async def reset_all_state(
-    settings: Any, *, app_state: Any | None = None
+    settings: Any, *, app_state: Any | None = None, keep: frozenset[str] = frozenset()
 ) -> dict[str, Any]:
     """Wipe live state AND the snapshot — return to factory-default.
 
@@ -691,17 +710,25 @@ async def reset_all_state(
     so concurrent requests cannot read the old store object after its
     backing collection has been deleted.
 
+    ``keep`` (optional) names tables to keep on top of what
+    ``memory.company_tables`` keeps on every swap, as a frozenset so a bare
+    string can't be passed by mistake: a caller that starts a company over
+    but keeps its team passes every people table (``people`` with
+    ``person_emails`` and the rest). Keeping ``workspace_settings`` also
+    keeps its row as it is.
+
     Steps (under the shared destructive-op lock):
       1. Empty live profile.yaml
       2. Delete + recreate company/docs/, clear ChromaDB company collection
-      3. Wipe every per-company table (memory.company_tables) — chat
-         history, run/audit history (so /jobs and /audit reset too), people,
-         departments and Goals (none are re-created) among them — then
-         re-register the shipped knowledge's review rows
+      3. Wipe every per-company table (memory.company_tables) but ``keep`` —
+         chat history, run/audit history (so /jobs and /audit reset too),
+         people, departments and Goals (none are re-created), the whole job
+         queue, and any table added later among them — then re-register the
+         shipped knowledge's review rows. The principal's own People row is
+         written back (``_restore_principal``), so the company keeps its owner
       5a. Reset the workspace settings to the defaults (team, no zone),
-          then re-bootstrap principal briefs, department cadences, and (if
-          enabled) the nudge-scan heartbeat — without this Today stays
-          blank until the next API restart
+          then seed every recurring job again (``seed_recurring_jobs``) —
+          without this Today stays blank until the next API restart
       6. Remove the _user_backup/ directory entirely (sentinel goes with it)
       7. Swap app.state.store inside the lock so concurrent reads cannot
          hit the deleted-then-recreated collection mid-flight
@@ -710,6 +737,13 @@ async def reset_all_state(
     from openexecutive.memory.company_profile import CompanyProfile
 
     async with _FIXTURE_OP_LOCK:
+        # The principal stays: a reset empties the company, not its owner.
+        # With no principal left, the first signed-in person to ask would be
+        # let set themselves up as the owner (``chat._caller_is_principal_or_unclaimed``
+        # is for a brand-new install only). Read first, so a roster that
+        # can't be read stops the reset before anything is wiped.
+        owner = _principal_to_keep(keep, settings)
+
         # 1. Live profile → empty
         CompanyProfile().save_to_yaml(settings.company_profile_path)
 
@@ -761,6 +795,11 @@ async def reset_all_state(
         company_skills_dir: Path = settings.company_profile_path.parent / "skills"
         if company_skills_dir.exists():
             shutil.rmtree(company_skills_dir)
+        # Files people attached in chats (orchestrator/conversation_files.py)
+        # and the scripts behind Python-job workflows (workflows/python_job.py):
+        # their rows go in the sweep below, so their files go too.
+        for files_dir in ("conversation_files", "python_jobs"):
+            shutil.rmtree(settings.company_profile_path.parent / files_dir, ignore_errors=True)
         store.delete_documents(
             collection=SKILLS_COLLECTION,
             where={"source": "company"},
@@ -769,31 +808,42 @@ async def reset_all_state(
         # built-in is back in effect.
         sync_builtin_skill_index(store)
 
-        # 3. Every per-company table — chat history, episodic memory, alerts,
-        # run/audit history, monitoring, the derived caches, people,
-        # departments, review state and the rest — from the one registry the
-        # blank client switch and fixture load/unload use too
-        # (memory.company_tables). A reset leaves no departments, like a new
-        # install: setup (or the Executive's create_goal tool) creates only the
-        # ones the company has. Never creates the DB, and skips a table it does
-        # not have.
+        # 3. Every per-company table — chats, episodic memory, decisions,
+        # tasks, alerts, watches, run/audit history, the derived caches,
+        # people, departments, review state, and whatever table is added
+        # later — from the one registry the blank client switch and fixture
+        # load/unload use too (memory.company_tables), less ``keep``. A reset
+        # leaves no departments, like a new install: setup (or the Executive's
+        # create_goal tool) creates only the ones the company has. Never
+        # creates the DB. People and departments read their own DB_PATH (bound
+        # at import); in a deployment it is the same file, so each distinct
+        # file is wiped once.
+        from openexecutive.departments import store as dept_store
         from openexecutive.memory.company_tables import (
             KEPT_ON_EVERY_SWAP,
             wipe_per_company_tables,
         )
         from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
-        from openexecutive.people.roster_requests import TABLES as ROSTER_REQUEST_TABLES
+        from openexecutive.people import store as people_store
 
-        cleared = wipe_per_company_tables(EPISODIC_DB_PATH, keep=KEPT_ON_EVERY_SWAP)
-        people_tables = {
-            *ROSTER_REQUEST_TABLES,
-            "person_emails",
-            "person_authority_scope",
-            "person_availability",
-            "people",
-        }
-        episodic_cleared = {t: n for t, n in cleared.items() if t not in people_tables}
-        people_cleared = {t: n for t, n in cleared.items() if t in people_tables}
+        cleared: dict[str, int] = {}
+        for db_path in dict.fromkeys(
+            p.resolve() for p in (EPISODIC_DB_PATH, people_store.DB_PATH, dept_store.DB_PATH)
+        ):
+            wiped = wipe_per_company_tables(db_path, keep={*KEPT_ON_EVERY_SWAP, *keep})
+            for table, count in wiped.items():
+                cleared[table] = cleared.get(table, 0) + count
+        # Right away, so nothing read during the rest of the reset (or after
+        # a later step fails) serves the rows just deleted.
+        forget_company_caches()
+        if owner is not None:
+            try:
+                _restore_principal(owner)
+            except Exception:
+                # The rest of the reset still runs; the roster is left with
+                # no principal (see ``_restore_principal``).
+                logger.exception("reset: couldn't write the principal back")
+            forget_company_caches()
 
         # 3c. Knowledge review state (same DB as the episodic rows above). A
         # "factory reset" that keeps the previous operator's approvals,
@@ -855,62 +905,26 @@ async def reset_all_state(
             except Exception:
                 logger.exception("reset: re-registering user knowledge failed")
 
+        # 4. People and 5. departments went in the wipe above (unless kept).
         departments_seeded = 0
 
-        # 5a. Re-bootstrap the built-in scheduled actions that
-        # ``api/main.py`` enqueues at process startup. The episodic wipe
-        # above just deleted them, but the bootstrap functions only run on
-        # API boot — without re-calling them here, the box stays "blank
-        # slate" until the next deploy/restart. That's what makes Today
-        # look stuck for the principal: no morning brief, no EoD digest,
-        # no reflection, and no department check-ins.
-        #
-        # All three calls are idempotent (each checks for a pending/running
-        # row before inserting), so calling them again on a freshly-empty
-        # table simply enqueues one row apiece.
-        from openexecutive.config import get_settings
-        from openexecutive.departments.cadence import bootstrap_cadences
+        # 5a. Seed the recurring jobs again. The sweep above emptied the
+        # queue (the company's reminders, follow-ups and open loops go with
+        # it), and the seeds otherwise only run at startup: without this the
+        # box has no brief, check-in, scan or sync until the next restart.
+        # The scheduler's start calls the same function, so the two can't
+        # drift; every seed is idempotent.
         from openexecutive.memory.workspace_settings import reset_workspace_settings
-        from openexecutive.scheduler.runner import seed_principal_briefs
+        from openexecutive.scheduler.runner import seed_recurring_jobs
 
         # Factory state is team mode with no zone of its own — reset it
-        # before the bootstraps below, which read both.
-        try:
-            reset_workspace_settings()
-        except Exception:
-            logger.exception("reset: reset_workspace_settings failed")
-        try:
-            seed_principal_briefs()
-        except Exception:
-            logger.exception("reset: seed_principal_briefs failed")
-        try:
-            bootstrap_cadences()
-        except Exception:
-            logger.exception("reset: bootstrap_cadences failed")
-        if get_settings().nudge_scan_enabled:
+        # before the seeding below, which reads both.
+        if "workspace_settings" not in keep:
             try:
-                from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
-                bootstrap_nudge_scan()
+                reset_workspace_settings()
             except Exception:
-                logger.exception("reset: bootstrap_nudge_scan failed")
-        if get_settings().external_monitor_enabled:
-            try:
-                from openexecutive.monitoring.pipeline import (
-                    bootstrap_external_monitor_scan,
-                )
-                bootstrap_external_monitor_scan()
-            except Exception:
-                logger.exception("reset: bootstrap_external_monitor_scan failed")
-        if get_settings().watchlist_research_enabled:
-            try:
-                from openexecutive.monitoring.research.scheduler import (
-                    bootstrap_watchlist_research_scan,
-                )
-                bootstrap_watchlist_research_scan()
-            except Exception:
-                logger.exception(
-                    "reset: bootstrap_watchlist_research_scan failed"
-                )
+                logger.exception("reset: reset_workspace_settings failed")
+        seed_recurring_jobs()
 
         # 5b. External per-person memory (Honcho) — best-effort. The
         # wrapper swallows its own errors and audits them; the second
@@ -974,9 +988,73 @@ async def reset_all_state(
         return {
             "reset": True,
             "departments_seeded": departments_seeded,
-            "episodic_cleared": episodic_cleared,
-            "people_cleared": people_cleared,
+            "cleared": cleared,
         }
+
+
+def forget_company_caches() -> None:
+    """Drop every in-memory copy of company data, so the next read sees the
+    tables as a reset, fixture load or client switch just left them: the
+    agent overrides (no expiry of their own), departments and people."""
+    from openexecutive.agents.overrides import invalidate_cache
+    from openexecutive.departments import registry as dept_registry
+    from openexecutive.people import registry as people_registry
+
+    invalidate_cache()
+    dept_registry.invalidate()
+    people_registry.invalidate()
+
+
+def _principal_to_keep(keep: Collection[str], settings: Any) -> Any:
+    """The principal's People row to write back after the sweep, or None
+    when the caller keeps the people table anyway, there is no principal, or
+    a simulator company or a client is live (its principal is that
+    company's, not the install owner's). With the owner's own company live,
+    its principal is kept as the install's owner too, so a handover on the
+    People page is what the reset keeps. Raises when the roster can't be
+    read: a reset must not drop an owner it could not see."""
+    if "people" in keep:
+        return None
+    from openexecutive.clients.slots import get_active_client
+    from openexecutive.people import install_owner
+    from openexecutive.people import store as people_store
+
+    # Read directly, not through ``install_owner.away_from_own_company``,
+    # which reads an error as away: here that would drop the owner, so an
+    # error aborts the reset instead.
+    if _fixture_active_sentinel(settings).exists() or get_active_client(settings) is not None:
+        # Only the kept owner may set the company up again
+        # (``chat._caller_is_principal_or_unclaimed``).
+        return None
+    principal = people_store.find_principal_person()
+    if principal is not None and principal.email:
+        install_owner.remember(principal.email)
+    return principal
+
+
+def _restore_principal(owner: Any) -> None:
+    """Write ``owner`` back as the principal: name, role, sign-in address,
+    the other addresses they write from and the chat accounts the Executive
+    reaches them on. Nothing else of the old company comes back: not their
+    departments, channel preference, reply time or authority. Should this
+    fail with the roster already empty, the install's kept owner
+    (``people.install_owner``) is still the only one who may set it up."""
+    from openexecutive.people import store as people_store
+
+    person_id = people_store.upsert_person(
+        full_name=owner.full_name,
+        role=owner.role,
+        is_principal=True,
+        email=owner.email,
+        slack_user_id=owner.slack_user_id,
+        telegram_chat_id=owner.telegram_chat_id,
+        discord_user_id=owner.discord_user_id,
+    )
+    for alias in owner.email_aliases:
+        try:
+            people_store.add_person_email(person_id, alias)
+        except ValueError:
+            logger.warning("reset: couldn't keep one of the principal's other addresses", exc_info=True)
 
 
 def get_fixture_status(settings: Any) -> dict[str, Any]:
@@ -1016,7 +1094,7 @@ async def snapshot_user_state_async(
     here so the lock serialises against concurrent load / unload.
     """
     async with _FIXTURE_OP_LOCK:
-        return snapshot_user_state(settings, force=force)
+        return await asyncio.to_thread(snapshot_user_state, settings, force=force)
 
 
 def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]:
@@ -1041,6 +1119,29 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
 
     backup_dir = _user_backup_dir(settings)
     backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 0. state.db — the whole company database, every table. The files
+    #       below only hold what a fixture also has; unload puts this copy
+    #       back last, so a table they don't cover (facts, contact notes,
+    #       saved tools, ...) comes back as it was. VACUUM INTO gives a
+    #       consistent copy while other connections hold the DB open. It goes
+    #       first and is written beside the old one, replacing it only once
+    #       complete: a failed copy (a full disk) leaves the whole earlier
+    #       backup as it was, files and database together.
+    from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
+
+    state_dst = backup_dir / "state.db"
+    if EPISODIC_DB_PATH.exists():
+        state_tmp = backup_dir / "state.db.tmp"
+        state_tmp.unlink(missing_ok=True)
+        conn = sqlite3.connect(str(EPISODIC_DB_PATH))
+        try:
+            conn.execute("VACUUM INTO ?", (str(state_tmp),))
+        finally:
+            conn.close()
+        os.replace(state_tmp, state_dst)
+    else:
+        state_dst.unlink(missing_ok=True)
 
     src_profile = settings.company_profile_path
 
@@ -1069,10 +1170,10 @@ def snapshot_user_state(settings: Any, *, force: bool = False) -> dict[str, Any]
     _dump_workspace(backup_dir / "workspace.yaml")
 
     # ── 6. profile.yaml, written LAST ─────────────────────────────────────
-    # Its presence is what marks a snapshot as taken (has_snapshot, and the
-    # auto-snapshot gate in _load_from_dir), so a dump above that raises must
-    # leave no profile.yaml behind, or the next load would skip the snapshot
-    # and wipe the tables this one failed to save.
+    # Its presence is what marks a snapshot as taken (has_snapshot, and
+    # unload's precondition), so a dump above that raises must leave no
+    # profile.yaml behind, or unload would offer to restore a snapshot that
+    # was never completed.
     dst_profile = backup_dir / "profile.yaml"
     if src_profile.exists():
         shutil.copy2(src_profile, dst_profile)

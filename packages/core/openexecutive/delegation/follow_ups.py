@@ -92,7 +92,7 @@ async def look(person: Any, client: Any, *, own: set[str], exec_address: str, no
     if last is not None and now - last < LOOK_EVERY:
         return
     _LAST_LOOK[person.id] = now
-    carded = {str(inbox.card_payload(c).get("thread_id") or "") for c in inbox.open_cards(person.id)}
+    carded = inbox.card_threads(inbox.open_cards(person.id))
     picked = 0
     seen: set[str] = set()
     for sent in await client.list_sent(limit=SENT_LOOKED_AT):

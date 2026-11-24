@@ -33,3 +33,9 @@ export function doneLink(row: DoneRowLike): { href: string; label: string } | nu
 export function anyWorking(rows: DoneRowLike[]): boolean {
   return rows.some((r) => r.status === "working");
 }
+
+/** Whose name a row's tag (GET /today `as_tag`) says it went out in: the
+ *  reader's ("Sent as you") or the Executive's. */
+export function asTagTone(tag: string): "you" | "executive" {
+  return /\bas you$/i.test(tag.trim()) ? "you" : "executive";
+}

@@ -669,10 +669,10 @@ def _faked(tool: str, tool_input: Any, session: Any) -> str:
 
 def faked_handlers(handlers: dict[str, Handler], session: Any) -> dict[str, Handler]:
     """The turn's handlers for a replay session: reads run, and every tool
-    a read-only turn is denied (``schedule_tools.MCP_CLIENT_WITHHELD_TOOLS``,
+    a read-only turn is denied (``schedule_tools.READ_ONLY_WITHHELD_TOOLS``,
     the ones that send, post, book, schedule, run or change stored state)
     returns "done" and is recorded on the session instead."""
-    from openexecutive.orchestrator.schedule_tools import MCP_CLIENT_WITHHELD_TOOLS
+    from openexecutive.orchestrator.schedule_tools import READ_ONLY_WITHHELD_TOOLS
 
     def fake(name: str) -> Handler:
         async def handler(tool_input: dict[str, Any]) -> str:
@@ -680,17 +680,17 @@ def faked_handlers(handlers: dict[str, Handler], session: Any) -> dict[str, Hand
 
         return handler
 
-    return {name: fake(name) if name in MCP_CLIENT_WITHHELD_TOOLS else h for name, h in handlers.items()}
+    return {name: fake(name) if name in READ_ONLY_WITHHELD_TOOLS else h for name, h in handlers.items()}
 
 
 def faked_call_tool(call_tool: Handler, session: Any) -> Handler:
     """The gateway's ``call_tool`` for a replay: the reads a read-only turn
-    may make (``MCP_CLIENT_MCP_TOOLS``) run; anything else is recorded."""
-    from openexecutive.orchestrator.schedule_tools import mcp_client_allows_mcp_tool
+    may make (``READ_ONLY_MCP_TOOLS``) run; anything else is recorded."""
+    from openexecutive.orchestrator.schedule_tools import read_only_allows_mcp_tool
 
     async def handler(tool_input: dict[str, Any]) -> Any:
         name = tool_input.get("name") if isinstance(tool_input, dict) else None
-        if mcp_client_allows_mcp_tool(name):
+        if read_only_allows_mcp_tool(name):
             return await call_tool(tool_input)
         return _faked(str(name or "call_tool"), tool_input.get("arguments") if isinstance(tool_input, dict) else {}, session)
 

@@ -13,6 +13,11 @@ from fastapi.responses import FileResponse
 
 router = APIRouter()
 
+# A chart or picture shows in the chat (``<img>``), so it goes out as its own
+# image type; anything else stays a download. Never SVG, which can carry script.
+_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".webp": "image/webp"}
+
 
 @router.get("/python-jobs/{job_id}/{name}")
 def download_job_file(job_id: str, name: str, request: Request) -> FileResponse:
@@ -27,7 +32,7 @@ def download_job_file(job_id: str, name: str, request: Request) -> FileResponse:
     return FileResponse(
         path,
         filename=path.name,
-        media_type="application/octet-stream",
+        media_type=_IMAGE_TYPES.get(path.suffix.lower(), "application/octet-stream"),
         # no-store: a result can quote Knowledge documents; keep it out of the
         # browser's disk cache, as confidential artifact downloads do.
         headers={"Content-Security-Policy": "sandbox", "X-Content-Type-Options": "nosniff",

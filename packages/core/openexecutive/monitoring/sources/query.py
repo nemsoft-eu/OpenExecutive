@@ -66,6 +66,7 @@ from openexecutive.orchestrator.web_search_tool import (
     client_tool_rounds,
     select_web_search_tool,
 )
+from openexecutive.utils.prompt_blocks import no_tags, scrub_block_line
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,10 @@ _QUERY_SYSTEM_PROMPT = (
     "Never invent results or URLs.\n"
     "- Prefer recent developments over evergreen background.\n"
     "- Each result needs a working source URL the principal can click.\n"
+    "- When a result raises a question another search can answer (who is "
+    "named, whether a claim or credit is right, when it was published), "
+    "search for it and put the answer in the summary. Never leave the "
+    "principal a check to do; say plainly what is still unknown.\n"
     "- An empty results list is the correct answer when nothing new and "
     "relevant turned up."
 )
@@ -200,7 +205,9 @@ class QuerySource:
 
         tools: list[dict[str, Any]] = [EMIT_QUERY_RESULTS_TOOL, search.tool]
         max_results = _coerce_max_results(item.config_json.get("max_results"))
-        user_content = _build_user_content(query, item.config_json, max_results)
+        user_content = _build_user_content(
+            query, item.config_json, max_results, notes=item.notes,
+        )
 
         agent = _QueryResearchAgent()
         try:
@@ -270,12 +277,24 @@ def _coerce_max_results(value: Any) -> int:
 
 
 def _build_user_content(
-    query: str, config: dict[str, Any], max_results: int
+    query: str, config: dict[str, Any], max_results: int, *, notes: str = "",
 ) -> str:
     parts = [
         f"Standing query to monitor:\n{query}",
         f"\nReport at most {max_results} distinct, high-signal results.",
     ]
+    if notes.strip():
+        # What the person told this watch (often by replying to one of its
+        # cards: monitoring/steer.py). Fenced: it is their words, read as
+        # guidance on what to report, not as instructions to the search.
+        close = "</watch_notes>"
+        fenced = "\n".join(
+            no_tags(scrub_block_line(line, close)) for line in notes.splitlines()
+        )
+        parts.append(
+            "\nNotes on this watch. Leave out results "
+            f"they say to skip:\n<watch_notes>\n{fenced}\n{close}"
+        )
     freshness = config.get("freshness_days")
     try:
         if freshness is not None and int(freshness) > 0:

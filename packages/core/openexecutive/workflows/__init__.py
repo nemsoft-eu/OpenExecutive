@@ -130,6 +130,27 @@ def get_workflow(name: str) -> Workflow:
     raise KeyError(f"Unknown workflow: {name}")
 
 
+def workflow_label(name: str) -> str:
+    """A workflow's name as people read it, wherever it is shown (Home,
+    cards, chat, mail): its title where one is known, also for one switched
+    off or deleted since, else its key in words ("weekly_laptop_restock" ->
+    "Weekly laptop restock"). Never the key itself."""
+    import contextlib
+
+    from openexecutive.workflows.dynamic_store import get_definition
+
+    with contextlib.suppress(Exception):
+        title = get_workflow(name).title.strip()
+        if title:
+            return title
+    with contextlib.suppress(Exception):
+        defn = get_definition(name)
+        if defn is not None and defn.title.strip():
+            return str(defn.title.strip())
+    words = " ".join(name.removeprefix("quick_").replace("_", " ").replace("-", " ").split())
+    return words[:1].upper() + words[1:] if words else "Workflow"
+
+
 def list_workflows() -> list[Workflow]:
     """All runnable workflows: built-ins, then the Quick ones (one per
     playbook nothing else follows), then active dynamic ones."""
@@ -152,4 +173,5 @@ __all__ = [
     "WORKFLOW_REGISTRY",
     "get_workflow",
     "list_workflows",
+    "workflow_label",
 ]

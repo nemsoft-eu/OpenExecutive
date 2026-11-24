@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
 
 import click
 from rich.console import Console
@@ -44,20 +46,55 @@ async def _ask(question: str) -> None:
     executive = Executive()
 
     console.print("\n[bold blue]Executive[/bold blue]\n")
-    response = ""
-    async for chunk in executive.stream_chat(
-        user_message=question,
-        session=session,
-        retrieved_context=retrieved,
-        episodic_context=episodic,
-        # Typed by the operator, so all their own words (and fetchable URLs).
-        memory_text=question,
-    ):
-        if isinstance(chunk, str) and chunk != Executive._THINKING:
-            response += chunk
-            console.print(chunk, end="", highlight=False)
+    await print_reply(
+        executive.stream_chat(
+            user_message=question,
+            session=session,
+            retrieved_context=retrieved,
+            episodic_context=episodic,
+            # Typed by the operator, so all their own words (and fetchable URLs).
+            memory_text=question,
+        )
+    )
 
     console.print("\n")
+
+
+async def print_reply(stream: AsyncIterator[str | dict[str, Any]]) -> str:
+    """Print a streamed reply and return the one left on screen.
+
+    A terminal can't take back printed text, so when the reply is written
+    again (a ``rewrite`` event) the new text is held until it differs from
+    what is on screen, then printed under a "Corrected" line. A rewrite that
+    comes back the same, or empty, leaves the shown reply as the answer."""
+    from openexecutive.orchestrator.executive import Executive
+
+    shown = ""
+    new: str | None = None
+
+    def _correct(text: str) -> None:
+        console.print("\n\n[dim]Corrected reply (replaces the one above):[/dim]\n")
+        console.print(text, end="", highlight=False)
+
+    async for chunk in stream:
+        if isinstance(chunk, dict):
+            if chunk.get("type") == "rewrite" and shown:
+                new = ""  # a rewrite not yet on screen starts over too
+            continue
+        if chunk == Executive._THINKING:
+            continue
+        if new is None:
+            shown += chunk
+            console.print(chunk, end="", highlight=False)
+            continue
+        new += chunk
+        if not shown.startswith(new):
+            _correct(new)
+            shown, new = new, None
+    if new and new != shown:
+        _correct(new)
+        shown = new
+    return shown
 
 
 @cli.command()
@@ -106,15 +143,15 @@ async def _chat() -> None:
         episodic = format_for_prompt()
 
         console.print("\n[bold blue]Executive[/bold blue]\n")
-        async for chunk in executive.stream_chat(
-            user_message=user_input,
-            session=session,
-            retrieved_context=retrieved,
-            episodic_context=episodic,
-            memory_text=user_input,  # typed by the operator, as above
-        ):
-            if isinstance(chunk, str) and chunk != Executive._THINKING:
-                console.print(chunk, end="", highlight=False)
+        await print_reply(
+            executive.stream_chat(
+                user_message=user_input,
+                session=session,
+                retrieved_context=retrieved,
+                episodic_context=episodic,
+                memory_text=user_input,  # typed by the operator, as above
+            )
+        )
 
         console.print("\n")
 

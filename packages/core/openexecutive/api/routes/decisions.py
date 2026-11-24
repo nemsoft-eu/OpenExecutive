@@ -23,6 +23,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -125,7 +126,15 @@ def _served_json(raw: str | None) -> str | None:
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("input"), dict):
         return None
-    return json.dumps(card_details.served(payload), ensure_ascii=False)
+    shown = card_details.served(payload)
+    said = payload.get(SAID_INPUT)
+    if isinstance(said, dict) and said and not isinstance(payload.get("steps"), list):
+        # The step with what was said on its card, for the cards whose
+        # Approve sends it (``edits.input``). ``details`` stay the step as
+        # filed: what a plain Approve, in chat or on a page, carries out.
+        said_details = card_details.served({**payload, "input": {**payload["input"], **said}})["details"]
+        shown = {**shown, "said_details": said_details}
+    return json.dumps(shown, ensure_ascii=False)
 
 
 def _served(instance: DecisionInstance) -> DecisionInstance:
@@ -249,13 +258,47 @@ def _caller_is_approver(instance: DecisionInstance, request: Request) -> bool:
     return caller is not None and caller == instance.approver_person_id
 
 
+def _own_chat_ok(instance: DecisionInstance, request: Request) -> bool:
+    """A step held from one person's own chat is theirs and its approver's
+    (``alerts.own_chat``): nobody else on the team sees or decides it, the
+    principal included. Fails closed."""
+    from openexecutive.alerts import own_chat
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    try:
+        caller = _resolve_caller_person_id(request)
+    except Exception:
+        logger.exception("decisions: caller lookup failed — treating them as someone else")
+        caller = None
+    return own_chat.decision_shown_to(instance, caller)
+
+
+def _own_chat_kept(instances: list[DecisionInstance], request: Request) -> list[DecisionInstance]:
+    """``instances`` without the ones held from someone else's own chat
+    (``_own_chat_ok``), with the caller and the chats looked up once for the
+    whole list. Fails closed."""
+    from openexecutive.alerts import own_chat
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    try:
+        caller = _resolve_caller_person_id(request)
+    except Exception:
+        logger.exception("decisions: caller lookup failed — treating them as someone else")
+        caller = None
+    only = own_chat.decision_readers(instances)
+    return [
+        i for i in instances
+        if only.get(int(i.id)) is None or (caller is not None and caller in only[int(i.id)])
+    ]
+
+
 def _visible_instance(instance_id: int, request: Request) -> DecisionInstance:
     """The instance, or 404 — also for a private one when the caller is not
     the principal, and for one only its approver may see when the caller is
     anyone else (the principal included), so its existence (and the contact
     or mail on it) is not revealed."""
     instance = get_decision_instance(instance_id)
-    if instance is None:
+    if instance is None or not _own_chat_ok(instance, request):
         raise HTTPException(status_code=404, detail="Decision instance not found")
     if _approver_only(instance):
         if not _caller_is_approver(instance, request):
@@ -283,7 +326,9 @@ def _resolver(instance: DecisionInstance, request: Request) -> int | None:
     from openexecutive.api.routes.chat import _resolve_caller_person_id
 
     caller = _resolve_caller_person_id(request)
-    if _approver_only(instance):
+    if not _own_chat_ok(instance, request):
+        pass  # from someone else's own chat: the 403 below
+    elif _approver_only(instance):
         if caller is not None and caller == instance.approver_person_id:
             return caller
     elif _approver_is_principal(request):
@@ -334,6 +379,9 @@ class DecisionClassSpec:
     approve: _Approve
     # Best effort, after a reject has been recorded.
     after_reject: Callable[[DecisionInstance], Awaitable[None]] | None = None
+    # Best effort, after the tidy-up let a waiting step lapse (True) or its
+    # Undo put it back (False): the class's own close-out, like Skip's.
+    after_lapse: Callable[[DecisionInstance, bool], None] | None = None
     # Undoes what an approval did; None when it can't be undone (409).
     cancel: Callable[[DecisionInstance], Awaitable[None]] | None = None
     # Only the person an instance went to for approval (``approver_person_id``)
@@ -342,6 +390,19 @@ class DecisionClassSpec:
     # Only the principal and the person it went to for approval may see or
     # resolve it; nobody else on the team, whatever its payload says.
     principal_and_approver: bool = False
+
+
+def run_after_lapse(instance_id: int, *, lapsed: bool, db_path: Path | None = None) -> None:
+    """Run a waiting step's class close-out for a lapse (or its Undo):
+    ``alerts.lifecycle.settle`` and the card's reopen call it, so a lapse
+    ends a step the way Skip does in each class's own records."""
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    instance = get_decision_instance(instance_id, db_path=db_path)
+    spec = DECISION_CLASSES.get(instance.decision_class) if instance is not None else None
+    if instance is None or spec is None or spec.after_lapse is None:
+        return
+    spec.after_lapse(instance, lapsed)
 
 
 def _spec_for(instance: DecisionInstance) -> DecisionClassSpec:
@@ -377,23 +438,46 @@ def get_decisions(
         instances = list_instances(decision_class, status=status, limit=500)
         return [_served(i) for i in instances if i.approver_person_id == caller][:limit]
     if _approver_is_principal(request):
-        return [_served(i) for i in list_instances(decision_class, status=status, limit=limit)]
+        # Read past ``limit``: steps held from other people's own chats drop
+        # out below, and a page of them must not hide the rest.
+        kept = _own_chat_kept(list_instances(decision_class, status=status, limit=500), request)
+        return [_served(i) for i in kept[:limit]]
     spec = DECISION_CLASSES.get(decision_class)
     if spec is not None and spec.principal_only:
         return []
-    instances = list_instances(decision_class, status=status, limit=limit)
-    return [_served(i) for i in instances if not _is_private(i)]
+    instances = list_instances(decision_class, status=status, limit=500)
+    return [_served(i) for i in _own_chat_kept(instances, request) if not _is_private(i)][:limit]
 
 
 @router.get("/decisions/{instance_id}", response_model=DecisionInstance)
 def get_decision(instance_id: int, request: Request) -> DecisionInstance:
-    return _served(_visible_instance(instance_id, request))
+    instance = _visible_instance(instance_id, request)
+    served = _served(instance)
+    if instance.decision_class not in _HELD_CLASSES or not served.proposed_payload_json:
+        return served
+    # Whether this reader may change its step (Edit, Or tell me), so a page
+    # offers only what Approve and /say take from them.
+    try:
+        may = _may_change(instance, request, _resolver(instance, request))
+    except HTTPException:
+        may = False
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.orchestrator import card_details
+
+    proposed = json.loads(served.proposed_payload_json)
+    # The card's opening lines (who it waits on, who started it, why it
+    # waits), as every app shows them.
+    top = card_details.top(
+        proposed, approver_id=instance.approver_person_id, viewer_id=_resolve_caller_person_id(request),
+    )
+    shown = {**proposed, "may_change": may, "top": top}
+    return served.model_copy(update={"proposed_payload_json": json.dumps(shown, ensure_ascii=False)})
 
 
 def _check_booking_edits(payload: dict[str, Any], edits: dict[str, Any]) -> None:
     """An edited booking keeps the shape the tool would have accepted: an
-    edited title of 1-200 characters, and a start and end it can read (naive
-    times count as UTC, as in ``calendar_tools._parse_iso``), end after start.
+    edited title of 1-200 characters, and a start and end it can read (a time
+    with no offset is the company's, as in ``calendar_tools._parse_iso``), end after start.
     422 otherwise."""
     from openexecutive.orchestrator.calendar_tools import _parse_iso
 
@@ -594,25 +678,13 @@ async def _carry_out_lead(
 
     payload = _parse_payload(instance)
     edits = body.edits or {}
-    changed: dict[str, str] = {}
-    if edits.get("input") is not None:
+    if _edits_beyond_said(payload, edits.get("input")):  # noqa: SIM102
         # Changing what the Executive says or books is the principal's: an
-        # area approver says yes or no to what it would do, as it stands.
+        # area approver says yes or no to what it would do, as it stands,
+        # with what was said on its card.
         if not _approver_is_principal(request):
             raise HTTPException(status_code=403, detail="Only the account owner can change this before approving.")
-        from openexecutive.orchestrator import card_details
-
-        if len(card_details.held_steps(payload)) > 1:
-            # One card for several calls: Approve runs each as shown.
-            raise HTTPException(status_code=422, detail="This one can't be changed from its card.")
-        source: dict[str, Any] = payload["input"] if isinstance(payload.get("input"), dict) else {}
-        try:
-            new_input, changed = take_the_lead.apply_edits(
-                str(payload.get("tool") or ""), source, edits["input"], mcp=bool(payload.get("mcp")),
-            )
-        except take_the_lead.EditError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-        payload = {**payload, "input": new_input}
+    payload, changed = _with_edits(payload, edits.get("input"))
     grant = payload.get("allow") if isinstance(payload.get("allow"), dict) else None
     allowing = edits.get("allow") is True
     if allowing:
@@ -636,6 +708,21 @@ async def _carry_out_lead(
     )
 
 
+def _own_card(instance: DecisionInstance, resolver: int | None, *, by_principal: bool) -> bool:
+    """Whether the person who asked is approving a step held on their own
+    card. Checked the same way for both card kinds; ``take_the_lead.carry_out``
+    decides which tools it covers (an extension's ``card`` tool, which only
+    ever runs on their own device), and for any other tool it changes
+    nothing."""
+    payload = _parse_payload(instance)
+    return (
+        not by_principal
+        and resolver is not None
+        and resolver == instance.approver_person_id
+        and resolver == payload.get("requested_by_person_id")
+    )
+
+
 async def _run_lead(
     instance: DecisionInstance, payload: dict[str, Any], resolver: int | None, *, by_principal: bool,
     changed: dict[str, str] | None = None, grant: dict[str, Any] | None = None,
@@ -649,12 +736,16 @@ async def _run_lead(
     if not claim_for_execution(instance.id, resolver_person_id=resolver):
         raise HTTPException(status_code=409, detail="Someone else resolved this decision first.")
     try:
-        result = await take_the_lead.carry_out(payload, by_principal=by_principal)
+        result = await take_the_lead.carry_out(
+            {**payload, "tapped_by": resolver}, by_principal=by_principal,
+            own_card=_own_card(instance, resolver, by_principal=by_principal),
+        )
     except Exception as exc:
         logger.exception("decisions/approve: As me action %d failed", instance.id)
         finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": type(exc).__name__})
         take_the_lead.resolved(instance.id, "failed")
         _clear_decision_alert(instance.id, "dismissed")
+        _keep_allowed(grant, instance.id, resolver, changed)
         raise HTTPException(status_code=502, detail="Something went wrong, so it may not have gone through. Check before trying again.") from None
     failed = take_the_lead.result_failed(result)
     finish_execution(
@@ -662,23 +753,43 @@ async def _run_lead(
         STATUS_FAILED if failed else STATUS_APPROVED_WITH_EDIT if changed else STATUS_APPROVED_UNCHANGED,
         final_payload={**payload, "result": result[:2000]},
     )
-    take_the_lead.resolved(instance.id, "failed" if failed else "approved")
+    take_the_lead.resolved(instance.id, "failed" if failed else "approved", payload=payload, result=result)
     _clear_decision_alert(instance.id, "dismissed" if failed else "ack")
     if failed:
-        raise HTTPException(status_code=502, detail=f"It couldn't do that: {result[:300]}")
-    if grant is not None:
-        try:
-            take_the_lead.allow(
-                str(grant.get("key")), str(grant.get("label") or ""), example=changed or None,
-                created_by=f"person:{resolver}" if resolver is not None else "principal", decision_id=instance.id,
-            )
-        except take_the_lead.RuleError:
-            # It's done; only the learning failed (the list filled up since
-            # the check above). Say so in the log rather than fail a sent card.
-            logger.warning("decisions/approve: As me action %d done but not allowed", instance.id)
-            return _refresh(instance.id)
-        _audit_allowed(str(grant.get("label") or ""), instance.id, bool(changed))
+        logger.warning("decisions/approve: step %d failed: %s", instance.id, result[:300])
+        _keep_allowed(grant, instance.id, resolver, changed)
+        raise HTTPException(
+            status_code=502,
+            detail=f"It couldn't do that. {take_the_lead.failure_words(str(payload.get('tool') or ''), result)}",
+        )
+    _keep_allowed(grant, instance.id, resolver, changed)
     return _refresh(instance.id)
+
+
+def _keep_allowed(
+    grant: dict[str, Any] | None, decision_id: int, resolver: int | None, changed: dict[str, str] | None,
+) -> None:
+    """Save an "on its own next time" tick. Kept whether or not the step
+    went through: the tick is about the kind of step, and a step that failed
+    (an app turned it down) shouldn't make the person teach it again."""
+    if grant is None:
+        return
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        take_the_lead.allow(
+            str(grant.get("key")), str(grant.get("label") or ""), example=changed or None,
+            created_by=f"person:{resolver}" if resolver is not None else "principal", decision_id=decision_id,
+        )
+    except take_the_lead.RuleError:
+        # Only the learning failed (the list filled up since the check
+        # before the step). Say so in the log rather than fail the card.
+        logger.warning("decisions/approve: the next-time tick on card %d couldn't be saved", decision_id)
+        return
+    except Exception:
+        logger.exception("decisions/approve: saving the next-time tick on card %d broke", decision_id)
+        return
+    _audit_allowed(str(grant.get("label") or ""), decision_id, bool(changed))
 
 
 def _provably_principal(request: Request) -> bool:
@@ -712,6 +823,14 @@ async def _lead_declined(instance: DecisionInstance) -> None:
     take_the_lead.resolved(instance.id, "declined")
 
 
+def _lead_lapsed(instance: DecisionInstance, lapsed: bool) -> None:
+    """The log reads it as lapsed, or waiting again on Undo; its text stays,
+    so Undo brings the same step back."""
+    from openexecutive.orchestrator import take_the_lead
+
+    take_the_lead.mark_lapsed(instance.id, lapsed=lapsed)
+
+
 # Take the lead: an action the gate held (orchestrator.take_the_lead), for
 # the person whose authority covers it or the principal. What it would do
 # quotes the Executive's context, so it is private to them.
@@ -722,6 +841,7 @@ _TAKE_THE_LEAD = DecisionClassSpec(
     alert_source=DECISION_ALERT_SOURCE,
     approve=_carry_out_lead,
     after_reject=_lead_declined,
+    after_lapse=_lead_lapsed,
 )
 
 async def _carry_out_actions(
@@ -805,24 +925,96 @@ _DELEGATED_INVITE = DecisionClassSpec(
 async def _carry_out_department_action(
     instance: DecisionInstance, body: ApproveBody, request: Request, resolver: int | None
 ) -> DecisionInstance:
-    """A team member's send or edit their department held
-    (orchestrator.department_gate): do that exact call, once (claimed first),
-    as it stands, and record who approved it."""
-    return await _run_department_action(instance, resolver, by_principal=_approver_is_principal(request))
+    """A step held for a yes (orchestrator.department_gate): do that exact
+    call, once (claimed first), and record who approved it. ``edits.input``
+    changes the card's editable fields first (an email's subject and text,
+    a message; ``take_the_lead.apply_edits``): the owner's, or the card's
+    own approver's."""
+    payload = _parse_payload(instance)
+    edits = body.edits or {}
+    if edits.get("input") is not None:
+        mine = resolver is not None and resolver == instance.approver_person_id
+        if not (_approver_is_principal(request) or mine):
+            raise HTTPException(status_code=403, detail="Only the person this card waits on can change it before approving.")
+    payload, changed = _with_edits(payload, edits.get("input"))
+    return await _run_department_action(
+        instance, resolver, by_principal=_approver_is_principal(request), payload=payload, edited=bool(changed),
+    )
+
+
+def may_change_as(instance: DecisionInstance, *, principal: bool, approver: bool) -> bool:
+    """Whether someone may change a held step's fields, as Approve's own
+    ``edits.input`` allows, on the page and in a chat app alike: a Take the
+    lead card's are the principal's, a held step's the principal's or the
+    person it waits on (``approver``)."""
+    return principal or (instance.decision_class == _DEPARTMENT_ACTION.name and approver)
+
+
+def _may_change(instance: DecisionInstance, request: Request, resolver: int | None) -> bool:
+    return may_change_as(
+        instance, principal=_approver_is_principal(request),
+        approver=resolver is not None and resolver == instance.approver_person_id,
+    )
+
+
+def _with_edits(
+    payload: dict[str, Any], input_edits: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """A held step's payload with ``input_edits`` put in through
+    ``take_the_lead.apply_edits`` (the step's own rules for a change), and
+    the fields that changed. Raises HTTPException (422)."""
+    from openexecutive.orchestrator import card_details, take_the_lead
+
+    if input_edits is None:
+        return {k: v for k, v in payload.items() if k != SAID_INPUT}, {}
+    if len(card_details.held_steps(payload)) > 1:
+        # One card for several calls: Approve runs each as shown.
+        raise HTTPException(status_code=422, detail="This one can't be changed from its card.")
+    source: dict[str, Any] = payload["input"] if isinstance(payload.get("input"), dict) else {}
+    try:
+        new_input, changed = take_the_lead.apply_edits(
+            str(payload.get("tool") or ""), source, input_edits, mcp=bool(payload.get("mcp")),
+        )
+    except take_the_lead.EditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    # What was said is in the input now: what was carried out shows as sent.
+    done = {k: v for k, v in _edited(payload, new_input, changed).items() if k != SAID_INPUT}
+    return done, changed
+
+
+def _edited(payload: dict[str, Any], new_input: dict[str, Any], changed: dict[str, str] | None) -> dict[str, Any]:
+    """The card's payload as the person changed it: what it does, and the
+    line Activity and Done for you show, say what goes out, never what the
+    card first said."""
+    from openexecutive.orchestrator import take_the_lead
+
+    out = {**payload, "input": new_input}
+    if changed:
+        try:
+            out["summary"] = take_the_lead.summarize(
+                str(payload.get("tool") or ""), new_input, mcp=bool(payload.get("mcp")),
+            )
+        except Exception:
+            logger.warning("decisions/approve: couldn't restate an edited card", exc_info=True)
+    return out
 
 
 async def _run_department_action(
     instance: DecisionInstance, resolver: int | None, *, by_principal: bool,
+    payload: dict[str, Any] | None = None, edited: bool = False,
 ) -> DecisionInstance:
     from openexecutive.audit import log_event
     from openexecutive.memory.decision_ledger import claim_for_execution, finish_execution
     from openexecutive.orchestrator import take_the_lead
 
-    payload = _parse_payload(instance)
+    payload = payload if payload is not None else _parse_payload(instance)
     if not claim_for_execution(instance.id, resolver_person_id=resolver):
         raise HTTPException(status_code=409, detail="Someone else resolved this decision first.")
     try:
-        result = await take_the_lead.carry_out(payload, by_principal=by_principal)
+        result = await take_the_lead.carry_out(
+            {**payload, "tapped_by": resolver}, by_principal=by_principal,
+            own_card=_own_card(instance, resolver, by_principal=by_principal),
+        )
     except Exception as exc:
         logger.exception("decisions/approve: department action %d failed", instance.id)
         finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": type(exc).__name__})
@@ -835,7 +1027,7 @@ async def _run_department_action(
     failed = take_the_lead.result_failed(result)
     finish_execution(
         instance.id,
-        STATUS_FAILED if failed else STATUS_APPROVED_UNCHANGED,
+        STATUS_FAILED if failed else STATUS_APPROVED_WITH_EDIT if edited else STATUS_APPROVED_UNCHANGED,
         final_payload={**payload, "result": result[:2000]},
     )
     _clear_decision_alert(instance.id, "dismissed" if failed else "ack")
@@ -844,24 +1036,30 @@ async def _run_department_action(
         instance, payload, resolver,
     )
     if failed:
-        raise HTTPException(status_code=502, detail=f"It couldn't do that: {result[:300]}")
+        logger.warning("decisions/approve: step %d failed: %s", instance.id, result[:300])
+        raise HTTPException(
+            status_code=502,
+            detail=f"It couldn't do that. {take_the_lead.failure_words(str(payload.get('tool') or ''), result)}",
+        )
     return _refresh(instance.id)
 
 
 def _audit_department_action(
     log_event: Any, event_type: str, instance: DecisionInstance, payload: dict[str, Any],
-    resolver: int | None,
+    resolver: int | None, *, actor: str | None = None,
 ) -> None:
     verb = {
         "department_action_done": "Approved and done",
         "department_action_failed": "Approved, but it failed",
         "department_action_declined": "Declined",
+        "department_action_lapsed": "Left to lapse",
+        "department_action_waiting": "Waiting again",
     }[event_type]
     try:
         log_event(
             event_type,
             f"{verb}: {payload.get('summary') or payload.get('tool')}"[:240],
-            actor=f"person:{resolver}" if resolver is not None else "user",
+            actor=actor or (f"person:{resolver}" if resolver is not None else "user"),
             details={
                 "decision_id": instance.id,
                 "tool": payload.get("tool"),
@@ -885,6 +1083,15 @@ async def _department_action_declined(instance: DecisionInstance) -> None:
     )
 
 
+def _department_action_lapsed(instance: DecisionInstance, lapsed: bool) -> None:
+    from openexecutive.audit import log_event
+
+    _audit_department_action(
+        log_event, "department_action_lapsed" if lapsed else "department_action_waiting", instance,
+        _parse_payload(instance), None, actor="executive" if lapsed else "user",
+    )
+
+
 # A send or edit a team member asked for in chat that their department's
 # authority held (orchestrator.department_gate), for the approver it went to
 # or the principal. What it says quotes the conversation, so nobody else on
@@ -896,6 +1103,7 @@ _DEPARTMENT_ACTION = DecisionClassSpec(
     alert_source=DECISION_ALERT_SOURCE,
     approve=_carry_out_department_action,
     after_reject=_department_action_declined,
+    after_lapse=_department_action_lapsed,
 )
 
 async def _carry_out_app_action(
@@ -913,6 +1121,7 @@ async def _carry_out_app_action(
     payload = _parse_payload(instance)
     if app_control.card_stale(instance.created_at):
         mark_resolved(instance.id, STATUS_REJECTED, resolver_person_id=resolver)
+        _clear_decision_alert(instance.id, "dismissed")
         raise HTTPException(
             status_code=409, detail="This was more than a day ago, so it wasn't done. Ask again in chat.",
         )
@@ -924,27 +1133,31 @@ async def _carry_out_app_action(
     except (app_control.Refused, HTTPException) as exc:
         reason = app_control.refusal_text(exc) if isinstance(exc, HTTPException) else str(exc)
         finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": reason})
+        _clear_decision_alert(instance.id, "dismissed")
         log_event("app_action_refused", f"Card {instance.id} refused", actor="user", details=details)
         status_code = exc.status_code if isinstance(exc, HTTPException) and exc.status_code < 500 else 409
         raise HTTPException(status_code=status_code, detail=reason) from None
     except Exception:
         logger.exception("decisions/approve: app action %d failed", instance.id)
         finish_execution(instance.id, STATUS_FAILED, final_payload={**payload, "error": "failed"})
+        _clear_decision_alert(instance.id, "dismissed")
         raise HTTPException(
             status_code=502, detail="That didn't go through. Check before trying again.",
         ) from None
     finish_execution(instance.id, STATUS_APPROVED_UNCHANGED, final_payload={**payload, "did": did})
+    _clear_decision_alert(instance.id, "ack")
     log_event("app_action_done", did[:200], actor="user", details=details)
     return _refresh(instance.id)
 
 
 # Something asked for in chat that waits for its person's tap
-# (orchestrator.app_control): theirs alone, and never an alert.
+# (orchestrator.app_control): theirs alone. Its Needs you card, left when the
+# chat couldn't show it, is cleared when it is answered.
 _APP_ACTION = DecisionClassSpec(
     name="app_action",
     principal_only=False,
     approver_only=True,
-    alert_source=None,
+    alert_source=DECISION_ALERT_SOURCE,
     approve=_carry_out_app_action,
 )
 
@@ -970,6 +1183,269 @@ async def approve_decision(
             detail=f"Cannot approve a decision with status={instance.status!r}",
         )
     return _served(await spec.approve(instance, body, request, resolver))
+
+
+# What an approved step gave back that the chat's next turn reads.
+_CHAT_RESULT_CHARS = 1500
+# What the turn reads when Approve came from a page in another app, which
+# never approves a card: the card still waits where it was.
+HOST_APPROVE_NOTE = (
+    "Approve came from a page in another app, which can't approve a card, so nothing was done. "
+    "The card still waits where it was. Say so in a line."
+)
+
+
+async def approve_in_chat(instance_id: int, request: Request, input_edits: dict[str, Any] | None = None) -> str:
+    """Approve tapped on a card shown under a reply in the person's own chat
+    (web or phone), then what that chat's next turn reads, so the Executive
+    carries on with what they asked instead of stopping at the card.
+
+    The tap is the card's own Approve (``approve_decision``, with every check
+    it makes on Today); ``input_edits`` are the card's changed fields, as its
+    Edit sends them. Never raises: a refusal or a failure is said in the
+    note, and the turn tells them."""
+    from openexecutive.orchestrator.content_trust import wrap_untrusted
+
+    try:
+        body = ApproveBody(edits={"input": input_edits} if input_edits else None)
+        instance = await approve_decision(instance_id, body, request)
+    except HTTPException as exc:
+        detail = exc.detail
+        if isinstance(detail, dict):
+            # A refusal says why in its `message` (department_gate).
+            detail = detail.get("message")
+        if not isinstance(detail, str) or not detail.strip():
+            detail = "it couldn't be done"
+        # Labelled as data: a failed step's words can carry the outside
+        # service's text, as what a step gave back can.
+        return (
+            "They tapped Approve on a card in this chat, but it didn't go through. "
+            "Say so in a line, then carry on with what you can.\nWhy:\n"
+            + wrap_untrusted(detail[:300], source="tool_result")
+        )
+    except Exception:
+        logger.exception("decisions: approving card %d from the chat failed", instance_id)
+        return (
+            "They tapped Approve on a card in this chat, but something went wrong, so it may not "
+            "have gone through. Say so in a line; don't say it was done."
+        )
+    payload = _parse_payload(instance)
+    try:
+        final = json.loads(instance.final_payload_json or "{}")
+    except ValueError:
+        final = {}
+    # Quoted: a step's summary can quote what it sends, words from outside.
+    summary = json.dumps(" ".join(str(payload.get("summary") or "the step").split())[:200])
+    note = (
+        f"They tapped Approve on the card {summary} in this chat, and it was done. "
+        "Carry on with what they asked in this chat, using what it gave back; "
+        "don't ask them to approve it again."
+    )
+    # A held step says what it gave back in `result`; an app action in `did`.
+    result = (final.get("result") or final.get("did")) if isinstance(final, dict) else None
+    if isinstance(result, str) and result.strip():
+        note += "\nWhat it gave back:\n" + wrap_untrusted(result[:_CHAT_RESULT_CHARS], source="tool_result")
+    return note
+
+
+class StepSayBody(BaseModel):
+    """Words said on a held step's card (Take the lead, a teammate's held
+    send): ``text``, and ``seen`` the fields as the card showed them, so a
+    go is judged against what they read."""
+
+    text: str = ""
+    seen: dict[str, str] = {}
+
+
+class StepFieldView(BaseModel):
+    field: str
+    label: str
+    value: str
+    long: bool = False
+
+
+class StepSayResponse(BaseModel):
+    # What the Executive said back.
+    reply: str
+    # The step's fields as they read now, with what was said put in.
+    fields: list[StepFieldView]
+    # The card once a go carried it out; None while it still waits.
+    approved: DecisionInstance | None = None
+
+
+SAID_INPUT = "said_input"
+
+
+def _edits_beyond_said(payload: dict[str, Any], input_edits: object) -> bool:
+    """True when ``input_edits`` changes the step past what was said on its card."""
+    if not input_edits:
+        return False
+    said = payload.get(SAID_INPUT)
+    said = said if isinstance(said, dict) else {}
+    return not isinstance(input_edits, dict) or any(said.get(k) != v for k, v in input_edits.items())
+SAY_MAX_CHARS = 500
+_COULD_NOT_DO = "I couldn't do that. Tap to try again."
+_PICK_TO_GO = "Here it is now. Tap Do it to go ahead."
+
+
+def said_fields(payload: dict[str, Any]) -> list[StepFieldView]:
+    """A held step's editable fields as they read now: as filed, with what
+    was said on the card put in (``said_input``)."""
+    from openexecutive.orchestrator import card_details, take_the_lead
+
+    if len(card_details.held_steps(payload)) > 1:
+        return []
+    source: dict[str, Any] = payload["input"] if isinstance(payload.get("input"), dict) else {}
+    said_raw = payload.get(SAID_INPUT)
+    said: dict[str, Any] = said_raw if isinstance(said_raw, dict) else {}
+    return [
+        StepFieldView(
+            field=str(f["field"]), label=str(f["label"]), long=bool(f.get("long")),
+            value=str(said.get(f["field"], f["value"])),
+        )
+        for f in take_the_lead.editable_fields(str(payload.get("tool") or ""), source, mcp=bool(payload.get("mcp")))
+    ]
+
+
+def _said_line(text: str) -> str:
+    line = " ".join((text or "").split())
+    if not line:
+        raise HTTPException(status_code=422, detail="Say something first.")
+    if len(line) > SAY_MAX_CHARS:
+        raise HTTPException(status_code=422, detail=f"Keep it under {SAY_MAX_CHARS} characters.")
+    return line
+
+
+@router.post("/decisions/{instance_id}/say", response_model=StepSayResponse)
+async def say_on_step(instance_id: int, body: StepSayBody, request: Request) -> StepSayResponse:
+    """Words said on a held step's card ("make it shorter", "yes, send it"):
+    ``say_on_held``, for the signed-in caller, with Approve as a tap on
+    the page."""
+    _said_line(body.text)
+    instance = _visible_instance(instance_id, request)
+    if instance.decision_class not in _HELD_CLASSES:
+        raise HTTPException(status_code=409, detail="Use this card's own buttons.")
+    resolver = _resolver(instance, request)
+
+    async def approve(fresh: DecisionInstance, edits: dict[str, str]) -> DecisionInstance:
+        return await _spec_for(fresh).approve(fresh, ApproveBody(edits={"input": edits}), request, resolver)
+
+    return await say_on_held(
+        instance, body.text, resolver=resolver, may_change=_may_change(instance, request, resolver),
+        caller_key=api_caller.caller(request).email, seen=body.seen, approve=approve,
+    )
+
+
+async def say_on_held(
+    instance: DecisionInstance,
+    text: str,
+    *,
+    resolver: int | None,
+    may_change: bool,
+    caller_key: str,
+    seen: dict[str, str],
+    approve: Callable[[DecisionInstance, dict[str, str]], Awaitable[DecisionInstance]],
+) -> StepSayResponse:
+    """Words said on a held step's card, by ``resolver``, who may answer it
+    (checked by the caller): on the page, or in reply to its card in a chat
+    app (``say_in_chat``). One fast call rewrites the step's fields from
+    them; the card keeps the new fields, and Approve sends them as the edit,
+    so the step's own rules for a change apply there as for a typed one.
+    When they said to go ahead (judged from their words and the fields
+    alone, ``replan.said_go``), ``approve`` carries it out at once with
+    those edits, the same as a tap. ``may_change``: whether they may change
+    its fields with Approve's own edits. ``seen``: the fields as the card
+    showed them, when it says. What was said stays on the card, for them
+    only."""
+    from openexecutive.alerts import card_talk, replan
+    from openexecutive.alerts.store import get_alert_by_external
+    from openexecutive.memory.decision_ledger import decision_alert_external_id, update_open_payload
+
+    line = _said_line(text)
+    instance_id = instance.id
+    if instance.decision_class not in _HELD_CLASSES:
+        raise HTTPException(status_code=409, detail="Use this card's own buttons.")
+    if instance.status != STATUS_PROPOSED:
+        raise HTTPException(status_code=409, detail="This card was already answered.")
+    payload = _parse_payload(instance)
+    # Its wording is changed only by whoever may change it with Approve's
+    # own edits, so what was said can go on any way the card is approved.
+    fields = said_fields(payload) if may_change else []
+    if not fields:
+        raise HTTPException(status_code=409, detail="This one can't be changed from its card.")
+    # What the card showed before these words, for a go when the page sent none.
+    shown = {f.field: f.value for f in fields}
+    try:
+        new = await replan.rewrite_fields(
+            str(payload.get("summary") or ""),
+            [replan.StepField(field=f.field, label=f.label, value=f.value) for f in fields],
+            line,
+            caller_key=caller_key,
+        )
+    except replan.ReplanError as exc:
+        code = {"empty": 422, "too_long": 422, "too_many": 429}.get(exc.code, 503)
+        raise HTTPException(status_code=code, detail=exc.message) from exc
+
+    # The fields as filed: what was said is kept as the change from these.
+    original = {f.field: f.value for f in said_fields({**payload, SAID_INPUT: {}})}
+    now = {**{f.field: f.value for f in fields}, **new.values}
+    refused = ""
+    if new.values:
+        said = {k: v for k, v in now.items() if v != original.get(k)}
+        # Kept only when the step's own rules for a change take it, so any
+        # Approve of the card can carry it out.
+        try:
+            _with_edits(payload, said)
+        except HTTPException as exc:
+            refused = f"I couldn't change it that way: {str(exc.detail).rstrip('.')}. Nothing changed."
+        if not refused:
+            changed = {**payload, SAID_INPUT: said}
+            if not update_open_payload(instance_id, changed, expected_json=instance.proposed_payload_json):
+                raise HTTPException(status_code=409, detail="This card changed meanwhile. Look again.")
+            payload = changed
+            fields = said_fields(payload)
+
+    alert = get_alert_by_external(DECISION_ALERT_SOURCE, decision_alert_external_id(instance_id))
+    talk_id = alert.id if alert is not None else None
+    if talk_id is not None:
+        card_talk.add_turn(talk_id, "you", line, person_id=resolver)
+
+    reply, approved = refused or new.reply, None
+    if new.go and not refused:
+        step = [replan.StepField(field=f.field, label=f.label, value=f.value) for f in fields]
+        saw = seen or shown
+        before = [replan.StepField(field=f.field, label=f.label, value=saw.get(f.field, "")) for f in fields]
+        limit = ""
+        try:
+            go = await replan.said_go(
+                replan.step_text(step), line, before=replan.step_text(before),
+                before_max=replan.STEP_TEXT_MAX, caller_key=caller_key,
+            )
+        except replan.ReplanError as exc:
+            go = False
+            limit = exc.message if exc.code == "too_many" else ""
+        if not go:
+            # It said it was on it, but the go wasn't sure (or the hour's
+            # limit was reached, which it says): the step waits.
+            reply = limit or _PICK_TO_GO
+        if go:
+            edits = {f.field: f.value for f in fields if f.value != original.get(f.field)}
+            fresh = get_decision_instance(instance_id)
+            try:
+                if fresh is None:
+                    raise HTTPException(status_code=409, detail=_COULD_NOT_DO)
+                approved = _served(await approve(fresh, edits))
+            except HTTPException as exc:
+                if exc.status_code >= 500:
+                    # It was tried: say what happened, and show it as it is now.
+                    reply = str(exc.detail)
+                    approved = _served(_refresh(instance_id))
+                else:
+                    # Not tried: why, in its own words when it has them.
+                    reply = exc.detail if isinstance(exc.detail, str) else _COULD_NOT_DO
+    if talk_id is not None:
+        card_talk.add_turn(talk_id, "me", reply, person_id=resolver)
+    return StepSayResponse(reply=reply, fields=fields, approved=approved)
 
 
 @router.post("/decisions/{instance_id}/reject", response_model=DecisionInstance)
@@ -1036,15 +1512,44 @@ class _ChatTapRequest:
         self.client = None
 
 
+def chat_card_is_theirs(instance: DecisionInstance, person: Any) -> bool:
+    """Whether ``person``, proven in a chat app, may see and answer card
+    ``instance`` there: the web chat's rule (``_resolver``). A card of
+    actions is its person's alone; a meeting is the principal's, or its
+    approver's unless it is the principal's private booking."""
+    from openexecutive.people.store import find_principal_person
+
+    if not shown_in_chat(instance) or person.id is None:
+        return False
+    principal = find_principal_person()
+    is_principal = principal is not None and principal.id == person.id
+    if _approver_only(instance):
+        allowed = person.id == instance.approver_person_id
+    else:
+        allowed = is_principal or (person.id == instance.approver_person_id and not _is_private(instance))
+    if allowed:
+        # A step held from someone else's own chat isn't theirs either.
+        from openexecutive.alerts import own_chat
+
+        allowed = own_chat.decision_shown_to(instance, person.id)
+    return allowed
+
+
 async def resolve_in_chat(
-    instance_id: int, person: Any, *, approve: bool, allow: bool = False,
+    instance_id: int, person: Any, *, approve: bool, allow: bool = False, shown_at: str | None = None,
+    edits: dict[str, Any] | None = None, shown: str | None = None,
 ) -> DecisionInstance:
     """Approve or skip a card tapped in a chat app, for ``person``: the one the
-    adapter proved tapped it. The rule is the web chat's (``_resolver``): a
-    card of actions is its person's alone; a meeting is the principal's, or
-    its approver's unless it is the principal's private booking. ``allow``
+    adapter proved tapped it, when it is theirs (``chat_card_is_theirs``). ``allow``
     is the "on its own next time" button (In training): the same as the web
-    card's tick. Raises HTTPException, as the routes do."""
+    card's tick. ``shown_at``: when the tapped card showed the card as it is
+    (a chat app's tap, ``channel_cards.tap``); else when it was posted to
+    the chat app. A held step goes as its chat card shows it: with what was
+    said on it (``said_input``, ``channel_cards.card_text``), or with
+    ``edits`` when given (a go said on it, ``say_in_chat``). ``shown``: the
+    version of the card tapped; a held step that reads differently now
+    (words said on it meanwhile) isn't done. Raises HTTPException, as the
+    routes do."""
     from openexecutive.delegation.action_cards import ApproveRefused
     from openexecutive.delegation.action_cards import approve as approve_actions
     from openexecutive.delegation.gmail import normalize_email
@@ -1053,7 +1558,8 @@ async def resolve_in_chat(
     from openexecutive.people.store import find_principal_person
 
     instance = get_decision_instance(instance_id)
-    if instance is None or not shown_in_chat(instance) or person.id is None:
+    if instance is None or not chat_card_is_theirs(instance, person):
+        # As the routes: a card that isn't theirs is not there.
         raise HTTPException(status_code=404, detail="This card is no longer there.")
     if instance.status == STATUS_PROPOSED and approve and card_text(instance.id) is None:
         # Not one a chat can show whole (``channel_cards.CARD_MAX``): what a
@@ -1062,13 +1568,6 @@ async def resolve_in_chat(
     spec = _spec_for(instance)
     principal = find_principal_person()
     is_principal = principal is not None and principal.id == person.id
-    if _approver_only(instance):
-        allowed = person.id == instance.approver_person_id
-    else:
-        allowed = is_principal or (person.id == instance.approver_person_id and not _is_private(instance))
-    if not allowed:
-        # As the routes: a card that isn't theirs is not there.
-        raise HTTPException(status_code=404, detail="This card is no longer there.")
     if not approve:
         return await _reject(instance, spec, person.id)
     if instance.status != STATUS_PROPOSED:
@@ -1079,7 +1578,7 @@ async def resolve_in_chat(
     if instance.decision_class == _APP_ACTION.name:
         return await _carry_out_app_action(instance, ApproveBody(), _ChatTapRequest(tap), person.id)  # type: ignore[arg-type]
     if instance.decision_class == _DELEGATED_REPLY.name:
-        return await _send_reply_from_chat(instance, tap, person.id, allow=allow)
+        return await _send_reply_from_chat(instance, tap, person.id, allow=allow, shown_at=shown_at)
     if instance.decision_class == _DELEGATED_INVITE.name:
         from openexecutive.delegation.invites import AnswerRefused, answer
 
@@ -1088,6 +1587,11 @@ async def resolve_in_chat(
         except AnswerRefused as refused:
             raise HTTPException(status_code=refused.status, detail=refused.message) from None
         return _refresh(instance.id)
+    if instance.decision_class in _HELD_CLASSES and shown is not None:
+        from openexecutive.integrations.channel_cards import shows
+
+        if not shows(instance, shown):
+            raise HTTPException(status_code=409, detail=_CHANGED_MEANWHILE)
     if instance.decision_class == _TAKE_THE_LEAD.name:
         # As it stands (changing it is the web card's); "next time" allows
         # it from now on, the owner's alone, as the web card's tick does.
@@ -1110,9 +1614,17 @@ async def resolve_in_chat(
                     status_code=409,
                     detail=f"It can learn at most {take_the_lead.ALLOWED_MAX} things. Remove one in Settings first.",
                 )
-        return await _run_lead(instance, payload, person.id, by_principal=is_principal, grant=grant if allow else None)
+        # As the chat card showed it: the step with what was said on it.
+        payload, changed = _with_edits(payload, _said_input(payload) if edits is None else edits or None)
+        return await _run_lead(
+            instance, payload, person.id, by_principal=is_principal, changed=changed, grant=grant if allow else None,
+        )
     if instance.decision_class == _DEPARTMENT_ACTION.name:
-        return await _run_department_action(instance, person.id, by_principal=is_principal)
+        payload = _parse_payload(instance)
+        payload, changed = _with_edits(payload, _said_input(payload) if edits is None else edits or None)
+        return await _run_department_action(
+            instance, person.id, by_principal=is_principal, payload=payload, edited=bool(changed),
+        )
     try:
         await approve_actions(instance, caller=tap, resolver=person.id, allow=allow)
     except ApproveRefused as refused:
@@ -1120,24 +1632,83 @@ async def resolve_in_chat(
     return _refresh(instance.id)
 
 
+def _said_input(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """What was said on a held step's card (``said_input``), as Approve's
+    edits, or None when nothing was."""
+    said = payload.get(SAID_INPUT)
+    return dict(said) if isinstance(said, dict) and said else None
+
+
+def as_said(payload: dict[str, Any]) -> dict[str, Any]:
+    """A held step's payload with what was said on its card put in, and its
+    line restated: what its chat card shows (``channel_cards.card_text``)
+    and its tap there carries out (``resolve_in_chat``)."""
+    said = _said_input(payload)
+    if said is None or not isinstance(payload.get("input"), dict):
+        return payload
+    return _edited(payload, {**payload["input"], **said}, said)
+
+
+_CHANGED_MEANWHILE = "This card changed meanwhile. Look again."
+
+
+async def say_in_chat(instance_id: int, person: Any, text: str, *, shown: str) -> StepSayResponse:
+    """Words said on a held step's card in a chat app (a reply to the card's
+    message), by ``person``, the one the adapter proved said them, when the
+    card is theirs (``chat_card_is_theirs``) and still says what the card
+    of version ``shown`` said: ``say_on_held``, as on the page, with a go
+    carried out as a tap on the chat card (``resolve_in_chat``). Raises
+    HTTPException, as the routes do."""
+    from openexecutive.delegation.gmail import normalize_email
+    from openexecutive.integrations.channel_cards import shows
+    from openexecutive.people.store import find_principal_person
+
+    instance = get_decision_instance(instance_id)
+    if instance is None or not chat_card_is_theirs(instance, person):
+        raise HTTPException(status_code=404, detail="This card is no longer there.")
+    if not shows(instance, shown):
+        # The step their words would change is the one they read.
+        raise HTTPException(status_code=409, detail=_CHANGED_MEANWHILE)
+    principal = find_principal_person()
+    may_change = may_change_as(
+        instance, principal=principal is not None and principal.id == person.id,
+        approver=person.id == instance.approver_person_id,
+    )
+
+    async def approve(fresh: DecisionInstance, edits: dict[str, str]) -> DecisionInstance:
+        # The fields the go was judged on, not a newer read of the card.
+        return await resolve_in_chat(fresh.id, person, approve=True, edits=edits)
+
+    return await say_on_held(
+        instance, text, resolver=person.id, may_change=may_change,
+        caller_key=normalize_email(person.email or ""), seen={}, approve=approve,
+    )
+
+
 async def _send_reply_from_chat(
-    instance: DecisionInstance, tap: Any, resolver: int, *, allow: bool = False,
+    instance: DecisionInstance, tap: Any, resolver: int, *, allow: bool = False, shown_at: str | None = None,
 ) -> DecisionInstance:
     """Send a reply card's draft on a tap in a chat app, as written. What
-    would ask a second yes on the web card (recipients changed, newer mail),
-    or that card's questions still waiting for an answer, is turned down here
-    with what to do instead. ``allow``: the "next time" button."""
+    would ask a second yes on the web card (recipients changed, newer mail,
+    a change the card, posted at ``shown_at``, didn't show), or that card's
+    questions still waiting for an answer, is turned down here with what to
+    do instead. ``allow``: the "next time" button."""
     from openexecutive.delegation.answers import questions_left
     from openexecutive.delegation.inbox import card_payload
     from openexecutive.delegation.reply_send import SendRefused, send_approved_reply
+    from openexecutive.integrations import channel_cards
 
     # The chat card doesn't show the questions, and the draft isn't finished.
     if questions_left(card_payload(instance)):
         raise HTTPException(
             status_code=409, detail="This reply still has a question for you. Open it in the app to answer it and send.",
         )
+    if shown_at is None:
+        shown_at = channel_cards.shown_at(instance.id)
     try:
-        await send_approved_reply(instance, caller=tap, resolver=resolver, confirm={}, allow=allow)
+        await send_approved_reply(
+            instance, caller=tap, resolver=resolver, confirm={}, allow=allow, shown_at=shown_at,
+        )
     except SendRefused as refused:
         message = refused.message
         if refused.code == "confirm":

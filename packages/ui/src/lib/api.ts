@@ -1,4 +1,6 @@
+import { cardDetail, cardDetails, type CardDetail } from "@/lib/cardDetails";
 import type { AlertApproval } from "@/lib/approvals";
+import { deviceTimeZone } from "@/lib/timeZone";
 import type { AnswerSources } from "@/lib/answerSources";
 import type { DirectoryListing, DirectoryOption } from "@/lib/chatDirectory";
 import type { HistoryNote, HistoryState } from "@/lib/history";
@@ -56,6 +58,12 @@ export interface ChatDraftState {
   // After a change: the sentences that are new, and a line on what changed.
   changed_sentences: string[];
   note: string;
+  // Who it goes from: you, or (switched on its card) the Executive, with you
+  // on cc; and the Executive's name for the card's From.
+  from_executive?: boolean;
+  executive_name?: string;
+  // The version shown, sent back with Send.
+  version?: string;
 }
 
 // Names the round of tool calls currently in flight, so the progress line can
@@ -87,6 +95,9 @@ export interface Activity {
 export interface ChatChunk {
   type:
     | "chunk"
+    // The reply is written again whole (a check found it said something
+    // untrue): drop what streamed so far; the next chunks replace it.
+    | "rewrite"
     | "done"
     | "error"
     | "thinking"
@@ -198,6 +209,27 @@ export interface HeldStepsEvent {
   steps: string[];
 }
 
+// The turn needed the person's browser and the extension wasn't connected
+// (browser/tools.py): a card to add it, under the reply.
+export interface BrowserNeededEvent {
+  type: "browser_needed";
+  session_id?: string;
+  store_url: string | null;
+}
+
+// A step in the person's browser only they can do, asked in the chat with
+// Done and Stop while the turn waits (browser/tools.py `hand_over_asks`,
+// lib/handOverAsk.ts). Shown to them only, never saved.
+export interface HandOverAskEvent {
+  type: "hand_over";
+  session_id?: string | null;
+  id: string;
+  text: string;
+  detail: string;
+  done_label: string;
+  stop_label: string;
+}
+
 // What the content check flagged this turn, in plain words: sent only with
 // held steps, as their reason (orchestrator/outside_content.py `pending_flags`).
 export interface FlagsEvent {
@@ -248,7 +280,9 @@ export type StreamItem =
   | MessageAdded
   | HandingOver
   | HeldStepsEvent
+  | BrowserNeededEvent
   | FlagsEvent
+  | HandOverAskEvent
   | ProgressEvent;
 
 export interface StreamChatOptions {
@@ -268,6 +302,10 @@ export interface StreamChatOptions {
   // Executive's own card body). JSON route only; the multipart route derives
   // its own from the typed text and filenames.
   memoryText?: string;
+  // A card under a reply in this chat that was tapped Approve: the server
+  // approves it as its own button does, and this turn carries on from there
+  // (`input`: the card's changed fields). JSON route only.
+  approveCard?: { id: number; input?: Record<string, string> };
   // Safety net only. The normal stop path leaves the stream open and lets the
   // server wind down and send `stopped` + `done`; this aborts the fetch
   // outright if that never arrives.
@@ -306,6 +344,8 @@ export async function* streamChat(
         page_context: opts?.pageContext ?? undefined,
         client_turn_id: opts?.clientTurnId ?? undefined,
         memory_text: opts?.memoryText ?? undefined,
+        approve_card: opts?.approveCard?.id ?? undefined,
+        approve_input: opts?.approveCard?.input ?? undefined,
       }),
       signal: opts?.signal,
     });
@@ -415,6 +455,21 @@ export async function stopChat(clientTurnId: string): Promise<boolean> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ client_turn_id: clientTurnId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Done or Stop on the chat's ask (lib/handOverAsk.ts). The turn waiting on it
+// carries on or stops; false when it had already finished.
+export async function answerHandOver(id: string, outcome: "done" | "stop"): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/browser/hand-over/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ outcome }),
     });
     return res.ok;
   } catch {
@@ -654,6 +709,8 @@ export async function commitOnboardDraft(
       departments,
       goals,
       owner_email: ownerEmail.trim() || null,
+      // The company's clock: this browser's zone.
+      timezone: deviceTimeZone(),
     }),
   });
   if (!res.ok) throw await onboardError(res, "Could not save your profile");
@@ -1353,6 +1410,7 @@ export type LiveChatEvent =
       content: string;
     }
   | { type: "chunk"; turn_key: string; content: string }
+  | { type: "rewrite"; turn_key: string }
   | { type: "thinking"; turn_key: string }
   | { type: "activity"; turn_key: string; label: string }
   | ({ turn_key: string } & ActionTaken)
@@ -1499,6 +1557,10 @@ export interface ChatMessage {
   // The last reply only: what the content check flagged in what its turn
   // read, from the stream's `flags` event or re-attached on reload.
   flags?: string[];
+  // The last reply only, this visit only: its turn needed the browser
+  // extension and it wasn't connected (`browser_needed`). Where to get it,
+  // or null for no install page.
+  browser_needed?: { store_url: string | null };
 }
 
 export interface Decision {
@@ -1593,6 +1655,8 @@ export interface StandingFact {
   decision?: boolean;
   department?: string;
   outcome?: string;
+  /** Set on a decision only this person sees (made in their own chat, not shared). */
+  private_to_person_id?: number | null;
 }
 
 export interface StandingFactsPage {
@@ -1602,13 +1666,10 @@ export interface StandingFactsPage {
   retirable_ids: number[];
   /** The principal: approves teammates' proposals and sets who needs approval. */
   can_review: boolean;
-}
-
-/** One teammate and whether the principal approves their facts first. */
-export interface FactApprovalRule {
-  person_id: number;
-  full_name: string;
-  needs_approval: boolean;
+  /** Your own private decisions: you can share them with the team. */
+  shareable_ids?: number[];
+  /** Shared decisions you recorded: you can make them private again. */
+  unshareable_ids?: number[];
 }
 
 export async function listStandingFacts(): Promise<StandingFactsPage> {
@@ -1638,6 +1699,35 @@ export async function editStandingFact(id: number, statement: string): Promise<S
   return res.json();
 }
 
+// Share your own private decision with the team, or make one you shared
+// private again.
+export async function shareDecision(id: number, shared: boolean): Promise<void> {
+  const res = await fetch(`${API_BASE}/memories/decisions/${id}/share`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ shared }),
+  });
+  if (!res.ok) {
+    const detail = await res.json().then((b) => b?.detail).catch(() => null);
+    throw new Error(typeof detail === "string" && res.status === 409 ? detail : "Couldn't change who sees it");
+  }
+}
+
+// Change or remove your own private decision (a shared one is the principal's).
+export async function editOwnDecision(id: number, summary: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/memories/decisions/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ summary }),
+  });
+  if (!res.ok) throw new Error("Couldn't save that change");
+}
+
+export async function removeOwnDecision(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/memories/decisions/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error("Failed to remove the decision");
+}
+
 export async function reviewStandingFact(
   id: number,
   decision: "approve" | "decline",
@@ -1648,25 +1738,6 @@ export async function reviewStandingFact(
     body: JSON.stringify({}),
   });
   if (!res.ok) throw new Error(`Failed to ${decision} standing fact`);
-  return res.json();
-}
-
-export async function listFactApprovalRules(): Promise<FactApprovalRule[]> {
-  const res = await fetch(`${API_BASE}/memories/facts/approval`);
-  if (!res.ok) throw new Error("Failed to list who needs approval");
-  return res.json();
-}
-
-export async function setFactApprovalRule(
-  personId: number,
-  needsApproval: boolean,
-): Promise<FactApprovalRule> {
-  const res = await fetch(`${API_BASE}/memories/facts/approval/${personId}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ needs_approval: needsApproval }),
-  });
-  if (!res.ok) throw new Error("Failed to change who needs approval");
   return res.json();
 }
 
@@ -1819,22 +1890,6 @@ export async function listScheduledActions(
   const params = new URLSearchParams({ status, limit: String(limit), order });
   const res = await fetch(`${API_BASE}/scheduled?${params.toString()}`, { signal });
   if (!res.ok) throw new Error("Failed to list scheduled actions");
-  return res.json();
-}
-
-export async function cancelScheduledAction(id: number): Promise<ScheduledAction> {
-  const res = await fetch(`${API_BASE}/scheduled/${id}`, { method: "DELETE" });
-  if (res.status === 409) {
-    throw new Error("Action is no longer pending — can't cancel.");
-  }
-  if (res.status === 401 || res.status === 503) {
-    // Signed-in users can cancel once the API and the UI share
-    // BACKEND_SHARED_SECRET (every internet-reachable deploy sets it).
-    throw new Error(
-      "Cancel isn't enabled on this server yet. Ask your administrator to set the same BACKEND_SHARED_SECRET on the API and the UI.",
-    );
-  }
-  if (!res.ok) throw new Error("Failed to cancel scheduled action");
   return res.json();
 }
 
@@ -2079,7 +2134,7 @@ export interface DelegationTeam {
 // on a card on Today (GET /delegation/replies).
 export interface InboxWatch {
   enabled: boolean;
-  // off, waiting, ok, checking, daily_limit, backlog_full, act_as_me_off,
+  // off, waiting, ok, checking, backlog_full, act_as_me_off,
   // client_slot, rate_limited, error, or why your Gmail can't be read.
   status: string;
   // The status in plain words, from the backend.
@@ -2172,6 +2227,17 @@ export interface ReplyTurn {
   from_name?: string;
   from_email?: string;
   at?: string;
+  // News: its subject and its files' names.
+  subject?: string;
+  files?: string[];
+  // A note that ends a run of the Executive's work: "done", "stopped" or
+  // "stuck", the steps it took, and next steps to tap (changeReply with
+  // work: true).
+  state?: "done" | "stopped" | "stuck" | string;
+  steps?: string[];
+  choices?: string[];
+  // A note on a change: the sentences it made new, quoted under it.
+  changed?: string[];
 }
 
 export interface ReplyCard {
@@ -2217,6 +2283,9 @@ export interface ReplyCard {
   questions_settled?: boolean;
   // Only from answering: the sentences the rewrite added or changed.
   changed_sentences?: string[];
+  // Answering words said on the card: they said to send it, so the card
+  // asks to confirm the send, as a tap on Send does.
+  send_now?: boolean;
   // Everyone else the email went to: Reply to: Everyone adds them. Empty or
   // absent when there is no choice to make.
   reply_others?: string[];
@@ -2233,8 +2302,18 @@ export interface ReplyCard {
   // The Executive is doing what the email asks right now; the card polls
   // until it is done.
   working?: boolean;
+  // While it works: the steps done so far, and what it is doing now.
+  work_steps?: string[];
+  work_now?: string;
   // The files your reply carries, by name: attached when it is sent.
   files?: string[];
+  // Goes from the Executive's own mailbox with you on cc (setReplyFrom);
+  // false or missing: from you.
+  from_executive?: boolean;
+  // The Executive's name, for the From choice.
+  executive_name?: string;
+  // Undo can take back the last change you asked for (undoReplyChange).
+  can_undo?: boolean;
 }
 
 // One thing a reply leaves you to decide (GET /delegation/replies).
@@ -2531,17 +2610,6 @@ export async function setDelegationEnabled(enabled: boolean): Promise<Delegation
   return res.json();
 }
 
-export async function setDelegationTeam(enabled: boolean): Promise<DelegationSettings> {
-  const res = await fetch(`${API_BASE}/delegation/team`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!res.ok) throw await delegationError(res, "Couldn't change As you for your team.");
-  delegationChanged();
-  return res.json();
-}
-
 export async function setInboxWatch(
   update: { enabled?: boolean; mailbox_drafts?: boolean },
 ): Promise<DelegationSettings> {
@@ -2579,6 +2647,19 @@ export async function setReplyRecipients(id: number, everyone: boolean): Promise
   return (await res.json()) as ReplyCard;
 }
 
+// Send a reply from the Executive's own mailbox with you on cc, or from you
+// again: the words are rewritten as the Executive writing for you, or put
+// back as they were. Sends nothing.
+export async function setReplyFrom(id: number, executive: boolean): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/from`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ executive }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't change who it's from.");
+  return (await res.json()) as ReplyCard;
+}
+
 // Answer what a reply left you to decide: the draft is rewritten with it
 // in your voice and saved on its card (and in your Drafts when it's there).
 export async function answerReplyQuestions(
@@ -2596,13 +2677,31 @@ export async function answerReplyQuestions(
 
 // Change the reply the way you say, in your own words: the Executive
 // rewrites it and says what it changed (POST .../change). Sends nothing.
-export async function changeReply(id: number, text: string): Promise<ReplyCard> {
+// While it works, your words stop the run going now and it starts again
+// your way. `work`: a next step you tapped, straight to the work.
+export async function changeReply(id: number, text: string, opts: { work?: boolean } = {}): Promise<ReplyCard> {
   const res = await fetch(`${API_BASE}/delegation/replies/${id}/change`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, work: Boolean(opts.work) }),
   });
   if (!res.ok) throw await delegationError(res, "Couldn't change your reply.");
+  return (await res.json()) as ReplyCard;
+}
+
+// Take back the last change you asked for on a reply card: its words as
+// they were before it (POST .../undo). Sends nothing.
+export async function undoReplyChange(id: number): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/undo`, { method: "POST" });
+  if (!res.ok) throw await delegationError(res, "Couldn't undo that.");
+  return (await res.json()) as ReplyCard;
+}
+
+// Stop what the Executive is doing on a reply card: the card keeps what it
+// did as a stopped run (POST .../stop). Sends nothing.
+export async function stopReplyWork(id: number): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/stop`, { method: "POST" });
+  if (!res.ok) throw await delegationError(res, "Couldn't stop it.");
   return (await res.json()) as ReplyCard;
 }
 
@@ -2769,11 +2868,22 @@ export async function sendReplyCard(
 // Send a draft the chat wrote as you, exactly as it was written (POST
 // /delegation/drafts/{row}/send). `threadMovedOn` is your second yes when a
 // newer message arrived in that conversation.
-export async function sendChatDraft(row: number, threadMovedOn = false): Promise<SendReplyResult> {
+// `seen` is what the tapped card showed: its version (the chat card), or
+// who it goes from (a Home row, which shows no words). Changed since, on
+// another screen: refused with `draft_changed`, nothing sent.
+export async function sendChatDraft(
+  row: number,
+  threadMovedOn = false,
+  seen: { version?: string; fromExecutive?: boolean } = {},
+): Promise<SendReplyResult> {
   const res = await fetch(`${API_BASE}/delegation/drafts/${row}/send`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ thread_moved_on: threadMovedOn }),
+    body: JSON.stringify({
+      thread_moved_on: threadMovedOn,
+      ...(seen.version ? { version: seen.version } : {}),
+      ...(seen.fromExecutive !== undefined ? { from_executive: seen.fromExecutive } : {}),
+    }),
   });
   if (res.ok) return { status: "sent" };
   const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
@@ -2818,6 +2928,19 @@ export async function setChatDraftText(row: number, text: string): Promise<ChatD
     body: JSON.stringify({ text }),
   });
   if (!res.ok) throw await chatDraftError(res, "Couldn't save your change.");
+  return (await res.json()) as ChatDraftState;
+}
+
+// Who the draft goes from: the Executive (with you on cc) or you. Its words
+// are written once for the new sender, here and in your Drafts. Sends
+// nothing.
+export async function setChatDraftFrom(row: number, executive: boolean): Promise<ChatDraftState> {
+  const res = await fetch(`${API_BASE}/delegation/drafts/${row}/from`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ executive }),
+  });
+  if (!res.ok) throw await chatDraftError(res, "Couldn't change who it's from.");
   return (await res.json()) as ChatDraftState;
 }
 
@@ -3189,6 +3312,9 @@ export interface DynamicWorkflowDef {
   // Who created it (server-managed; echoing it back in a body has no effect).
   // Asked to approve the workflow's first write to a new target.
   owner_person_id?: number | null;
+  // Whether the signed-in person may delete it: its creator or the principal
+  // (GET /workflows/custom only; the server decides again on DELETE).
+  can_delete?: boolean;
 }
 
 // The specialists a dynamic step may consult (matches SPECIALIST_REGISTRY,
@@ -3487,6 +3613,8 @@ export interface ResumeProgress {
 }
 
 export interface WorkflowRunDetail extends WorkflowRunSummary {
+  /** The workflow's name as people read it (never its key). */
+  workflow_title: string;
   inputs: Record<string, unknown>;
   artifact: string | null;
   error: string | null;
@@ -4627,8 +4755,8 @@ export async function unloadFixture(): Promise<UnloadResult> {
 export interface ResetResult {
   reset: boolean;
   departments_seeded: number;
-  episodic_cleared: Record<string, number>;
-  people_cleared: Record<string, number>;
+  /** Rows deleted per table. */
+  cleared: Record<string, number>;
 }
 
 export async function resetAllState(): Promise<ResetResult> {
@@ -4736,6 +4864,8 @@ export interface DepartmentConfig {
   specialist_key: string | null;
   charter: DepartmentCharter;
   authority_level: "auto_execute" | "propose_only" | "escalate";
+  // Its Approvals level by name: Careful, Balanced or Hands-off.
+  approvals: string;
   head_person_id: number | null;
   head_persona_slug: string | null;
   cadences: Record<string, string>;
@@ -4745,6 +4875,8 @@ export interface DepartmentConfig {
   slack_channel_id: string | null;
   discord_channel_id: string | null;
   telegram_chat_id: string | null;
+  // A Google Chat space the Chat app is in ("spaces/…").
+  google_chat_space?: string | null;
   // Named external entities this department wants monitored. The research
   // watch policy treats them as strong grounding: a proposal about one can
   // be added to the watch list on its own and is routed to this department.
@@ -4813,6 +4945,7 @@ export interface DepartmentPatch {
   slack_channel_id?: string | null;
   discord_channel_id?: string | null;
   telegram_chat_id?: string | null;
+  google_chat_space?: string | null;
   watched_entities?: string[];
 }
 
@@ -5639,6 +5772,8 @@ export interface DepartmentBriefItem {
   slug: string;
   title: string;
   authority_level: string;
+  // Its Approvals level by name; "" on the row of goals with no department.
+  approvals?: string;
   goal_count: number;
   at_risk_count: number;
   off_track_count: number;
@@ -5683,6 +5818,8 @@ export interface ProposalItem {
   headline: string;
   routed_to_person_id: number | null;
   suggested_action: string;
+  // The step Approve does, in a few words for its button ("" when none).
+  action_label?: string;
   created_at: string;
   topic_tags: string[];
   // Presentation signals from the backend (see briefing/ranking.py).
@@ -5695,6 +5832,18 @@ export interface ProposalItem {
   // external/watchlist signal was pulled into the action lane by its severity
   // (e.g. a large stock move). Null/absent for everything else.
   surfaced_reason?: string | null;
+  // The watch that raised this card, when a watch did: what the person
+  // says on the card corrects it (sayOnCard), and the card links to its page.
+  watch_slug?: string | null;
+  // That watch's name as a person says it ("Acme pricing page").
+  watch_title?: string | null;
+  // Someone changed the plan by saying so on the card or picking another
+  // of its options.
+  plan_changed?: boolean;
+  // Who changed it, when it wasn't the reader: "What I'll do · Changed by <name>".
+  plan_changed_by?: string | null;
+  // Whether what the person says on the card can change its plan (sayOnCard).
+  plan_editable?: boolean;
   // Set when this proposal is backed by a decision_instance (a gated calendar
   // booking awaiting approval). The briefing routes Approve/Reject to the
   // /decisions endpoints (which book/cancel server-side) instead of the
@@ -5744,6 +5893,86 @@ export interface ProposalItem {
   // Who else waits on this card: the teammate whose ask was held for your
   // OK. Home puts these cards first.
   waiting_on?: string;
+  // Where it came from (Alert.source).
+  source?: string;
+  // What the card shows, words and buttons, decided on the server
+  // (briefing/card_view.py). The card draws it as it is.
+  view?: CardView | null;
+}
+
+// One button on a card. `action` is how a press is carried out, the same on
+// every screen; `place` is where it sits (the one main button, the ⋯ menu,
+// apart on the right, or a row of answers in the card's body).
+export interface CardButton {
+  action: "edit_approve" | "dismiss" | "snooze" | "rerun" | "open" | "open_url" | "chat" | "call";
+  label: string;
+  place: "primary" | "menu" | "side" | "answer";
+  href: string;
+  run_id: string;
+  prompt: string;
+  memory: string;
+  done: string;
+  busy_label: string;
+}
+
+export type CardTone = "neutral" | "amber" | "sky" | "rose" | "emerald";
+
+export interface CardChip {
+  label: string;
+  tone: CardTone;
+  title: string;
+}
+
+// One way to go on a card, picked before anything happens (the first is the
+// Executive's own pick). "approve": Approve with `plan`. "answer": send
+// `label` as the answer to the card's question.
+export interface CardOption {
+  action: "approve" | "answer";
+  label: string;
+  plan: string;
+}
+
+// One line of the reader's conversation on a card: theirs ("you") or the
+// Executive's ("me").
+export interface CardLine {
+  who: "you" | "me";
+  text: string;
+}
+
+export interface CardView {
+  kind: "new_sender" | "lead" | "held" | "ask" | "rerun" | "document" | "signal" | "decision" | "proposal";
+  panel: "" | "new_sender" | "lead" | "held";
+  routed_to: string;
+  need: string;
+  as_me: boolean;
+  source: string;
+  // A watch's signal: "I noticed this on the Acme pricing page I'm watching."
+  // "" on every other card.
+  noticed?: string;
+  status: CardChip | null;
+  description: string;
+  long: boolean;
+  // What happened, in one line ("" until it is written).
+  happened: string;
+  // What I'll do: shown under `plan_title` when that is set.
+  plan_title: string;
+  plan: string;
+  options: CardOption[];
+  // "Or tell me…": the person can say anything on the card (sayOnCard).
+  tell_me: boolean;
+  turns: CardLine[];
+  waiting_because: string;
+  radar: string;
+  review: { title: string; text: string; tone: CardTone } | null;
+  chips: CardChip[];
+  surfaced: string;
+  tags: CardChip[];
+  document: boolean;
+  reviewed: string;
+  buttons: CardButton[];
+  // A held step's card opens with these (orchestrator.card_details.top):
+  // empty on every other card. Read with heldCardTop.
+  top?: Record<string, string>;
 }
 
 // One autonomous alert-review move since the last delivered morning brief
@@ -5837,8 +6066,8 @@ export interface PointSource {
 // One row of Home's Done for you (GET /today `done_for_you`): a card the
 // viewer approved (`kind` "approval", one row per card, its status changing
 // in place) or something the Executive did on its own in the last day.
-// One line of Home's Watching next (GET /today `watching`): a follow-up it
-// will send (`action:<id>`) or a standing job (`job:<id>`), what it does
+// One line of Home's Following up (GET /today `watching`): a follow-up it
+// will send (`action:<id>`) or standing work (`job:<id>`), what it does
 // next and when. Stop ends that one thing (POST /today/watching/stop).
 export interface WatchingItem {
   key: string;
@@ -5866,6 +6095,44 @@ export async function stopWatching(key: string): Promise<void> {
   }
 }
 
+export interface ActOnCount {
+  key: "tasks_overdue" | "goals_at_risk" | "goals_unchecked" | "people_follow_up";
+  text: string;
+  count: number;
+  href: string;
+}
+
+// The Schedule page (GET /schedule): everything the Executive does without
+// being asked, soonest first. Follow-ups and standing work stop with
+// stopWatching(stop_key); the rest open `href`, where each is managed.
+export type ScheduleKind = "follow_up" | "standing" | "workflow" | "watch" | "always";
+
+export interface ScheduleItem {
+  key: string;
+  kind: ScheduleKind;
+  title: string;
+  detail: string;
+  /** When it acts next (ISO), or null. */
+  at: string | null;
+  /** A watch: when it last checked (ISO). */
+  last_checked: string | null;
+  /** How often, in words ("every day"); "" for a one-off. */
+  cadence: string;
+  href: string | null;
+  stop_key: string | null;
+}
+
+export interface ScheduleResponse {
+  items: ScheduleItem[];
+  counts: Record<ScheduleKind, number>;
+}
+
+export async function getSchedule(signal?: AbortSignal): Promise<ScheduleResponse> {
+  const res = await fetch(`${API_BASE}/schedule`, { cache: "no-store", signal });
+  if (!res.ok) throw new Error("Couldn't load the schedule.");
+  return res.json();
+}
+
 export interface DoneRow {
   key: string;
   kind: string;
@@ -5877,6 +6144,17 @@ export interface DoneRow {
   alert_id?: number | null;
   approval_id?: number | null;
   artifact_id?: string | null;
+  // Whose name it went out in: "Sent as you", "Sent as <Executive>", "Done
+  // as <Executive>". "" when the title says it.
+  as_tag?: string;
+}
+
+/** Home's Done for you on its own (GET /today/done), for the screens that
+ *  show it without the rest of Home, in the same rows and words. */
+export async function getDone(): Promise<DoneRow[]> {
+  const res = await fetch(`${API_BASE}/today/done`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to load Done for you: ${res.statusText}`);
+  return res.json();
 }
 
 /** Something waiting on the reader that lives on another page: Home's Needs
@@ -5898,6 +6176,8 @@ export interface RightNowRow {
   subject: string;
   at: string;
   note?: string;
+  // A draft switched to go from the Executive (its note names it).
+  from_executive?: boolean;
   source?: {
     kind: "mail" | "alert" | "link";
     message_id?: string | null;
@@ -5952,6 +6232,9 @@ export interface Today {
   // Done for you: what the Executive did or is doing for the viewer today.
   done_for_you?: DoneRow[];
   watching?: WatchingItem[];
+  // Home's bottom line: only the counts that need the reader to act, each a
+  // link. Empty: everything else is on track.
+  to_act_on?: ActOnCount[];
   inbox_also_total?: number;
   // The owner's own: today's delivered morning brief and the meetings still
   // ahead today.
@@ -6259,7 +6542,8 @@ export type WatchlistSignalType =
   | "vendor_status"
   | "query"
   | "edgar"
-  | "page_watch";
+  | "page_watch"
+  | "mailbox";
 export type WatchlistCadence = "real_time" | "15min" | "hourly" | "daily" | "weekly";
 export type WatchlistMode = "active" | "dry_run";
 export type WatchlistSeverity = "low" | "medium" | "high" | "urgent";
@@ -6301,6 +6585,8 @@ export interface WatchlistItem {
   tells_you_when: string;
   /** "It checks every 15 minutes." */
   checks: string;
+  /** An email watch's "nothing by" day ("Ping if nothing by Wed Nov 25"); "" when none. */
+  quiet_line?: string;
   /** The newest thing it told you; null when it has said nothing yet. */
   last_told: { at: string; summary: string; url: string } | null;
   goal_title: string;
@@ -6606,17 +6892,58 @@ export interface DecisionInstance {
 
 // Approve a proposal card that has no decision behind it: the server records
 // who approved it, claims it and carries it out (alerts/approvals.py).
-export async function approveAlert(alertId: number, editedBody?: string): Promise<AlertApproval> {
+// `plan` is the plan of the option picked on the card: the server goes ahead
+// only while the card still offers it (what someone says on it can change it).
+export async function approveAlert(alertId: number, editedBody?: string, plan?: string): Promise<AlertApproval> {
   const res = await fetch(`${API_BASE}/alerts/${alertId}/approve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ edited_body: editedBody ?? null }),
+    body: JSON.stringify({ edited_body: editedBody ?? null, plan: plan ?? null }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Failed to approve: ${res.statusText}${text ? ` — ${text}` : ""}`);
   }
   return res.json();
+}
+
+// What the Executive said back when the person said something on a card,
+// and the card as it reads now (null once it is gone). `approval` is set
+// when what they said started the work: getAlertApproval says how it ends.
+export interface SayResult {
+  reply: string;
+  card: ProposalItem | null;
+  approval: AlertApproval | null;
+  // Other cards a correction to a watch closed with this one.
+  closed_alert_ids?: number[];
+}
+
+// "Or tell me…" on any card: an answer, "ask Dan instead", "yes, send it
+// from you", "that's our own repo". The card takes it its own way.
+// `seenPlan` is the plan the card shows as they speak: a go is judged
+// against it, so it never runs a plan someone changed since.
+export async function sayOnCard(alertId: number, text: string, seenPlan = ""): Promise<SayResult> {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/say`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, seen_plan: seenPlan }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(body ? detailOf(body) : "Couldn't send that. Try again.");
+  }
+  return res.json();
+}
+
+// A card's `call` button (CardButton.action "call"): POST to the path the
+// server gave, with no body. Throws the server's reason when it fails.
+export async function cardCall(path: string): Promise<void> {
+  if (!path.startsWith("/") || path.startsWith("//")) throw new Error("That didn't work.");
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(body ? detailOf(body) : "That didn't work.");
+  }
 }
 
 // What a Needs you card asks of its reader (ProposalItem.needs).
@@ -6920,7 +7247,7 @@ export async function updateClientMeta(
 
 // ── Take the lead (Delegate → Take the lead) ────────────────
 
-export type LeadRuleKind = "person" | "domain" | "words" | "amount";
+export type LeadRuleKind = "person" | "domain" | "words" | "amount" | "topic";
 // "wait": always waits for your yes; "go": goes on its own where the level
 // would hold it (never past Careful or In training).
 export type LeadRuleEffect = "wait" | "go";
@@ -7135,11 +7462,38 @@ export interface LeadCardField {
   label: string;
   long: boolean;
   value: string;
+  // A Drive file shown by its name links to it; a sheet's rows draw as a table.
+  href?: string;
+  table?: string[][];
+  header?: boolean;
+}
+
+// The lines a held step's card opens with, the same on every app
+// (``orchestrator.card_details.top``): whose OK it waits for when that isn't
+// the reader, who started it, and why it waits.
+export interface HeldCardTop {
+  waitingOn: string;
+  started: string;
+  waits: string;
+  // The title, naming the file it works on; "" when not known.
+  title: string;
+}
+
+export function heldCardTop(raw: unknown): HeldCardTop | null {
+  if (!raw || typeof raw !== "object" || Object.keys(raw).length === 0) return null;
+  const t = raw as Record<string, unknown>;
+  return {
+    waitingOn: String(t.waiting_on ?? ""),
+    started: String(t.started ?? ""),
+    waits: String(t.waits ?? ""),
+    title: String(t.title ?? ""),
+  };
 }
 
 // What a Take the lead card holds (its decision's payload), for the card's
 // Edit and Approve + allow. Only its approver and the owner can read it.
 export interface LeadCardPayload {
+  top: HeldCardTop | null;
   summary: string;
   // Who and what in a few words, and where it would go ("On Slack"). Empty on
   // cards made before they were saved.
@@ -7147,10 +7501,53 @@ export interface LeadCardPayload {
   where: string;
   // What a connected app's call would send, read-only (to, subject, message).
   details: LeadCardField[];
+  // The same with what was said on the card, which its Approve sends.
+  saidDetails: LeadCardField[];
   reason: string;
   kind: string;
   fields: LeadCardField[];
   allow?: { key: string; label: string };
+  // What was said on the card, put into its fields (by field): Approve
+  // sends it as the edit.
+  said: Record<string, string>;
+  // Whether this reader may change it (Edit, Or tell me).
+  mayChange: boolean;
+  // Goes rules that would let this exact step go next time (the card's
+  // "Next time" box, take_the_lead.rule_offers); raw, read by parseOffers.
+  offers: unknown;
+}
+
+function saidInput(payload: { said_input?: unknown }): Record<string, string> {
+  const said = payload.said_input;
+  if (!said || typeof said !== "object") return {};
+  return Object.fromEntries(Object.entries(said).filter(([, v]) => typeof v === "string")) as Record<string, string>;
+}
+
+// The page reads a card's details in plain words (``card_details.served``):
+// each is {field: "To", value}, the field being its label. Older cards kept
+// {field, label, long}. Either way the card shows the label, and a message
+// (or anything long) as a block.
+function leadDetail(d: {
+  field?: unknown;
+  label?: unknown;
+  long?: unknown;
+  value?: unknown;
+  href?: unknown;
+  table?: unknown;
+  header?: unknown;
+}): LeadCardField {
+  const { value, href, table, header } = cardDetail(d);
+  const label = String(d.label ?? d.field ?? "");
+  return {
+    field: String(d.field ?? label),
+    label,
+    long: table
+      ? true
+      : typeof d.long === "boolean" ? d.long : /^message$/i.test(label) || value.includes("\n") || value.length > 120,
+    value,
+    ...(href ? { href } : {}),
+    ...(table ? { table, header } : {}),
+  };
 }
 
 export async function getLeadCard(id: number, signal?: AbortSignal): Promise<LeadCardPayload> {
@@ -7159,14 +7556,19 @@ export async function getLeadCard(id: number, signal?: AbortSignal): Promise<Lea
   const instance: DecisionInstance = await res.json();
   const payload = JSON.parse(instance.proposed_payload_json || "{}");
   return {
+    top: heldCardTop(payload.top),
     summary: String(payload.summary ?? ""),
     headline: String(payload.headline ?? ""),
     where: String(payload.where ?? ""),
-    details: Array.isArray(payload.details) ? payload.details : [],
+    details: Array.isArray(payload.details) ? payload.details.map(leadDetail) : [],
+    saidDetails: Array.isArray(payload.said_details) ? payload.said_details.map(leadDetail) : [],
     reason: String(payload.reason ?? ""),
     kind: String(payload.kind ?? ""),
     fields: Array.isArray(payload.fields) ? payload.fields : [],
     allow: payload.allow && typeof payload.allow.key === "string" ? payload.allow : undefined,
+    said: saidInput(payload),
+    mayChange: payload.may_change !== false,
+    offers: payload.offers,
   };
 }
 
@@ -7174,10 +7576,22 @@ export async function getLeadCard(id: number, signal?: AbortSignal): Promise<Lea
 // decision): who asked, why it waited, and every field of the call in full.
 // Only its approver and the owner can read it.
 export interface HeldActionPayload {
+  top: HeldCardTop | null;
   summary: string;
   reason: string;
   requestedBy: string;
-  details: { field: string; value: string }[];
+  details: CardDetail[];
+  // The step with what was said on the card: what an Approve that sends
+  // `said` carries out. Empty when nothing was said.
+  saidDetails: CardDetail[];
+  // What Edit may change before Approve (an email's subject and text).
+  fields: LeadCardField[];
+  // What was said on the card, put into its fields: Approve sends it.
+  said: Record<string, string>;
+  // Whether this reader may change it (Edit, Or tell me).
+  mayChange: boolean;
+  // Goes rules that would let it go next time (parseOffers).
+  offers: unknown;
 }
 
 export async function getHeldAction(id: number, signal?: AbortSignal): Promise<HeldActionPayload> {
@@ -7187,14 +7601,38 @@ export async function getHeldAction(id: number, signal?: AbortSignal): Promise<H
   const payload = JSON.parse(instance.proposed_payload_json || "{}");
   const details = Array.isArray(payload.details) ? payload.details : [];
   return {
+    top: heldCardTop(payload.top),
     summary: String(payload.summary ?? ""),
     reason: String(payload.reason ?? ""),
     requestedBy: String(payload.requested_by ?? ""),
-    details: details.map((d: { field?: unknown; value?: unknown }) => ({
-      field: String(d.field ?? ""),
-      value: String(d.value ?? ""),
-    })),
+    details: cardDetails(details),
+    saidDetails: cardDetails(Array.isArray(payload.said_details) ? payload.said_details : []),
+    fields: (Array.isArray(payload.fields) ? payload.fields : []).filter(
+      (f: { field?: unknown; value?: unknown }) => typeof f?.field === "string" && typeof f?.value === "string",
+    ),
+    said: saidInput(payload),
+    mayChange: payload.may_change !== false,
+    offers: payload.offers,
   };
+}
+
+// Words said on a held step's card (Take the lead, a teammate's held send):
+// its fields as they read now, what the Executive said back, and the card
+// once a go carried it out.
+export interface StepSayResult {
+  reply: string;
+  fields: LeadCardField[];
+  approved: DecisionInstance | null;
+}
+
+export async function sayOnStep(id: number, text: string, seen: Record<string, string>): Promise<StepSayResult> {
+  const res = await fetch(`${API_BASE}/decisions/${id}/say`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, seen }),
+  });
+  if (!res.ok) throw await leadError(res, "Couldn't send that. Try again.");
+  return res.json();
 }
 
 // Approve a Take the lead card: ``input`` changes its editable fields first,
@@ -7425,4 +7863,33 @@ export async function answerRepeatOffer(id: number, accept: boolean): Promise<bo
   } catch {
     return false;
   }
+}
+
+// Settings → Browser and chat's cards: whether this person's Open Executive
+// browser extension is connected (api/routes/browser.py).
+export interface BrowserStatus {
+  /** False while the browser is turned off here (OE_BROWSER_OFF). */
+  available: boolean;
+  /** Their extension is asking for steps now. */
+  connected: boolean;
+  /** "Stay connected" in their extension; null when not connected or too old to say. */
+  stay_connected: boolean | null;
+  /** Where to get the extension, or null: Settings shows how to load it. */
+  store_url: string | null;
+  /** The version of the extension's calls this server speaks. */
+  protocol?: number;
+}
+
+export async function getBrowserStatus(): Promise<BrowserStatus> {
+  const res = await fetch(`${API_BASE}/browser/status`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to load your browser's status");
+  return res.json();
+}
+
+/** The "Try one" asks on a new chat once the browser is connected
+ *  (browser/starters.py). Empty while it's turned off here. */
+export async function getBrowserStarters(signal?: AbortSignal): Promise<string[]> {
+  const res = await fetch(`${API_BASE}/browser/starters`, { cache: "no-store", signal });
+  if (!res.ok) throw new Error("Failed to load browser suggestions");
+  return ((await res.json()) as { starters: string[] }).starters;
 }

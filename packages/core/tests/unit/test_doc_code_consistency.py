@@ -18,12 +18,12 @@ from typing import Any
 
 import yaml
 
-from openexecutive.architecture import facts as facts_mod
+from openexecutive.architecture import sections as sections_mod
 from openexecutive.workflows import resumer
 
 
 def _load_facts() -> dict[str, Any]:
-    path = Path(facts_mod.__file__).parent / "architecture-facts.yaml"
+    path = Path(sections_mod.__file__).parent / "architecture-facts.yaml"
     return yaml.safe_load(path.read_text())
 
 

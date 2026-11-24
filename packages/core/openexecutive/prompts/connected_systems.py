@@ -21,15 +21,16 @@ if TYPE_CHECKING:
     from openexecutive.config import Settings
 
 GOOGLE_SERVER = "google_workspace"
+MICROSOFT_SERVER = "microsoft_365"
 
 # Server names are operator-written JSON keys rendered into the prompt; only
 # plain identifiers are shown (a `_comment` key is config, not a server).
 _SERVER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 # The Google Workspace tools the Executive reaches for on most turns, by
-# service, as workspace-mcp 2.1.0 (pinned in docker/Dockerfile) names them.
+# service, as workspace-mcp 2.4.2 (pinned in docker/Dockerfile) names them.
 # A new workspace-mcp can rename tools: re-check this list when bumping the
-# pin. Apps Script tools stay out, since the gateway refuses them. Listing a
+# pin. Apps Script tools stay out: they are rarely the right tool. Listing a
 # name here never widens access: every call still runs the gateway's gates
 # and a private turn's allow-list (schedule_tools.PRIVATE_TURN_MCP_TOOLS).
 GOOGLE_TOOL_MANIFEST: dict[str, tuple[str, ...]] = {
@@ -85,7 +86,7 @@ GOOGLE_SERVICE_OF: dict[str, str] = {
 }
 
 # Pinned tools that workspace-mcp's `core` tier does NOT include, read from
-# `core/tool_tiers.yaml` in the pinned 2.1.0. Tiers are cumulative, so
+# `core/tool_tiers.yaml` in the pinned 2.4.2. Tiers are cumulative, so
 # `extended` and `complete` carry all 24 and only `core` needs subtracting.
 # Re-check when bumping the pin, exactly as for the manifest above.
 GOOGLE_TOOLS_ABOVE_CORE: frozenset[str] = frozenset({
@@ -143,6 +144,61 @@ def _on(flag: bool) -> str:
     return "on" if flag else "off"
 
 
+def google_chat_reach(settings: Settings) -> str | None:
+    """How people reach the Executive in Google Chat, when that is a Chat app.
+
+    Without it the model only knows Google Chat is "on", so it tells people
+    to DM its own Google account, and reads Google's "messaged you while you
+    were away" email about such a DM as the app failing. None when Google
+    Chat isn't answered through a Chat app."""
+    if not settings.google_chat_project_number:
+        return None
+    steps = (
+        "1) in Google Chat, find your Chat app under New chat → Apps (a "
+        "Workspace admin may need to allow it), 2) send it a message, or "
+        "@mention it in a space"
+    )
+    app = "your Chat app"
+    return (
+        f"- **How people reach you in Google Chat:** only through {app}: a DM to "
+        "it, or an @mention of it in a space. A message or @mention sent to your "
+        "own Google account never reaches you; Google only emails your mailbox a "
+        "\"messaged you while you were away\" summary of it. That is not the app "
+        "failing. When someone says you don't answer them in Google Chat, tell "
+        f"them these steps yourself: {steps}. "
+        "Don't raise it with anyone else as a problem."
+    )
+
+
+def microsoft_mail_on(settings: Settings) -> bool:
+    """Whether the Microsoft 365 server's Outlook mail tools are offered: the
+    MCP config hides them while the company's mail runs elsewhere."""
+    from fnmatch import fnmatchcase
+
+    from openexecutive.config import denied_tool_patterns
+
+    probe = f"{MICROSOFT_SERVER}__send-mail"
+    return not any(fnmatchcase(probe, p) for p in denied_tool_patterns(settings.mcp_servers_config_path))
+
+
+def _microsoft_line(settings: Settings, *, dead: bool) -> str:
+    if dead:
+        return (
+            "- **Microsoft 365: needs reconnecting.** Its sign-in has expired or was revoked, so "
+            "its calendar, OneDrive and other tools fail until the owner connects it again "
+            "(Settings → Status). If asked, say so plainly."
+        )
+    mail = (
+        "Outlook mail too"
+        if microsoft_mail_on(settings)
+        else "not Outlook mail: your email is your own mailbox above"
+    )
+    return (
+        "- **Microsoft 365: connected** — calendar, OneDrive and the rest of its tools, "
+        f"{mail}. Find its tools with `search_tools`."
+    )
+
+
 def render_connected_systems(
     *,
     mcp_servers: Sequence[str],
@@ -164,7 +220,8 @@ def render_connected_systems(
     servers = sorted({s for s in mcp_servers if _SERVER_NAME_RE.fullmatch(s)})
     google = GOOGLE_SERVER in servers
     google_dead = google and GOOGLE_SERVER in set(needs_reconnect)
-    others = [s for s in servers if s != GOOGLE_SERVER]
+    others = [s for s in servers if s not in (GOOGLE_SERVER, MICROSOFT_SERVER)]
+    microsoft = MICROSOFT_SERVER in servers
     email = settings.exec_email_address
 
     lines = [
@@ -218,6 +275,9 @@ def render_connected_systems(
             "than implying access."
         )
 
+    if microsoft:
+        lines.append(_microsoft_line(settings, dead=MICROSOFT_SERVER in set(needs_reconnect)))
+
     if others:
         lines.append(
             "- **Other tool servers:** "
@@ -237,6 +297,9 @@ def render_connected_systems(
         + ". Reach people only on a channel that is on, through your own "
         "messaging tools."
     )
+    reach = google_chat_reach(settings)
+    if reach:
+        lines.append(reach)
     if settings.notion_sync_enabled:
         lines.append(
             "- **Notion: synced into your knowledge base.** You read it through "
@@ -245,6 +308,18 @@ def render_connected_systems(
     elif not any("notion" in s.lower() for s in others):
         # A Notion MCP server, when configured, is listed with the others.
         lines.append("- **Notion:** not connected.")
+    folders = [
+        name for name, on in (
+            ("Google Drive", settings.drive_sync_enabled),
+            ("OneDrive", settings.onedrive_sync_enabled),
+        ) if on
+    ]
+    if folders:
+        lines.append(
+            f"- **{' and '.join(folders)} folders: synced into your knowledge base.** You read "
+            "the shared folders through retrieval, not live; opening or changing a file live "
+            "needs that service connected above."
+        )
     if settings.confluence_sync_enabled:
         # Settings-derived and constant per deployment, so block 0 stays
         # cacheable. Without the sync, a Confluence MCP server (if any) is

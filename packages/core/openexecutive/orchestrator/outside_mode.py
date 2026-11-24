@@ -20,13 +20,14 @@ stored beside it; a channel not set follows the company's level):
   team (``outside_content.mark_read``).
 - ``trust`` (Hands-off): on the principal's own turn on an interactive
   surface (``content_trust.principal_only_withheld`` offers them everything),
-  no read holds; a flagged one is still flagged to them, and the model is
-  told not to follow it. Anyone else's turn falls back to ``outsiders``.
+  no read holds. A flagged one is flagged to them, the model is told not
+  to follow it, and the rest of that turn runs at Balanced: a flagged read
+  is someone else's words (``outside_content._flag``). A teammate's turn runs at it too; a turn whose
+  words may come from someone not in People falls back to ``outsiders``.
 
 Whatever the setting, a turn answering mail from someone not in People is
-held from the start, a shared chat or another AI app's turn is ``ask``,
-mail and messages still go only to people on People, and someone added to
-People this turn is reached no earlier than the next one.
+held from the start, someone else's AI app's turn is ``ask``, and someone
+added to People this turn is reached no earlier than the next one.
 
 What Balanced trusts without checking rests on Gmail's sender authentication and
 on the Executive's own address: a company whose domain doesn't enforce DMARC
@@ -229,51 +230,36 @@ def channel_of(session: Any) -> str | None:
 
 
 def _someone_else(session: Any) -> bool:
-    """Whether the turn's words may be someone other than the owner's: mail
-    from someone not in People, a shared chat someone else wrote in since the
-    owner did, a host page, another AI app that isn't the owner's own
-    (``owners_ai_app``), or a teammate. Hands-off is the
-    owner's trust in their own Executive, so it never covers these."""
+    """Whether the turn's words may come from someone not in People: mail
+    from someone not in People, mail whose sender its mail service didn't
+    prove, or a page in another app. The level belongs to
+    whoever asks, and they have none: Hands-off never covers them. Nor a
+    Google Chat space, where anyone may have written last (a speaker on no
+    People entry waits on the owner's card anyway:
+    ``levels.unrostered_speaker``). A teammate's turn, and a
+    shared web chat a teammate wrote in, run at the company's level like the
+    owner's."""
     if getattr(session, "sender_off_team", False) is True:
-        return True
-    if getattr(session, "shared_chat", False) is True and getattr(session, "others_spoke_last", False) is True:
         return True
     if getattr(session, "from_host", False) is True:
         return True
     if str(getattr(session, "origin_channel", "") or "") == "email":
-        # Mail names its sender in a header anyone can write, and the poller
-        # sets no caller: only the owner's own mail, proven by their mail
-        # service (Session.email_authenticated), is them. A teammate's mail,
-        # or mail forged in the owner's or a teammate's name, is not.
-        return getattr(session, "email_authenticated", False) is not True
-    if getattr(session, "from_mcp_client", False) is True:
-        # The owner's own AI app, signed in as them and allowed to act, is
-        # them: their level applies as in the web app. Any other is not.
-        return not owners_ai_app(session)
-    caller = getattr(session, "caller_person_id", None)
-    if isinstance(caller, int) and not isinstance(caller, bool):
-        from openexecutive.people.store import get_person
-
-        person = get_person(caller)
-        return person is not None and not person.is_principal
-    return False
-
-
-def owners_ai_app(session: Any) -> bool:
-    """Whether ``session`` is another AI app's turn that the owner is signed
-    in to and allowed to act (``Session.mcp_client_may_act``), with the owner
-    as its verified caller. Never raises: an error is no."""
-    try:
-        if getattr(session, "from_mcp_client", False) is not True:
-            return False
-        if getattr(session, "mcp_client_may_act", False) is not True:
-            return False
-        from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
-
-        return is_principal_on_verified_surface(session)
-    except Exception:
-        logger.warning("outside_mode: couldn't tell whose AI app this is — treating it as someone else's", exc_info=True)
-        return False
+        # Mail names its sender in a header anyone can write: only mail its
+        # mail service proved is the owner's (Session.email_authenticated)
+        # or a teammate's (Session.email_sender_authenticated) runs at the
+        # company's level. Mail forged in the owner's or a teammate's name
+        # does not.
+        return not (
+            getattr(session, "email_authenticated", False) is True
+            or getattr(session, "email_sender_authenticated", False) is True
+        )
+    # A Google Chat space turns no one away, so its last words may be from
+    # someone not in People.
+    return (
+        getattr(session, "origin_channel", "") == "google_chat"
+        and getattr(session, "shared_chat", False) is True
+        and getattr(session, "others_spoke_last", False) is True
+    )
 
 
 def for_turn(session: Any) -> str:

@@ -95,6 +95,7 @@ def log_provider_status(settings: Any, config_path: Path) -> None:
 
 async def send_from_executive(
     gateway: Any, *, to: str, subject: str, body: str, html: bool = False,
+    cc: list[str] | None = None, attachments: list[tuple[str, str, bytes]] | None = None,
 ) -> str:
     """Send one message from the Executive's own mailbox through the
     configured mail backend (``EMAIL_PROVIDER``) and return the tool result.
@@ -111,6 +112,7 @@ async def send_from_executive(
         "name": provider.send_tool_name,
         "arguments": provider.build_send_arguments(
             mailbox=settings.exec_email_address, to=to, subject=subject, body=body, html=html,
+            cc=cc, attachments=attachments,
         ),
     })
     return str(result)

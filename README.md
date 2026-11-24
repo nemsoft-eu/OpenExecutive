@@ -1,11 +1,11 @@
 # Open Executive
 
-[![CI](https://github.com/SenteLabsAI/OpenExecutive/actions/workflows/ci.yml/badge.svg)](https://github.com/SenteLabsAI/OpenExecutive/actions/workflows/ci.yml)
+[![CI](https://github.com/ForeactLabs/OpenExecutive/actions/workflows/ci.yml/badge.svg)](https://github.com/ForeactLabs/OpenExecutive/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Next.js 15](https://img.shields.io/badge/Next.js-15-black.svg)](https://nextjs.org/)
+[![Next.js 16](https://img.shields.io/badge/Next.js-16-black.svg)](https://nextjs.org/)
 
-Open Executive is designed to transform leadership and management. Highly configurable, it can be deployed at any management level. Out of the box it supports spend approval thresholds, integration with corporate knowledge systems, and defined governance for how it interacts with human colleagues and other AI systems. Open Executive can also act as a busy leader's digital twin: with **Act as me** switched on, it drafts email in their own voice, from their own Gmail, for them to review and send—so leaders can truly scale their impact through AI without giving up the final say.
+Open Executive is designed to transform leadership and management. Highly configurable, it can be deployed at any management level. Out of the box it supports approval levels, spend approval ranges, integration with corporate knowledge systems, and defined governance for how it interacts with human colleagues and other AI systems. Open Executive can also act as a busy leader's digital twin: with **As you** switched on, it drafts email in their own voice, from their own Gmail or Outlook, and sends only what their Approvals let go on its own. The rest waits for them to tap Send.
 
 It meets people where they already work, with integrations for Slack, Discord, Telegram, Google Chat, email, Google Workspace, Microsoft 365 (Outlook mail and calendar, OneDrive), Notion, Confluence and any MCP-compatible AI tool, with more on the roadmap. Open Executive will always be open source.
 
@@ -14,13 +14,15 @@ A managed cloud offering is coming (https://openexecutive.ai), where you can get
 
 ## Demo
 
-[![Open Executive demo video](https://img.youtube.com/vi/hDk_RcjujPU/hqdefault.jpg)](https://youtu.be/hDk_RcjujPU)
+[![Open Executive demo video](https://img.youtube.com/vi/Z8UC-mnY7dU/maxresdefault.jpg)](https://youtu.be/Z8UC-mnY7dU)
 
-A walkthrough of Open Executive in action — [watch on YouTube](https://youtu.be/hDk_RcjujPU).
+A walkthrough of Open Executive in action — [watch on YouTube](https://youtu.be/Z8UC-mnY7dU).
 
 ## What It Does
 
-Developed by [Foreact Labs](https://foreactlabs.com) Open Executive provides a single coherent executive voice backed by nine specialist AI agents:
+Developed by [ForeAct Labs](https://foreactlabs.com), Open Executive provides a single coherent executive voice backed by nine specialist AI agents, plus a triage agent that sorts incoming work:
+
+<p align="center"><img src="docs/assets/specialists-ring.svg" width="440" alt="The Executive at the center, with nine specialists around it: strategy, finance, people, legal, operations, marketing, product, sales and board"></p>
 
 - **Chief Strategy Officer** — competitive analysis, M&A, market positioning, OKRs
 - **Chief Financial Officer** — financial modeling, fundraising, unit economics, cash flow
@@ -34,25 +36,36 @@ Developed by [Foreact Labs](https://foreactlabs.com) Open Executive provides a s
 
 All responses come from one consistent executive voice. The internal agent architecture is never exposed to the user. Beyond Q&A, the system maintains episodic memory of past decisions and initiatives across sessions, and a built-in scheduler can proactively surface follow-ups and time-sensitive actions.
 
+### What you can let it do
+
+- **Home** opens with your brief: what needs you, and **Done for you**, what it did for you in the last day.
+- **As you** drafts replies to your inbox in your own voice, from your own mailbox. Each teammate can turn it on for their own mail, which stays private to them.
+- **As me** lets it act in its own name: book a meeting, follow up with someone, update a sheet, answer a customer. Every step is listed.
+- **Approvals** decide what goes on its own and what waits for your yes, the same on every channel. Pick **Careful**, **Balanced** or **Hands-off**, add **Your rules** ("always wait" or "goes on its own" by amount, person or company), and keep a feature **In training** while you check its work. Anything that waits comes to you as an Approve card. As you, As me and Approvals sit together on the **Delegate** page.
+- **Departments, People and Goals** tell it who decides what. A cost goes to the person whose approval range covers it.
+- **Tasks, Workflows, Documents and the Watch list** hold the work it is doing, the jobs it runs on a schedule, what it delivered, and what it keeps an eye on.
+
+The Executive can also **use your web browser** to get things done on websites for you. With the Open Executive extension in Chrome, it looks at the page you're on, clicks, types, fills in forms and opens pages until the task is done: "sort this search by best sellers and list the top five", "fill in this vendor form from the contract". It follows your Approvals, never types passwords or card numbers, hands a sign-in or a code back to you, and stops when you press Stop. Saved workflows can use it too. See [docs/browser_extension_setup.md](docs/browser_extension_setup.md).
+
 ## Architecture
 
 ```
 User message
     ↓
-Executive Orchestrator (claude-sonnet-5-5)
+Executive Orchestrator
     ↓ tool use → parallel specialist calls
-CSO / CFO / CHRO / GC / COO / CMO / CPO / Board
+CSO / CFO / CHRO / GC / COO / CMO / CPO / Sales / Board
     ↓ each specialist retrieves relevant context from ChromaDB
 Built-in MBA knowledge + Your company documents
     ↓
 Synthesized executive response
 ```
 
-**Knowledge** — Two retrieval layers per specialist call: (1) built-in MBA-level Markdown (`knowledge/builtin/`, git-tracked) seeded into ChromaDB at startup, and (2) your uploaded company documents chunked and stored in a separate `company_docs` collection. RAG context is injected into the user turn, never the cached system prompt.
+**Knowledge** — Two retrieval layers per specialist call: (1) built-in MBA-level Markdown (`packages/core/openexecutive/knowledge/builtin/`, git-tracked) seeded into ChromaDB at startup, and (2) your uploaded company documents chunked and stored in a separate `company_docs` collection. RAG context is injected into the user turn, never the cached system prompt.
 
 **Episodic memory** — After every response, a background `claude-haiku-5-5` pass extracts key decisions, initiatives, and advice into SQLite. The next session opens with a `<past_decisions>` block so the Executive remembers what it recommended last month.
 
-**Always in the loop** — Each person can turn on "Keep track of what happens" (Settings → Memory). The Executive then keeps private, dated notes of what they said, in chat where it can confirm it's them (the web app signed in, their own Slack or Discord, Telegram with a webhook secret) and in Act as me replies they send. Every note rests on their own words, checked word for word. Only they see it, in Memories → History, where they can correct, pin or forget it. Notes are read back only to them, in a private chat, and expire after 90 days by default (the owner can change this). The owner's morning brief and evening digest include what the owner's own notes say is due, and anyone with notes on gets a short reminder on the day something they promised by email is due. It needs no setup and no extra service.
+**Always in the loop** — Each person can turn on "Keep track of what happens" (Settings → Memory). The Executive then keeps private, dated notes of what they said, in chat where it can confirm it's them (the web app signed in, their own Slack or Discord, Telegram with a webhook secret) and in As you replies they send. Every note rests on their own words, checked word for word. Only they see it, in Memories → History, where they can correct, pin or forget it. Notes are read back only to them, in a private chat, and expire after 90 days by default (the owner can change this). The owner's morning brief and evening digest include what the owner's own notes say is due, and anyone with notes on gets a short reminder on the day something they promised by email is due. It needs no setup and no extra service.
 
 **Scheduler** — A built-in job runner claims due actions via `UPDATE … RETURNING` to prevent double-firing. The API must run as a single instance; do not horizontally scale it without gating the scheduler first.
 
@@ -62,17 +75,16 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Tech Stack
 
+**Bring your own model.** Open Executive runs on Claude, on any model OpenRouter offers (GPT, Gemini, Llama, DeepSeek, Grok and more), or on models you host yourself with Ollama, LM Studio, vLLM or any OpenAI-compatible server. You can mix them: keep the Executive on one model and move any specialist to another in the Agent Council. Out of the box it uses Claude; see [Configuration](#configuration) and [Running on Local Models](#running-on-local-models) to change that.
+
 | Layer | Choice |
 |---|---|
-| LLM backbone | Anthropic Claude API |
-| Default model | `claude-sonnet-5-5` (Executive + most specialists) |
-| Deep reasoning | `claude-opus-5-5` (CSO, CFO, GC, Board — with adaptive thinking) |
-| Other models | Pick any agent's model in the Agent Council, including `claude-fable-5-1` |
+| Models | Your choice, per agent (see above) |
 | Backend | Python 3.11 + FastAPI |
 | Package manager | `uv` |
 | Vector store | ChromaDB (local, embedded) |
 | Episodic memory | SQLite |
-| Web UI | Next.js 15 (App Router) + Tailwind |
+| Web UI | Next.js 16 (App Router) + Tailwind |
 | License | Apache 2.0 |
 
 ## Repo Layout
@@ -82,24 +94,35 @@ openexecutive/
 ├── packages/
 │   ├── core/
 │   │   └── openexecutive/
-│   │       ├── orchestrator/     # Executive persona + routing loop
-│   │       ├── agents/           # 9 specialist agents
-│   │       ├── knowledge/        # ChromaDB store + RAG pipeline
+│   │       ├── orchestrator/     # Executive persona, routing loop, Approvals
+│   │       ├── agents/           # Specialist agents + triage
+│   │       ├── knowledge/        # ChromaDB store + RAG pipeline + built-in knowledge
 │   │       ├── memory/           # Company profile + episodic memory
+│   │       ├── people/           # The People list: who the Executive can reach and wait on
+│   │       ├── departments/      # Department state, goals and memory
+│   │       ├── delegation/       # As you: writing from a person's own mailbox
+│   │       ├── briefing/         # The morning brief and Home
 │   │       ├── onboarding/       # Wizard state machine + profile builder
 │   │       ├── prompts/          # Persona + domain prompts + cache manager
+│   │       ├── providers/        # Claude, OpenRouter and local model backends
 │   │       ├── api/              # FastAPI app + routes
+│   │       ├── mcp_server/       # Open Executive as an MCP server
 │   │       ├── integrations/     # Slack, Email (Gmail or Outlook), Telegram, Google Chat, Discord
 │   │       ├── scheduler/        # Background job runner (single-instance)
 │   │       ├── alerts/           # Proactive alert system
+│   │       ├── monitoring/       # Watching status pages, feeds and prices
 │   │       ├── audit/            # Audit logging
-│   │       ├── architecture/     # Internal architecture utilities
+│   │       ├── architecture/     # Content for the /architecture page
+│   │       ├── guide/            # Content for the User Guide page
 │   │       ├── workflows/        # Multi-step workflow definitions
+│   │       ├── browser/          # Using a person's own browser via the extension
+│   │       ├── evals/            # Eval scenarios (_scenarios/) + judges
 │   │       └── cli.py            # Click CLI
-│   └── ui/                       # Next.js 15 web UI
-├── evals/                        # Eval scenarios + LLM-as-judge runner
+│   ├── ui/                       # Next.js 16 web UI
+│   └── extension/                # Chrome extension (load unpacked or build your own)
+├── evals/                        # LLM-as-judge runner
 ├── fixtures/                     # Demo company fixtures (profiles, docs, rosters)
-├── scripts/                      # Operator scripts (Google auth)
+├── scripts/                      # Operator scripts (mailbox sign-in, caller keys, PR checks)
 ├── docker/                       # Dockerfile(s) + docker-compose.yml
 └── docs/                         # Architecture + deployment docs
 ```
@@ -108,7 +131,7 @@ openexecutive/
 
 ```bash
 # Clone the repo
-git clone https://github.com/SenteLabsAI/OpenExecutive.git
+git clone https://github.com/ForeactLabs/OpenExecutive.git
 cd OpenExecutive
 
 # Install the backend and web app dependencies
@@ -189,7 +212,7 @@ setup guide:
 | **Google Chat** | Answers mentions in a space | [docs/google_chat_setup.md](docs/google_chat_setup.md) |
 | **Email and calendar (Google Workspace)** | Reads and sends the Executive's Gmail, books on its calendar | [Google Workspace credentials](docs/deployment.md#google-workspace-credentials) |
 | **Email and calendar (Microsoft 365)** | The same with Outlook mail and calendar | [Microsoft 365 credentials](docs/deployment.md#microsoft-365-credentials) |
-| **Act as me** | Drafts replies in the owner's own Gmail for them to send | [Your own Gmail](docs/deployment.md#your-own-gmail-act-as-me-optional) |
+| **As you** | Drafts replies in each person's own Gmail or Outlook, sent as their Approvals allow | [Your own Gmail or Outlook](docs/deployment.md#your-own-gmail-or-outlook-act-as-me-optional) |
 | **Google Drive folders** | Syncs shared folders into the knowledge base (read-only) | [docs/drive_sync_setup.md](docs/drive_sync_setup.md) |
 | **OneDrive folders** | Syncs chosen OneDrive or SharePoint folders into the knowledge base, as the Executive's Microsoft 365 sign-in | [docs/onedrive_sync_setup.md](docs/onedrive_sync_setup.md) |
 | **OneDrive in chat** | Search, read, upload, move, copy and share OneDrive files (no delete, no anonymous links) | Set `MS365_MCP_ONEDRIVE=true` and sign in again ([docs/onedrive_sync_setup.md](docs/onedrive_sync_setup.md)) |
@@ -197,6 +220,7 @@ setup guide:
 | **Notion** | Syncs the pages shared with an internal integration into the knowledge base | Set `NOTION_SYNC_ENABLED=true` and `NOTION_API_KEY` (see [.env.example](.env.example)) |
 | **MCP tools** | Gives the Executive tools from other MCP servers, with deny rules for destructive ones | Copy [packages/core/mcp_servers.json.example](packages/core/mcp_servers.json.example) to `company/mcp_servers.json` and list your servers under `mcpServers`; MCP turns on when the file exists (Docker keeps it on `/data`, see [docs/deployment.md](docs/deployment.md#persistent-state)) |
 | **MCP clients** | Lets any MCP client talk to the Executive | [Connect as an MCP Server](#connect-as-an-mcp-server) |
+| **Browser** | Uses each person's own Chrome to do tasks on websites, through the Open Executive extension (on by default) | [docs/browser_extension_setup.md](docs/browser_extension_setup.md) |
 
 Synced Drive, OneDrive, Confluence and Notion content is kept apart from your uploaded
 documents and labelled as unreviewed, so it ranks below them.
@@ -263,7 +287,7 @@ The first time you visit the app, you'll be guided through a wizard to set up yo
 
 After onboarding, the Executive will reference your specific company context in every response.
 
-The built-in knowledge base is **trusted by default** — the Executive can use it straight away, and the Review queue starts empty rather than asking you to sign off on ~81 shipped documents. Items reach the queue when you upload a document, edit an existing file, or deliberately send a domain for review from the Review page. While a domain is being reviewed its content is withheld from the Executive, so the UI confirms the count before it starts.
+The built-in knowledge base is **trusted by default** — the Executive can use it straight away, and the Review queue starts empty rather than asking you to sign off on ~100 shipped documents. Items reach the queue when you upload a document, edit an existing file, or deliberately send a domain for review from the Review page. While a domain is being reviewed its content is withheld from the Executive, so the UI confirms the count before it starts.
 
 ## Interfaces
 
@@ -275,6 +299,7 @@ The built-in knowledge base is **trusted by default** — the Executive can use 
 | **Telegram** | Message the configured bot |
 | **Google Chat** | Mention the app in a space |
 | **Discord** | DM the bot, `@mention` it in a channel, or use `/ask` / `/today` slash commands |
+| **Browser** | Add the Open Executive extension to Chrome, connect it, then ask in the web chat ([setup](docs/browser_extension_setup.md)) |
 | **CLI** | `openexecutive chat` |
 | **MCP** | Point any MCP client at `http://localhost:8000/mcp` (see [Connect as an MCP Server](#connect-as-an-mcp-server)) |
 
@@ -317,13 +342,14 @@ claude mcp add --transport http open-executive http://localhost:8000/mcp \
   --header "x-api-key: YOUR_BACKEND_SHARED_SECRET"
 ```
 
-Connected clients get eight read-only resources (company profile, today's
-briefing and activity, people roster, department state, and episodic memory for
-decisions, initiatives and advice) and five tools: `consult_specialist` (domain
-analysis from any of the ten specialists, each grounded in your company's
-knowledge base), `search_knowledge`, `list_workflows`, `ask_executive` and
-`post_progress_update`. The full inventory is on the **MCP Server** section of
-the `/architecture` page.
+Connected clients get read-only resources (company profile, today's brief,
+Needs you cards, Done for you, tasks, watches, Approvals, people, departments,
+and episodic memory for decisions, initiatives and advice) and seven tools:
+`consult_specialist` (domain analysis from any of the ten specialists, each
+grounded in your company's knowledge base), `search_knowledge`,
+`list_workflows`, `run_workflow`, `answer_card` (Approve, Skip or reply to a
+Needs you card), `ask_executive` and `post_progress_update`. The full
+inventory is on the **MCP Server** section of the `/architecture` page.
 
 `post_progress_update` is for other agents working for you. It stores a short
 progress update and sends it, quoted as received, to the principals' chat apps
@@ -356,31 +382,18 @@ what a token can do, rotation, and what the content check does not catch.
 `x-caller-email` (open mode) the client is the owner, as the CLI is. A request
 that carries a signed-in person (a deployment that puts its own sign-in in
 front of `/mcp` and stamps the caller as the web UI's proxy does; see
-[signed callers](docs/auth.md#signed-callers)) gets that person's answers: the
-owner's episodic memory and recent activity go to the owner alone, the briefing
-and roster to someone on the roster (the briefing narrowed as the web app
-narrows it), and the company profile, departments, specialists, knowledge and
-workflow catalog to anyone. With signed callers on, a client holding only the
-shared secret is a service: never the owner, and `ask_executive` asks as no
-one. By default `ask_executive` only reads and advises: on its turn the
-Executive is not offered anything that sends, posts, books, schedules, runs or
-changes stored data, and of the connected MCP servers' tools only the reads.
+[signed callers](docs/auth.md#signed-callers)) gets that person's answers. The
+resources read through the same routes as the web app, so each one shows what
+that person sees there. With signed callers on, a client holding only the
+shared secret is a service: never the owner, and its turns ask as no one.
 
-A client can let it act by sending `x-mcp-client-actions: on` (honored only on a
-request the `BACKEND_SHARED_SECRET` authenticated; with no secret set the header
-is ignored and `MCP_CLIENT_ACTIONS=true` turns it on for every request). Then it
-makes the person's own changes inside Open Executive (alerts, open loops,
-follow-ups, the watch list, goals, decision outcomes, remembered facts and the
-company profile), each under the same permissions as in the web app. It never
-changes the People list; a new contact goes on a card that always waits.
-A message or a meeting is left on an approval card instead of sent: it waits
-for the person's tap on the web, or goes on its own when their Handle it for me
-is on, everyone on it has been on the People list for at least a week, and
-nothing on it is sensitive. It still
-never runs scripts or workflows, loads MCP servers or reads their mailbox, and
-every action is recorded as coming from the AI app. On a server without signed
-callers (`CALLER_ASSERTION_PUBLIC_KEYS`), acting mode trusts whoever holds the
-shared secret to say who is asking.
+`ask_executive`, `answer_card` and `run_workflow` are the person's own turn, the
+same as typing in the web chat. Every step goes through the same three checks
+as every other channel: Approvals (Careful, Balanced or Hands-off), Your rules,
+and In training. A step that has to wait is left on a Needs you card. Every
+action is recorded as coming from the AI app. On a server without signed
+callers (`CALLER_ASSERTION_PUBLIC_KEYS`), whoever holds the shared secret says
+who is asking.
 
 This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
 under [Configuration](#configuration), which configure the MCP *gateway*: Open
@@ -415,8 +428,8 @@ Versioned images are published to GitHub Container Registry on every release,
 so a deployment can pull instead of building:
 
 ```bash
-docker pull ghcr.io/sentelabsai/openexecutive-api:<version>
-docker pull ghcr.io/sentelabsai/openexecutive-ui:<version>
+docker pull ghcr.io/foreactlabs/openexecutive-api:<version>
+docker pull ghcr.io/foreactlabs/openexecutive-ui:<version>
 ```
 
 Tags: `X.Y.Z` and `X.Y` for a release, `latest` for the most recently
@@ -467,6 +480,8 @@ the app refuses to start.
 | `EMAIL_POLL_INTERVAL_SECONDS` | No | `60` | How often to poll for new email |
 | `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token (from @BotFather) |
 | `TELEGRAM_WEBHOOK_SECRET` | No | — | Random string for webhook validation |
+| `BROWSER_EXTENSION_URL` | No | — | Where Add to Chrome goes (your own listing, or the published one); unset shows no button: load it from the repo ([setup](docs/browser_extension_setup.md)) |
+| `OE_BROWSER_OFF` | No | — | `1` turns browser use off |
 | `DISCORD_BOT_TOKEN` | No | — | Discord bot token (Developer Portal → Bot tab) |
 | `DISCORD_APP_ID` | No | — | Discord application ID (General Information tab) |
 | `DISCORD_GUILD_IDS` | No | — | Comma-separated guild IDs for dev slash-command registration |
@@ -488,7 +503,7 @@ the app refuses to start.
 | `PROGRESS_LINK_HOSTS` | No | — | Comma-separated hosts an update's https link may point at; empty refuses every link |
 | `EMAIL_PROVIDER` | No | `google` | Backend for the inbound mailbox poller + alert email: `google` or `microsoft` |
 | `CALENDAR_PROVIDER` | No | `google` | Backend for the typed calendar booking tools: `google` or `microsoft` |
-| `DELEGATION_GOOGLE_CREDENTIALS_DIR` | No | — | Where the owner's own Gmail credential for Act as me lives (see [docs/deployment.md](docs/deployment.md#your-own-gmail-act-as-me-optional)) |
+| `DELEGATION_GOOGLE_CREDENTIALS_DIR` | No | — | Where the owner's own Gmail credential for As you lives (see [docs/deployment.md](docs/deployment.md#your-own-gmail-or-outlook-act-as-me-optional)) |
 | `DRIVE_SYNC_ENABLED` | No | `false` | Sync shared Google Drive folders into the knowledge base |
 | `DRIVE_SYNC_SERVICE_ACCOUNT_FILE` | No | — | Service account key with `drive.readonly` |
 | `DRIVE_SYNC_FOLDER_IDS` | No | — | Comma-separated Drive folder IDs to sync |
@@ -640,8 +655,8 @@ data.
 1. Create `packages/core/openexecutive/agents/your_agent.py` extending `BaseAgent`
 2. Add a system prompt constant in `packages/core/openexecutive/prompts/domain_prompts.py`
 3. Register in `packages/core/openexecutive/orchestrator/router.py` — add to `SPECIALIST_REGISTRY` and the `specialist` enum in `SPECIALIST_TOOLS`
-4. Add domain alias to `DOMAIN_ALIASES` in `packages/core/openexecutive/knowledge/retriever.py`
-5. Add knowledge docs to `knowledge/builtin/your_domain/`
+4. Add domain alias to `DOMAIN_ALIASES` in `packages/core/openexecutive/knowledge/retriever.py`, and the specialist's area in plain words to `_AREAS` in `packages/core/openexecutive/orchestrator/answer_sources.py`
+5. Add knowledge docs to `packages/core/openexecutive/knowledge/builtin/your_domain/`
 6. Add at least 2 eval scenarios to `packages/core/openexecutive/evals/_scenarios/`
 7. Submit a PR — CI requires all of the above
 
@@ -660,7 +675,7 @@ pytest packages/core/tests/unit/ -v
 
 ## Evaluation System
 
-`evals/` contains 29 scenarios covering all 8 domains, scored by `claude-opus-5-5` as an LLM-as-judge. Each scenario defines a query, simulated company context, expected topics, required specialist routing, and a domain-specific rubric. Five scoring dimensions (persona coherence, domain accuracy, company context utilization, routing quality, actionability) are each rated 1–5. The CI gate requires ≥ 3.5/5 average; any dimension dropping > 10% vs `main` fails the PR.
+`packages/core/openexecutive/evals/_scenarios/` holds over 100 scenarios, covering every specialist and features such as As you, Approvals, departments and MCP tools. `make eval` runs them against a running API and scores each answer with an LLM-as-judge (Opus by default, or `EVAL_JUDGE_MODEL`). Each scenario defines a query, simulated company context, expected topics, required specialist routing, and a rubric. CI checks that a new agent or prompt change comes with its scenarios; the scored run is `make eval`, which writes its results to `evals/results/`.
 
 ## Privacy
 

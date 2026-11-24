@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 TABLE = "brief_requests"
@@ -72,12 +74,7 @@ class BriefRequest:
     expires_at: str
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:

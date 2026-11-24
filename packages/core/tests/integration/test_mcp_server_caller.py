@@ -124,7 +124,7 @@ def _read(app: Any, endpoint: Any, uri: str, headers: dict[str, str]) -> dict[st
     [
         (lambda: _signed_as("user", OWNER), True),
         (lambda: _signed_as("operator"), True),
-        (lambda: _signed_as("user", TEAMMATE), False),
+        (lambda: _signed_as("user", TEAMMATE), True),
         (lambda: {}, False),  # a service: signed callers on, no assertion
     ],
 )
@@ -137,7 +137,7 @@ def test_signed_callers_reach_the_mcp_handlers(
     if allowed:
         assert json.loads(out["result"]["contents"][0]["text"]) == []
     else:
-        assert "Only the owner can read this." in out["error"]["message"]
+        assert "Only someone on the team can read this." in out["error"]["message"]
 
 
 def test_a_signed_in_teammate_reads_the_roster_and_a_service_does_not(
@@ -158,8 +158,9 @@ def test_open_mode_takes_the_caller_header_at_its_word(
     with patch("openexecutive.memory.episodic.list_advice", return_value=[]):
         mine = _read(app, endpoint, "oe://memory/advice", {})
         theirs = _read(app, endpoint, "oe://memory/advice", {"x-caller-email": TEAMMATE})
-    assert "result" in mine
-    assert "Only the owner can read this." in theirs["error"]["message"]
+        stranger = _read(app, endpoint, "oe://memory/advice", {"x-caller-email": "x@else.example"})
+    assert "result" in mine and "result" in theirs
+    assert "Only someone on the team can read this." in stranger["error"]["message"]
 
 
 @pytest.mark.parametrize(
@@ -208,34 +209,45 @@ def _secret_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     return app, endpoint
 
 
-@pytest.mark.parametrize(
-    ("headers", "may_act"),
-    [
-        ({"x-api-key": "s3cret", "x-mcp-client-actions": "on"}, True),
-        ({"x-api-key": "s3cret"}, False),
-    ],
-)
-def test_the_actions_header_counts_only_behind_the_shared_secret(
-    roster: dict[str, int], monkeypatch: pytest.MonkeyPatch, headers: dict[str, str], may_act: bool
+def test_ask_executive_is_the_callers_own_turn_behind_the_shared_secret(
+    roster: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The setting is ignored once a secret is configured.
-    monkeypatch.setenv("MCP_CLIENT_ACTIONS", "true")
     app, endpoint = _secret_app(monkeypatch)
     chat = AsyncMock(return_value="An answer")
     with (
         patch("openexecutive.orchestrator.executive.Executive.chat", new=chat),
         patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None),
-        patch("openexecutive.briefing.context.render_and_trust", return_value=""),
+        patch("openexecutive.briefing.context.render_and_trust", return_value="<board/>"),
     ):
         out = _rpc(
             app, endpoint, "tools/call",
-            {"name": "ask_executive", "arguments": {"message": "Close the pilot loop"}}, headers,
+            {"name": "ask_executive", "arguments": {"message": "Close the pilot task"}},
+            {"x-api-key": "s3cret"},
         )
     assert out["result"]["content"][0]["text"] == "An answer"
-    session = chat.await_args.kwargs["session"]
-    assert session.from_mcp_client is True
-    assert session.mcp_client_may_act is may_act
-    assert session.caller_person_id == roster["principal"]
+    kwargs = chat.await_args.kwargs
+    assert kwargs["session"].from_mcp_client is True
+    assert kwargs["session"].caller_person_id == roster["principal"]
+    assert kwargs["briefing_context"] == "<board/>"
+
+
+def test_route_reads_answer_as_the_verified_caller(roster: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tasks are read through the web app's own route with the /mcp
+    request: the owner sees everyone's, a teammate their own."""
+    from openexecutive.attunement import open_loops
+
+    seen: list[int | None] = []
+
+    def list_tasks(**kwargs: Any) -> tuple[list[Any], int]:
+        seen.append(kwargs["owner_person_id"])
+        return [], 0
+
+    monkeypatch.setattr(open_loops, "list_tasks", list_tasks)
+    app, endpoint = _app(monkeypatch, signed=True)
+    for email in (OWNER, TEAMMATE):
+        out = _read(app, endpoint, "oe://tasks", _signed_as("user", email))
+        assert json.loads(out["result"]["contents"][0]["text"]) == {"tasks": [], "total": 0}
+    assert seen == [None, roster["teammate"]]
 
 
 def test_a_wrong_key_never_reaches_the_tool(roster: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,22 +260,9 @@ def test_a_wrong_key_never_reaches_the_tool(roster: dict[str, int], monkeypatch:
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 response = await client.post(
                     "/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-                    headers={"x-api-key": "wrong", "x-mcp-client-actions": "on",
+                    headers={"x-api-key": "wrong",
                              "accept": "application/json, text/event-stream"},
                 )
         return response.status_code
 
     assert asyncio.run(_go()) == 401
-
-
-def test_without_a_secret_the_header_is_ignored(roster: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MCP_CLIENT_ACTIONS", raising=False)
-    app, endpoint = _app(monkeypatch, signed=False)
-    chat = AsyncMock(return_value="An answer")
-    with (
-        patch("openexecutive.orchestrator.executive.Executive.chat", new=chat),
-        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None),
-    ):
-        _rpc(app, endpoint, "tools/call",
-             {"name": "ask_executive", "arguments": {"message": "x"}}, {"x-mcp-client-actions": "on"})
-    assert chat.await_args.kwargs["session"].mcp_client_may_act is False

@@ -1,11 +1,10 @@
 "use client";
 
-// Contacts the Executive keeps up to date (people/contact_keeper.py), on the
-// Contacts tab: "Changes I made" with an Undo each (Add / Not now on a
-// suggestion), and the "Keep my contacts up to date" switch. The
-// principal's alone; the page shows it only to them.
+// Contacts the Executive keeps up to date (people/contact_keeper.py): the
+// "Keep my contacts up to date" switch on People (what it changed is under
+// Needs a look, components/people/PeopleNeeds.tsx), and on a person's own
+// page what it filled in and what it remembers. The principal's alone.
 
-import Link from "next/link";
 import { useState } from "react";
 
 import Button from "@/components/ui/Button";
@@ -13,7 +12,6 @@ import {
   decideContactChange,
   editContactNote,
   removeContactNote,
-  markContactChangesSeen,
   setContactKeeperMode,
   type ContactChange,
   type ContactChanges as ContactChangesData,
@@ -22,96 +20,17 @@ import {
 } from "@/lib/api";
 import {
   addedByLine,
-  cardChanges,
-  changeLine,
   changeReason,
   contactActivityLines,
   fieldLabel,
   keeperBlocked,
 } from "@/lib/contactChanges";
 
-const TAG_CLS = {
-  Added: "bg-emerald-500/15 text-emerald-500",
-  Updated: "bg-accent/15 text-accent",
-  Suggested: "bg-amber-500/15 text-amber-500",
-} as const;
-
 const MODES: { id: ContactKeeperMode; label: string }[] = [
   { id: "on", label: "On" },
   { id: "ask", label: "Ask me first" },
   { id: "off", label: "Off" },
 ];
-
-function ChangeRow({ change, onDecided }: { change: ContactChange; onDecided: () => void }) {
-  const line = changeLine(change);
-  const decide = (verb: "undo" | "accept" | "dismiss") => {
-    decideContactChange(change.id, verb).then(onDecided, onDecided);
-  };
-  return (
-    <li className="flex items-start gap-3 py-3 border-t border-line first:border-t-0">
-      <span className={`mt-0.5 shrink-0 rounded-md px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide ${TAG_CLS[line.tag]}`}>
-        {line.tag}
-      </span>
-      <div className="min-w-0 flex-1">
-        {change.person_id !== null && change.status === "applied" ? (
-          <Link href={`/people/${change.person_id}`} className="text-[15px] font-semibold text-fg hover:underline">
-            {line.title}
-          </Link>
-        ) : (
-          <span className="text-[15px] font-semibold text-fg">{line.title}</span>
-        )}
-        <p className="text-sm text-fg-muted mt-0.5 break-words">{line.detail}</p>
-      </div>
-      {change.status === "suggested" ? (
-        <div className="flex shrink-0 flex-col items-end gap-1 sm:flex-row sm:items-center">
-          <Button size="sm" variant="secondary" onClick={() => decide("accept")}>Add</Button>
-          <Button size="sm" variant="ghost" onClick={() => decide("dismiss")}>Not now</Button>
-        </div>
-      ) : (
-        <button
-          type="button"
-          onClick={() => decide("undo")}
-          className="shrink-0 text-sm font-semibold text-accent hover:underline"
-        >
-          Undo
-        </button>
-      )}
-    </li>
-  );
-}
-
-export function ContactChangesCard({
-  data,
-  onChanged,
-}: {
-  data: ContactChangesData;
-  onChanged: (next?: ContactChangesData) => void;
-}) {
-  const rows = cardChanges(data.changes);
-  if (rows.length === 0) return null;
-  const onlySuggestions = rows.every((c) => c.status === "suggested");
-  return (
-    <section className="rounded-2xl border border-line bg-surface-elevated p-5 mb-4" aria-label="Changes I made">
-      <div className="flex items-center justify-between gap-3 mb-1">
-        <h2 className="text-[17px] font-semibold text-fg">{onlySuggestions ? "People to add" : "Changes I made"}</h2>
-        {!onlySuggestions && (
-          <button
-            type="button"
-            onClick={() => markContactChangesSeen().then(onChanged, () => onChanged())}
-            className="text-sm font-semibold text-accent hover:underline"
-          >
-            Got it
-          </button>
-        )}
-      </div>
-      <ul>
-        {rows.map((c) => (
-          <ChangeRow key={c.id} change={c} onDecided={() => onChanged()} />
-        ))}
-      </ul>
-    </section>
-  );
-}
 
 export function ContactKeeperSwitch({
   data,

@@ -5,10 +5,12 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 
+from openexecutive.api import own_rows
 from openexecutive.memory.episodic import (
     Advice,
     Decision,
     Initiative,
+    _as_decision,
     current_decision,
     delete_advice,
     delete_decision,
@@ -16,7 +18,6 @@ from openexecutive.memory.episodic import (
     get_advice,
     get_initiative,
     list_advice,
-    list_decisions,
     list_initiatives,
     update_advice,
     update_decision,
@@ -24,15 +25,15 @@ from openexecutive.memory.episodic import (
 )
 from openexecutive.memory.facts import (
     Fact,
-    PrincipalFactConflict,
-    approval_rules,
     approve_fact,
+    decision_rows,
     decline_fact,
     get_fact,
     list_facts,
+    readable,
     record_fact,
     retire_fact,
-    set_needs_approval,
+    share_decision,
 )
 from openexecutive.memory.honcho_client import (
     PERSON_CONCLUSIONS_MAX_PAGE,
@@ -43,7 +44,6 @@ from openexecutive.memory.honcho_client import (
     people_overview,
     person_conclusions,
 )
-from openexecutive.people.models import Person
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -72,31 +72,118 @@ class AdviceUpdate(BaseModel):
 # --- Decisions ---
 
 
-@router.get("/memories/decisions", response_model=list[Decision])
-def get_decisions() -> list[Decision]:
-    return list_decisions()
+class DecisionOut(Decision):
+    # Only the caller reads it: they made it in their own chat and have not
+    # shared it with the team.
+    private: bool = False
+    # The caller may share it with the team (their own private decision).
+    can_share: bool = False
+    # The caller may make it private again (a shared one they recorded).
+    can_make_private: bool = False
+    # Shared by a teammate whose facts the principal approves first: not the
+    # team's yet.
+    waiting_for_approval: bool = False
 
 
-@router.patch("/memories/decisions/{decision_id}", response_model=Decision)
-def patch_decision(decision_id: int, body: DecisionUpdate, request: Request) -> Decision:
-    # A decision is a standing fact read on everyone's turns, kept on the
-    # principal's word: only they change or remove one here.
-    _require_principal(request, "change a decision")
-    if not update_decision(decision_id, **body.model_dump(exclude_unset=True)):
+class DecisionShare(BaseModel):
+    shared: bool
+
+
+def _decision_reader(request: Request) -> tuple[int | None, bool]:
+    """``(reader, principal)``: whose private decisions this caller reads
+    (their own; a request with no caller is the principal's), and whether
+    they are the principal."""
+    principal = _caller_is_principal(request)
+    reader = _caller_id(request)
+    if reader is None and principal:
+        from openexecutive.api.routes.today import principal_id
+
+        reader = principal_id()
+    return reader, principal
+
+
+def _decision_out(fact: Fact, reader: int | None, principal: bool) -> DecisionOut:
+    private = fact.private_to_person_id is not None
+    own = reader is not None and (
+        fact.recorded_by_role == "principal" if principal
+        else fact.recorded_by_role == "teammate" and fact.recorded_by_person_id == reader
+        and fact.approved_at is None
+    )
+    return DecisionOut(
+        **_as_decision(fact).model_dump(),
+        private=private,
+        can_share=private and fact.private_to_person_id == reader and fact.status == "active",
+        can_make_private=not private and own and (
+            fact.status == "active" or (fact.status == "proposed" and fact.recorded_by_role == "teammate")
+        ),
+        waiting_for_approval=fact.status == "proposed",
+    )
+
+
+def _own_private_decision(decision_id: int, reader: int | None) -> bool:
+    fact = get_fact(decision_id)
+    return (
+        fact is not None and fact.decision and reader is not None
+        and fact.private_to_person_id == reader
+    )
+
+
+@router.get("/memories/decisions", response_model=list[DecisionOut])
+def get_decisions(request: Request) -> list[DecisionOut]:
+    """The team's decisions, and the caller's own private ones (a decision
+    made in someone's own chat is theirs alone until they share it)."""
+    reader, principal = _decision_reader(request)
+    return [_decision_out(f, reader, principal) for f in decision_rows(limit=1000, reader=reader)]
+
+
+@router.patch("/memories/decisions/{decision_id}", response_model=DecisionOut)
+def patch_decision(decision_id: int, body: DecisionUpdate, request: Request) -> DecisionOut:
+    # A shared decision is a standing fact read on everyone's turns: only the
+    # principal changes or removes one. A private one is its person's own.
+    reader, principal = _decision_reader(request)
+    if not _own_private_decision(decision_id, reader):
+        _require_principal(request, "change a decision")
+    if not update_decision(
+        decision_id, **body.model_dump(exclude_unset=True), reader=reader, own_only=not principal
+    ):
         raise HTTPException(status_code=404, detail="Decision not found")
     # A new summary is an edit, kept as a new fact that replaces this one.
-    updated = current_decision(decision_id)
-    if updated is None:
+    updated = current_decision(decision_id, reader=reader)
+    fact = get_fact(updated.id) if updated is not None and updated.id is not None else None
+    if fact is None:
         raise HTTPException(status_code=404, detail="Decision not found")
-    return updated
+    return _decision_out(fact, reader, principal)
 
 
 @router.delete("/memories/decisions/{decision_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_decision(decision_id: int, request: Request) -> Response:
-    _require_principal(request, "remove a decision")
-    if not delete_decision(decision_id):
+    reader, _principal = _decision_reader(request)
+    current = current_decision(decision_id, reader=reader)
+    if not (current is not None and current.id is not None and _own_private_decision(current.id, reader)):
+        _require_principal(request, "remove a decision")
+    if not delete_decision(decision_id, reader=reader):
         raise HTTPException(status_code=404, detail="Decision not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/memories/decisions/{decision_id}/share", response_model=DecisionOut)
+def share_decision_route(decision_id: int, body: DecisionShare, request: Request) -> DecisionOut:
+    """Share the caller's own private decision with the team
+    (``shared: true``), or make one they recorded private to them again
+    (``shared: false``)."""
+    reader, principal = _decision_reader(request)
+    if reader is None:
+        raise HTTPException(status_code=403, detail="Sign in as someone on the People list")
+    fact = share_decision(decision_id, shared=body.shared, person_id=reader, is_principal=principal)
+    if fact is None:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    _audit_fact(
+        "decision_shared" if body.shared else "decision_made_private",
+        f"Decision {decision_id} {'shared with the team' if body.shared else 'made private'}",
+        {"fact_id": decision_id, "status": fact.status, "caller_person_id": reader},
+        actor="principal" if principal else "teammate",
+    )
+    return _decision_out(fact, reader, principal)
 
 
 # --- Initiatives ---
@@ -128,12 +215,23 @@ def remove_initiative(initiative_id: int) -> Response:
 
 
 @router.get("/memories/advice", response_model=list[Advice])
-def get_advice_list() -> list[Advice]:
-    return list_advice()
+def get_advice_list(request: Request) -> list[Advice]:
+    # The team's and the caller's own (``api.own_rows``).
+    reader = own_rows.reader_for(request)
+    return [a for a in list_advice() if reader.sees_session_row(a)]
+
+
+def _own_advice(advice_id: int, request: Request) -> Advice:
+    """The advice row, or 404 when there is none or it is another person's."""
+    row = get_advice(advice_id)
+    if row is None or not own_rows.reader_for(request).sees_session_row(row):
+        raise HTTPException(status_code=404, detail="Advice not found")
+    return row
 
 
 @router.patch("/memories/advice/{advice_id}", response_model=Advice)
-def patch_advice(advice_id: int, body: AdviceUpdate) -> Advice:
+def patch_advice(advice_id: int, body: AdviceUpdate, request: Request) -> Advice:
+    _own_advice(advice_id, request)
     if not update_advice(advice_id, **body.model_dump(exclude_unset=True)):
         raise HTTPException(status_code=404, detail="Advice not found")
     updated = get_advice(advice_id)
@@ -143,7 +241,8 @@ def patch_advice(advice_id: int, body: AdviceUpdate) -> Advice:
 
 
 @router.delete("/memories/advice/{advice_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_advice(advice_id: int) -> Response:
+def remove_advice(advice_id: int, request: Request) -> Response:
+    _own_advice(advice_id, request)
     if not delete_advice(advice_id):
         raise HTTPException(status_code=404, detail="Advice not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -159,9 +258,13 @@ class FactsPage(BaseModel):
     # The facts this caller may retire: every active one for the principal; a
     # teammate's own attributed ones for them.
     retirable_ids: list[int] = []
-    # Whether this caller approves or declines teammates' proposed facts and
-    # sets who needs approval (the principal only).
+    # Whether this caller approves or declines a decision copied in from mail
+    # that waits for their OK (the principal only).
     can_review: bool = False
+    # The caller's own private decisions, which they may share with the team.
+    shareable_ids: list[int] = []
+    # Shared decisions the caller recorded, which they may make private again.
+    unshareable_ids: list[int] = []
 
 
 class FactRetire(BaseModel):
@@ -174,16 +277,6 @@ class FactEdit(BaseModel):
 
 class FactReview(BaseModel):
     reason: str = ""
-
-
-class FactApprovalRule(BaseModel):
-    person_id: int
-    full_name: str
-    needs_approval: bool
-
-
-class FactApprovalUpdate(BaseModel):
-    needs_approval: bool
 
 
 def _caller_id(request: Request) -> int | None:
@@ -206,12 +299,39 @@ def _is_own_teammate_fact(fact: Fact, caller: int | None) -> bool:
     )
 
 
+def _is_own_fact(fact: Fact, caller: int | None) -> bool:
+    """A fact this teammate may edit or retire: their own attributed one, or
+    a decision private to them."""
+    return _is_own_teammate_fact(fact, caller) or (
+        caller is not None and fact.private_to_person_id == caller
+    )
+
+
+def _readable_fact(fact_id: int, request: Request) -> Fact | None:
+    """The fact, or None when it is someone else's private decision."""
+    fact = get_fact(fact_id)
+    if fact is None:
+        return None
+    reader, _ = _decision_reader(request)
+    return fact if readable(fact, reader) else None
+
+
 def _is_own_quote(fact: Fact, caller: int | None) -> bool:
     return (
         caller is not None
         and fact.recorded_by_role == "teammate"
         and fact.recorded_by_person_id == caller
     )
+
+
+def _audit_text(fact: Fact, **text: str) -> dict[str, object]:
+    """What a fact says, for its audit row: nothing for a private decision,
+    which is its person's alone and the audit page is the principal's."""
+    return {"private": True} if fact.private_to_person_id is not None else dict(text)
+
+
+def _audit_subject(fact: Fact) -> str:
+    return "" if fact.private_to_person_id is not None else f": {fact.subject[:80]}"
 
 
 def _audit_fact(event: str, summary: str, details: dict[str, object], actor: str) -> None:
@@ -237,8 +357,7 @@ def get_facts(
     proposed and declined history unless ``include_inactive=false`` — and the
     company-profile fields changed from chat. Every prompt that produces
     output reads the active ones. The history is the principal's alone:
-    anyone else gets the active rows, plus their own proposals waiting for
-    the principal.
+    anyone else gets the active rows.
 
     The facts themselves are company knowledge every conversation already
     sees, and so is who stated a teammate's (it renders "(per <name>)"); the
@@ -246,19 +365,23 @@ def get_facts(
     and person id it came from) is shown to the principal only."""
     principal = _caller_is_principal(request)
     caller = None if principal else _caller_id(request)
+    # A private decision is listed for its person alone.
+    reader, _ = _decision_reader(request)
     # A teammate sees only what is in force: a fact the principal retired or
     # replaced (perhaps because it was wrong or too sensitive) no longer
     # renders anywhere, so its text is not theirs to read either.
     if principal:
-        rows = list_facts(include_inactive=include_inactive, limit=limit)
+        rows = list_facts(include_inactive=include_inactive, limit=limit, reader=reader)
         retirable = [f.id for f in rows if f.status == "active" and f.kind != "profile"]
+        flags = {f.id: _decision_out(f, reader, principal) for f in rows if f.decision}
     else:
-        rows = (
-            list_facts(own_proposals_of=caller, limit=limit)
-            if caller is not None
-            else list_facts(limit=limit)
-        )
-        retirable = [f.id for f in rows if f.status == "active" and _is_own_teammate_fact(f, caller)]
+        rows = list_facts(limit=limit, reader=reader)
+        retirable = [
+            f.id for f in rows
+            if f.status == "active"
+            and (_is_own_teammate_fact(f, caller) or f.private_to_person_id is not None)
+        ]
+        flags = {f.id: _decision_out(f, reader, principal) for f in rows if f.decision}
         # Provenance is the principal's: their words, and which of their
         # chats and turns a fact came from (ids other routes may key on).
         rows = [
@@ -269,7 +392,11 @@ def get_facts(
             })
             for f in rows
         ]
-    return FactsPage(facts=rows, can_retire=principal, retirable_ids=retirable, can_review=principal)
+    return FactsPage(
+        facts=rows, can_retire=principal, retirable_ids=retirable, can_review=principal,
+        shareable_ids=[i for i, d in flags.items() if d.can_share],
+        unshareable_ids=[i for i, d in flags.items() if d.can_make_private],
+    )
 
 
 @router.post("/memories/facts/{fact_id}/retire", response_model=Fact)
@@ -278,9 +405,9 @@ def retire_standing_fact(fact_id: int, request: Request, body: FactRetire | None
     ``retired``, so the Pulse page still shows what it said. The principal
     can retire any; a teammate only one they recorded themselves."""
     principal = _caller_is_principal(request)
-    existing = get_fact(fact_id)
+    existing = _readable_fact(fact_id, request)
     caller = None if principal else _caller_id(request)
-    if not principal and not (existing is not None and _is_own_teammate_fact(existing, caller)):
+    if not principal and not (existing is not None and _is_own_fact(existing, caller)):
         raise HTTPException(
             status_code=403,
             detail="Only the principal, or the teammate who recorded it, can retire a standing fact",
@@ -288,13 +415,17 @@ def retire_standing_fact(fact_id: int, request: Request, body: FactRetire | None
     if existing is None or existing.kind == "profile":
         raise HTTPException(status_code=404, detail="Fact not found")
     reason = " ".join(((body.reason if body else "") or "retired from the Memory page").split())
-    retired = retire_fact(fact_id, reason=reason[:280], teammate_id=None if principal else caller)
+    retired = retire_fact(
+        fact_id, reason=reason[:280],
+        # A private decision is its person's own, whoever outranks whom.
+        teammate_id=None if principal or existing.private_to_person_id is not None else caller,
+    )
     if retired is None:
         raise HTTPException(status_code=409, detail="Fact is no longer active")
     # Not the reason: it is the retiring person's own words.
     _audit_fact(
-        "fact_retired", f"Standing fact {fact_id} retired: {existing.subject[:80]}",
-        {"fact_id": fact_id, "subject": existing.subject, "statement": existing.statement,
+        "fact_retired", f"Standing fact {fact_id} retired" + _audit_subject(existing),
+        {"fact_id": fact_id, **_audit_text(existing, subject=existing.subject, statement=existing.statement),
          "by": "principal" if principal else "teammate",
          **({} if principal else {"caller_person_id": caller})},
         actor="principal" if principal else "teammate",
@@ -307,12 +438,11 @@ def edit_standing_fact(fact_id: int, body: FactEdit, request: Request) -> Fact:
     """Change what an active fact says. The edit is recorded as a correction
     that replaces it (same subject; the old wording kept as what it
     corrects), through ``record_fact``'s own checks. Who may: as for retire,
-    the principal any fact, a teammate only their own, whose edit follows
-    their usual approval rule."""
+    the principal any fact, a teammate only their own."""
     principal = _caller_is_principal(request)
-    existing = get_fact(fact_id)
+    existing = _readable_fact(fact_id, request)
     caller = None if principal else _caller_id(request)
-    if not principal and not (existing is not None and _is_own_teammate_fact(existing, caller)):
+    if not principal and not (existing is not None and _is_own_fact(existing, caller)):
         raise HTTPException(
             status_code=403,
             detail="Only the principal, or the teammate who recorded it, can edit a standing fact",
@@ -333,14 +463,13 @@ def edit_standing_fact(fact_id: int, body: FactEdit, request: Request) -> Fact:
             recorded_by_role="principal" if principal else "teammate",
             recorded_by_name="" if principal else existing.recorded_by_name,
         )
-    except PrincipalFactConflict:
-        raise HTTPException(status_code=403, detail="Only the principal can change this fact") from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     _audit_fact(
-        "fact_edited", f"Standing fact {fact_id} edited: {existing.subject[:80]}",
-        {"fact_id": fact_id, "new_fact_id": fact.id, "subject": existing.subject,
-         "before": existing.statement, "after": fact.statement, "status": fact.status,
+        "fact_edited", f"Standing fact {fact_id} edited" + _audit_subject(existing),
+        {"fact_id": fact_id, "new_fact_id": fact.id,
+         **_audit_text(existing, subject=existing.subject, before=existing.statement, after=fact.statement),
+         "status": fact.status,
          "superseded_ids": [f.id for f in replaced],
          "by": "principal" if principal else "teammate",
          **({} if principal else {"caller_person_id": caller})},
@@ -356,9 +485,9 @@ def _require_principal(request: Request, what: str) -> None:
 
 @router.post("/memories/facts/{fact_id}/approve", response_model=Fact)
 def approve_standing_fact(fact_id: int, request: Request) -> Fact:
-    """Put a teammate's proposed fact in force (it replaces what it names,
-    the principal's own fact included). Principal only."""
-    _require_principal(request, "approve a teammate's fact")
+    """Put a proposed fact in force: a decision copied in from mail or a chat
+    app that waits for the principal's OK (``memory.facts.approve_fact``)."""
+    _require_principal(request, "approve a fact")
     approved = approve_fact(fact_id)
     if approved is None:
         raise HTTPException(status_code=409, detail="Fact is not waiting for approval")
@@ -374,8 +503,8 @@ def approve_standing_fact(fact_id: int, request: Request) -> Fact:
 
 @router.post("/memories/facts/{fact_id}/decline", response_model=Fact)
 def decline_standing_fact(fact_id: int, request: Request, body: FactReview | None = None) -> Fact:
-    """Drop a teammate's proposed fact; it is never used. Principal only."""
-    _require_principal(request, "decline a teammate's fact")
+    """Drop a proposed fact; it is never used. Principal only."""
+    _require_principal(request, "decline a fact")
     reason = " ".join(((body.reason if body else "") or "declined from the Memory page").split())
     declined = decline_fact(fact_id, reason=reason[:280])
     if declined is None:
@@ -387,47 +516,6 @@ def decline_standing_fact(fact_id: int, request: Request, body: FactReview | Non
         actor="principal",
     )
     return declined
-
-
-def _teammates() -> list[Person]:
-    from openexecutive.people.store import list_people
-
-    return [
-        p for p in list_people()
-        if not p.is_principal and not p.archived and p.kind == "team" and p.id is not None
-    ]
-
-
-@router.get("/memories/facts/approval", response_model=list[FactApprovalRule])
-def get_fact_approval_rules(request: Request) -> list[FactApprovalRule]:
-    """Every teammate and whether the principal approves their facts before
-    they are used ("needs my approval", on by default; off = trusted).
-    Principal only."""
-    _require_principal(request, "see who needs approval")
-    rules = approval_rules()
-    return [
-        FactApprovalRule(person_id=pid, full_name=p.full_name, needs_approval=rules.get(pid, True))
-        for p in _teammates()
-        if (pid := p.id) is not None
-    ]
-
-
-@router.put("/memories/facts/approval/{person_id}", response_model=FactApprovalRule)
-def put_fact_approval_rule(person_id: int, body: FactApprovalUpdate, request: Request) -> FactApprovalRule:
-    """Turn "needs my approval" on or off for one teammate. Principal only."""
-    _require_principal(request, "change who needs approval")
-    person = next((p for p in _teammates() if p.id == person_id), None)
-    if person is None:
-        raise HTTPException(status_code=404, detail="Teammate not found")
-    set_needs_approval(person_id, body.needs_approval)
-    _audit_fact(
-        "fact_approval_changed",
-        f"Standing facts from {person.full_name} {'need' if body.needs_approval else 'no longer need'} approval",
-        {"person_id": person_id, "needs_approval": body.needs_approval},
-        actor="principal",
-    )
-    return FactApprovalRule(person_id=person_id, full_name=person.full_name,
-                            needs_approval=body.needs_approval)
 
 
 # --- People (peer memory) ---

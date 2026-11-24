@@ -187,6 +187,41 @@ def _is_thin(text: str, pages: int) -> bool:
 
 # ── The deployment's model (a document block, through any provider) ──────────
 
+def _page_range(data: bytes, start: int, end: int, out: str) -> int:
+    """The page count; pages [start, end) are written as a PDF to ``out``
+    (left empty when ``start`` is past the last page). Runs in a child
+    process (``page_range``): the slice goes through a file, since it can be
+    larger than the answer a child may send back."""
+    from pypdf import PdfReader
+
+    total = len(PdfReader(io.BytesIO(data)).pages)
+    if start < total:
+        Path(out).write_bytes(slice_pdf(data, start, min(end, total)))
+    return total
+
+
+async def page_range(data: bytes, start: int, end: int) -> tuple[int, bytes | None]:
+    """``(page count, pages [start, end) as a PDF)``, read in a child process
+    like every other parse of a file someone sent; None for the pages when
+    ``start`` is past the last page."""
+    import os
+    import tempfile
+
+    fd, out = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        total = await asyncio.to_thread(
+            run_isolated, _page_range, data, start, end, out, timeout=_TEXT_LAYER_TIMEOUT_S,
+            # The slice is written to ``out``: room for pages as large as the
+            # whole file, with the usual margin on top.
+            file_limit=2 * len(data) + 64 * 1024 * 1024,
+        )
+        part = await asyncio.to_thread(Path(out).read_bytes)
+    finally:
+        Path(out).unlink(missing_ok=True)
+    return int(total), (part or None)
+
+
 def slice_pdf(data: bytes, start: int, end: int) -> bytes:
     """Pages [start, end) of ``data`` as a standalone PDF."""
     from pypdf import PdfReader, PdfWriter

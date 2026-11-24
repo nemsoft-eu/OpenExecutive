@@ -353,6 +353,8 @@ def test_the_only_send_is_an_existing_draft_by_its_id() -> None:
         "answer_invite",
         # A contact's newest mail, for their signature (people.contact_keeper): read-only.
         "latest_from", "recent_from",
+        # An email watch on the watch list (monitoring.sources.mailbox): read-only.
+        "received_since",
     }
     # Gmail's send endpoints (/settings/sendAs is a read, and allowed): the
     # draft one, once, and never messages.send, which sends any text.
@@ -963,3 +965,83 @@ def test_sent_mail_pages_past_100_and_a_slowdown_drops_nothing(monkeypatch: pyte
     # The third page was refused: the 200 listed are still read.
     assert len(sent) == 200 and slowed == {"s7"}
     assert "s7" in {m.id for m in sent}
+
+
+# --------------------------------------------------------------------------- #
+# A mailbox whose address isn't the person's own
+# --------------------------------------------------------------------------- #
+
+
+def _file(directory: Path, data: dict[str, object]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    gm.credential_path(EMAIL, directory=directory).write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_the_mailbox_is_the_files_or_their_own_address(tmp_path: Path) -> None:
+    assert gm.mailbox_of(EMAIL, directory=tmp_path) == EMAIL  # no file
+    _file(tmp_path, {"email": EMAIL})
+    assert gm.mailbox_of(EMAIL.upper(), directory=tmp_path) == EMAIL
+    _file(tmp_path, {"email": EMAIL, "mailbox": " Me@Outlook.example "})
+    assert gm.mailbox_of(EMAIL, directory=tmp_path) == "me@outlook.example"
+    assert gm.mailbox_of("", directory=tmp_path) == ""
+    assert gm.mailbox_field(EMAIL, EMAIL.upper()) == {}
+    assert gm.mailbox_field(EMAIL, "") == {}
+    assert gm.mailbox_field(EMAIL, "Me@Outlook.example") == {"mailbox": "me@outlook.example"}
+
+
+def test_status_checks_the_mailbox_they_connected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gm, "credentials_dir", lambda: tmp_path)
+    _file(tmp_path, {"email": EMAIL, "mailbox": "me@outlook.example"})
+    assert asyncio.run(gmail_status(EMAIL, gmail=_Mailbox(opened="me@outlook.example"))) == "connected"
+    # Their own address no longer matches: the token opens the connected mailbox.
+    assert asyncio.run(gmail_status(EMAIL, gmail=_Mailbox(opened=EMAIL))) == "mismatch"
+    # The Executive's mailbox stays refused under any address.
+    _file(tmp_path, {"email": EMAIL, "mailbox": EXEC})
+    assert asyncio.run(gmail_status(EMAIL, gmail=SimpleNamespace(profile_email=None))) == "shared_mailbox"
+
+
+def test_their_mail_is_the_mailboxs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.delegation import threads
+
+    monkeypatch.setattr(gm, "credentials_dir", lambda: tmp_path)
+    _file(tmp_path, {"email": EMAIL, "mailbox": "me@outlook.example"})
+    sent = SimpleNamespace(from_addr="me@outlook.example", labels=["SENT"])
+    assert threads.mine(sent, EMAIL)
+    assert not threads.mine(SimpleNamespace(from_addr=EMAIL, labels=["SENT"]), EMAIL)
+    client = gm.DelegateGmail(EMAIL)
+    assert client.mailbox == "me@outlook.example"
+    assert "authuser=me%40outlook.example" in gm.mailbox_link(EMAIL, thread_id="abc123")
+
+
+def test_the_script_saves_the_mailbox_they_signed_in_to(tmp_path: Path) -> None:
+    script = _script()
+    assert "mailbox" not in script.credential_payload(EMAIL, "r", "c", "s", mailbox=EMAIL.upper())
+    payload = script.credential_payload(EMAIL, "r", "c", "s", mailbox="Olivia.Home@Gmail.com")
+    assert payload["mailbox"] == "olivia.home@gmail.com"
+    assert script.mailbox_field(EMAIL, "x@y.example") == gm.mailbox_field(EMAIL, "x@y.example")
+    script.write_credential(tmp_path, EMAIL, payload)
+    assert gm.mailbox_of(EMAIL, directory=tmp_path) == "olivia.home@gmail.com"
+
+
+def test_received_since_reads_one_window_of_their_inbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An email watch (monitoring.sources.mailbox) reads a page at a time.
+    client = FakeGoogle().client()
+    asked: list[tuple[str, int]] = []
+
+    async def ids(query: str, *, max_results: int = 100) -> list[tuple[str, str]]:
+        asked.append((query, max_results))
+        return [("m1", "t1"), ("gone", "t2")]
+
+    async def get(message_id: str) -> MailMessage:
+        if message_id == "gone":
+            raise gm.GmailNotFound("deleted")
+        return MailMessage(id=message_id, thread_id="t1", from_addr="a@b.example")
+
+    monkeypatch.setattr(client, "list_message_ids", ids)
+    monkeypatch.setattr(client, "get_message", get)
+    after = datetime.fromtimestamp(1_700_000_000, UTC)
+    found = asyncio.run(client.received_since(after, limit=500))
+    assert [m.id for m in found] == ["m1"]  # deleted since it was listed: left out
+    assert asked[-1] == ("in:inbox -in:chats -from:me after:1700000000", 50)
+    asyncio.run(client.received_since(after, before=datetime.fromtimestamp(1_700_003_600, UTC), limit=10))
+    assert asked[-1] == ("in:inbox -in:chats -from:me after:1700000000 before:1700003600", 10)

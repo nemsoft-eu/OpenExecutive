@@ -94,6 +94,16 @@ def test_patch_watched_entities_cleans_and_validates(client: TestClient) -> None
     assert client.patch("/departments/finance", json={"watched_entities": [f"e{i}" for i in range(51)]}).status_code == 422
 
 
+def test_patch_google_chat_space_sets_and_clears(client: TestClient) -> None:
+    resp = client.patch("/departments/finance", json={"google_chat_space": "spaces/AAAAfin"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["google_chat_space"] == "spaces/AAAAfin"
+    # Omitting it leaves it alone; null clears it; anything not a space is refused.
+    assert client.patch("/departments/finance", json={"headcount": 2}).json()["config"]["google_chat_space"] == "spaces/AAAAfin"
+    assert client.patch("/departments/finance", json={"google_chat_space": "users/123"}).status_code == 422
+    assert client.patch("/departments/finance", json={"google_chat_space": None}).json()["config"]["google_chat_space"] is None
+
+
 @pytest.mark.parametrize("spec", ["mondays@09:00", "daily@25:00", "weekly@xyz@09:00", "quarterly@00-09:00", " "])
 def test_patch_rejects_invalid_cadence(client: TestClient, spec: str) -> None:
     before = client.get("/departments/finance").json()["config"]["cadences"]
@@ -413,7 +423,10 @@ def test_patch_invalidates_registry_cache(client: TestClient) -> None:
     # Warm the cache, then assert the warm state actually populated module
     # state — otherwise this test would pass even if the cache were broken.
     before = registry.list_states()
-    assert all(s.config.authority_level.value == "propose_only" for s in before)
+    # Every read says the level that applies now (the company's Approvals).
+    from openexecutive.departments.authority import department_level
+
+    assert all(s.config.authority_level == department_level(s.config.slug) for s in before)
     assert registry._cache is not None
     assert registry._cache_expires_at > 0.0
 
@@ -443,7 +456,9 @@ def test_create_department(client: TestClient) -> None:
     assert body["config"]["slug"] == "customer-success"
     assert body["config"]["title"] == "Customer Success"
     assert body["config"]["specialist_key"] is None
-    assert body["config"]["authority_level"] == "propose_only"
+    from openexecutive.departments.authority import department_level
+
+    assert body["config"]["authority_level"] == department_level("customer-success").value
     assert body["goals"] == []
 
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
 import threading
-from collections.abc import Collection, Generator
-from contextlib import contextmanager
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -14,6 +14,7 @@ from typing import Any, NamedTuple
 from pydantic import BaseModel
 
 from openexecutive.memory.conversation_ids import family_clause, family_params
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,11 @@ class ScheduledAction(BaseModel):
     # runs as that teammate and reaches only them (scheduler.runner). NULL
     # for rows the system queued and for rows from before the column.
     created_by_person_id: int | None = None
+    # A follow-up that repeats ("from now on", "every Monday"): its cadence
+    # spec ('daily@HH:MM', 'weekly@DOW@HH:MM', …, company time). When one
+    # occurrence finishes the next is queued (``_queue_next``), until it is
+    # cancelled. None runs once.
+    repeat: str | None = None
 
 
 class OutboundContext(BaseModel):
@@ -155,15 +161,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path)
 
 
 def initialize_db(db_path: Path | None = None) -> None:
@@ -357,6 +355,11 @@ def initialize_db(db_path: Path | None = None) -> None:
             ("task_completed_at", "TEXT"),
             ("task_closed_reason", "TEXT"),
             ("task_closed_due_at", "TEXT"),
+            # A task from someone's own chat: theirs and its assignee's to
+            # see (attunement.open_loops.visible_to). NULL: the team's.
+            ("private_to_person_id", "INTEGER"),
+            # ScheduledAction.repeat.
+            ("repeat", "TEXT"),
         ):
             if col not in _sa_existing:
                 try:
@@ -589,6 +592,11 @@ def initialize_db(db_path: Path | None = None) -> None:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+        # Topics saved from a "no topic" reply ("Write none") before the
+        # name check caught that wording: their chats go under no topic.
+        from openexecutive.memory.chat_topics import drop_no_topic_topics
+
+        drop_no_topic_topics(conn)
         # Who a chat's owner shared it with, to read (session_store.share_session).
         conn.execute(
             """
@@ -688,7 +696,8 @@ def _mirror_to_dept_honcho(
     those rows have no dept peer to land in. SQL is the system of record;
     a Honcho failure (no loop, disabled, network error) never affects
     the episodic INSERT that just committed. The wrapper itself audits
-    every outcome via the peer_memory event type.
+    every call that reaches Honcho via the peer_memory event type (a
+    disabled call writes no row).
 
     Type ``kind`` must be one of the literals accepted by
     ``honcho_client.NoteKind`` — typing at the boundary keeps mypy
@@ -891,13 +900,16 @@ def get_recent_advice(
 def get_recent_decisions(
     limit: int = 10,
     db_path: Path | None = None,
+    *,
+    reader: int | None = None,
 ) -> list[Decision]:
-    """The newest decisions (decision facts), newest first."""
+    """The newest decisions (decision facts), newest first: the team's, and
+    with ``reader`` that person's private ones too (``facts._seen_by``)."""
     from openexecutive.memory import facts
 
     if not _resolve_db_path(db_path).exists():
         return []
-    return [_as_decision(f) for f in facts.decision_rows(limit=limit, db_path=db_path)]
+    return [_as_decision(f) for f in facts.decision_rows(limit=limit, reader=reader, db_path=db_path)]
 
 
 def has_department_decision_since(
@@ -920,6 +932,7 @@ def decisions_since(
     *,
     limit: int = 20,
     db_path: Path | None = None,
+    reader: int | None = None,
 ) -> list[Decision]:
     """Decisions made after ``since``, newest first (the weekly review's
     "this week's decisions")."""
@@ -927,7 +940,7 @@ def decisions_since(
 
     if not _resolve_db_path(db_path).exists():
         return []
-    return [_as_decision(f) for f in facts.decision_rows(since=since, limit=limit, db_path=db_path)]
+    return [_as_decision(f) for f in facts.decision_rows(since=since, limit=limit, reader=reader, db_path=db_path)]
 
 
 def decisions_awaiting_outcome(
@@ -935,6 +948,7 @@ def decisions_awaiting_outcome(
     *,
     limit: int = 3,
     db_path: Path | None = None,
+    reader: int | None = None,
 ) -> list[Decision]:
     """Decisions made before ``older_than`` with no outcome recorded yet,
     newest first — the weekly review asks "how did this turn out?" about
@@ -944,7 +958,9 @@ def decisions_awaiting_outcome(
 
     if not _resolve_db_path(db_path).exists():
         return []
-    rows = facts.decision_rows(before=older_than, awaiting_outcome=True, limit=limit, db_path=db_path)
+    rows = facts.decision_rows(
+        before=older_than, awaiting_outcome=True, limit=limit, reader=reader, db_path=db_path
+    )
     return [_as_decision(f) for f in rows]
 
 
@@ -978,12 +994,12 @@ def get_recent_initiatives(
     return [Initiative(**dict(row)) for row in rows]
 
 
-def list_decisions(db_path: Path | None = None) -> list[Decision]:
+def list_decisions(db_path: Path | None = None, *, reader: int | None = None) -> list[Decision]:
     from openexecutive.memory import facts
 
     if not _resolve_db_path(db_path).exists():
         return []
-    return [_as_decision(f) for f in facts.decision_rows(limit=1000, db_path=db_path)]
+    return [_as_decision(f) for f in facts.decision_rows(limit=1000, reader=reader, db_path=db_path)]
 
 
 def list_initiatives(db_path: Path | None = None) -> list[Initiative]:
@@ -1008,14 +1024,19 @@ def list_advice(db_path: Path | None = None) -> list[Advice]:
     return [Advice(**dict(row)) for row in rows]
 
 
-def get_decision(decision_id: int, db_path: Path | None = None) -> Decision | None:
-    """The active decision fact ``decision_id``, else None."""
+def get_decision(
+    decision_id: int, db_path: Path | None = None, *, reader: int | None = None
+) -> Decision | None:
+    """The active decision fact ``decision_id`` when ``reader`` may read it
+    (the team's, or private to them), else None."""
     from openexecutive.memory import facts
 
     if not _resolve_db_path(db_path).exists():
         return None
     fact = facts.get_fact(decision_id, db_path=db_path)
-    return _as_decision(fact) if fact is not None and fact.decision and fact.status == "active" else None
+    if fact is None or not fact.decision or fact.status != "active" or not facts.readable(fact, reader):
+        return None
+    return _as_decision(fact)
 
 
 def get_initiative(initiative_id: int, db_path: Path | None = None) -> Initiative | None:
@@ -1040,9 +1061,12 @@ def get_advice(advice_id: int, db_path: Path | None = None) -> Advice | None:
     return Advice(**dict(row)) if row else None
 
 
-def current_decision(decision_id: int, db_path: Path | None = None) -> Decision | None:
+def current_decision(
+    decision_id: int, db_path: Path | None = None, *, reader: int | None = None
+) -> Decision | None:
     """The decision as it stands now: ``decision_id``, or the edit that
-    replaced it (an edit is a new fact, ``superseded_by``)."""
+    replaced it (an edit is a new fact, ``superseded_by``). None for one
+    ``reader`` may not read."""
     from openexecutive.memory import facts
 
     seen: set[int] = set()
@@ -1050,7 +1074,7 @@ def current_decision(decision_id: int, db_path: Path | None = None) -> Decision 
     while fact_id is not None and fact_id not in seen:
         seen.add(fact_id)
         fact = facts.get_fact(fact_id, db_path=db_path)
-        if fact is None or not fact.decision:
+        if fact is None or not fact.decision or not facts.readable(fact, reader):
             return None
         if fact.status == "active":
             return _as_decision(fact)
@@ -1067,26 +1091,42 @@ def update_decision(
     outcome: str | None = None,
     tags: str | None = None,
     db_path: Path | None = None,
+    reader: int | None = None,
+    own_only: bool = False,
 ) -> bool:
     """Change a decision: ``outcome`` in place; a new ``summary`` or a
     ``rationale`` (added after the summary, which already holds any earlier
     reason) as an edit that replaces the fact, keeping it a decision with its
     department and outcome. ``domain`` and ``tags`` are no longer kept. False
-    when it is no active decision."""
+    when it is no active decision, or, with ``own_only``, when it is not
+    ``reader``'s own private one as read here (it may have been shared since
+    the caller checked)."""
     from openexecutive.memory import facts
 
-    current = get_decision(decision_id, db_path)
+    current = get_decision(decision_id, db_path, reader=reader)
     if current is None:
         return False
+    if own_only:
+        mine = facts.get_fact(decision_id, db_path=db_path)
+        if mine is None or reader is None or mine.private_to_person_id != reader:
+            return False
     base = summary if summary is not None and " ".join(summary.split()) else current.summary
     statement = " ".join(f"{base} {rationale or ''}".split())
     if statement != " ".join(current.summary.split()):
         old = facts.get_fact(decision_id, db_path=db_path)
+        # A private decision stays its person's own row: who recorded it is
+        # carried over, so sharing it later follows their approval rule.
+        own = old is not None and old.private_to_person_id is not None
+        if own_only and not own:
+            return False
         new, _ = facts.record_fact(
             subject=old.subject if old is not None else statement[: facts.SUBJECT_MAX],
             statement=statement, source_quote="", kind="correction",
             previous_statement=current.summary, replaces_fact_id=decision_id,
             session_id=current.session_id or None, db_path=db_path,
+            recorded_by_person_id=old.recorded_by_person_id if own and old is not None else None,
+            recorded_by_role=old.recorded_by_role if own and old is not None else "principal",
+            recorded_by_name=old.recorded_by_name if own and old is not None else "",
         )
         decision_id = new.id
     if outcome is not None:
@@ -1183,11 +1223,13 @@ def update_advice(
         return cursor.rowcount > 0
 
 
-def delete_decision(decision_id: int, db_path: Path | None = None) -> bool:
+def delete_decision(
+    decision_id: int, db_path: Path | None = None, *, reader: int | None = None
+) -> bool:
     """Retire a decision fact so it stops rendering anywhere."""
     from openexecutive.memory import facts
 
-    current = current_decision(decision_id, db_path)
+    current = current_decision(decision_id, db_path, reader=reader)
     if current is None or current.id is None:
         return False
     return facts.retire_fact(current.id, reason="removed from memory", db_path=db_path) is not None
@@ -1248,6 +1290,8 @@ def insert_scheduled_action(
     required_scope: str | None = None,
     status: str = "pending",
     created_by_person_id: int | None = None,
+    repeat: str | None = None,
+    private_to_person_id: int | None = None,
     db_path: Path | None = None,
 ) -> int:
     if channel not in _VALID_SCHEDULED_CHANNELS:
@@ -1270,12 +1314,12 @@ def insert_scheduled_action(
             "INSERT INTO scheduled_actions "
             "(created_at, run_at, channel, channel_ref, intent_text, originating_session_id, "
             "department, kind, assigned_to_person_id, awaiting_response_since, scope_key, "
-            "required_scope, status, created_by_person_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "required_scope, status, created_by_person_id, repeat, private_to_person_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 now, run_at, channel, channel_ref, intent_text, originating_session_id,
                 department, kind, assigned_to_person_id, awaiting_str, scope_key,
-                required_scope, status, created_by_person_id,
+                required_scope, status, created_by_person_id, repeat or None, private_to_person_id,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -1526,7 +1570,7 @@ def count_activity_by_day(
         # counts, so an edit (a new row) or a removal doesn't add one.
         ("facts",
          "SELECT substr(created_at, 1, 10) AS day FROM facts"
-         " WHERE decision = 1 AND status = 'active'"
+         " WHERE decision = 1 AND status = 'active' AND private_to_person_id IS NULL"
          " AND substr(created_at, 1, 10) >= ?"),
         ("advice_given",
          "SELECT substr(timestamp, 1, 10) AS day FROM advice_given"
@@ -1623,6 +1667,66 @@ def requeue_orphaned_running(db_path: Path | None = None) -> int:
         return int(cursor.rowcount)
 
 
+# How late a restored job may still run. A copy back after a short time
+# away (the overnight client rotation puts the active client back within the
+# hour, its queue paused meanwhile) keeps its jobs and they run a little
+# late; one that sat for longer would fire them long past their point (a
+# days-old follow-up, a morning brief in the afternoon).
+RESTORED_LATE_GRACE = timedelta(hours=6)
+
+
+def settle_restored_queue(
+    db_path: Path | None = None, *, in_flight: Collection[tuple[int, str, str]] = ()
+) -> int:
+    """Settle the job queue of a database copy that was just made live.
+
+    A row that was 'running' when the copy was saved ran in this process
+    against the database it replaced, so running it again would do the work
+    twice (a rotation, a send). One whose handler is still going
+    (``in_flight``, matched on id, kind and run_at, since another company's
+    copy can hold the same id) stays 'running': the handler finishes it and
+    chains its next run, and a seed would otherwise chain a second. A 'pending' row more than
+    ``RESTORED_LATE_GRACE`` past its time would fire long late, all of them
+    on the next tick. Both are marked 'cancelled' with the reason; a row
+    still to come, or only a little late, is left to run. The caller seeds
+    the recurring jobs again. Returns the count closed.
+    """
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return 0
+    cutoff = (datetime.now(UTC) - RESTORED_LATE_GRACE).isoformat()
+    live = set(in_flight)
+    with _get_conn(resolved) as conn:
+        stale = [
+            int(row[0]) for row in conn.execute(
+                "SELECT id, kind, run_at FROM scheduled_actions WHERE status = 'running'"
+            ).fetchall()
+            if (int(row[0]), str(row[1]), str(row[2])) not in live
+        ]
+        running = conn.execute(
+            "UPDATE scheduled_actions SET status = 'cancelled', "
+            "last_error = 'was running when this copy was saved' "
+            "WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(stale),),
+        ).rowcount
+        late = [
+            int(row[0]) for row in conn.execute(
+                "SELECT id FROM scheduled_actions WHERE status = 'pending' AND run_at <= ?", (cutoff,),
+            ).fetchall()
+        ]
+        overdue = conn.execute(
+            "UPDATE scheduled_actions SET status = 'cancelled', "
+            "last_error = 'its time passed long before this copy came back' "
+            "WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(late),),
+        ).rowcount
+        # Only these occurrences are dropped: a repeating one comes back at
+        # its next time from now.
+        for action_id in [*stale, *late]:
+            _queue_next(conn, action_id)
+        return int(running) + int(overdue)
+
+
 def claim_due_actions(
     now: datetime, db_path: Path | None = None, limit: int = 20
 ) -> list[ScheduledAction]:
@@ -1680,34 +1784,82 @@ def reschedule_action(
 def mark_action_done(action_id: int, db_path: Path | None = None) -> bool:
     with _get_conn(_resolve_db_path(db_path)) as conn:
         cursor = conn.execute(
-            "UPDATE scheduled_actions SET status = 'done', last_error = '' WHERE id = ?",
+            "UPDATE scheduled_actions SET status = 'done', last_error = '' "
+            "WHERE id = ? AND status IN ('pending', 'running')",
             (action_id,),
         )
-        return cursor.rowcount > 0
+        done = cursor.rowcount > 0
+        # Only the first finish of an open row queues a repeat's next one.
+        if done:
+            _queue_next(conn, action_id)
+        return done
 
 
 def mark_action_failed(action_id: int, error: str, db_path: Path | None = None) -> bool:
-    """Fail an action terminally, with no retry."""
+    """Fail an action terminally, with no retry. A repeating one queues its
+    next occurrence, as when it gives up after its retries."""
     with _get_conn(_resolve_db_path(db_path)) as conn:
         cursor = conn.execute(
-            "UPDATE scheduled_actions SET status = 'failed', last_error = ? WHERE id = ?",
+            "UPDATE scheduled_actions SET status = 'failed', last_error = ? "
+            "WHERE id = ? AND status IN ('pending', 'running')",
             (error[:500], action_id),
         )
-        return cursor.rowcount > 0
+        done = cursor.rowcount > 0
+        if done:
+            _queue_next(conn, action_id)
+        return done
 
 
-def mark_action_cancelled(action_id: int, reason: str, db_path: Path | None = None) -> bool:
+def _queue_next(conn: sqlite3.Connection, action_id: int) -> int | None:
+    """When a repeating follow-up's occurrence finishes (it went, or gave
+    up), queue the next one: the same row, at its cadence's next time after
+    now. The one place a repeat goes on, whichever path finished it; a
+    cancelled one stops. Returns the new row's id."""
+    row = conn.execute("SELECT * FROM scheduled_actions WHERE id = ?", (action_id,)).fetchone()
+    spec = (row["repeat"] or "").strip() if row is not None else ""
+    if not spec:
+        return None
+    from openexecutive.departments.cadence import _parse_cadence_spec
+    from openexecutive.memory import workspace_settings
+
+    run_at = _parse_cadence_spec(spec, datetime.now(UTC), workspace_settings.get_user_timezone())
+    if run_at is None:
+        logger.warning("episodic: repeating follow-up %s has a cadence that can't be read: %r", action_id, spec)
+        return None
+    cursor = conn.execute(
+        "INSERT INTO scheduled_actions "
+        "(created_at, run_at, channel, channel_ref, intent_text, originating_session_id, "
+        "department, kind, assigned_to_person_id, scope_key, required_scope, status, "
+        "created_by_person_id, repeat) "
+        "SELECT ?, ?, channel, channel_ref, intent_text, originating_session_id, department, kind, "
+        "assigned_to_person_id, scope_key, required_scope, 'pending', created_by_person_id, "
+        "repeat FROM scheduled_actions WHERE id = ?",
+        (datetime.now(UTC).isoformat(), run_at.isoformat(), action_id),
+    )
+    return int(cursor.lastrowid or 0) or None
+
+
+def mark_action_cancelled(
+    action_id: int, reason: str, db_path: Path | None = None, *, ends_repeat: bool = False,
+) -> bool:
     """Retire a claimed action without running it, recording why in
     ``last_error`` (e.g. a department check-in in a solo workspace). Unlike
     ``cancel_scheduled_action`` this also moves a ``running`` row — for the
-    runner, which holds the claim."""
+    runner, which holds the claim. Only this occurrence stands down (already
+    handled, the creator's month used up, …): a repeating one queues its
+    next. ``ends_repeat`` stops the series too, for a stop nobody would want
+    repeated (the creator left the team); a person's own cancel is
+    ``cancel_scheduled_action``."""
     with _get_conn(_resolve_db_path(db_path)) as conn:
         cursor = conn.execute(
             "UPDATE scheduled_actions SET status = 'cancelled', last_error = ? "
             "WHERE id = ? AND status IN ('pending', 'running')",
             (reason[:500], action_id),
         )
-        return cursor.rowcount > 0
+        done = cursor.rowcount > 0
+        if done and not ends_repeat:
+            _queue_next(conn, action_id)
+        return done
 
 
 def mark_action_failed_or_retry(
@@ -1730,6 +1882,7 @@ def mark_action_failed_or_retry(
                 "UPDATE scheduled_actions SET status = 'failed', last_error = ? WHERE id = ?",
                 (error[:500], action_id),
             )
+            _queue_next(conn, action_id)
             return "failed"
         # Backoff: 30s, 5m, 30m for attempts 1, 2, 3.
         backoff_seconds = {1: 30, 2: 300, 3: 1800}.get(attempts, 1800)
@@ -1743,27 +1896,33 @@ def mark_action_failed_or_retry(
 
 
 def cancel_scheduled_action(action_id: int, db_path: Path | None = None) -> str:
-    """Soft-cancel a pending action. Returns the resulting status or 'not_cancellable'."""
+    """Soft-cancel a pending action. Returns the resulting status or 'not_cancellable'.
+    A repeating one that is running right now finishes this time and comes
+    back no more: its repeat is cleared and the answer is 'cancelled'."""
     with _get_conn(_resolve_db_path(db_path)) as conn:
         row = conn.execute(
             "SELECT status FROM scheduled_actions WHERE id = ?", (action_id,)
         ).fetchone()
         if row is None:
             return "not_found"
-        current = row["status"]
-        if current != "pending":
-            return "not_cancellable"
-        # Guard the write too: the scheduler's claim can flip the row to
-        # 'running' between the SELECT and here, and a cancel must never
-        # overwrite a claimed row (the dispatch would go ahead regardless).
+        # Guard the write: the scheduler's claim can flip the row to
+        # 'running' at any moment, and a cancel must never overwrite a
+        # claimed row (the dispatch would go ahead regardless).
         cursor = conn.execute(
             "UPDATE scheduled_actions SET status = 'cancelled' "
             "WHERE id = ? AND status = 'pending'",
             (action_id,),
         )
-        if cursor.rowcount == 0:
-            return "not_cancellable"
-        return "cancelled"
+        if cursor.rowcount:
+            return "cancelled"
+        # Claimed (before or after the read above): a repeat ends after this
+        # occurrence.
+        ended = conn.execute(
+            "UPDATE scheduled_actions SET repeat = NULL "
+            "WHERE id = ? AND status = 'running' AND repeat IS NOT NULL AND repeat != ''",
+            (action_id,),
+        )
+        return "cancelled" if ended.rowcount else "not_cancellable"
 
 
 # Intent-text shapes of the ad-hoc reminders the removed talent /
@@ -1862,9 +2021,11 @@ def list_scheduled_actions(
     limit: int = 100,
     order: str = "asc",
     exclude_internal: bool = False,
+    kinds: Collection[str] | None = None,
     db_path: Path | None = None,
 ) -> list[ScheduledAction]:
-    """List scheduled actions, optionally filtered by status.
+    """List scheduled actions, optionally filtered by status (and ``kinds``,
+    in the query, so ``limit`` counts only what matches).
 
     ``exclude_internal`` drops ``__internal__``-channel rows in SQL, so a
     caller that only wants real sends (the activity feed) is not starved by
@@ -1891,6 +2052,12 @@ def list_scheduled_actions(
         clauses.append("channel != '__internal__'")
         clauses.append("kind != ?")
         params.append(BRIEF_DELIVERY_KIND)
+    if kinds is not None:
+        wanted = sorted(kinds)
+        if not wanted:
+            return []
+        clauses.append(f"kind IN ({','.join('?' * len(wanted))})")
+        params += wanted
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     with _get_conn(resolved) as conn:
         rows = conn.execute(
@@ -1982,6 +2149,11 @@ def list_awaiting_replies_by_person(
             # then nobody is waiting on the owner (the nudge engine uses the
             # same cut-off).
             "  AND NOT (kind = 'open_loop' AND awaiting_response_since > ?) "
+            # A task from someone's own chat is theirs and its assignee's
+            # (attunement.open_loops.visible_to). These counts are the same for
+            # everyone who opens Today, so only the team's tasks count, the
+            # principal's own private ones included.
+            "  AND NOT (kind = 'open_loop' AND private_to_person_id IS NOT NULL) "
             "GROUP BY assigned_to_person_id",
             (datetime.now(UTC).isoformat(),),
         ).fetchall()

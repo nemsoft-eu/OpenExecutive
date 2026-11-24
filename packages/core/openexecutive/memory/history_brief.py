@@ -95,7 +95,7 @@ def note_line(note: Any, *, lead: str) -> str:
     kind = _KIND_LABEL.get(note.kind, note.kind)
     head = f"- {lead}{kind}, {where}" + (f", with {who}" if who else "")
     if note.correction:
-        body = f"{_clean(note.correction, 300)} (as they corrected it)"
+        body = f"{_clean(note.corrected, 300)} (as they corrected it)"
     else:
         body = f'their words: "{_clean(note.quote, 300)}" (noted as: {_clean(note.summary, 240)})'
     return no_tags(f"{head} [{note.occurred_at[:10]}]: {body}")

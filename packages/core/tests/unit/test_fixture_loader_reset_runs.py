@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from openexecutive.memory.company_tables import (
+    COMPANY_INDEPENDENT_TABLES,
     KEPT_ON_EVERY_SWAP,
     PER_COMPANY_TABLES,
     wipe_per_company_tables,
@@ -92,12 +93,14 @@ def test_reset_clears_workflow_runs_audit_log_and_eval_runs(
 def test_reset_wipes_run_history_the_decision_ledger_and_act_as_me() -> None:
     """A reset box has run nothing, proposed nothing, and keeps nobody's Act
     as me state. Act as me's tables come from its own list, so a new one is
-    wiped too."""
+    wiped too, except the marker of its one-time upgrades."""
     from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
+    from openexecutive.delegation.schema import UPGRADES_TABLE
 
     wiped = set(PER_COMPANY_TABLES) - set(KEPT_ON_EVERY_SWAP)
     assert {
         "workflow_runs", "audit_log", "eval_runs",
         "decision_instances", "decision_class_state",
-        *DELEGATION_TABLES,
+        *(t for t in DELEGATION_TABLES if t != UPGRADES_TABLE),
     } <= wiped
+    assert UPGRADES_TABLE in COMPANY_INDEPENDENT_TABLES

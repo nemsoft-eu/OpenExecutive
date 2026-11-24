@@ -186,9 +186,13 @@ def test_authority_level_is_applied(dept_db: Path) -> None:
     reconcile_onboarding_departments(
         [DepartmentDraft(title="Finance", authority_level="auto_execute")], {}
     )
-    finance = dept_store.get_department("finance", dept_db)
-    assert finance is not None
-    assert finance.config.authority_level.value == "auto_execute"
+    import sqlite3
+
+    # Stored as drafted; a read says the level that applies now
+    # (departments.authority.department_level).
+    with sqlite3.connect(dept_db) as conn:
+        stored = conn.execute("SELECT authority_level FROM departments WHERE slug = 'finance'").fetchone()
+    assert stored == ("auto_execute",)
 
 
 def test_blank_titles_are_skipped(dept_db: Path) -> None:

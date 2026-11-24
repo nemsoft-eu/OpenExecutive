@@ -16,9 +16,11 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from openexecutive.audit import log_event as audit_log
+from openexecutive.monitoring import mailbox
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.describe import trigger_line, watch_title
 from openexecutive.monitoring.models import (
@@ -29,6 +31,7 @@ from openexecutive.monitoring.models import (
     ORIGIN_EXECUTIVE,
     ORIGIN_RESEARCH_PROPOSED,
     RESEARCH_ORIGINS,
+    SOURCE_KIND_MAILBOX,
     SOURCE_KIND_PAGE_WATCH,
     is_valid_cadence,
     is_valid_mode,
@@ -70,7 +73,13 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
         "the principal asks the Executive to watch a stock ticker, a vendor "
         "status page, an RSS / Atom feed, a competitor's changelog, or a "
         "standing web-search query (e.g. 'Acme Corp layoffs OR funding') for "
-        "developments that no single feed publishes."
+        "developments that no single feed publishes. Also email (signal_type "
+        "'mailbox'): \"tell me every time a sign-up email comes in\", \"let "
+        "me know when Pat replies\", \"watch for Robin's email, and ping me if "
+        "nothing by Wednesday\". It watches your own inbox, the Executive's, and "
+        "theirs too when it is connected, and tells them about every email that "
+        "matches, until they turn it off; never answer that with a reminder or a "
+        "scheduled check."
     ),
     "input_schema": {
         "type": "object",
@@ -87,7 +96,7 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "vendor_status", "rss", "stock", "query", "edgar",
-                    "page_watch",
+                    "page_watch", "mailbox",
                 ],
                 "description": (
                     "Which adapter handles this entry. vendor_status polls "
@@ -99,7 +108,9 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "company's new filings (8-K / 10-K / 10-Q / Form 4) by "
                     "ticker or CIK; page_watch detects content changes on an "
                     "arbitrary web page that has no feed (e.g. a pricing or "
-                    "careers page)."
+                    "careers page); mailbox watches email that reaches you "
+                    "(the Executive) and the person's own inbox when it is "
+                    "connected, and tells them about each email that matches."
                 ),
             },
             "target": {
@@ -110,6 +121,8 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "For query: the natural-language search to watch "
                     "(e.g. 'Acme Corp layoffs OR restructuring OR funding'). "
                     "For edgar: a ticker (e.g. 'AAPL') or CIK (e.g. '320193'). "
+                    "For mailbox: what it watches for, in their words "
+                    "(e.g. 'sign-up emails', 'Pat's reply'). "
                     "URLs must be public http/https — the SSRF guard "
                     "rejects file://, private IPs, link-local, etc."
                 ),
@@ -131,6 +144,12 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "{'keywords': ['pricing', 'launch']} fires only on "
                     "matching entries. For edgar: {'forms': ['8-K', '10-K']} "
                     "limits to those filing types (default 8-K/10-K/10-Q). "
+                    "For mailbox (required, at least one): {'from': "
+                    "['pat@example.com']} for mail from those senders, "
+                    "{'keywords': ['sign up', 'signed up']} for mail whose "
+                    "subject or sender names one; both means both. Words "
+                    "are matched as written, so list the few ways the "
+                    "subject could say it. "
                     "Add 'only_big': true (any type but stock) only when the "
                     "principal wants to hear about big changes only. The "
                     "trigger is the one filter: whatever meets it is told to "
@@ -142,7 +161,7 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "enum": ["real_time", "15min", "hourly", "daily", "weekly"],
                 "description": (
                     "How often to check. Never faster than the source "
-                    "allows. Defaults to '15min'."
+                    "allows. Defaults to '15min' ('real_time' for mailbox)."
                 ),
             },
             "for_goal_id": {
@@ -157,7 +176,10 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "type": "integer",
                 "description": (
                     "The People id of the teammate this watch is for: what "
-                    "it finds is told to them. Leave out for the principal."
+                    "it finds is told to them. Leave out for the person "
+                    "asking (a teammate's own watch tells them; otherwise "
+                    "the principal). An email watch always tells the person "
+                    "who set it up, so it has no effect on one."
                 ),
             },
             "route_to_specialist": {
@@ -173,15 +195,24 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": ["active", "dry_run"],
                 "description": (
-                    "'active' (default) surfaces signals normally. "
-                    "'dry_run' captures + scores but never promotes — use "
-                    "this when adding a new source you want to calibrate "
-                    "before the principal sees the noise."
+                    "'active' (default) tells the person on a card when its "
+                    "trigger is met. 'dry_run' is Watch quietly: never a "
+                    "card; what it finds goes only in their next brief. Use "
+                    "it when they ask to hear about it only in the brief, or "
+                    "quietly."
                 ),
             },
             "notes": {
                 "type": "string",
                 "description": "Free-text note (max ~500 chars).",
+            },
+            "quiet_by": {
+                "type": "string",
+                "description": (
+                    "Mailbox only: the day (YYYY-MM-DD) to ping them that "
+                    "morning if nothing has matched by then (\"if nothing by "
+                    "Wed, ping me\")."
+                ),
             },
         },
         "required": ["slug", "signal_type", "target"],
@@ -205,7 +236,7 @@ LIST_WATCHLIST_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "vendor_status", "rss", "stock", "query", "edgar",
-                    "page_watch",
+                    "page_watch", "mailbox",
                 ],
                 "description": "Filter by adapter kind. Omit for all kinds.",
             },
@@ -251,9 +282,10 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
     "name": "tune_watchlist_entry",
     "description": (
         "Modify an existing watchlist entry. Use to disable a noisy source, "
-        "flip into dry_run mode, change the trigger (its threshold, keywords, "
-        "or 'only_big': true for big changes only), or set the goal or "
-        "person it is for. Pass only the fields you want to change."
+        "flip into dry_run mode (Watch quietly: only in the brief, never a card), change the trigger (its threshold, keywords, "
+        "or 'only_big': true for big changes only), set the goal or "
+        "person it is for, or rewrite its notes when the person corrects it. "
+        "Pass only the fields you want to change."
     ),
     "input_schema": {
         "type": "object",
@@ -266,7 +298,7 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
             "mode": {
                 "type": "string",
                 "enum": ["active", "dry_run"],
-                "description": "Switch between active surfacing and dry-run capture.",
+                "description": "'active' tells the person on a card; 'dry_run' (Watch quietly) puts it only in their next brief.",
             },
             "for_goal_id": {
                 "type": ["integer", "null"],
@@ -274,7 +306,10 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
             },
             "for_person_id": {
                 "type": ["integer", "null"],
-                "description": "People id of the teammate it is for; null means the principal.",
+                "description": (
+                    "People id of the teammate it is for; null means the principal. "
+                    "No effect on an email watch, which tells only the person who set it up."
+                ),
             },
             "cadence": {
                 "type": "string",
@@ -288,7 +323,25 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "merge — keep all fields you want preserved)."
                 ),
             },
-            "notes": {"type": "string"},
+            "quiet_by": {
+                "type": ["string", "null"],
+                "description": (
+                    "Email watch only: the day (YYYY-MM-DD) to ping them that "
+                    "morning if nothing has matched by then; null clears it. "
+                    "\"Wait another day\" on its ping is the next day."
+                ),
+            },
+            "notes": {
+                "type": "string",
+                "description": (
+                    "What you know about this watch (its What I know). Every "
+                    "check reads it before deciding whether to tell anyone, so "
+                    "when the person corrects a watch (e.g. 'that's our own "
+                    "repo, skip it') put it here: keep what still holds, add "
+                    "the correction, short lines. Replaces the whole note "
+                    "(max ~500 chars)."
+                ),
+            },
         },
         "required": ["slug"],
     },
@@ -392,12 +445,17 @@ WATCHLIST_TOOLS: list[dict[str, Any]] = [
 # --------------------------------------------------------------------- #
 
 
-def _audit(tool: str, ok: bool, summary: str, details: dict[str, Any]) -> None:
+def _audit(
+    tool: str, ok: bool, summary: str, details: dict[str, Any], privacy: dict[str, Any] | None = None,
+) -> None:
+    """``privacy``: an email watch's rows are its owner's alone
+    (``mailbox.audit_privacy``)."""
     audit_log(
         "tool_invocation",
         summary,
         actor="executive",
         details={"tool": tool, "ok": ok, **details},
+        **(privacy or {}),
     )
 
 
@@ -437,6 +495,8 @@ async def _validated_target(
     if not isinstance(trigger, dict):
         return _err(tool, "trigger must be a JSON object")
 
+    if signal_type == SOURCE_KIND_MAILBOX:
+        slug = mailbox.own_slug(slug)
     if ms.get_watchlist_item_by_slug(slug) is not None:
         return _err(tool, f"slug {slug!r} already exists; use tune_watchlist_entry to modify")
 
@@ -467,6 +527,122 @@ def _principal_asked() -> bool:
     from openexecutive.orchestrator.schedule_tools import current_session
 
     return is_principal_on_verified_surface(current_session.get())
+
+
+def _teammate_asking() -> Any:
+    """The rostered teammate asking on a surface that verified them, else
+    None (``people_tools.teammate_on_verified_surface``). Fails closed."""
+    from openexecutive.orchestrator.people_tools import teammate_on_verified_surface
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    try:
+        return teammate_on_verified_surface(current_session.get())
+    except Exception:
+        logger.warning("watchlist_tools: teammate lookup failed", exc_info=True)
+        return None
+
+
+def _default_person(for_ids: dict[str, int | None]) -> int | None:
+    """Who a new watch tells: the person the call named, else the teammate
+    who asked for it (what it finds is theirs), else the principal (None)."""
+    if "route_to_person_id" in for_ids:
+        return for_ids["route_to_person_id"]
+    teammate = _teammate_asking()
+    return getattr(teammate, "id", None) if teammate is not None else None
+
+
+def _speaker_id() -> int | None:
+    """The People id of whoever this turn is for, when a surface verified
+    them (a teammate, or the principal), else None."""
+    teammate = _teammate_asking()
+    if teammate is not None:
+        return getattr(teammate, "id", None)
+    if _principal_asked():
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        return principal.id if principal is not None else None
+    return None
+
+
+def _shown(item: Any) -> bool:
+    """Whether the person this turn is for may see this watch: an email
+    watch is its owner's alone (``monitoring.mailbox.shown_to``)."""
+    return item is not None and mailbox.shown_to(item, _speaker_id())
+
+
+async def _email_watch(
+    tool: str, trigger: dict[str, Any], config: dict[str, Any], quiet_by: object,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | str:
+    """``(config, trigger, reply)`` for an email watch set up by the person
+    this turn is for, or the JSON string to return. Whose watch it is is
+    never an argument: it is the speaker's. It watches the Executive's inbox,
+    and theirs too whenever it is connected (``monitoring.mailbox``);
+    ``reply`` says which, for the words of the answer."""
+    from openexecutive.delegation.gmail import gmail_status
+    from openexecutive.people.store import get_person
+
+    owner = _speaker_id()
+    person = get_person(owner) if owner is not None else None
+    if person is None or person.id is None:
+        return _err(tool, "no one on People is asking in this conversation, so there is no one for the watch to tell")
+    cleaned = mailbox.clean_trigger(trigger)
+    if not cleaned:
+        return _err(tool, "say who the email is from (trigger.from) or words its subject has (trigger.keywords)")
+    now = datetime.now(UTC)
+    day = mailbox.clean_quiet_by(quiet_by, today=now.astimezone(_zone()).date())
+    if isinstance(day, str):
+        return _err(tool, day)
+    config = {**mailbox.owner_config(config, person.id), **mailbox.quiet_config(day, now)}
+    # Only whether their own inbox can be read: nothing in it is opened on
+    # this turn, so setting a watch never counts as having read their mail.
+    own = await gmail_status(person.email) == "connected"
+    return config, cleaned, _watch_words(own, day, principal=person.is_principal is True)
+
+
+def _zone() -> Any:
+    from openexecutive.memory.workspace_settings import get_user_timezone
+
+    return get_user_timezone()
+
+
+def _watch_words(own_inbox: bool, day: Any, *, principal: bool) -> dict[str, Any]:
+    """What the reply says about a new email watch. It tells only email its
+    owner could already see (``mailbox.seen_by``): the Executive's inbox is
+    the principal's to read, so a teammate's watch reads their own inbox
+    (and their own mail with the Executive)."""
+    ping = f" If nothing comes by {day:%a %b} {day.day}, I'll ping you that morning." if day else ""
+    if principal:
+        where = "emails me or your inbox" if own_inbox else "emails me"
+        watches = "the Executive's inbox and their own" if own_inbox else "the Executive's inbox"
+        extra = ""
+    else:
+        where = "emails your inbox" if own_inbox else "emails you"
+        watches = "their own inbox" if own_inbox else "nothing yet: their own inbox isn't connected"
+        extra = (
+            "" if own_inbox else
+            " Then say in a line that it starts once their own inbox is connected, since email to you,"
+            " the Executive, is read by the owner, and it only tells them email they can already see."
+        )
+    return {
+        "watches": watches,
+        "quiet_by": day.isoformat() if day else None,
+        "note": (
+            f"Say it in a line or two, like: 'I'll tell you each time <who> {where}.{ping}' "
+            f"Then that it's on their watch list, by its name.{extra}"
+        ),
+    }
+
+
+def _scan_soon() -> None:
+    """Bring the monitor's next pass forward so a new watch gets its first
+    check within a minute, not up to a whole scan interval later."""
+    from openexecutive.monitoring.pipeline import scan_soon
+
+    try:
+        scan_soon()
+    except Exception:
+        logger.warning("watchlist_tools: couldn't bring the next scan forward", exc_info=True)
 
 
 def _own_words(note: str) -> str:
@@ -511,17 +687,25 @@ def _for_ids(tool: str, tool_input: dict[str, Any]) -> dict[str, int | None] | s
 
 
 async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
-    from openexecutive.delegation.lockdown import outside_reach_refusal
+    from openexecutive.delegation.lockdown import outside_reach_reason, outside_reach_refusal
 
     tool = "add_watchlist_entry"
-    if (refused := outside_reach_refusal(tool)) is not None:
+    # A watch on their own inbox fetches nothing outside, so their own mail
+    # read never holds it (lockdown.own_inbox_watch); a sender's words do.
+    if outside_reach_reason(tool, tool_input) and (refused := outside_reach_refusal(tool)) is not None:
         return refused
     validated = await _validated_target(tool, tool_input)
     if isinstance(validated, str):
         return validated
     slug, signal_type, target, config, trigger = validated
+    words: dict[str, Any] = {}
+    if signal_type == SOURCE_KIND_MAILBOX:
+        watch = await _email_watch(tool, trigger, config, tool_input.get("quiet_by"))
+        if isinstance(watch, str):
+            return watch
+        config, trigger, words = watch
 
-    cadence = str(tool_input.get("cadence", "15min"))
+    cadence = str(tool_input.get("cadence") or ("real_time" if signal_type == SOURCE_KIND_MAILBOX else "15min"))
     if not is_valid_cadence(cadence):
         return _err(tool, f"unknown cadence {cadence!r}")
 
@@ -542,7 +726,7 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
             trigger=trigger,
             cadence=cadence,
             route_to_specialist=str(tool_input.get("route_to_specialist", "")),
-            route_to_person_id=for_ids.get("route_to_person_id"),
+            route_to_person_id=_default_person(for_ids),
             goal_id=for_ids.get("goal_id"),
             mode=mode,
             notes=str(tool_input.get("notes", ""))[:500],
@@ -551,7 +735,11 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
     except Exception as exc:
         logger.exception("add_watchlist_entry: insert failed")
         return _err(tool, f"insert failed: {exc}")
+    _scan_soon()
 
+    privacy = (
+        {"private": True, "private_to_person": config[mailbox.OWNER_KEY]} if signal_type == SOURCE_KIND_MAILBOX else None
+    )
     _audit(
         tool, True,
         f"add_watchlist_entry: created {slug!r} ({signal_type})",
@@ -562,6 +750,7 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
             "target": target,
             "mode": mode,
         },
+        privacy,
     )
     return json.dumps({
         "ok": True,
@@ -569,6 +758,7 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
         "slug": slug,
         "signal_type": signal_type,
         "mode": mode,
+        **words,
     })
 
 
@@ -590,6 +780,8 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     # validation, so a declined source is never even requested again.
     raw_type = str(tool_input.get("signal_type", "")).strip()
     raw_target = str(tool_input.get("target", "")).strip()
+    if raw_type == SOURCE_KIND_MAILBOX:
+        return _err(tool, "research watches the outside world; a person's inbox is theirs to watch (add_watchlist_entry)")
     if raw_target and ms.is_declined(normalize_target(raw_type, raw_target)):
         return _err(tool, f"target {raw_target!r} was declined by the principal — do not re-propose it")
     entity = str(tool_input.get("grounding_entity", ""))[:120]
@@ -659,6 +851,7 @@ async def handle_list_watchlist(tool_input: dict[str, Any]) -> str:
         items = ms.list_watchlist(
             enabled_only=enabled_only,
             signal_type=signal_type,
+            for_person=_speaker_id(),
         )
     except Exception as exc:
         logger.exception("list_watchlist: failed")
@@ -675,6 +868,7 @@ async def handle_list_watchlist(tool_input: dict[str, Any]) -> str:
             "enabled": i.enabled,
             "title": watch_title(i),
             "tells_you_when": trigger_line(i.signal_type, i.trigger_json),
+            **({"quiet_by": q.isoformat()} if (q := mailbox.quiet_by(i)) is not None else {}),
             "last_check": _own_words(i.last_check_note),
             "for_goal_id": i.goal_id,
             "for_person_id": i.route_to_person_id,
@@ -703,7 +897,7 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
         return _err(tool, "slug is required and cannot be empty")
 
     item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
+    if item is None or not _shown(item):
         return _err(tool, f"slug {slug!r} not found")
 
     try:
@@ -733,15 +927,18 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
         tool, removed,
         f"remove_watchlist_entry: {slug} ({'deleted' if removed else 'no-op'})",
         {"slug": slug, "watchlist_id": item.id, "removed": removed},
+        mailbox.audit_privacy(item),
     )
-    return json.dumps({"ok": removed, "slug": slug})
+    return json.dumps({"ok": removed, "slug": slug, "signal_type": item.signal_type})
 
 
 async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
-    from openexecutive.delegation.lockdown import outside_reach_refusal
+    from openexecutive.delegation.lockdown import outside_reach_reason, outside_reach_refusal
 
     tool = "tune_watchlist_entry"
-    if (refused := outside_reach_refusal(tool)) is not None:
+    # A watch on their own inbox fetches nothing outside, so their own mail
+    # read never holds it (lockdown.own_inbox_watch); a sender's words do.
+    if outside_reach_reason(tool, tool_input) and (refused := outside_reach_refusal(tool)) is not None:
         return refused
     try:
         slug = str(tool_input["slug"]).strip()
@@ -751,7 +948,7 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         return _err(tool, "slug is required and cannot be empty")
 
     item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
+    if item is None or not _shown(item):
         return _err(tool, f"slug {slug!r} not found")
     assert item.id is not None
 
@@ -802,17 +999,34 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         trig = tool_input["trigger"] or {}
         if not isinstance(trig, dict):
             return _err(tool, "trigger must be a JSON object")
+        if mailbox.is_mailbox(item):
+            trig = mailbox.clean_trigger(trig)
+            if not trig:
+                return _err(tool, "say who the email is from (trigger.from) or words its subject has (trigger.keywords)")
         fields["trigger_json"] = json.dumps(trig)
         changes.append("trigger replaced")
     if "notes" in tool_input:
         fields["notes"] = str(tool_input["notes"])[:500]
         changes.append("notes updated")
+    quiet: dict[str, Any] = {}
+    if "quiet_by" in tool_input:
+        if not mailbox.is_mailbox(item):
+            return _err(tool, "quiet_by is for an email watch")
+        now = datetime.now(UTC)
+        day = mailbox.clean_quiet_by(tool_input["quiet_by"], today=now.astimezone(_zone()).date())
+        if isinstance(day, str):
+            return _err(tool, day)
+        quiet = mailbox.quiet_config(day, now)
+        changes.append(f"quiet_by={day.isoformat() if day else None}")
 
-    if not fields:
+    if not fields and not quiet:
         return _err(tool, "nothing to change — pass at least one tunable field")
 
     try:
-        ms.update_watchlist_fields(item.id, fields)
+        if fields:
+            ms.update_watchlist_fields(item.id, fields)
+        for key, value in quiet.items():
+            ms.set_watchlist_config_key(item.id, key, value)
     except Exception as exc:
         logger.exception("tune_watchlist_entry: UPDATE failed")
         return _err(tool, f"UPDATE failed: {exc}")
@@ -823,8 +1037,32 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         tool, True,
         f"tune_watchlist_entry: {slug} -> {', '.join(changes)}",
         {"slug": slug, "watchlist_id": item.id, "changes": changes},
+        mailbox.audit_privacy(item),
     )
-    return json.dumps({"ok": True, "slug": slug, "changes": changes})
+    return json.dumps({"ok": True, "slug": slug, "signal_type": item.signal_type, "changes": changes})
+
+
+def speakers_own_row(tool_name: str, tool_input: Any, result: Any = None) -> bool:
+    """Whether the Executive's dispatch row for a watch-list call is the
+    speaker's alone: it sets up or changes a watch on their own inbox, or
+    its result names one (every result here names the kind of each watch
+    it touched). Such a row quotes who the email is from and what it says,
+    like every row the watch writes itself (``mailbox.audit_privacy``).
+    Never raises; False when unsure."""
+    if tool_name not in WATCHLIST_TOOL_HANDLERS:
+        return False
+    from openexecutive.delegation.lockdown import own_inbox_watch
+
+    if own_inbox_watch(tool_name, tool_input):
+        return True
+    try:
+        data = json.loads(result) if isinstance(result, str) else None
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    touched = [data, *(w for w in data.get("watchlist") or [] if isinstance(w, dict))]
+    return any(w.get("signal_type") == SOURCE_KIND_MAILBOX for w in touched)
 
 
 WATCHLIST_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = {
@@ -846,4 +1084,5 @@ __all__ = [
     "handle_list_watchlist",
     "handle_remove_watchlist_entry",
     "handle_tune_watchlist_entry",
+    "speakers_own_row",
 ]

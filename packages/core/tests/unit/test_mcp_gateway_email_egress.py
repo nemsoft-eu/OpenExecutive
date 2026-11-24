@@ -571,3 +571,21 @@ def test_forbidden_arg_key_error_is_accurate() -> None:
     assert "additional_headers" in err
     assert "not permitted" in err
     assert "EMAIL_ALLOWED_SENDERS" not in err
+
+
+def test_a_stray_field_goes_back_to_be_written_again_not_on_a_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model put its reason in the call ("why"): that is a slip to
+    retry, never an Approve card saying the recipient isn't in People."""
+    from openexecutive.orchestrator import levels
+
+    carded: list[Any] = []
+    monkeypatch.setattr(levels, "card_or", lambda blocked, *a, **k: carded.append(k) or blocked)
+    gateway, session_call = _make_gateway()
+    result = _call(
+        gateway,
+        {"to": "leo@example.com", "subject": "Re: paying early", "body": "Fine by us.", "why": "answering Leo"},
+        ["leo@example.com"],
+    )
+    assert session_call.await_count == 0 and carded == []
+    error = json.loads(result)["error"]
+    assert "'why'" in error and "Call it again" in error and "People" not in error

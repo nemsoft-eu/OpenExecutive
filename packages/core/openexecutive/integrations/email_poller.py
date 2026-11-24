@@ -68,6 +68,12 @@ _MAX_ATTEMPTS = 3
 _DEFAULT_TURN_TIMEOUT_S = 300.0
 # The wait before the sender check is tried a second time (_prove).
 _PROVE_RETRY_S = 2.0
+# Why each recent message's sender was left unproven
+# (``fact_confirmation.unproven_cause``), for its card's wording
+# (``integrations.unanswered_mail``). Taken once by ``_note_reply_outcome``;
+# the cap only bounds what an unanswered message leaves behind.
+_UNPROVEN_CAUSES: dict[str, str] = {}
+_UNPROVEN_CAUSES_MAX = 200
 
 _SKIP_SENDERS = ("noreply", "no-reply", "mailer-daemon", "postmaster", "do-not-reply")
 
@@ -84,6 +90,40 @@ class EmailTurnTimeout(Exception):
     def __init__(self, timeout_s: float) -> None:
         super().__init__(f"email turn ran past {timeout_s:.0f}s")
         self.timeout_s = timeout_s
+
+
+class TurnNotRun(Exception):
+    """The AI service refused the email's turn (busy, or out of credit) before
+    it sent anything: the message stays unread, so a later poll runs it
+    again, and a card says so if it never gets through."""
+
+    def __init__(self, *, sender: str, sender_name: str, thread_id: str, subject: str) -> None:
+        super().__init__(f"the AI service refused the turn for mail from {sender}")
+        self.sender = sender
+        self.sender_name = sender_name
+        self.thread_id = thread_id
+        self.subject = subject
+
+
+def _refused(exc: BaseException) -> bool:
+    """Whether ``exc`` is the AI service turning the call away (busy, rate
+    limited or out of credit: HTTP 402, 429 or 529, anywhere in its chain),
+    not a fault in the turn itself."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status = getattr(current, "status_code", None) or getattr(response, "status_code", None)
+        if status in (402, 429, 529):
+            return True
+        pending += [current.__cause__, current.__context__]
+        if isinstance(current, BaseExceptionGroup):
+            pending += list(current.exceptions)
+    return False
 
 
 def _turn_timeout_s() -> float:
@@ -175,6 +215,15 @@ _ATTRIBUTION_MAX_LINES = 4
 # Where everything below is an older message rather than the sender's text.
 _ORIGINAL_MESSAGE_RE = re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE)
 _FORWARDED_RE = re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}", re.IGNORECASE)
+# Apple Mail and iPhone forward with this line, the forwarded message quoted
+# with ">" below it ("> Begin forwarded message:"), or unquoted.
+_BEGIN_FORWARDED_RE = re.compile(r"^(>\s?)?Begin forwarded message:\s*$", re.IGNORECASE)
+_FORWARD_SUBJECT_RE = re.compile(r"^\s*(\[[^\]]{0,40}\]\s*)*(fwd?|fw|wg|tr|rv)(\[\d{1,3}\])?\s*:", re.IGNORECASE)
+# A reply's subject prefix (not a forward's), in the common mail languages.
+_REPLY_ONLY_SUBJECT_RE = re.compile(
+    r"^\s*(\[[^\]]{0,40}\]\s*)*(re|aw|sv|vs|antw|antwort|rif|res|odp|ynt|vá|отв|回复|答复)(\[\d{1,3}\])?\s*[:：]",
+    re.IGNORECASE,
+)
 _OUTLOOK_RULE_RE = re.compile(r"^_{10,}\s*$")
 _OUTLOOK_HEADER_RE = re.compile(r"^From:\s")
 _OUTLOOK_SENT_RE = re.compile(r"^(Sent|Date):\s")
@@ -303,6 +352,30 @@ def _attribution_end(body: list[str], i: int) -> tuple[int, bool] | None:
     return None
 
 
+async def _note_thread(
+    thread_id: str, from_addr: str, subject: str, prove: Callable[[], Awaitable[bool]],
+) -> None:
+    """Note the conversation this mail's thread belongs to (one card per
+    topic): a follow-up the mailbox filed as a new thread joins the sender's
+    earlier conversation only once the mailbox vouches for the sender, since
+    anyone can write a From: line. ``prove`` runs only when the mail would
+    join one. Never raises."""
+    from openexecutive.alerts import one_card
+
+    try:
+        proven = await asyncio.to_thread(one_card.continues, thread_id, from_addr, subject) and await prove()
+    except Exception:  # noqa: BLE001 - optional step; must not lose the email.
+        logger.warning("couldn't check a follow-up's sender; it keeps its own thread", exc_info=True)
+        proven = False
+    await asyncio.to_thread(one_card.note_mail, thread_id, from_addr, subject, proven=proven)
+
+
+def _header_subject(raw_email: str) -> str:
+    """The Subject: line of a fetched message, or ''."""
+    header, _body, _attachments = _split_gmail_content(raw_email)
+    return next((ln.split(":", 1)[1].strip() for ln in header if ln.lower().startswith("subject:")), "")
+
+
 def _retrieval_query(raw_email: str) -> str:
     """What to search Knowledge for on an email turn: its subject and what
     the sender wrote, not the raw mail (whose first lines are headers), cut
@@ -326,47 +399,190 @@ def _retrieval_query(raw_email: str) -> str:
     return (words or topic or raw_email)[:500]
 
 
-def _new_text_lines(body: list[str]) -> tuple[list[str], bool]:
+def _new_text_lines(body: list[str], subject: str = "") -> tuple[list[str], bool]:
     """The sender's own lines, without quoted replies, stopping where an
     older message is appended below. Returns (lines, whether a forwarded
-    message was cut off).
+    message was cut off). A ">"-quoted forward does not count under a
+    reply ``subject``."""
+    kept, cut_at, forwarded = _scan_new_text(body, subject)
+    return kept, forwarded and cut_at is not None
+
+
+def _scan_new_text(body: list[str], subject: str = "") -> tuple[list[str], int | None, bool]:
+    """The sender's own lines, the index where an older message appended
+    below them starts (None when none is), and whether that line opened a
+    forwarded message rather than reply history.
 
     A reply attribution followed by ">" lines is skipped rather than ending
     the scan, so text the sender wrote below a quote (bottom-posting or an
-    interleaved reply) is kept.
+    interleaved reply) is kept. A forward marker counts only before any
+    reply attribution: one inside quoted history is that history's. A
+    ">"-quoted forward (Apple Mail) is skipped like any quote, its start
+    noted, so a note written below it is kept; an unquoted one ends the scan.
     """
     kept: list[str] = []
     i = 0
+    # A ">"-quoted forward marker in a reply (Re:, AW:, SV: ...) is quoted
+    # history, whatever language the reply's attribution line is in.
+    quoted_forwards = _REPLY_ONLY_SUBJECT_RE.match(subject or "") is None
+    replied = False
+    quoted_forward: int | None = None
+
+    def stop(at: int, forwarded: bool) -> tuple[list[str], int | None, bool]:
+        if quoted_forward is not None:
+            return kept, quoted_forward, True
+        return kept, at, forwarded
+
     while i < len(body):
         text = body[i].strip()
-        if _FORWARDED_RE.match(text):
-            return kept, True
+        if _FORWARDED_RE.match(text) or (
+            not replied and quoted_forward is None and _BEGIN_FORWARDED_RE.match(text)
+            and not (text.startswith(">") and (not quoted_forwards or _inside_quote(body, i)))
+        ):
+            if text.startswith(">"):
+                quoted_forward = i
+            elif quoted_forward is None and next(
+                (b.strip() for b in body[i + 1:] if b.strip()), ""
+            ).startswith(">"):
+                # An iPhone marker over a ">"-quoted forward: skip the quote
+                # like any other, so a note written below it is kept.
+                quoted_forward = i
+                i += 1
+                continue
+            else:
+                return stop(i, True)
         if _ORIGINAL_MESSAGE_RE.match(text) or _OUTLOOK_RULE_RE.match(text):
-            break
+            return stop(i, False)
         if _OUTLOOK_HEADER_RE.match(text) and any(
             _OUTLOOK_SENT_RE.match(b.strip())
             for b in body[i + 1:i + 1 + _OUTLOOK_HEADER_SPAN]
         ):
-            break
+            return stop(i, False)
         attribution = _attribution_end(body, i)
         if attribution is not None:
             end, quoted = attribution
             if not quoted:
-                break
+                return stop(i, False)
+            replied = True
             i = end + 1
             continue
         if not text.startswith(">") and text != _NO_BODY_PLACEHOLDER:
             kept.append(body[i].rstrip())
         i += 1
-    return kept, False
+    return stop(i, False) if quoted_forward is not None else (kept, None, False)
 
 
 def sender_new_text(body: str) -> str:
     """A message body without the quoted replies or forwarded message below
     it — just what its sender wrote. Act as me's voice learner reads the
-    principal's own sent mail through this (``delegation.voice``)."""
+    principal's own sent mail through this (``delegation.voice``). To read
+    an email for what it says, use ``readable_text``: a forward's content
+    is not anywhere else in the thread."""
     lines, _forwarded = _new_text_lines(body.splitlines())
     return "\n".join(lines).strip()
+
+
+FORWARDED_HEADING = "Forwarded message:"
+
+
+def readable_text(
+    body: str, subject: str = "", *, max_chars: int | None = None, forwarded_chars: int | None = None,
+) -> str:
+    """What an email says, to read it: its sender's own words
+    (``sender_new_text``), then any message they forwarded, under
+    ``FORWARDED_HEADING`` with the forward's own ">" quoting taken off
+    (``split_forward``). With ``forwarded_chars``, ``max_chars`` caps the
+    sender's words and ``forwarded_chars`` the forwarded message; without
+    it, ``max_chars`` caps the whole text."""
+    own, inner = split_forward(body, subject, max_chars=max_chars, forwarded_chars=forwarded_chars)
+    text = f"{own}\n\n{FORWARDED_HEADING}\n{inner}".strip() if inner else own
+    # Without forwarded_chars, max_chars is the cap on the whole text.
+    return text[:max_chars] if max_chars is not None and forwarded_chars is None else text
+
+
+def _forward_quote(lines: list[str]) -> int | None:
+    """Where the forwarded email starts in a forward whose marker isn't
+    recognised: the last ">" run that stands as its own block (after a blank
+    line or at the top), so a line the sender quotes inline above it isn't
+    taken for it; else the last ">" run. None when there is none or a reply
+    attribution opens first."""
+    block = run = None
+    for i, line in enumerate(lines):
+        if _attribution_end(lines, i) is not None:
+            break
+        prev = lines[i - 1].strip() if i else ""
+        if line.lstrip().startswith(">") and not prev.startswith(">"):
+            run = i
+            if not prev:
+                block = i
+    return block if block is not None else run
+
+
+def _inside_quote(lines: list[str], i: int) -> bool:
+    """Whether the ">" line at ``i`` is inside a quote rather than opening
+    one. Apple Mail opens a forward's quote with its marker; a marker further
+    down a quote belongs to the quoted history, whatever its language."""
+    for j in range(i - 1, -1, -1):
+        prev = lines[j].strip()
+        if prev and prev != ">":
+            return prev.startswith(">")
+    return False
+
+
+def split_forward(
+    body: str, subject: str = "", *, max_chars: int | None = None, forwarded_chars: int | None = None,
+) -> tuple[str, str]:
+    """An email's sender's own words and the message they forwarded in it
+    ("" when none), apart, so a reader can keep someone else's forwarded
+    words out of what it marks as the sender's. Reply history quoted below
+    is left out (each earlier message is its own message in the thread),
+    except in a forward (``subject`` Fwd:/Fw:), where an Outlook-style header
+    block is the forwarded message."""
+    lines = body.splitlines()
+    kept, cut_at, forwarded = _scan_new_text(lines, subject)
+    is_forward = _FORWARD_SUBJECT_RE.match(subject or "") is not None
+    if cut_at is None and is_forward:
+        # A forward whose marker is in another language ("Anfang der
+        # weitergeleiteten Nachricht:"): its last ">" block, when no reply
+        # attribution comes before it, is the forwarded email.
+        # The scan skipped it like any quote, so their words above and below
+        # it are already kept.
+        cut_at = _forward_quote(lines)
+    # A skipped quote leaves the blank lines around it: one is enough.
+    own = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if max_chars is not None:
+        own = own[:max_chars]
+    if cut_at is None or not (forwarded or is_forward):
+        return own, ""
+    rest = lines[cut_at:]
+    if rest and not rest[0].lstrip().startswith(">") and (
+        _BEGIN_FORWARDED_RE.match(rest[0].strip())
+        or _FORWARDED_RE.match(rest[0].strip())
+        or _OUTLOOK_RULE_RE.match(rest[0].strip())
+    ):
+        rest = rest[1:]  # the reader's own heading says it
+    first = next((k for k, ln in enumerate(rest) if ln.strip()), None)
+    if first is not None and rest[first].lstrip().startswith(">"):
+        # Quoted (Apple Mail, or an iPhone marker with its forward quoted
+        # below): the forward is the run of ">" lines, one level of ">" off
+        # each. What the sender wrote below it is in ``kept``.
+        end = len(rest)
+        for k in range(first, len(rest)):
+            if rest[k].strip() and not rest[k].lstrip().startswith(">"):
+                end = k
+                break
+        after = rest[end:]
+        rest = [re.sub(r"^(\s*)>\s?", r"\1", ln) for ln in rest[first:end]]
+        if rest and _BEGIN_FORWARDED_RE.match(rest[0].strip()):
+            rest = rest[1:]
+        # A second forward below it (where the scan stopped) is forwarded too.
+        later = next((k for k, ln in enumerate(after) if _FORWARDED_RE.match(ln.strip())
+                      or _BEGIN_FORWARDED_RE.match(ln.strip())), None)
+        if later is not None:
+            rest += ["", *after[later:]]
+    inner = "\n".join(ln.rstrip() for ln in rest).strip()
+    cap = forwarded_chars if forwarded_chars is not None else max_chars
+    return own, inner[:cap] if cap is not None else inner
 
 
 def _email_memory_text(raw: str) -> str:
@@ -387,7 +603,7 @@ def _email_memory_text(raw: str) -> str:
         (ln.split(":", 1)[1].strip() for ln in header if ln.lower().startswith("subject:")),
         "",
     )
-    new_lines, forwarded = _new_text_lines(body)
+    new_lines, forwarded = _new_text_lines(body, subject)
     new_text = "\n".join(new_lines).strip()
     names = [name for name in map(_attachment_name, attachments) if name]
 
@@ -422,7 +638,7 @@ async def poll_once(gateway: MCPGateway, provider: MailProvider | None = None) -
             await _handle_email(gateway, mid, ref.thread_id, user_email, provider=provider)
             _processed_ids.add(mid)
             _failed_attempts.pop(mid, None)
-        except Exception:
+        except Exception as exc:
             attempts = _failed_attempts.get(mid, 0) + 1
             if attempts < _MAX_ATTEMPTS:
                 _failed_attempts[mid] = attempts
@@ -440,6 +656,26 @@ async def poll_once(gateway: MCPGateway, provider: MailProvider | None = None) -
                 await _mark_read(gateway, mid, user_email, provider=provider)
             except Exception:
                 logger.warning("could not mark message=%s read", mid, exc_info=True)
+            if isinstance(exc, TurnNotRun):
+                # Nobody answered it: the owner is told, not left to find it.
+                _card_for_unanswered(exc, mid)
+
+
+def _card_for_unanswered(refused: TurnNotRun, message_id: str) -> None:
+    """A card for mail the AI service never let the Executive answer. Never
+    raises."""
+    try:
+        from openexecutive.integrations import unanswered_mail
+
+        unanswered_mail.file_card(
+            thread_key=refused.thread_id or refused.sender,
+            message_id=message_id,
+            sender_name=refused.sender_name,
+            from_principal=False,
+            sender_address=refused.sender,
+        )
+    except Exception:  # noqa: BLE001 - the mail is still in the inbox
+        logger.warning("could not raise the unanswered-mail card for message=%s", message_id, exc_info=True)
 
 
 async def _handle_email(
@@ -478,10 +714,32 @@ async def _prove_sender(gateway: Any, message_id: str, from_addr: str) -> bool:
 
     if await fact_confirmation.sender_authenticated(gateway, message_id, from_addr):
         return True
-    if _MIME_HEADER_RE.search(await fact_confirmation.read_raw(gateway, message_id)):
+    raw = await fact_confirmation.read_raw(gateway, message_id)
+    if _MIME_HEADER_RE.search(raw):
+        _log_unconfirmed(message_id, raw, from_addr)
         return False
     await asyncio.sleep(_PROVE_RETRY_S)
-    return await fact_confirmation.sender_authenticated(gateway, message_id, from_addr)
+    if await fact_confirmation.sender_authenticated(gateway, message_id, from_addr):
+        return True
+    _log_unconfirmed(message_id, raw, from_addr)
+    return False
+
+
+def _log_unconfirmed(message_id: str, raw: str, from_addr: str) -> None:
+    """Which part of the sender check said no, for the log
+    (``fact_confirmation.why_not_authenticated``). Never raises."""
+    from openexecutive.integrations import fact_confirmation
+
+    try:
+        why = fact_confirmation.why_not_authenticated(raw, from_addr)
+    except Exception:  # noqa: BLE001 - a diagnostic only
+        why = "unreadable"
+    logger.info("sender not confirmed for message=%s: %s", message_id, why)
+    cause = fact_confirmation.unproven_cause(raw, from_addr)
+    if cause and message_id:
+        while len(_UNPROVEN_CAUSES) >= _UNPROVEN_CAUSES_MAX:
+            _UNPROVEN_CAUSES.pop(next(iter(_UNPROVEN_CAUSES)))
+        _UNPROVEN_CAUSES[message_id] = cause
 
 
 async def _handle_one_email(
@@ -549,7 +807,11 @@ async def handle_inbound(mail: InboundMail, gateway: MCPGateway | None = None) -
         gateway = get_active_gateway()
     # One message, one turn, as in `_handle_email`.
     with set_session(None):
-        return await _handle_mail(mail, gateway, mailbox=None)
+        try:
+            return await _handle_mail(mail, gateway, mailbox=None)
+        except TurnNotRun:
+            # Nothing went out: the source hands it over again later.
+            return PAUSED
 
 
 _SKIPPED = "skipped"
@@ -598,6 +860,14 @@ async def _handle_mail(
     sender_blob = f"{msg.from_name} {from_addr}".lower()
     if any(p in sender_blob for p in _SKIP_SENDERS):
         logger.debug("skipping automated sender for message=%s", message_id)
+        # No turn for it, but someone may be watching for it ("tell me every
+        # time a sign-up email comes in"): the principal, who reads the
+        # Executive's inbox (sign-in codes and resets come this way). Nothing
+        # proves who sent it, so it joins no card.
+        await _note_watches(
+            msg, private=True, mail_of=None, proven=None,
+            header_id=_header_id_reader(gateway, msg, in_mailbox=mailbox is not None),
+        )
         return _SKIPPED
     if not message_id.strip("0"):
         # No real message behind it: a fetch of id "0" returns an error text,
@@ -610,6 +880,23 @@ async def _handle_mail(
         # finds it in the inbox. A source's mail is left to the source.
         logger.warning("skipping message=%s with no sender", message_id)
         if mailbox is not None and done is not None:
+            await done()
+        return _SKIPPED
+    from openexecutive.integrations import email_repeats
+
+    repeat_key = email_repeats.fingerprint(
+        # Only the parsed body: the raw text carries per-copy headers.
+        from_addr, msg.subject, msg.body_text, has_attachments=msg.has_attachments or bool(msg.attachments),
+    )
+    # Checked before the turn and noted after it (_run_executive): the mail
+    # loops handle one message at a time, each turn awaited before the next,
+    # so a second copy is never in flight with the first. A turn that times
+    # out is not noted, so its retry runs again.
+    if await asyncio.to_thread(email_repeats.is_copy, repeat_key, message_id):
+        # The same email again (a second delivery, or sent twice): the first
+        # copy was answered, so this one is marked read and left alone.
+        logger.info("skipping message=%s: a copy of one already handled", message_id)
+        if done is not None:
             await done()
         return _SKIPPED
 
@@ -719,6 +1006,13 @@ async def _handle_mail(
         private_rows(private),
         rows_for_person(teammate_id) if teammate_id is not None else contextlib.nullcontext(),
     ):
+        if not sender_in_roster:
+            from openexecutive.integrations import roster_intake
+
+            if roster_intake.looks_like_phishing(raw) and not _is_contact(from_addr):
+                # A stranger fishing for sign-in details, or giving the AI
+                # orders: no reply, no "Who is" card and no turn, one alert.
+                return await _drop_phishing(mail, raw, display_name, private=private, done=done)
         if not sender_in_roster and mailbox is None and not _is_contact(from_addr):
             # A source mails the turn's answer, and this sender is neither on
             # the team nor a contact, so there is no one it could go to: the
@@ -726,17 +1020,15 @@ async def _handle_mail(
             # back here once they say. No turn, whatever else failed above.
             return await _hold_from_source(mail, raw, display_name, private=private, done=done)
         if not sender_in_roster:
-            # A contact, like any non-team sender, gets no reply from this turn
-            # (the gateway reaches contacts only when the principal asks
-            # directly). A contact's row reads exactly like a non-roster
-            # sender's; only its visibility differs (private to the principal).
-            logger.info(
-                "non-roster sender=%s message=%s — routing to Executive (no auto-reply allowed)",
-                from_addr, message_id,
-            )
+            # Mail from outside the team. This row says only that it arrived:
+            # whether an answer went out is the outbound row's to say
+            # (``integration_outbound`` / ``integration_outbound_blocked``).
+            # A contact's row reads exactly like any outside sender's; only
+            # its visibility differs (private to the principal).
+            logger.info("outside sender=%s message=%s — routing to Executive", from_addr, message_id)
             audit_log(
                 "integration_inbound",
-                f"Accepted non-roster email from {from_addr} (reply blocked at outbound gate)",
+                f"Accepted email from {from_addr}, who isn't on the team",
                 actor="email",
                 details={
                     "channel": "email",
@@ -802,6 +1094,14 @@ async def _handle_mail(
             full=full,
             private=private,
         )
+        # Before the turn, so a turn that fails or is tried again later still
+        # tells whoever is watching for this email; the watch's card joins
+        # the card the turn makes for them, whichever comes first.
+        await _note_watches(
+            msg, private=private, mail_of=teammate_id,
+            proven=_known_proof if teammate_authenticated is True else prove,
+            header_id=_header_id_reader(gateway, msg, in_mailbox=mailbox is not None),
+        )
         outcome = "turn failed"
         try:
             outcome = await _run_executive(
@@ -813,6 +1113,7 @@ async def _handle_mail(
                 teammate_authenticated=teammate_authenticated,
                 source=None if mailbox is not None else mail,
                 prove_sender=prove,
+                repeat_key=repeat_key,
             ) or "answered"
         except EmailTurnTimeout as exc:
             # Past EMAIL_TURN_TIMEOUT_S: the turn was cancelled where it
@@ -840,12 +1141,71 @@ async def _handle_mail(
                 private=private,
             )
             outcome = "turn timed out"
+        except TurnNotRun:
+            # Not marked read: a later poll runs it again (``poll_once``).
+            logger.warning("the AI service refused the turn for message=%s; it stays unread", message_id)
+            raise
         except Exception:
             logger.exception("Executive raised for message=%s", message_id)
 
         if done is not None:
             await done()
         return outcome
+
+
+async def _note_watches(
+    msg: Any, *, private: bool, mail_of: int | None, proven: Callable[[], Awaitable[bool | None]] | None,
+    header_id: Callable[[], Awaitable[str]] | None = None,
+) -> None:
+    """Check the email against the email watches (``monitoring.mailbox``):
+    each one it matches whose owner could see it tells them, on the card of
+    its mail thread only when ``proven`` (asked only on a match) says the
+    sender is who it says. ``header_id`` (also asked only on a match) reads
+    its Message-ID, so the same email in the watcher's own inbox is told
+    once. Never raises."""
+    from openexecutive.monitoring.mailbox import note_executive_mail
+
+    await note_executive_mail(
+        message_id=msg.message_id, thread_id=msg.thread_id or "", from_addr=msg.from_addr,
+        from_name="" if msg.from_name.strip().lower() == msg.from_addr.lower() else msg.from_name,
+        subject=msg.subject, private=private, mail_of=mail_of, proven=proven, header_id=header_id,
+    )
+
+
+def _message_id_in(text: str) -> str:
+    """The Message-ID among the header lines of ``text`` (a fetched message
+    or raw MIME; never its body, which the sender writes), or ""."""
+    header, _body, _attachments = _split_gmail_content(text)
+    for line in header:
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "message-id" and value.strip():
+            return value.strip().split()[0]
+    return ""
+
+
+def _header_id_reader(gateway: Any, msg: Any, *, in_mailbox: bool) -> Callable[[], Awaitable[str]]:
+    """Reads the email's Message-ID header: from its own text when that
+    carries it, else, for mail in the Executive's mailbox, from the mailbox
+    (Gmail's raw message, Outlook's headers). "" when it can't be read."""
+
+    async def read() -> str:
+        found = _message_id_in(str(getattr(msg, "raw_text", "") or ""))
+        if found or not in_mailbox or gateway is None:
+            return found
+        from openexecutive.integrations import fact_confirmation
+        from openexecutive.integrations.workspace.registry import get_mail_provider
+
+        if get_mail_provider().name == "microsoft":
+            headers = await fact_confirmation.read_outlook_headers(gateway, msg.message_id)
+            return str(headers.get("Message-ID") or "").strip() if headers is not None else ""
+        return _message_id_in(await fact_confirmation.read_raw(gateway, msg.message_id))
+
+    return read
+
+
+async def _known_proof() -> bool:
+    """A sender already proven on this message."""
+    return True
 
 
 def _is_contact(from_addr: str) -> bool:
@@ -859,6 +1219,66 @@ def _is_contact(from_addr: str) -> bool:
     except Exception:  # noqa: BLE001 - unknown reads as a stranger.
         logger.warning("contact lookup failed; the mail is treated as a stranger's", exc_info=True)
         return False
+
+
+async def _drop_phishing(
+    mail: InboundMail,
+    raw: str,
+    display_name: str,
+    *,
+    private: bool,
+    done: Callable[[], Awaitable[None]] | None,
+) -> str:
+    """Mail from someone off the People list that looks like phishing: one
+    private alert for the principal, and nothing else (no acknowledgement,
+    no "Who is" card, no turn). Returns what happened."""
+    from openexecutive.alerts.models import PRIVATE_ALERT_TAG, AlertSeverity
+    from openexecutive.alerts.store import insert_alert
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.people.store import find_principal_person
+
+    msg = mail.message
+    header, _body, _att = _split_gmail_content(raw)
+    subject_line = next((ln for ln in header if ln.lower().startswith("subject:")), "")
+    subject = " ".join(subject_line[len("subject:"):].split())[:120]
+    who = f"{display_name} <{msg.from_addr}>" if display_name else msg.from_addr
+    try:
+        principal = find_principal_person()
+        insert_alert(
+            source="phishing",
+            external_id=f"phishing:{msg.message_id}",
+            severity=AlertSeverity.MEDIUM.value,
+            headline=f"Looks like phishing: {subject or 'an email'}"[:160],
+            body=(
+                f"{who} wrote to the Executive's inbox. It asks for passwords or codes, "
+                "threatens to close an account, or gives the Executive orders, so it got "
+                "no reply and nothing in it was done. Delete it, or add the sender on "
+                "People if you know them."
+            ),
+            topic_tags=[PRIVATE_ALERT_TAG],
+            dedup_key=f"phishing:{msg.message_id}",
+            routed_to_person_id=principal.id if principal is not None else None,
+            # Nothing to approve: it is for them to know (Got it).
+            needs="fyi",
+        )
+    except Exception:
+        logger.exception("email: couldn't raise the phishing alert for message=%s", msg.message_id)
+    audit_log(
+        "integration_inbound",
+        f"Email from {msg.from_addr} looks like phishing: alerted, not answered",
+        actor="email",
+        details={
+            "channel": "email",
+            "provider": mail.source,
+            "from": msg.from_addr,
+            "message_id": msg.message_id,
+            "outcome": "dropped_phishing",
+        },
+        private=private,
+    )
+    if done is not None:
+        await done()
+    return "alerted: it looks like phishing"
 
 
 async def _hold_from_source(
@@ -943,7 +1363,8 @@ async def _hold_for_roster(
     new_lines, _fw = _new_text_lines(body_lines)
     subject_line = next((ln for ln in header if ln.lower().startswith("subject:")), "")
     subject = subject_line[len("subject:"):].strip()
-    preview = f"{subject} — {' '.join(new_lines)}" if subject else " ".join(new_lines)
+    message = "\n".join(new_lines).strip()
+    preview = f"{subject}\n\n{message}" if subject else message
 
     async def _ack(_text: str) -> None:
         from openexecutive.integrations.workspace.registry import get_mail_provider
@@ -1060,7 +1481,7 @@ def _unproven_notice(from_addr: str, person: Any, principal_name: str) -> str:
 def _forwarded(raw_email: str) -> bool:
     """Whether the message carries a forwarded one below the sender's text."""
     _header, body, _attachments = _split_gmail_content(raw_email)
-    return _new_text_lines(body)[1]
+    return _new_text_lines(body, _header_subject(raw_email))[1]
 
 
 def _private_to_principal_mail(from_addr: str, raw_email: str) -> bool:
@@ -1102,13 +1523,14 @@ def _forwarded_by_principal_notice(principal: Any) -> str:
     )
 
 
-def _principal_email_text(raw_email: str, from_addr: str) -> str:
-    """The principal's own authenticated email as the turn shows it.
+def _proven_email_text(raw_email: str, from_addr: str) -> str:
+    """Email the mail service proved is its sender's own (the owner's or a
+    teammate's, ``people_tools.email_sender_proven``) as the turn shows it.
 
     Their new text is theirs. What it quotes or forwards — a stranger's
     message they replied to or passed on — is not, whoever sent it on: left
     unlabelled beside every other inbound mail, labelled, it would read as
-    the principal speaking. So when anything was cut from their new text, the
+    them speaking. So when anything was cut from their new text, the
     message as received goes in an ``<untrusted_content>`` block below their
     own words (which it repeats: the cut is a heuristic, and the whole message
     is what the Executive must be able to read)."""
@@ -1122,7 +1544,7 @@ def _principal_email_text(raw_email: str, from_addr: str) -> str:
     if "\n".join(ln for ln in own.splitlines() if ln.strip()) == whole:
         return raw_email
     return (
-        "The mailbox authenticated this email as the principal's own. Their new text "
+        "The mailbox authenticated this email as the sender's own. Their new text "
         "in it:\n"
         f"{own or '(none)'}\n\n"
         "The message as received, including what it quotes or forwards — "
@@ -1146,6 +1568,7 @@ async def _run_executive(
     teammate_authenticated: bool | None = None,
     source: InboundMail | None = None,
     prove_sender: Callable[[], Awaitable[bool]] | None = None,
+    repeat_key: str | None = None,
 ) -> str | None:
     """The Executive's turn for one email. Mail from the mailbox is answered
     with its send tool (``reply_block``); mail from a mail source
@@ -1197,6 +1620,8 @@ async def _run_executive(
 
         prove = prove_sender or _gmail_proof
         session.email_from = from_addr.strip().lower()
+        session.email_thread_id = str(thread_id or "")
+        await _note_thread(thread_id, from_addr, _header_subject(raw_email), prove)
         try:
             principal = await asyncio.to_thread(principal_address)
         except Exception:  # noqa: BLE001 - optional step; must not lose the email.
@@ -1222,24 +1647,6 @@ async def _run_executive(
                     other_principal_proven = await prove()
             except Exception:  # noqa: BLE001 - optional step; must not lose the email.
                 logger.warning("sender check failed; teammate mail stays private this turn", exc_info=True)
-    if from_addr:
-        # Only register the sender as a schedulable channel_ref if they
-        # are in the People roster. Without this guard, an attacker who
-        # can spoof a From header could persuade the Executive (via
-        # prompt injection in the body) to schedule outbound mail to
-        # arbitrary third parties. The roster gate in _handle_email
-        # already ensures we only get here for known senders, but
-        # re-verify defensively — _run_executive is also reachable from
-        # other code paths.
-        from openexecutive.people.identity import resolve_email_sender
-
-        settings = get_settings()
-        if (
-            from_addr.lower() == settings.exec_email_address.lower()
-            or resolve_email_sender(from_addr) is not None
-        ):
-            session.seen_channel_refs.add(("email", f"{from_addr}|{thread_id}"))
-            session.seen_channel_refs.add(("email", from_addr))
     # Look up the OE Person record (case-insensitive by email) so Honcho
     # can key per-person memory off Person.id (shared across channels).
     # No match → person_id stays None and the Honcho layer no-ops. Team
@@ -1259,6 +1666,10 @@ async def _run_executive(
     # text from its first word: the whole turn is held as one that read
     # outside content (orchestrator.outside_content.SENDER).
     session.sender_off_team = person is None
+    if session.sender_off_team:
+        from openexecutive.integrations import roster_intake
+
+        session.sender_gave_orders = roster_intake.looks_like_phishing(raw_email)
 
     # Multi-peer co-presence: parse To+Cc headers and resolve each
     # recipient to a Person via find_person_by_email. Skip the From
@@ -1266,15 +1677,23 @@ async def _run_executive(
     # (we ARE the executive — never a peer). Best-effort: parse
     # failures degrade to an empty list rather than blocking the turn.
     co_present_person_ids: list[int] = []
+    # Nobody else on it: the sender's conversation with the Executive alone
+    # (Session.email_one_on_one). Unknown when the headers can't be read or
+    # don't name us.
+    others_on_mail = True
     try:
         recipients = _parse_recipients(raw_email)
         exec_email = get_settings().exec_email_address.lower()
         own_address = source.own_address.lower() if source is not None else exec_email
         from_addr_lower = (from_addr or "").lower()
+        # Read only when our own address is among them: headers that came
+        # back empty prove nothing about who else is on it.
+        others_on_mail = not any(a.lower() in (exec_email, own_address) for a in recipients)
         for addr in recipients:
             addr_lower = addr.lower()
             if addr_lower in (exec_email, from_addr_lower, own_address):
                 continue
+            others_on_mail = True
             other = resolve_email_sender(addr)
             if other and other.id is not None and other.id not in co_present_person_ids:
                 co_present_person_ids.append(other.id)
@@ -1295,6 +1714,7 @@ async def _run_executive(
     # they are a contact or a teammate nothing proves wrote it — then to the
     # principal, never on the strength of an unproven From.
     answer_to = from_addr.strip().lower()
+    session.email_one_on_one = not others_on_mail
     unproven_teammate = (
         source is not None and person is not None and person.is_principal is not True
         and session.email_sender_authenticated is not True
@@ -1400,15 +1820,18 @@ async def _run_executive(
                 attachment_text, attachment_blocks = read.text, read.image_blocks
         except Exception:
             logger.exception("email: reading attachments failed for message=%s", message_id)
-    # The mail itself is someone else's text unless Gmail authenticated the
-    # principal's own address on it: it goes in labelled as such, with its
-    # sender, so nothing in it reads as the principal or the system speaking
-    # (`content_trust.wrap_untrusted`). The framing and the [POLICY] notice
-    # above it are ours and stay outside the block.
-    principal_sent = session.email_authenticated and getattr(person, "is_principal", False) is True
+    # The mail itself is someone else's text unless the mail service proved it
+    # is the sender's own and they are on the team: it goes in labelled as
+    # such, with its sender, so nothing in it reads as them or the system
+    # speaking (`content_trust.wrap_untrusted`). What proven mail quotes or
+    # forwards is still labelled (`_proven_email_text`). The framing and the
+    # [POLICY] notice above it are ours and stay outside the block.
+    from openexecutive.orchestrator.people_tools import email_sender_proven
+
+    own_mail = person is not None and email_sender_proven(session)
     email_text = (
-        _principal_email_text(raw_email, from_addr)
-        if principal_sent
+        _proven_email_text(raw_email, from_addr)
+        if own_mail
         else wrap_untrusted(raw_email, source="email", author=from_addr)
     )
     if source is None:
@@ -1506,14 +1929,48 @@ async def _run_executive(
                 memory_text=_email_memory_text(raw_email) if person_id is not None else None,
                 fetch_own_urls=fetch_own_urls,
             )
-    except TimeoutError as exc:
-        if deadline.expired():
+    except Exception as exc:
+        if isinstance(exc, TimeoutError) and deadline.expired():
             raise EmailTurnTimeout(timeout_s) from exc
+        if _refused(exc) and not (session.mail_sent_to or session.mail_replied_ids or session.steps_held):
+            # Nothing went out or waits on a card: running it again can't do it twice.
+            raise TurnNotRun(
+                sender=from_addr, sender_name=(person.full_name if person is not None else "") or from_addr,
+                thread_id=thread_id, subject="",
+            ) from exc
         raise
     if source is None:
         _note_reply_outcome(session, person, raw_email, message_id, thread_id, from_addr, response)
+        await _note_if_answered(repeat_key, message_id, session, from_addr)
         return None
-    return await _send_answer(source, response, answer_to, session_id or session.session_id)
+    outcome = await _send_answer(source, response, answer_to, session_id or session.session_id)
+    await _note_if_answered(repeat_key, message_id, session, from_addr, answered=outcome == "answered")
+    return outcome
+
+
+async def _note_if_answered(
+    repeat_key: str | None, message_id: str, session: Any, from_addr: str, *, answered: bool = False,
+) -> None:
+    """Note an email as answered (``integrations.email_repeats``), so a copy
+    of it is left alone, once its turn ran for a sender the mail provider
+    vouched for and the sender got something: a reply, or a step waiting on
+    an Approve card. A turn that sent nothing is not noted, so the same email
+    sent again is handled again."""
+    if repeat_key is None or True not in (
+        session.email_authenticated, session.email_sender_authenticated,
+    ):
+        return
+    sender = from_addr.strip().lower()
+    if not (
+        answered
+        or sender in session.mail_sent_to
+        or message_id in session.mail_replied_ids
+        or int(getattr(session, "steps_held", 0) or 0) > 0
+    ):
+        return
+    from openexecutive.integrations import email_repeats
+
+    await asyncio.to_thread(email_repeats.remember, repeat_key, message_id)
 
 
 def _note_reply_outcome(
@@ -1539,6 +1996,7 @@ def _note_reply_outcome(
     try:
         addresses = {sender, *(a.strip().lower() for a in [person.email, *person.email_aliases] if a)}
         if addresses & session.mail_sent_to or (message_id and message_id in session.mail_replied_ids):
+            _UNPROVEN_CAUSES.pop(message_id, None)
             unanswered_mail.close_card(thread_key)
             unanswered_mail.record_reply(thread_key, sender, getattr(session, "session_id", None))
             return
@@ -1554,12 +2012,15 @@ def _note_reply_outcome(
             header, _body, _attachments = _split_gmail_content(raw_email)
             line = next((ln for ln in header if ln.lower().startswith("subject:")), "")
             subject = line[len("subject:"):].strip()
+        cause = _UNPROVEN_CAUSES.pop(message_id, "") if message_id else ""
         unanswered_mail.file_card(
             thread_key=thread_key,
             message_id=message_id,
             sender_name=str(getattr(person, "full_name", "") or from_addr),
             from_principal=from_principal,
             verified=verified,
+            sender_address=sender,
+            cause="" if verified else cause,
             principal_address=getattr(person, "is_principal", False) is True,
             subject=subject,
             answer=response if from_principal and isinstance(response, str) else "",
