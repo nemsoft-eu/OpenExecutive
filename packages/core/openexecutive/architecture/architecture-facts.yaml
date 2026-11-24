@@ -4564,7 +4564,10 @@ attunement:
       included; hidden reads as not found. The list tool never refuses and
       always carries PRIVATE_TASKS_NOTE. Internal reads default to
       EVERYONE; the reflection block and Take the lead's overdue watch read
-      as the principal (`principal_reader`).
+      as the principal (`principal_reader`). With more than one principal
+      the reflection block reads the team's tasks only, since
+      `principal_reader` names the lowest-id one and the reflection can
+      message the company.
     verbatim_text: |
       The stored loop `text` must itself appear verbatim in the speaker's
       message (drop reason `text_not_verbatim`): it is re-injected into the

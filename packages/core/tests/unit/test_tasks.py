@@ -361,6 +361,19 @@ def test_the_principals_own_reads_keep_their_private_tasks(team: SimpleNamespace
     assert any("the Q3 deck" in d for d in overdue) and not any("Ortiz boxes" in d for d in overdue)
 
 
+def test_the_reflection_keeps_no_private_task_with_two_principals(team: SimpleNamespace) -> None:
+    """With a co-founder on the roster the reflection, which can message the
+    company, reads the team's tasks only: the lowest-id principal's private
+    task is not their co-founder's to hear about."""
+    people_store.upsert_person(full_name="Cleo Cofounder", is_principal=True)
+    due = datetime.now(UTC) - timedelta(hours=1)
+    open_loops.open_loop(owner_person_id=team.ben, description="Pat Principal asked Ben Ortiz for: the Q3 deck",
+                         due_at=due, private_to_person_id=team.principal)
+    open_loops.open_loop(owner_person_id=team.ben, description="Ben Ortiz will send: the team memo", due_at=due)
+    lines = "\n".join(open_loops.render_for_reflection())
+    assert "the team memo" in lines and "the Q3 deck" not in lines
+
+
 def test_waiting_counts_skip_private_tasks(team: SimpleNamespace) -> None:
     due = datetime.now(UTC) - timedelta(hours=1)
     open_loops.open_loop(owner_person_id=team.ben, description="Pat Principal asked Ben Ortiz for: the deck", due_at=due)

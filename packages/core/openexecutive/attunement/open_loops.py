@@ -1036,10 +1036,15 @@ def consume_call_budget(limit: int, *, db_path: Path | None = None) -> bool:
 def render_for_reflection(limit: int = 10, *, db_path: Path | None = None) -> list[str]:
     """One line per open loop, soonest-due first, for the reflection prompt:
     what the principal sees (``principal_reader``), since it is written for
-    them."""
+    them. With more than one principal it is the team's only: the
+    reflection can message the company, and ``principal_reader`` names only
+    the lowest-id one, so their private tasks would reach their co-founders."""
+    from openexecutive.people.store import active_principals
+
     now = datetime.now(UTC)
     lines: list[str] = []
-    for loop in list_open_loops(limit=limit, reader=principal_reader(db_path), db_path=db_path):
+    reader = principal_reader(db_path) if len(active_principals(db_path)) <= 1 else None
+    for loop in list_open_loops(limit=limit, reader=reader, db_path=db_path):
         due = _parse_iso(loop.due_at)
         state = "OVERDUE" if due is not None and due <= now else "due"
         lines.append(
