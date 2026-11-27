@@ -32,23 +32,27 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from openexecutive.alerts.models import SEVERITY_RANK, AlertEvent, AlertSeverity
 from openexecutive.alerts.pipeline import schedule_evaluation
 from openexecutive.audit import log_event as audit_log
 from openexecutive.config import get_settings
 from openexecutive.memory.episodic import insert_scheduled_action
-from openexecutive.monitoring import store
+from openexecutive.monitoring import mailbox, store
 from openexecutive.monitoring.enrichment import build_company_context, enrich_signal
 from openexecutive.monitoring.models import (
+    EVENT_QUIET_FIND,
     MODE_ACTIVE,
     MODE_DRY_RUN,
     ORIGIN_RESEARCH_PROPOSED,
     OUTCOME_ALERTED,
     OUTCOME_FAILED,
+    OUTCOME_HELD_BRIEF,
     OUTCOME_HELD_DIGEST,
     OUTCOME_SUPPRESSED_BASELINE,
     OUTCOME_SUPPRESSED_BELOW_FLOOR,
+    OUTCOME_SUPPRESSED_BY_NOTES,
     OUTCOME_SUPPRESSED_DRY_RUN,
     OUTCOME_SUPPRESSED_LOW_RELEVANCE,
     OUTCOME_SUPPRESSED_STALE,
@@ -323,6 +327,19 @@ def _signal_to_alert_event(
         if isinstance(link, dict) and link.get("url"):
             text = _without_links(collapse_whitespace(str(link.get("text") or "")))[:200]
             parts.append(f"New: {text} — {_safe_url(str(link['url']))}")
+    if mailbox.is_mailbox(item):
+        # An email watch's own words, written by its source, never by a feed:
+        # the mail thread its email came on, and the ping's choice.
+        payload = signal.raw_payload
+        mail: dict[str, Any] = {k: str(payload.get(k) or "") for k in ("mail_thread", "mail_from")}
+        card: dict[str, Any] = {
+            "needs": str(payload.get("needs") or ""),
+            "question": str(payload.get("question") or ""),
+            "choices": [str(c) for c in payload.get("choices") or [] if str(c).strip()],
+        }
+    else:
+        mail = {}
+        card = {}
     target = signal.raw_payload.get("target_url")
     if target:
         parts.append(f"Source: {target}")
@@ -336,7 +353,12 @@ def _signal_to_alert_event(
         # One watch = one open alert: repeats of the same watch coalesce
         # into the existing card (alerts.pipeline) while the signal-level
         # dedup_key keeps every observation in external_signals.
-        dedup_hint=f"watch:{item.slug}",
+        # An email watch's card is one email, so every email that matches
+        # is its own card and reaches the person (``#`` keeps the watch's
+        # slug readable: ``briefing.ranking.watch_slug_of``).
+        dedup_hint=(
+            f"watch:{item.slug}#{signal.source_external_id}" if mailbox.is_mailbox(item) else f"watch:{item.slug}"
+        ),
         # A watch that belongs to a department (set by the research policy
         # from the department's watched entities, or by hand) sends its
         # alerts to that department's head and tags them department:<slug>
@@ -344,8 +366,13 @@ def _signal_to_alert_event(
         # instead of the principal's. The slug goes in ``department`` — a
         # tag hint — never in ``channel``, which triage would read as the
         # room the event came from and answer with a team-room broadcast.
-        routed_to_person_id=item.route_to_person_id,
-        department=item.route_to_department,
+        # An email watch's cards are its owner's alone: their mail never
+        # reaches anyone else, whoever or whichever department the watch was
+        # set to tell.
+        routed_to_person_id=mailbox.owner_id(item) if mailbox.is_mailbox(item) else item.route_to_person_id,
+        department="" if mailbox.is_mailbox(item) else item.route_to_department,
+        **mail,
+        **card,
     )
 
 
@@ -407,6 +434,7 @@ async def promote_signal_to_alert(
             # embed a token in the link; we don't want it in audit.
             "provenance_url": _safe_url(signal.provenance_url),
         },
+        **mailbox.audit_privacy(item),
     )
     return True
 
@@ -451,8 +479,14 @@ def _digest_signal(item: WatchlistItem, held: list[dict]) -> tuple[Signal, dict 
             if url and url not in seen:
                 seen.add(url)
                 links.append(link)
-        if not payload.get("new_links") and payload.get("added_text"):
-            texts.append(str(payload["added_text"])[:300])
+        if payload.get("new_links"):
+            continue
+        changes = str(payload.get("changes") or "")
+        if any(not line.startswith("added ") for line in changes.splitlines()):
+            # Both sides of a rewrite (page_watch._diff).
+            texts.append("changes: " + changes.replace("\n", "; ")[:300])
+        elif payload.get("added_text"):
+            texts.append("new text: " + str(payload["added_text"])[:300])
     worst = max(
         (AlertSeverity(row.get("severity_hint") or "low") for row in held),
         key=lambda sev: SEVERITY_RANK[sev.value],
@@ -464,7 +498,9 @@ def _digest_signal(item: WatchlistItem, held: list[dict]) -> tuple[Signal, dict 
         more = len(links) - 3
         detail = f"new: {titles}" + (f" (+{more} more)" if more > 0 else "")
     else:
-        detail = "new text: " + (_without_links(texts[0])[:160] if texts else "see the page")
+        # A rewrite says more than an addition, whichever row came last.
+        pick = next((t for t in texts if t.startswith("changes: ")), texts[0] if texts else "")
+        detail = _without_links(pick)[:180] if pick else "new text: see the page"
     summary = f"[{label}] {len(held)} changes since {first_seen} — {detail}"
     readable = "\n".join(
         f"- {_without_links(str(link.get('text') or ''))} ({_safe_url(str(link.get('url') or ''))})"
@@ -541,6 +577,7 @@ def _audit_received(signal_id: int, item: WatchlistItem, signal: Signal) -> None
             "severity_hint": signal.severity_hint.value,
             "dedup_key": signal.dedup_key,
         },
+        **mailbox.audit_privacy(item),
     )
 
 
@@ -583,6 +620,7 @@ def _audit_deferred(item: WatchlistItem, tally: _PollTally) -> None:
                 for s in deferred[:10]
             ],
         },
+        **mailbox.audit_privacy(item),
     )
 
 
@@ -609,6 +647,31 @@ def _audit_suppressed(
             "dedup_key": signal.dedup_key,
             "outcome": outcome,
         },
+        **mailbox.audit_privacy(item),
+    )
+
+
+def _note_for_brief(item: WatchlistItem, signal: Signal) -> None:
+    """A quiet watch's find, for the next brief to report (it reads this
+    audit row as something handled since the last one)."""
+    from openexecutive.monitoring.describe import watch_title
+
+    try:
+        label = watch_title(item)
+    except Exception:
+        label = item.target
+    summary = _without_links(collapse_whitespace(signal.normalized_summary))[:200]
+    audit_log(
+        EVENT_QUIET_FIND,
+        f"Quiet watch on {label}: {summary}",
+        actor="external_monitor",
+        details={
+            "watchlist_id": item.id,
+            "watchlist_slug": item.slug,
+            "source_kind": signal.source_kind,
+            "provenance_url": _safe_url(signal.provenance_url),
+        },
+        **mailbox.audit_privacy(item),
     )
 
 
@@ -847,7 +910,9 @@ _HELD_WORDS: dict[str, str] = {
     OUTCOME_SUPPRESSED_DRY_RUN: "It is watching quietly, so it did not tell you.",
     OUTCOME_SUPPRESSED_BELOW_FLOOR: "Not a big change, so it stayed quiet.",
     OUTCOME_SUPPRESSED_LOW_RELEVANCE: "Not close enough to your company, so it stayed quiet.",
+    OUTCOME_SUPPRESSED_BY_NOTES: "You told it to skip this, so it stayed quiet.",
     OUTCOME_HELD_DIGEST: "It already told you today, so this waits for the next summary.",
+    OUTCOME_HELD_BRIEF: "It is watching quietly, so this goes in your next brief.",
 }
 
 
@@ -1037,6 +1102,11 @@ async def _poll_one_watchlist_item(
     tally.deferred_skew = skew
     tally.race_tick = lost_race is not None
     cap_logged = False
+    # An email watch's emails are never charged to the scan budget nor
+    # dropped by it: each is one email the person asked to hear about, and
+    # its source has already read past them (``sources.mailbox``), so a
+    # dropped one would never come back.
+    charged = not mailbox.is_mailbox(item)
     for signal in capped:
         baseline_entry = lost_race is not None and lost_race.covers(signal)
         # The three guards below apply only to entries that are NOT baseline;
@@ -1046,7 +1116,7 @@ async def _poll_one_watchlist_item(
         if not baseline_entry and _is_future(signal, fetched_at, skew):
             tally.deferred.append(signal)  # not recorded: see _is_future
             continue
-        if not baseline_entry and budget.exhausted:
+        if not baseline_entry and charged and budget.exhausted:
             # Skip (don't break): baseline-covered entries later in the
             # list must still be recorded, or they'd replay next tick.
             if not cap_logged:
@@ -1067,7 +1137,7 @@ async def _poll_one_watchlist_item(
             continue
 
         tally.written += 1
-        if not baseline_entry:
+        if not baseline_entry and charged:
             budget.admit()
         _audit_received(signal_id, item, signal)
 
@@ -1095,10 +1165,16 @@ async def _poll_one_watchlist_item(
             continue
 
         if item.mode == MODE_DRY_RUN:
-            _suppress(
-                signal_id, item, signal, OUTCOME_SUPPRESSED_DRY_RUN,
-                tally=tally, db_path=db_path,
-            )
+            if item.origin == ORIGIN_RESEARCH_PROPOSED:
+                # A suggestion waiting for the person's OK tells no one.
+                _suppress(
+                    signal_id, item, signal, OUTCOME_SUPPRESSED_DRY_RUN,
+                    tally=tally, db_path=db_path,
+                )
+            else:
+                # Watch quietly: never a card, only a line in the next brief.
+                _suppress(signal_id, item, signal, OUTCOME_HELD_BRIEF, tally=tally, db_path=db_path)
+                _note_for_brief(item, signal)
             continue
 
         # The watch's own trigger was met (``_matches`` above), so this
@@ -1207,6 +1283,15 @@ async def _maybe_enrich(
             signal_id,
         )
 
+    # Only notes on the watch can ask to skip: with none, a skip could only
+    # have come from the outside text itself.
+    if result.skip and item.notes.strip():
+        _suppress(
+            signal_id, item, signal, OUTCOME_SUPPRESSED_BY_NOTES,
+            tally=tally, db_path=db_path,
+        )
+        return False, payload
+
     if result.relevance_score < settings.external_monitor_enrichment_min_relevance:
         _suppress(
             signal_id, item, signal, OUTCOME_SUPPRESSED_LOW_RELEVANCE,
@@ -1233,7 +1318,7 @@ async def run_external_monitor_scan(
     settings = get_settings()
     cap_total = settings.external_monitor_max_signals_per_scan
 
-    items = store.list_watchlist(enabled_only=True, db_path=db_path)
+    items = store.list_watchlist(enabled_only=True, every_watch=True, db_path=db_path)
     if not items:
         return 0
 
@@ -1251,8 +1336,8 @@ async def run_external_monitor_scan(
     budget = _ScanBudget(remaining=cap_total)
     poll_start = datetime.now(UTC)
     for item in items:
-        if budget.exhausted:
-            break
+        if budget.exhausted and not mailbox.is_mailbox(item):
+            continue
         # Billed standing-query adapter has its own kill switch — skip those
         # rows entirely (no poll, no mark_polled) when disabled.
         if (
@@ -1317,6 +1402,7 @@ async def run_external_monitor_scan(
                     "duration_ms": duration_ms,
                     "failed": failed,
                 },
+                **mailbox.audit_privacy(item),
             )
 
     try:
@@ -1353,6 +1439,32 @@ def _heartbeat_pending(db_path: Path | None = None) -> bool:
             (HEARTBEAT_KIND,),
         ).fetchone()
     return row is not None
+
+
+def scan_soon(
+    now: datetime | None = None,
+    *,
+    db_path: Path | None = None,
+) -> bool:
+    """Bring the pending scan forward to ``now``, so a watch just added gets
+    its first check on the scheduler's next tick instead of waiting out the
+    rest of the scan interval (up to half an hour on a hosted company).
+    Only moves a scan that is later than ``now``; nothing is added when no
+    scan is pending (``bootstrap_external_monitor_scan`` makes one at boot).
+    Returns whether one moved."""
+    from openexecutive.memory.episodic import _get_conn, _resolve_db_path
+
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return False
+    at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+    with _get_conn(resolved) as conn:
+        cursor = conn.execute(
+            "UPDATE scheduled_actions SET run_at = ? "
+            "WHERE kind = ? AND status = 'pending' AND run_at > ?",
+            (at, HEARTBEAT_KIND, at),
+        )
+        return cursor.rowcount > 0
 
 
 def bootstrap_external_monitor_scan(

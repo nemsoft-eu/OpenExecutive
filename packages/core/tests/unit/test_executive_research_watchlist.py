@@ -216,6 +216,23 @@ async def test_watchlist_pass_skips_already_watched(
 
 
 @pytest.mark.asyncio
+async def test_watchlist_pass_stops_at_its_rounds_even_when_each_is_refused(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = er._MAX_WATCHLIST_PROPOSALS_PER_RUN + 3
+    for i in range(n):
+        monitoring_store.insert_watchlist_item(slug=f"stock-x{i}", signal_type="stock", target=f"X{i}", db_path=db)
+    # One new proposal a round, each a slug already watched: none repeats.
+    _stub_provider(monkeypatch, [_resp([_propose(f"stock-x{i}", "stock", f"X{i}")], stop_reason="tool_use") for i in range(n)])
+    calls = await er._watchlist_analysis_loop(
+        [_finding()], existing_watchlist=monitoring_store.list_watchlist(db_path=db),
+        profile=_profile(), initiatives=[],
+    )
+    # One proposal a round: the pass's own rounds end it first.
+    assert len(calls) == er._MAX_WATCHLIST_ITERATIONS and not any(c["ok"] for c in calls)
+
+
+@pytest.mark.asyncio
 async def test_watchlist_pass_never_calls_add_tool(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A model that tries the old tool gets "unknown tool" — nothing lands.
     _stub_provider(monkeypatch, [

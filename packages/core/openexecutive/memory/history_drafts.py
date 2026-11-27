@@ -45,7 +45,7 @@ def notes_for_draft(person_id: int | None, recipients: Iterable[str]) -> str | N
         for note in history.list_notes(person_id, limit=history.MAX_LIST):
             if note.source != history.SOURCE_APPROVED_REPLY or not wanted <= _addresses(note.counterpart):
                 continue
-            words = note.correction or note.quote
+            words = note.corrected or note.quote
             line = f"[{note.occurred_at[:10]}] {note.kind}: \"{one_line(plain(words), 300)}\""
             if note.due_date:
                 line += f" (due {note.due_date})"

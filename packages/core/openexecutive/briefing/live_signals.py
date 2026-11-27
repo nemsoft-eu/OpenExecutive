@@ -12,7 +12,7 @@ already hold them:
     ("Inbound email from …", "Inbound google_chat from …"), grouped by sender
     and subject so a thread of replies reads as one line.
   • STUCK — replies the outbound gate held (``integration_outbound_blocked``
-    to a recipient, and the inbound "reply blocked at outbound gate" rows),
+    to a recipient),
     Google Chat messages left unanswered or not delivered, and chat drafts
     saved in the principal's own Gmail and not yet sent or deleted there
     (``delegation.drafts``, private).
@@ -303,17 +303,6 @@ def _inbound(
     for ev in rows:  # newest first
         summary = str(ev.summary or "")
         details = ev.details if isinstance(ev.details, dict) else {}
-        if details.get("outcome") == "accepted_non_roster":
-            sender = _one_line(details.get("from"), 80)
-            key = f"nonroster:{sender.lower()}"
-            if sender and key not in stuck_seen:
-                stuck_seen.add(key)
-                stuck.append(
-                    f"[{_local_hhmm(ev.ts, tz, now)}] {_named(sender, include_private)} is not "
-                    "on the roster, so the "
-                    "Executive could not reply to their email — they may be waiting"
-                )
-            continue
         if _STUCK_INBOUND_RE.match(summary):
             key = f"chat:{summary[:60].lower()}"
             if key not in stuck_seen:

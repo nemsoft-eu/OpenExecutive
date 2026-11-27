@@ -339,3 +339,48 @@ def test_side_effect_failures_never_roll_back_the_setting(monkeypatch: pytest.Mo
     assert ws.set_timezone("Europe/Athens").timezone == "Europe/Athens"
     assert ws.set_workspace_mode("solo").mode == "solo"
     assert ws.get_workspace() == ws.WorkspaceSettings(mode="solo", timezone="Europe/Athens")
+
+
+def test_company_time_reads_a_bare_time_on_the_companys_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zoneinfo import ZoneInfo
+
+    from openexecutive.memory import workspace_settings
+
+    zone = ZoneInfo("America/Chicago")
+    monkeypatch.setattr(workspace_settings, "get_user_timezone", lambda: zone)
+    assert workspace_settings.company_time("2026-11-20T12:00") == datetime(2026, 11, 20, 12, tzinfo=zone)
+    # An explicit zone is kept, "Z" included.
+    assert workspace_settings.company_time("2026-11-20T12:00Z") == datetime(2026, 11, 20, 12, tzinfo=UTC)
+    assert workspace_settings.company_time("2026-11-20T12:00-05:00").utcoffset().total_seconds() == -5 * 3600
+    assert workspace_settings.company_time("noon tomorrow") is None
+    assert workspace_settings.company_time(None) is None
+
+
+def test_set_timezone_if_unset_stores_only_while_no_zone_is_in_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ws.set_timezone_if_unset("America/New_York") is True
+    assert ws.get_workspace().timezone == "America/New_York"
+    # A stored zone stays.
+    assert ws.set_timezone_if_unset("Asia/Tokyo") is False
+    assert ws.get_workspace().timezone == "America/New_York"
+    # So does a USER_TIMEZONE clock with nothing stored.
+    ws.set_timezone(None)
+    monkeypatch.setattr(ws, "_configured_timezone", lambda: ws.ZoneInfo("Europe/Berlin"))
+    assert ws.set_timezone_if_unset("Asia/Tokyo") is False
+    assert ws.get_workspace().timezone is None
+
+
+def test_set_timezone_if_unset_never_replaces_a_zone_it_could_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws.set_timezone("Europe/Lisbon")
+
+    def _locked(*_a: object, **_k: object) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(ws, "_read_row", _locked)
+        with pytest.raises(sqlite3.OperationalError):
+            ws.set_timezone_if_unset("Asia/Tokyo")
+    assert ws.get_workspace().timezone == "Europe/Lisbon"

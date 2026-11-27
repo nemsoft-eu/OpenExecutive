@@ -13,8 +13,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Generator, Iterable
-from contextlib import contextmanager
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from openexecutive.departments.models import (
     GoalStatus,
     PeriodType,
 )
+from openexecutive.utils import db
 from openexecutive.utils.slug import DEPARTMENT_SLUG_FALLBACK, slugify
 
 logger = logging.getLogger(__name__)
@@ -54,18 +54,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    # Foreign keys are off by default in SQLite; we don't rely on FK enforcement
-    # but turning it on keeps invariants visible if a caller violates them.
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path, foreign_keys=True)
 
 
 def _now() -> str:
@@ -139,6 +128,48 @@ def initialize_db(db_path: Path | None = None) -> None:
         _migrate_add_last_reviewed_at_column(conn)
         _migrate_add_watched_entities_column(conn)
         _migrate_goals_stand_alone(conn)
+        _cadences_to_company_time(conn)
+
+
+# Marks a database whose department check-in times were moved from UTC to
+# the company's time zone (``_cadences_to_company_time``).
+_LOCAL_CADENCES = "cadences_in_company_time"
+
+
+def _cadences_to_company_time(conn: sqlite3.Connection) -> None:
+    """Once per database: rewrite the check-in times saved while they were
+    read in UTC as the same times in the company's time zone, which is how
+    they are read now (``workspace_settings.get_user_timezone``). The first process to mark
+    the database does it, in the same transaction. Best effort: a row it
+    can't read stays as it is."""
+    from openexecutive.workflows.dynamic_cadence import from_utc
+
+    try:
+        from openexecutive.memory.workspace_settings import get_user_timezone
+
+        # Read before marking: a zone that can't be read now leaves the
+        # move for the next start, never marked done as a no-op.
+        zone = get_user_timezone()
+    except Exception:
+        logger.warning("departments: couldn't read the company's time zone; check-ins stay for now", exc_info=True)
+        return
+    marked = conn.execute(
+        "INSERT OR IGNORE INTO departments_meta (key, value) VALUES (?, ?)", (_LOCAL_CADENCES, _now())
+    )
+    if marked.rowcount != 1:
+        return
+    for slug, body in conn.execute("SELECT slug, cadences_json FROM departments").fetchall():
+        try:
+            cadences = json.loads(body or "{}")
+            if not isinstance(cadences, dict) or not cadences:
+                continue
+            moved = {k: from_utc(v, zone) if isinstance(v, str) and v else v for k, v in cadences.items()}
+            if moved != cadences:
+                conn.execute(
+                    "UPDATE departments SET cadences_json = ? WHERE slug = ?", (json.dumps(moved), slug)
+                )
+        except Exception:
+            logger.warning("departments: couldn't move %r's check-in to company time", slug, exc_info=True)
 
 
 def _migrate_add_last_reviewed_at_column(conn: sqlite3.Connection) -> None:
@@ -175,7 +206,7 @@ def _migrate_add_channel_columns(conn: sqlite3.Connection) -> None:
     concurrent boot race are treated as success.
     """
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(departments)")}
-    for col in ("slack_channel_id", "discord_channel_id", "telegram_chat_id"):
+    for col in ("slack_channel_id", "discord_channel_id", "telegram_chat_id", "google_chat_space"):
         if col in existing:
             continue
         try:
@@ -377,17 +408,11 @@ def _row_to_config(row: sqlite3.Row) -> DepartmentConfig:
         cadences = json.loads(row["cadences_json"]) or {}
     except (ValueError, TypeError):
         cadences = {}
-    # A future migration or hand-edited DB row could carry an unknown
-    # authority_level token; default to the safest level (propose_only) and
-    # warn rather than 500ing every read of `list_departments`.
-    try:
-        authority_level = AuthorityLevel(row["authority_level"])
-    except ValueError:
-        logger.warning(
-            "departments: unknown authority_level=%r on slug=%s — defaulting to propose_only",
-            row["authority_level"], row["slug"],
-        )
-        authority_level = AuthorityLevel.PROPOSE_ONLY
+    # The stored authority_level ("How it acts") no longer decides anything:
+    # every read says the level the department's work runs at now.
+    from openexecutive.departments.authority import department_level
+
+    authority_level = department_level(row["slug"])
     # Channel columns are nullable and were added via additive ALTER in
     # _migrate_add_channel_columns; row indexing via sqlite3.Row tolerates
     # missing columns by raising IndexError, so use getattr-style access.
@@ -418,6 +443,7 @@ def _row_to_config(row: sqlite3.Row) -> DepartmentConfig:
         slack_channel_id=_opt_col("slack_channel_id"),
         discord_channel_id=_opt_col("discord_channel_id"),
         telegram_chat_id=_opt_col("telegram_chat_id"),
+        google_chat_space=_opt_col("google_chat_space"),
         watched_entities=(
             [str(e) for e in watched if isinstance(e, str) and e.strip()]
             if isinstance(watched, list) else []
@@ -605,6 +631,7 @@ def update_department(
     slack_channel_id: str | None | object = _UNSET,
     discord_channel_id: str | None | object = _UNSET,
     telegram_chat_id: str | None | object = _UNSET,
+    google_chat_space: str | None | object = _UNSET,
     watched_entities: list[str] | None = None,
     db_path: Path | None = None,
 ) -> bool:
@@ -644,6 +671,8 @@ def update_department(
         fields.append(("discord_channel_id", discord_channel_id))
     if telegram_chat_id is not _UNSET:
         fields.append(("telegram_chat_id", telegram_chat_id))
+    if google_chat_space is not _UNSET:
+        fields.append(("google_chat_space", google_chat_space))
     if watched_entities is not None:
         fields.append(("watched_entities_json", json.dumps(list(watched_entities))))
     if not fields:

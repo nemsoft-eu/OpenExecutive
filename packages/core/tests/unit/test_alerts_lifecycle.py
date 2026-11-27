@@ -136,16 +136,18 @@ def test_a_snooze_restarts_the_ttl_so_the_card_comes_back(db: Path) -> None:
     assert not lifecycle.is_live(a, now)
 
 
-def test_exempt_sources_never_expire(db: Path) -> None:
+def test_a_drafted_artifact_never_expires_but_a_waiting_step_does(db: Path) -> None:
     art = _insert(db, source="artifact", severity="medium", topic_tags=["artifact"])
     dec = _insert(db, source="decision_scheduling", severity="medium")
     _backdate(db, art, 90)
     _backdate(db, dec, 90)
-    for aid in (art, dec):
-        a = get_alert(aid, db_path=db)
-        assert a is not None
-        assert lifecycle.ttl_days_for(a, monitoring_days=3, action_days=14) is None
-        assert not lifecycle.is_expired(a, monitoring_days=3, action_days=14)
+    a = get_alert(art, db_path=db)
+    assert a is not None
+    assert lifecycle.ttl_days_for(a, monitoring_days=3, action_days=14) is None
+    assert not lifecycle.is_expired(a, monitoring_days=3, action_days=14)
+    d = get_alert(dec, db_path=db)
+    assert d is not None
+    assert lifecycle.is_expired(d, monitoring_days=3, action_days=14)
 
 
 # --------------------------------------------------------------------------- #

@@ -47,7 +47,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from openexecutive.audit.usage import UsageRollup, bind_research_run, log_model_usage
+from openexecutive.audit.usage import UsageRollup, bind_research_run
 from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.monitoring.research.dedup import dedup_findings
 from openexecutive.monitoring.research.models import (
@@ -57,7 +57,6 @@ from openexecutive.monitoring.research.models import (
 from openexecutive.monitoring.research.specialist_research import (
     research_one_specialist,
 )
-from openexecutive.providers.translator import reasoning_replay_block
 from openexecutive.workflows.base import (
     Workflow,
     WorkflowEvent,
@@ -66,6 +65,11 @@ from openexecutive.workflows.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The most rounds of tool calls research's routing and watch passes run
+# (the owner's choice, 11-18: background passes keep their old counts).
+_MAX_SYNTHESIS_ITERATIONS = 3
+_MAX_WATCHLIST_ITERATIONS = 2
 
 # Specialists the workflow fans out to. Kept module-scoped so tests can
 # patch / shrink without monkeypatching half the workflow internals.
@@ -93,12 +97,6 @@ def active_research_specialists() -> tuple[str, ...]:
     chosen = tuple(s for s in RESEARCH_SPECIALISTS if s in wanted)
     return chosen or RESEARCH_SPECIALISTS
 
-# Synthesis loop budget. A real routing run needs at least three turns:
-# (1) look recipients up (lookup_person), (2) fire the resolved DMs /
-# alerts, (3) emit the wrap-up summary. Two iterations starved that
-# middle step — the model spent iteration 1 on lookups and never reached
-# the routing turn. Beyond three, the model is usually spiralling.
-_MAX_SYNTHESIS_ITERATIONS = 3
 _MAX_SYNTHESIS_TOKENS = 2000
 
 # Hard ceiling on how many outbound tools the Executive synthesis can
@@ -106,8 +104,8 @@ _MAX_SYNTHESIS_TOKENS = 2000
 # alerts at the principal — the original failure mode (52 alerts from
 # one research run on round_2). The cap is enforced both via the
 # system prompt instruction and as a runtime gate in the synthesis
-# loop — once the model exceeds it, subsequent tool_use blocks are
-# rejected with an "over budget" tool_result and the loop terminates.
+# loop — once it is reached, a further outbound call is refused with an
+# "over budget" tool_result and the pass writes its closing summary.
 _MAX_ROUTING_TOOLS_PER_RUN = 5
 
 # Read-only context tools the Executive calls to PREPARE a routing
@@ -116,9 +114,9 @@ _MAX_ROUTING_TOOLS_PER_RUN = 5
 # not count against the routing budget above and must never be refused
 # for being "over budget" — otherwise the Executive spends its whole
 # budget looking people up and never fires the DM the lookup was for
-# (the "looks up people but never routes" bug). Passed to
-# ``execute_tool_calls`` as ``free_tools`` and excluded from the
-# budget-accounting counts via ``_routing_ok``.
+# (the "looks up people but never routes" bug). Never refused as over
+# budget in the synthesis pass, and excluded from the budget-accounting
+# counts via ``_routing_ok``.
 _NON_ROUTING_TOOLS: frozenset[str] = frozenset({
     "lookup_person",
     "list_people",
@@ -144,7 +142,6 @@ def _routing_ok(calls: list[dict[str, Any]]) -> int:
 # `watch_policy.apply_proposals` decides add / suggest / reject under the
 # settings-driven per-run budgets (direct adds + suggestions).
 _MAX_WATCHLIST_PROPOSALS_PER_RUN = 6
-_MAX_WATCHLIST_ITERATIONS = 2
 
 
 def _routing_option_a(configured: set[str], has_roster: bool = True) -> str:
@@ -828,6 +825,7 @@ async def _executive_synthesis_loop(
     )
     # The Python job tool as this instance describes it (a runner's libraries).
     _ALL_SKILL_TOOLS = _offered_skill_tools()
+    from openexecutive.orchestrator.rounds import run_rounds
     from openexecutive.orchestrator.schedule_tools import (
         configured_integrations,
         current_session,
@@ -837,10 +835,7 @@ async def _executive_synthesis_loop(
     from openexecutive.orchestrator.session import Session
     from openexecutive.people.store import list_people
     from openexecutive.providers import get_provider
-    from openexecutive.workflows._synthesis import (
-        execute_tool_calls,
-        extract_artifact_from_response,
-    )
+    from openexecutive.workflows._synthesis import execute_tool_call
 
     # Load the roster once: it both seeds the anti-spam guard AND is rendered
     # into the synthesis turn so the Executive can DM by person_id directly
@@ -865,28 +860,12 @@ async def _executive_synthesis_loop(
     has_roster = bool(_render_team_roster(roster_people))
     user_content = _render_synthesis_turn(findings, people, mode=mode)
 
-    # Seed a synthetic Session so send_slack_dm / send_discord_dm etc.
-    # don't trip the anti-spam guard the chat path enforces. Identical
-    # mechanism to executive_reflection's setup — channels visible
-    # only when they correspond to a real Person.
-    seen: set[tuple[str, str]] = set()
-    for person in roster_people:
-        if person.slack_user_id:
-            seen.add(("slack_dm", person.slack_user_id))
-        if person.discord_user_id:
-            seen.add(("discord_dm", person.discord_user_id))
-        if person.telegram_chat_id:
-            seen.add(("telegram", person.telegram_chat_id))
-        if person.email:
-            seen.add(("email", person.email))
-
     # Pin the run's mode so its tool handlers agree with its toolkit.
     # ...and its principal's role, so a specialist it consults (or a workflow
     # it starts) sees the role of the turn that started it, not a fresh read.
     from openexecutive.orchestrator.artifact_records import current_viewer
 
     synth_session = Session(
-        seen_channel_refs=seen,
         # What it drafts belongs to whoever's turn started the run.
         documents_viewer=current_viewer(),
         turn_workspace_mode=mode,
@@ -925,143 +904,56 @@ async def _executive_synthesis_loop(
     ]
     tool_calls: list[dict[str, Any]] = []
     final_text = ""
-    iteration = 0
-    needs_summary = False
+    # Outbound calls that ran, whatever they returned: one that errored may
+    # still have gone out (a send that timed out after delivering).
+    routed = 0
+
+    async def _run(use: dict[str, Any]) -> Any:
+        nonlocal routed
+        name, tool_input = use["name"], use["input"]
+        # Lookups are free; each outbound call that runs counts toward the
+        # run's routing calls, whether or not it reported an error.
+        outbound = name not in _NON_ROUTING_TOOLS
+        over = outbound and routed >= _MAX_ROUTING_TOOLS_PER_RUN
+        # DMs the synthesis sends are proactive research outreach; the
+        # outcome ledger records whether they land.
+        from openexecutive.attunement.outcomes import SOURCE_RESEARCH, tag_proactive
+
+        with tag_proactive(SOURCE_RESEARCH):
+            call, result = await execute_tool_call(name, tool_input, handlers, over_budget=over)
+        if outbound and call.get("ran"):
+            routed += 1
+        call["done_label"] = _done_label(name, tool_input, str(call.get("result_preview", "")))
+        tool_calls.append(call)
+        return result
+
+    def _routed_enough() -> str | None:
+        # Once the run's routing calls are made, it writes its closing
+        # summary (a lookups-only round never ends it).
+        if routed >= _MAX_ROUTING_TOOLS_PER_RUN:
+            logger.info("research.synthesis: routing calls made (%d); writing up", _MAX_ROUTING_TOOLS_PER_RUN)
+            return _CLOSING_SUMMARY_ASK
+        return None
 
     try:
-        for iteration in range(1, _MAX_SYNTHESIS_ITERATIONS + 1):
-            try:
-                response = await get_provider(model).messages_create(
-                    model=model,
-                    max_tokens=_MAX_SYNTHESIS_TOKENS,
-                    system=synthesis_system,
-                    tools=tools,  # type: ignore[arg-type]
-                    messages=messages,  # type: ignore[arg-type]
-                )
-            except Exception:
-                logger.exception(
-                    "research.synthesis: provider call failed iter=%d",
-                    iteration,
-                )
-                break
-            log_model_usage(
-                response, model=model, actor="research_synthesis", iteration=iteration,
-            )
-
-            ok_so_far = _routing_ok(tool_calls)
-            budget_remaining = max(0, _MAX_ROUTING_TOOLS_PER_RUN - ok_so_far)
-            # DMs the synthesis sends are proactive research outreach; the
-            # outcome ledger records whether they land.
-            from openexecutive.attunement.outcomes import SOURCE_RESEARCH, tag_proactive
-
-            with tag_proactive(SOURCE_RESEARCH):
-                iter_calls = await execute_tool_calls(
-                    response, handlers,
-                    budget_remaining=budget_remaining,
-                    free_tools=_NON_ROUTING_TOOLS,
-                )
-            uses = [b for b in response.content if getattr(b, "type", "") == "tool_use"]
-            for call, block in zip(iter_calls, uses, strict=False):
-                call["done_label"] = _done_label(
-                    call.get("tool", ""), getattr(block, "input", {}) or {},
-                    str(call.get("result_preview", "")),
-                )
-            tool_calls.extend(iter_calls)
-
-            stop_reason = getattr(response, "stop_reason", "")
-            # Only the closing summary is the write-up. Text the model writes
-            # next to its tool calls is it thinking out loud (its plan, the
-            # budget, which tools it has), never something to show anyone.
-            if stop_reason != "tool_use":
-                text = extract_artifact_from_response(response)
-                if text:
-                    final_text = text
-
-            if stop_reason != "tool_use" or not iter_calls:
-                # Model emitted text-only summary — done.
-                break
-
-            # Build the next user turn carrying tool_result blocks so
-            # the model sees what fired and can summarize.
-            assistant_blocks: list[dict[str, Any]] = []
-            for block in response.content:
-                block_type = getattr(block, "type", "")
-                if block_type == "text":
-                    assistant_blocks.append({
-                        "type": "text",
-                        "text": getattr(block, "text", ""),
-                    })
-                elif block_type == "tool_use":
-                    assistant_blocks.append({
-                        "type": "tool_use",
-                        "id": getattr(block, "id", ""),
-                        "name": getattr(block, "name", ""),
-                        "input": getattr(block, "input", {}) or {},
-                    })
-                elif (replay := reasoning_replay_block(block)) is not None:
-                    # OpenRouter reasoning continuity across tool iterations.
-                    assistant_blocks.append(replay)
-            messages.append({"role": "assistant", "content": assistant_blocks})
-
-            tool_results: list[dict[str, Any]] = []
-            summary_iter = iter(iter_calls)
-            for block in response.content:
-                if getattr(block, "type", "") != "tool_use":
-                    continue
-                summary = next(summary_iter, None)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": getattr(block, "id", ""),
-                    "content": (
-                        summary["result_preview"]
-                        if summary else "no result captured"
-                    ),
-                })
-            messages.append({"role": "user", "content": tool_results})
-
-            # If we exhausted the routing budget and the model still
-            # wants more tools, terminate the loop — further iterations
-            # would just collect more "over budget" stubs. The remaining
-            # tool_use blocks are already echoed back as
-            # "over budget — skipped" via execute_tool_calls. Counts only
-            # OUTBOUND routing calls — a lookups-only iteration must NOT
-            # terminate the loop before the model gets to route.
-            new_ok = _routing_ok(iter_calls)
-            if (ok_so_far + new_ok) >= _MAX_ROUTING_TOOLS_PER_RUN:
-                logger.info(
-                    "research.synthesis: routing budget exhausted "
-                    "(%d/%d); terminating loop",
-                    ok_so_far + new_ok, _MAX_ROUTING_TOOLS_PER_RUN,
-                )
-                needs_summary = True
-                break
-
-            # No forward progress this iteration — every tool call failed
-            # or was skipped. Stop rather than spend another turn on the
-            # same stuck state (e.g. a lookup that keeps raising, or
-            # outbound calls that keep failing). A successful free lookup
-            # counts as progress, so the normal lookup→route flow is
-            # unaffected; only a fully-failed iteration terminates here.
-            # This also stops a fully-failed outbound iteration from
-            # resetting its budget on the next round.
-            if not any(t.get("ok") for t in iter_calls):
-                logger.info(
-                    "research.synthesis: no successful tool call in "
-                    "iteration %d; terminating loop", iteration,
-                )
-                needs_summary = True
-                break
-
-        else:
-            # Out of iterations with the model still mid-routing.
-            needs_summary = True
-
-        # The loop stopped the model mid-routing, so it never wrote its
-        # closing summary: ask for it once, with no tools on offer.
-        if needs_summary and not final_text:
-            final_text = await _closing_summary(
-                model, synthesis_system, tools, messages,
-            )
+        # No count of rounds (orchestrator.rounds). Only the closing answer
+        # is the write-up: text beside the tool calls is the model thinking
+        # out loud (its plan, which tools it has), never shown to anyone.
+        done = await run_rounds(
+            get_provider(model),
+            model=model,
+            max_tokens=_MAX_SYNTHESIS_TOKENS,
+            system=synthesis_system,
+            tools=tools,
+            messages=messages,
+            run_call=_run,
+            actor="research_synthesis",
+            max_rounds=_MAX_SYNTHESIS_ITERATIONS,
+            enough=_routed_enough,
+        )
+        final_text = done.text
+    except Exception:
+        logger.exception("research.synthesis: provider call failed")
     finally:
         current_session.reset(ctx_token)
 
@@ -1072,39 +964,6 @@ _CLOSING_SUMMARY_ASK = (
     "That is all the routing for this run. Write your closing summary now, "
     "as the SUMMARY section says."
 )
-
-
-async def _closing_summary(
-    model: str, system: str, tools: list[dict[str, Any]], messages: list[dict[str, Any]],
-) -> str:
-    """The closing summary of a routing pass the loop cut off mid-routing.
-    ``messages`` ends with the tool results of the last turn; the ask rides
-    in that same user turn, and ``tool_choice`` none keeps the model from
-    calling anything more. Empty when the call fails."""
-    from openexecutive.providers import get_provider
-    from openexecutive.workflows._synthesis import extract_artifact_from_response
-
-    last = messages[-1] if messages else None
-    if not last or last.get("role") != "user" or not isinstance(last.get("content"), list):
-        return ""
-    closing = [*messages[:-1], {
-        "role": "user",
-        "content": [*last["content"], {"type": "text", "text": _CLOSING_SUMMARY_ASK}],
-    }]
-    try:
-        response = await get_provider(model).messages_create(
-            model=model,
-            max_tokens=_MAX_SYNTHESIS_TOKENS,
-            system=system,
-            tools=tools,  # type: ignore[arg-type]
-            tool_choice={"type": "none"},
-            messages=closing,  # type: ignore[arg-type]
-        )
-    except Exception:
-        logger.exception("research.synthesis: closing summary call failed")
-        return ""
-    log_model_usage(response, model=model, actor="research_synthesis", iteration=0)
-    return extract_artifact_from_response(response)
 
 
 async def _watchlist_analysis_loop(
@@ -1133,12 +992,13 @@ async def _watchlist_analysis_loop(
     from openexecutive.config import get_settings
     from openexecutive.monitoring import store as monitoring_store
     from openexecutive.monitoring.research import watch_policy
+    from openexecutive.orchestrator.rounds import run_rounds
     from openexecutive.orchestrator.watchlist_tools import (
         PROPOSE_WATCH_TOOL,
         handle_propose_watch,
     )
     from openexecutive.providers import get_provider
-    from openexecutive.workflows._synthesis import execute_tool_calls
+    from openexecutive.workflows._synthesis import execute_tool_call
 
     policy_settings = watch_policy.PolicySettings.load()
     proposals: list[watch_policy.WatchProposal] = []
@@ -1178,73 +1038,37 @@ async def _watchlist_analysis_loop(
     )
     call_summaries: list[dict[str, Any]] = []
 
-    for _iteration in range(1, _MAX_WATCHLIST_ITERATIONS + 1):
-        try:
-            response = await get_provider(model).messages_create(
-                model=model,
-                max_tokens=_MAX_SYNTHESIS_TOKENS,
-                system=system,
-                tools=tools,  # type: ignore[arg-type]
-                messages=messages,  # type: ignore[arg-type]
-            )
-        except Exception:
-            logger.exception("research.watchlist: provider call failed")
-            break
-        log_model_usage(
-            response, model=model, actor="research_watchlist", iteration=_iteration,
+    async def _run(use: dict[str, Any]) -> Any:
+        over = len(proposals) >= _MAX_WATCHLIST_PROPOSALS_PER_RUN
+        call, result = await execute_tool_call(use["name"], use["input"], handlers, over_budget=over)
+        call_summaries.append(call)
+        return result
+
+    def _proposed_enough() -> str | None:
+        # Every proposal made counts, kept or refused (a declined target, a
+        # slug already watched): a pass that keeps proposing what is refused
+        # is done as surely as one that filled its proposals.
+        if len(call_summaries) >= _MAX_WATCHLIST_PROPOSALS_PER_RUN:
+            logger.info("research.watchlist: proposal cap reached (%d); stopping", len(call_summaries))
+            return ""  # the proposals are the pass's output: no write-up
+        return None
+
+    try:
+        # No count of rounds (orchestrator.rounds).
+        await run_rounds(
+            get_provider(model),
+            model=model,
+            max_tokens=_MAX_SYNTHESIS_TOKENS,
+            system=system,
+            tools=tools,
+            messages=messages,
+            run_call=_run,
+            actor="research_watchlist",
+            max_rounds=_MAX_WATCHLIST_ITERATIONS,
+            enough=_proposed_enough,
         )
-
-        budget_remaining = max(0, _MAX_WATCHLIST_PROPOSALS_PER_RUN - len(proposals))
-        iter_calls = await execute_tool_calls(
-            response, handlers, budget_remaining=budget_remaining,
-        )
-        call_summaries.extend(iter_calls)
-
-        stop_reason = getattr(response, "stop_reason", "")
-        if stop_reason != "tool_use" or not iter_calls:
-            break
-        if len(proposals) >= _MAX_WATCHLIST_PROPOSALS_PER_RUN:
-            logger.info(
-                "research.watchlist: proposal cap reached (%d); stopping",
-                len(proposals),
-            )
-            break
-
-        # Carry assistant tool_use + tool_result blocks forward so the model
-        # can continue or wrap up on the next iteration.
-        assistant_blocks: list[dict[str, Any]] = []
-        for block in response.content:
-            block_type = getattr(block, "type", "")
-            if block_type == "text":
-                assistant_blocks.append(
-                    {"type": "text", "text": getattr(block, "text", "")}
-                )
-            elif block_type == "tool_use":
-                assistant_blocks.append({
-                    "type": "tool_use",
-                    "id": getattr(block, "id", ""),
-                    "name": getattr(block, "name", ""),
-                    "input": getattr(block, "input", {}) or {},
-                })
-            elif (replay := reasoning_replay_block(block)) is not None:
-                # OpenRouter reasoning continuity across tool iterations.
-                assistant_blocks.append(replay)
-        messages.append({"role": "assistant", "content": assistant_blocks})
-
-        tool_results: list[dict[str, Any]] = []
-        summary_iter = iter(iter_calls)
-        for block in response.content:
-            if getattr(block, "type", "") != "tool_use":
-                continue
-            summary = next(summary_iter, None)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": getattr(block, "id", ""),
-                "content": (
-                    summary["result_preview"] if summary else "no result captured"
-                ),
-            })
-        messages.append({"role": "user", "content": tool_results})
+    except Exception:
+        logger.exception("research.watchlist: provider call failed")
 
     # Proposals the handler refused (bad target, declined, duplicate slug)
     # are already in call_summaries with ok=False; keep them so the artifact

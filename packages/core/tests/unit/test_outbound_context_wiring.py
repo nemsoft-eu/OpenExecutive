@@ -136,7 +136,7 @@ async def test_discord_dm_inbound_hydrates_from_linkage() -> None:
     """A DM reply is passed to Executive.chat with the hydration helper's
     output, while the pristine text is persisted."""
     send_fn = AsyncMock()
-    session_mock = MagicMock(seen_channel_refs=set())
+    session_mock = MagicMock()
 
     def _fake_hydrate(*, channel: str, channel_ref: str, user_message: str) -> str:
         assert channel == "discord_dm"

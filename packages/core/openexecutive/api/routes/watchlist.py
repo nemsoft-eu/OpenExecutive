@@ -20,12 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from openexecutive.alerts.models import AlertSeverity
 from openexecutive.api import caller as api_caller
 from openexecutive.audit import log_event as audit_log
+from openexecutive.monitoring import mailbox
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.describe import (
     DescribeError,
     WatchDraft,
     checks_line,
     describe_watch,
+    quiet_line,
     trigger_line,
     watch_title,
 )
@@ -38,6 +40,7 @@ from openexecutive.monitoring.models import (
     MODE_DRY_RUN,
     ORIGIN_RESEARCH_PROPOSED,
     RESEARCH_ORIGINS,
+    SOURCE_KIND_MAILBOX,
     WatchlistItem,
     is_valid_cadence,
     is_valid_mode,
@@ -64,13 +67,39 @@ _SIGNALS_DEFAULT_LIMIT = 50
 _SIGNALS_MAX_LIMIT = 200
 
 
-def _audit(event: str, ok: bool, summary: str, details: dict[str, Any]) -> None:
+def _audit(
+    event: str, ok: bool, summary: str, details: dict[str, Any], privacy: dict[str, Any] | None = None,
+) -> None:
+    """``privacy``: an email watch's rows are its owner's alone
+    (``mailbox.audit_privacy``)."""
     audit_log(
         "tool_invocation",
         summary,
         actor=_API_ACTOR,
         details={"tool": event, "ok": ok, **details},
+        **(privacy or {}),
     )
+
+
+def _caller_person(request: Request) -> int | None:
+    """The People id of whoever is signed in (the owner too), or None."""
+    try:
+        from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+        person_id = _resolve_caller_person_id(request)
+    except Exception:
+        logger.warning("watchlist: couldn't tell who is asking", exc_info=True)
+        return None
+    return int(person_id) if person_id is not None else None
+
+
+def _shown_or_404(slug: str, request: Request) -> WatchlistItem:
+    """The watch by slug, as this caller may see it: an email watch is its
+    owner's alone, so to anyone else it is not there."""
+    item = ms.get_watchlist_item_by_slug(slug)
+    if item is None or not mailbox.shown_to(item, _caller_person(request)):
+        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+    return item
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +166,8 @@ class WatchlistView(WatchlistItem):
     title: str = ""
     tells_you_when: str = ""
     checks: str = ""
+    # An email watch's "nothing by" day ("Ping if nothing by Wed Nov 25").
+    quiet_line: str = ""
     last_told: LastTold | None = None
     goal_title: str = ""
     # Who it tells, when that is a teammate ("" = the owner), and their role.
@@ -208,12 +239,14 @@ class _Names:
 
 def _view(item: WatchlistItem, names: _Names) -> dict[str, Any]:
     told = names.last_told.get(item.id or 0)
-    person_name, person_role = names.person(item.route_to_person_id)
+    # An email watch tells its owner alone (monitoring.pipeline), so it is for "You".
+    person_name, person_role = names.person(None if mailbox.is_mailbox(item) else item.route_to_person_id)
     return {
         **item.model_dump(),
         "title": watch_title(item),
         "tells_you_when": trigger_line(item.signal_type, item.trigger_json),
         "checks": checks_line(item.signal_type, item.cadence),
+        "quiet_line": quiet_line(item),
         "last_told": LastTold(
             at=str(told.get("processed_at") or told.get("captured_at") or ""),
             summary=_told_summary(str(told.get("normalized_summary") or "")),
@@ -299,33 +332,30 @@ class SignalRow(BaseModel):
 
 @router.get("/watchlist", response_model=list[WatchlistView])
 def list_watchlist(
+    request: Request,
     enabled_only: bool = False,
     signal_type: str | None = None,
 ) -> list[WatchlistView]:
     names = _Names()
-    return [
-        WatchlistView(**_view(item, names))
-        for item in ms.list_watchlist(enabled_only=enabled_only, signal_type=signal_type)
-    ]
+    items = ms.list_watchlist(
+        enabled_only=enabled_only, signal_type=signal_type, for_person=_caller_person(request),
+    )
+    return [WatchlistView(**_view(item, names)) for item in items]
 
 
 @router.get("/watchlist/{slug}", response_model=WatchlistDetail)
-def get_watchlist_entry(slug: str) -> WatchlistDetail:
-    item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
-        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+def get_watchlist_entry(slug: str, request: Request) -> WatchlistDetail:
+    item = _shown_or_404(slug, request)
     return WatchlistDetail(**_view(item, _Names()), noise=watch_noise(item))
 
 
 @router.get("/watchlist/{slug}/signals", response_model=list[SignalRow])
 def get_watchlist_signals(
-    slug: str, limit: int = _SIGNALS_DEFAULT_LIMIT, told: bool = False,
+    slug: str, request: Request, limit: int = _SIGNALS_DEFAULT_LIMIT, told: bool = False,
 ) -> list[SignalRow]:
     """A watch's recent signals, newest first. ``told=true`` keeps only the
     ones it told the person about (the watch page's "What it told you")."""
-    item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
-        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+    item = _shown_or_404(slug, request)
     assert item.id is not None
     bounded = max(1, min(limit, _SIGNALS_MAX_LIMIT))
     rows = ms.list_signals_for_watchlist(item.id, limit=bounded, told_only=told)
@@ -355,12 +385,29 @@ async def describe_watchlist_entry(body: WatchlistDescribe, request: Request) ->
         raise HTTPException(status_code=_DESCRIBE_STATUS.get(exc.code, 422), detail=exc.message) from exc
 
 
+def _creator_person(request: Request) -> int | None:
+    """Who a watch made on this request tells: a teammate who made it (what
+    it finds is theirs), else the principal (None). Fails to the principal."""
+    try:
+        from openexecutive.api.routes.chat import _resolve_caller_person_id
+        from openexecutive.people.store import get_person
+
+        person_id = _resolve_caller_person_id(request)
+        person = get_person(int(person_id)) if person_id is not None else None
+    except Exception:
+        logger.warning("watchlist.create: couldn't tell who made it", exc_info=True)
+        return None
+    if person is None or person.is_principal or person.archived or person.kind != "team":
+        return None
+    return person.id
+
+
 @router.post(
     "/watchlist",
     response_model=WatchlistView,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
+async def create_watchlist_entry(body: WatchlistCreate, request: Request) -> WatchlistView:
     slug = body.slug.strip()
     signal_type = body.signal_type.strip()
     target = body.target.strip()
@@ -390,6 +437,8 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             detail=f"unknown severity_ceiling {body.severity_ceiling!r}",
         )
 
+    if signal_type == SOURCE_KIND_MAILBOX:
+        slug = mailbox.own_slug(slug)
     if ms.get_watchlist_item_by_slug(slug) is not None:
         raise HTTPException(
             status_code=409,
@@ -399,6 +448,19 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
     config: dict[str, Any] = dict(body.config)
     for key, value in display_label_config(signal_type, body.display_label).items():
         config.setdefault(key, value)
+    trigger: dict[str, Any] = body.trigger
+    privacy: dict[str, Any] = {}
+    if signal_type == SOURCE_KIND_MAILBOX:
+        # An email watch reads the inbox of whoever sets it up, and only
+        # theirs: the owner is the caller, never a value in the body.
+        owner = _caller_person(request)
+        if owner is None:
+            raise HTTPException(status_code=422, detail="Sign in as someone on People to watch your inbox.")
+        trigger = mailbox.clean_trigger(body.trigger)
+        if not trigger:
+            raise HTTPException(status_code=422, detail="Say who the email is from or a word in its subject.")
+        config = mailbox.owner_config(config, owner)
+        privacy = {"private": True, "private_to_person": owner}
 
     # Insert-time validation: a non-feed rss target is converted to a
     # page_watch (when the page has readable text) or rejected, so a dead
@@ -412,6 +474,7 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             "watchlist.create", False,
             f"watchlist.create: target rejected for {slug!r}",
             {"slug": slug, "target": target, "reason": exc.reason},
+            privacy,
         )
         raise HTTPException(status_code=422, detail=exc.reason) from exc
 
@@ -421,11 +484,12 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             signal_type=signal_type,
             target=target,
             config=config,
-            trigger=body.trigger,
+            trigger=trigger,
             cadence=body.cadence,
             severity_floor=AlertSeverity(body.severity_floor),
             severity_ceiling=AlertSeverity(body.severity_ceiling),
             route_to_specialist=body.route_to_specialist,
+            route_to_person_id=_creator_person(request),
             mode=body.mode,
             notes=body.notes[:500],
         )
@@ -437,6 +501,7 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             "watchlist.create", False,
             f"watchlist.create: integrity error on {slug!r}",
             {"slug": slug, "error": "integrity"},
+            privacy,
         )
         logger.exception("watchlist.create: integrity error slug=%s", slug)
         raise HTTPException(
@@ -448,6 +513,7 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             "watchlist.create", False,
             f"watchlist.create: insert failed for {slug!r}",
             {"slug": slug, "error": "insert"},
+            privacy,
         )
         logger.exception("watchlist.create: insert failed slug=%s", slug)
         raise HTTPException(status_code=500, detail="insert failed") from exc
@@ -462,7 +528,16 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistView:
             "target": target,
             "mode": body.mode,
         },
+        privacy,
     )
+
+    try:
+        # Its first check within a minute, not at the end of the scan interval.
+        from openexecutive.monitoring.pipeline import scan_soon
+
+        scan_soon()
+    except Exception:
+        logger.warning("watchlist.create: couldn't bring the next scan forward", exc_info=True)
 
     created = ms.get_watchlist_item(new_id)
     if created is None:
@@ -487,9 +562,8 @@ def _check_person(person_id: int) -> None:
 
 @router.patch("/watchlist/{slug}", response_model=WatchlistView)
 def patch_watchlist_entry(slug: str, body: WatchlistPatch, request: Request) -> WatchlistView:
-    item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
-        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+    item = _shown_or_404(slug, request)
+    privacy = mailbox.audit_privacy(item)
     assert item.id is not None
 
     # Same per-field validation as the chat tune tool — build the update
@@ -529,7 +603,12 @@ def patch_watchlist_entry(slug: str, body: WatchlistPatch, request: Request) -> 
         fields["severity_ceiling"] = body.severity_ceiling
         changes.append(f"severity_ceiling={body.severity_ceiling}")
     if "trigger" in raw and body.trigger is not None:
-        fields["trigger_json"] = json.dumps(body.trigger)
+        trigger = body.trigger
+        if mailbox.is_mailbox(item):
+            trigger = mailbox.clean_trigger(body.trigger)
+            if not trigger:
+                raise HTTPException(status_code=422, detail="Say who the email is from or a word in its subject.")
+        fields["trigger_json"] = json.dumps(trigger)
         changes.append("trigger replaced")
     if "notes" in raw and body.notes is not None:
         fields["notes"] = body.notes[:500]
@@ -569,6 +648,7 @@ def patch_watchlist_entry(slug: str, body: WatchlistPatch, request: Request) -> 
             "watchlist.patch", False,
             f"watchlist.patch: UPDATE failed for {slug!r}",
             {"slug": slug, "watchlist_id": item.id, "error": "update"},
+            privacy,
         )
         logger.exception("watchlist.patch: UPDATE failed slug=%s", slug)
         raise HTTPException(status_code=500, detail="UPDATE failed") from exc
@@ -577,6 +657,7 @@ def patch_watchlist_entry(slug: str, body: WatchlistPatch, request: Request) -> 
         "watchlist.patch", True,
         f"watchlist.patch: {slug} -> {', '.join(changes)}",
         {"slug": slug, "watchlist_id": item.id, "changes": changes, "by": api_caller.actor(request)},
+        privacy,
     )
 
     updated = ms.get_watchlist_item(item.id)
@@ -602,10 +683,9 @@ def _record_decline(item: WatchlistItem, reason: str) -> None:
 
 
 @router.delete("/watchlist/{slug}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
-    item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
-        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+def delete_watchlist_entry(slug: str, request: Request, reason: str | None = None) -> Response:
+    item = _shown_or_404(slug, request)
+    privacy = mailbox.audit_privacy(item)
     assert item.id is not None
     if reason is not None and reason not in EXPLICIT_DECLINE_REASONS:
         raise HTTPException(status_code=400, detail=f"unknown reason {reason!r}")
@@ -616,6 +696,7 @@ def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
             "watchlist.delete", False,
             f"watchlist.delete: failed for {slug!r}",
             {"slug": slug, "watchlist_id": item.id, "error": "delete"},
+            privacy,
         )
         logger.exception("watchlist.delete: failed slug=%s", slug)
         raise HTTPException(status_code=500, detail="delete failed") from exc
@@ -631,6 +712,7 @@ def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
         "watchlist.delete", removed,
         f"watchlist.delete: {slug} ({'deleted' if removed else 'no-op'})",
         {"slug": slug, "watchlist_id": item.id, "removed": removed, "reason": reason},
+        privacy,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -642,7 +724,9 @@ def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
 
 def _pending_suggestion_or_409(slug: str) -> WatchlistItem:
     item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
+    # An email watch is never a suggestion, and to anyone but its owner it
+    # is not there: not found, for everyone, so its name says nothing.
+    if item is None or mailbox.is_mailbox(item):
         raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
     if item.origin != ORIGIN_RESEARCH_PROPOSED or item.mode != MODE_DRY_RUN:
         raise HTTPException(

@@ -3,7 +3,7 @@
 import { useState } from "react";
 
 import type { LeadRule, LeadRuleEffect, LeadRuleKind } from "@/lib/api";
-import { EFFECT_HINT, RULE_KINDS, RULES_ORDER, describeRule, kindGoes, ruleGoes } from "@/lib/leadRules";
+import { EFFECT_HINT, RULE_KINDS, RULES_ORDER, TOPICS, describeRule, kindGoes, ruleGoes } from "@/lib/leadRules";
 
 // Your rules (orchestrator/take_the_lead.py), the owner's, on Delegate →
 // Approvals. A Waits rule always waits for a yes, on every level; a Goes
@@ -146,7 +146,10 @@ export default function LeadRulesEditor({
                   key={r.kind}
                   type="button"
                   aria-pressed={kind === r.kind}
-                  onClick={() => setKind(r.kind)}
+                  onClick={() => {
+                    if ((r.kind === "topic") !== (kind === "topic")) setValue("");
+                    setKind(r.kind);
+                  }}
                   disabled={busy || disabled}
                   className={segment(kind === r.kind)}
                 >
@@ -159,16 +162,33 @@ export default function LeadRulesEditor({
             <label className="text-[13px] font-semibold text-fg" htmlFor="lead-rule-value">
               {kind === "amount" ? (effect === "go" ? "Under" : "This much or more") : spec.label}
             </label>
-            <input
-              id="lead-rule-value"
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              placeholder={spec.placeholder}
-              maxLength={200}
-              inputMode={kind === "amount" ? "decimal" : undefined}
-              disabled={busy || disabled}
-              className="min-h-touch w-full max-w-sm rounded-lg border border-line bg-surface px-3 text-[15px]"
-            />
+            {kind === "topic" ? (
+              <select
+                id="lead-rule-value"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                disabled={busy || disabled}
+                className="min-h-touch w-full max-w-sm rounded-lg border border-line bg-surface px-3 text-[15px]"
+              >
+                <option value="">Pick a topic</option>
+                {TOPICS.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                id="lead-rule-value"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder={spec.placeholder}
+                maxLength={200}
+                inputMode={kind === "amount" ? "decimal" : undefined}
+                disabled={busy || disabled}
+                className="min-h-touch w-full max-w-sm rounded-lg border border-line bg-surface px-3 text-[15px]"
+              />
+            )}
           </div>
           <p className="text-sm text-fg-muted">{EFFECT_HINT[effect]}</p>
           <div className="flex gap-2">

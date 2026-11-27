@@ -21,6 +21,7 @@ import {
   type QuietDays,
   type QuietHours,
 } from "@/lib/notifications";
+import { deviceTimeZone } from "@/lib/timeZone";
 
 // Settings → Notifications (GET/PUT /notifications/settings): the signed-in
 // person's own quiet hours, whether things reach them as they happen or in
@@ -31,14 +32,6 @@ import {
 const INPUT =
   "w-full h-11 px-3 rounded-xl text-[15px] bg-surface border border-line text-fg focus:outline-none focus:border-line-strong disabled:opacity-60";
 
-function browserTimeZone(): string | null {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
-  } catch {
-    return null;
-  }
-}
-
 type Loaded = NotificationSettings | null | "loading" | "error";
 
 export default function NotificationsCard() {
@@ -46,7 +39,7 @@ export default function NotificationsCard() {
   const [draft, setDraft] = useState<QuietHours | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const browserZone = useMemo(() => browserTimeZone(), []);
+  const browserZone = useMemo(() => deviceTimeZone(), []);
 
   useEffect(() => {
     const ctrl = new AbortController();

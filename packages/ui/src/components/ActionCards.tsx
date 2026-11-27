@@ -224,7 +224,16 @@ export function ActionCardItem({
 // The chat: the cards a reply left (its propose_actions chips carry their
 // ids), shown under it while they wait. A card already approved, dismissed
 // or expired shows nothing here; its chip still links to Today.
-export function ChatActionCards({ ids }: { ids: number[] }) {
+export function ChatActionCards({
+  ids,
+  onApprove,
+  approveDisabled,
+}: {
+  ids: number[];
+  // A held step's Approve, sent through the chat so it carries on.
+  onApprove?: (id: number, input?: Record<string, string>) => Promise<void> | void;
+  approveDisabled?: boolean;
+}) {
   const { cards, loaded, gone } = useActionCards();
   const shown = cards.filter((c) => ids.includes(c.decision_id));
   // Any other id is an approval of another kind (a meeting, something asked
@@ -241,7 +250,7 @@ export function ChatActionCards({ ids }: { ids: number[] }) {
         <div key={id}>
           <ChatMeetingCard id={id} />
           <ChatAppActionCard id={id} />
-          <ChatHeldActionCard id={id} />
+          <ChatHeldActionCard id={id} onApprove={onApprove} approveDisabled={approveDisabled} />
         </div>
       ))}
     </div>

@@ -14,7 +14,6 @@ import pytest
 from openexecutive.briefing import grounding as g
 from openexecutive.briefing.grounding import (
     HELD_BACK_ALL,
-    SOURCES_HEADER,
     GroundingScope,
     GroundingSource,
     check_text,
@@ -53,7 +52,6 @@ def _no_company_data(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, di
     monkeypatch.setattr(g, "org_sources", lambda: [])
     monkeypatch.setattr(g, "roster", lambda: ["Dana Whitfield", "Tom Ruiz"])
     monkeypatch.setattr(g, "grounding_mode", lambda: "enforce")
-    monkeypatch.setattr(g, "citations_enabled", lambda: True)
     rows: list[tuple[str, str, dict[str, Any]]] = []
 
     def _log(event_type: str, summary: str, **kw: Any) -> None:
@@ -238,7 +236,7 @@ BRIEF = """**Top call** — Sign Dana's lease renewal for 48 units by Friday.
 
 
 @pytest.mark.asyncio
-async def test_ground_brief_drops_cites_and_notes(
+async def test_ground_brief_drops_and_notes_without_marks(
     _no_company_data: list[tuple[str, str, dict[str, Any]]],
 ) -> None:
     out, result = await ground_brief(BRIEF, context=CONTEXT, kind="k", private=True)
@@ -246,15 +244,11 @@ async def test_ground_brief_drops_cites_and_notes(
     assert "Marcus" not in out and "18%" not in out
     # The emptied "At risk" header goes too.
     assert "**At risk**" not in out
-    assert "48 [1] units" in out
-    assert "$1.2M [2] approved" in out
+    assert "48 units" in out and "$1.2M approved" in out
     assert "_I left out 2 lines" in out and "Left out of your brief in Memory, What it does" in out
-    body, footer = out.split(SOURCES_HEADER)
-    assert "I left out" in body
-    assert "- [1] Inbound since the last brief — " in footer
-    assert "- [2] Inbound since the last brief — " in footer and "Budget $1,234,567" in footer
-    # Never "[n]:" at a line start (a Markdown link reference definition).
-    assert not any(ln.lstrip().startswith("[") for ln in out.splitlines())
+    # No [n] marks and no Sources list: the note is the brief's last line.
+    assert "[1]" not in out and "Sources" not in out
+    assert out.rstrip().splitlines()[-1].startswith("_I left out 2 lines")
     [(event_type, _summary, kw)] = _no_company_data
     assert event_type == "grounding"
     assert kw["private"] is True
@@ -270,6 +264,16 @@ async def test_clean_text_without_figures_is_byte_identical(
     _no_company_data: list[tuple[str, str, dict[str, Any]]],
 ) -> None:
     text = "**Top call** — Sign Dana's lease renewal by Friday."
+    out, _ = await ground_brief(text, context=CONTEXT, kind="k")
+    assert out == text
+    assert _no_company_data == []
+
+
+@pytest.mark.asyncio
+async def test_grounded_figures_leave_text_byte_identical(
+    _no_company_data: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    text = "**Top call** — Sign the renewal for 48 units.\n- Budget of $1.2M approved."
     out, _ = await ground_brief(text, context=CONTEXT, kind="k")
     assert out == text
     assert _no_company_data == []
@@ -301,26 +305,6 @@ async def test_report_mode_leaves_text_and_audits(
 async def test_off_mode_does_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(g, "grounding_mode", lambda: "off")
     assert await ground_brief(BRIEF, context=CONTEXT, kind="k") == (BRIEF, None)
-
-
-@pytest.mark.asyncio
-async def test_citations_can_be_turned_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(g, "citations_enabled", lambda: False)
-    text = "**Top call** — Sign the renewal for 48 units."
-    out, _ = await ground_brief(text, context=CONTEXT, kind="k")
-    assert out == text
-
-
-@pytest.mark.asyncio
-async def test_citations_cap_and_sanitise() -> None:
-    lines = [f"- ITEM{i}: [x](javascript:y) <b>{100 + i}</b> things" for i in range(12)]
-    ctx = "STUFF:\n" + "\n".join(lines)
-    brief = "\n".join(f"- {100 + i} things" for i in range(12))
-    out, _ = await ground_brief(brief, context=ctx, kind="k")
-    footer = out.split(SOURCES_HEADER)[1]
-    assert footer.count("\n- [") == 9
-    assert "[x]" not in footer and "<b>" not in footer and "(javascript" not in footer
-    assert "- 111 things" in out  # the 12th figure: over the cap, left unmarked
 
 
 @pytest.mark.asyncio
@@ -402,8 +386,26 @@ async def test_tool_results_ground_later_prose(sources: list[GroundingSource]) -
     handlers = scope.guard({"lookup_person": _lookup, "message_person": _send})
     msg = {"person_id": 7, "text": "Marcus Lee: Dana needs the lease checked."}
     assert "error" in json.loads(await handlers["message_person"](msg))
-    await handlers["lookup_person"]({"query": "property manager"})
+    # Running the lookup grounds nothing; what the model was sent does.
+    found = await handlers["lookup_person"]({"query": "property manager"})
+    assert "error" in json.loads(await handlers["message_person"](msg))
+    scope.read({"name": "lookup_person"}, found)
     assert json.loads(await handlers["message_person"](msg)) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_read_back_grounds_nothing(sources: list[GroundingSource]) -> None:
+    async def _send(_tool_input: dict[str, Any]) -> str:
+        return json.dumps({"ok": True})
+
+    scope = GroundingScope(sources, [], surface="test")
+    handlers = scope.guard({"message_person": _send})
+    msg = {"person_id": 7, "text": "Marcus Lee owes $40k."}
+    refused = await handlers["message_person"](msg)
+    assert "error" in json.loads(refused)
+    # The refusal quotes the draft back; the model reading it is no evidence.
+    scope.read({"name": "message_person"}, refused)
+    assert "error" in json.loads(await handlers["message_person"](msg))
 
 
 @pytest.mark.asyncio
@@ -499,18 +501,6 @@ def test_raw_event_fallbacks_are_made_inert() -> None:
         assert "evil.example" not in text and "<" not in text and "|" not in text
         assert "@everyone" not in text and "@here" not in text
     assert "(link removed)" in headline
-
-
-@pytest.mark.asyncio
-async def test_citation_snippets_mask_links_and_mentions() -> None:
-    ctx = (
-        "INBOUND SINCE THE LAST BRIEF (1 message):\n"
-        "- 08:14 email from Al <al@b.co>: 48 units, pay at https://evil.example/pay @everyone"
-    )
-    out, _ = await ground_brief("- Renewal covers 48 units", context=ctx, kind="k")
-    footer = out.split(SOURCES_HEADER)[1]
-    assert "evil.example" not in footer and "@everyone" not in footer
-    assert "(link removed)" in footer and "al@b.co" in footer
 
 
 def test_recent_held_back_lists_enforced_brief_lines_newest_first(

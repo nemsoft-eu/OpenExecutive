@@ -215,22 +215,19 @@ def test_the_wait_for_a_slot_counts_against_the_timeout(monkeypatch) -> None:
     assert time.monotonic() - started < 6
 
 
-def test_the_in_process_fallback_does_not_hold_a_slot(monkeypatch) -> None:
-    """An in-process parse cannot be timed out; a hung one must not keep a
-    slot the child processes need."""
+def test_without_a_child_process_nothing_holds_a_slot(monkeypatch) -> None:
+    """A child that can't start gives its slot back, so the next parse
+    still gets one."""
     import threading
 
     slots = threading.BoundedSemaphore(1)
     monkeypatch.setattr(isolated, "_child_slots", slots)
     monkeypatch.setattr(isolated.sys, "executable", "/nonexistent/python")
 
-    def slot_is_free() -> bool:
-        if slots.acquire(blocking=False):
-            slots.release()
-            return True
-        return False
-
-    assert run_isolated(slot_is_free, timeout=60) is True
+    with pytest.raises(WorkerStopped):
+        run_isolated(math.sqrt, 9.0, timeout=60)
+    assert slots.acquire(blocking=False)
+    slots.release()
 
 
 def test_a_caller_with_its_own_gate_does_not_wait_on_the_shared_one(monkeypatch) -> None:
@@ -248,10 +245,19 @@ def test_a_caller_with_its_own_gate_does_not_wait_on_the_shared_one(monkeypatch)
         shared.release()
 
 
-def test_without_a_child_process_it_parses_in_process(monkeypatch) -> None:
+def test_without_a_child_process_the_file_is_not_parsed_in_process(monkeypatch) -> None:
+    """No usable interpreter: the read fails, and the server never parses a
+    file someone sent in its own memory."""
     monkeypatch.setattr(isolated.sys, "executable", "/nonexistent/python")
+    ran: list[float] = []
 
-    assert run_isolated(math.sqrt, 9.0, timeout=60) == 3.0
+    def _record(value: float) -> float:
+        ran.append(value)
+        return value
+
+    with pytest.raises(WorkerStopped, match="could not start"):
+        run_isolated(_record, 9.0, timeout=60)
+    assert ran == []
 
 
 # ── PDFs: same reads as in-process ───────────────────────────────────────────
@@ -381,3 +387,62 @@ async def test_a_pdf_met_by_busy_parsers_says_so_and_is_not_cached(monkeypatch) 
     assert busy.method == "none" and busy.busy
     assert "busy reading other documents" in busy.note
     assert read.method == "text_layer"
+
+
+async def test_a_page_range_is_read_in_a_child_process(monkeypatch) -> None:
+    """Reading some pages of a PDF counts and slices it in a child, as every
+    other parse of a file someone sent is."""
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    data = buf.getvalue()
+    seen: list[str] = []
+    real = isolated._run_child
+
+    def _spy(func, args, timeout, reraise, file_limit=None):  # type: ignore[no-untyped-def]
+        seen.append(func.__qualname__)
+        return real(func, args, timeout, reraise, file_limit)
+
+    monkeypatch.setattr(isolated, "_run_child", _spy)
+    total, part = await pdf_reader.page_range(data, 1, 3)
+    assert total == 5
+    assert part is not None and len(PdfReader(io.BytesIO(part)).pages) == 2
+    assert seen == ["_page_range"]
+    assert await pdf_reader.page_range(data, 5, 6) == (5, None)
+
+
+def _blank_pages(pages: int = 5) -> bytes:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def test_the_file_limit_reaches_the_child(tmp_path) -> None:
+    """The child writes the slice under the limit its caller sets: one
+    that fits the error reply but not the slice stops the write."""
+    data = _blank_pages(200)
+    out = tmp_path / "part.pdf"
+    with pytest.raises(isolated.IsolatedError, match="File too large"):
+        isolated.run_isolated(pdf_reader._page_range, data, 0, 150, str(out), timeout=60, file_limit=2048)
+
+
+async def test_a_page_range_sets_a_limit_that_fits_the_file(monkeypatch) -> None:
+    """With the default limit far below the slice, page_range still reads
+    it: it sets its own limit from the file's size."""
+    from pypdf import PdfReader
+
+    data = _blank_pages()
+    monkeypatch.setattr(isolated, "_MAX_ANSWER_BYTES", 256)
+    total, part = await pdf_reader.page_range(data, 0, 4)
+    assert total == 5
+    assert part is not None and len(part) > 512
+    assert len(PdfReader(io.BytesIO(part)).pages) == 4

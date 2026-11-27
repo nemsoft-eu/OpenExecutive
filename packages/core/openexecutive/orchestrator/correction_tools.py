@@ -30,6 +30,9 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from openexecutive.memory.workspace_settings import COMPANY_TIME_HINT, company_time
+from openexecutive.orchestrator.speaker import speaker as _speaker
+
 logger = logging.getLogger(__name__)
 
 FOLLOWUP_KIND = "ad_hoc"
@@ -86,14 +89,13 @@ MOVE_FOLLOWUP_TOOL: dict[str, Any] = {
     "name": "move_followup",
     "description": (
         "Move a pending follow-up or reminder to a new time when the person "
-        "asks. action_id from list_followups; run_at is ISO 8601 with a zone, "
-        "in the future."
+        "asks. action_id from list_followups; run_at is in the future."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "action_id": {"type": "integer"},
-            "run_at": {"type": "string", "description": "ISO 8601, e.g. 2026-10-20T09:00:00-04:00"},
+            "run_at": {"type": "string", "description": COMPANY_TIME_HINT},
         },
         "required": ["action_id", "run_at"],
     },
@@ -140,32 +142,6 @@ def _audit(tool: str, ok: bool, summary: str, details: dict[str, Any]) -> None:
 
 def _refused(detail: str) -> str:
     return json.dumps({"status": "refused", "detail": detail})
-
-
-def _speaker(session: Any = None) -> Any:
-    """The verified speaker's People row (principal or teammate), or None.
-    ``session`` defaults to the turn's own (``current_session``)."""
-    from openexecutive.orchestrator.people_tools import (
-        is_principal_on_verified_surface,
-        teammate_on_verified_surface,
-    )
-    from openexecutive.people.store import get_person
-
-    session = session if session is not None else _session()
-    if session is None or getattr(session, "unattended", False):
-        return None
-    try:
-        if is_principal_on_verified_surface(session):
-            caller = getattr(session, "caller_person_id", None)
-            if caller is not None:
-                return get_person(int(caller))
-            from openexecutive.people.store import find_principal_person
-
-            return find_principal_person()
-        return teammate_on_verified_surface(session)
-    except Exception:
-        logger.warning("correction_tools: speaker lookup failed", exc_info=True)
-        return None
 
 
 _NOT_VERIFIED = (
@@ -280,7 +256,8 @@ def pending_followups_block(session: Any) -> str:
                 at = when.astimezone(zone).strftime("%a %d %b %H:%M")
             except ValueError:
                 at = a.run_at
-            lines.append(f"- #{a.id}, {at}: {' '.join(a.intent_text.split())[:200]}")
+            again = f" (repeats {a.repeat} until cancelled)" if a.repeat else ""
+            lines.append(f"- #{a.id}, {at}{again}: {' '.join(a.intent_text.split())[:200]}")
     except Exception:
         logger.warning("correction_tools: pending follow-ups lookup failed", exc_info=True)
         return ""
@@ -306,7 +283,8 @@ async def handle_list_followups(tool_input: dict[str, Any]) -> str:
     ][:_LIST_MAX]
     return json.dumps({
         "followups": [
-            {"action_id": a.id, "run_at": a.run_at, "says": " ".join(a.intent_text.split())[:200]}
+            {"action_id": a.id, "run_at": a.run_at, "says": " ".join(a.intent_text.split())[:200],
+             **({"repeat": a.repeat} if a.repeat else {})}
             for a in rows
         ],
     })
@@ -346,11 +324,11 @@ async def handle_move_followup(tool_input: dict[str, Any]) -> str:
         return _refused(_NOT_VERIFIED)
     try:
         action_id = int(tool_input["action_id"])
-        parsed = datetime.fromisoformat(str(tool_input["run_at"]).replace("Z", "+00:00"))
+        parsed = company_time(tool_input["run_at"])
     except (KeyError, TypeError, ValueError):
-        return json.dumps({"error": "action_id (from list_followups) and run_at (ISO 8601) are required"})
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        parsed = None
+    if parsed is None:
+        return json.dumps({"error": "action_id (from list_followups) and run_at are required. run_at: " + COMPANY_TIME_HINT})
     run_at = parsed.astimezone(UTC)
     now = datetime.now(UTC)
     if run_at <= now:

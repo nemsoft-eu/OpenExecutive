@@ -115,6 +115,15 @@ def _text(tool_input: dict[str, Any], name: str) -> str:
     return "" if raw is None else " ".join(str(raw).split())
 
 
+def _reader() -> int | None:
+    """Whose private decisions this turn reads: the speaker's, in their own
+    chat (``fact_tools.own_chat_person``)."""
+    from openexecutive.orchestrator.fact_tools import own_chat_person
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    return own_chat_person(current_session.get())
+
+
 def _awaiting_outcome() -> list[dict[str, Any]]:
     """Decisions with no outcome yet (the newest first), for the model to
     pick an id from. Includes recent ones: the principal may report early."""
@@ -122,7 +131,7 @@ def _awaiting_outcome() -> list[dict[str, Any]]:
 
     try:
         rows = decisions_awaiting_outcome(
-            datetime.now(UTC) + timedelta(seconds=1), limit=_CANDIDATES_MAX
+            datetime.now(UTC) + timedelta(seconds=1), limit=_CANDIDATES_MAX, reader=_reader(),
         )
     except Exception:
         logger.warning("decision_tools: decisions unreadable", exc_info=True)
@@ -143,12 +152,14 @@ async def handle_record_decision_outcome(tool_input: dict[str, Any]) -> str:
 
     # ---- Who is asking ----
     if not _principal_asked():
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
         return _bad(
             "refused: only the principal can record how a decision turned out, "
             "and this request did not come from a conversation that confirms it "
-            "is them. Tell whoever asked that the principal needs to record it — "
-            "in the web app, or by telling you there or in their own Slack or "
-            "Discord.",
+            "is them. Tell whoever asked, plainly, that the principal can record "
+            "it in the web app, or by telling you there or in their own Slack or "
+            f"Discord. {PASS_ON_NOTHING}",
             refused=True, **_caller_context(),
         )
 
@@ -177,14 +188,16 @@ async def handle_record_decision_outcome(tool_input: dict[str, Any]) -> str:
     # ---- Write ----
     db_path = episodic._resolve_db_path(None)
     try:
-        decision = episodic.get_decision(decision_id, db_path=db_path)
+        decision = episodic.get_decision(decision_id, db_path=db_path, reader=_reader())
         if decision is None:
             return json.dumps({
                 "error": f"no decision {decision_id}. Pick the id from awaiting_outcome "
                          "and call again.",
                 "awaiting_outcome": _awaiting_outcome(),
             })
-        updated = episodic.update_decision(decision_id, outcome=outcome, db_path=db_path)
+        updated = episodic.update_decision(
+            decision_id, outcome=outcome, db_path=db_path, reader=_reader()
+        )
     except Exception as exc:
         logger.exception("record_decision_outcome: write failed id=%s", decision_id)
         _audit(False, f"record_decision_outcome FAILED id={decision_id}: {type(exc).__name__}",

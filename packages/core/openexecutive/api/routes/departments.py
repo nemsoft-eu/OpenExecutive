@@ -78,6 +78,7 @@ class DepartmentPatch(BaseModel):
     slack_channel_id: str | None = None
     discord_channel_id: str | None = None
     telegram_chat_id: str | None = None
+    google_chat_space: str | None = Field(default=None, max_length=200, pattern=r"^spaces/[A-Za-z0-9_-]{1,128}$")
     # Named external entities the department wants watched (strong grounding
     # for the research watch policy). Sending `[]` clears the list.
     watched_entities: list[str] | None = Field(default=None, max_length=50)
@@ -111,18 +112,9 @@ class DepartmentDetail(DepartmentState):
     next_check_in_at: str | None = None
 
 
-def _with_level(state: DepartmentState) -> DepartmentState:
-    """``state`` showing the level its work runs at: Approvals
-    (``authority.department_level``), not the "How it acts" it once stored."""
-    from openexecutive.departments.authority import department_level
-
-    config = state.config.model_copy(update={"authority_level": department_level(state.config.slug)})
-    return state.model_copy(update={"config": config})
-
-
 def _detail(state: DepartmentState) -> DepartmentDetail:
     return DepartmentDetail(
-        **_with_level(state).model_dump(),
+        **state.model_dump(),
         next_check_in_at=next_check_in_at(state.config.slug),
     )
 
@@ -202,7 +194,7 @@ def list_departments() -> list[DepartmentState]:
     """List all departments with their Goals."""
     # Read straight through the store (not the cache) so the API view is always
     # fresh; the registry cache is for the per-turn prompt-block path only.
-    return [_with_level(state) for state in store.list_departments()]
+    return store.list_departments()
 
 
 @router.get("/departments/{slug}", response_model=DepartmentDetail)
@@ -292,6 +284,7 @@ def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentDetail:
         slack_channel_id=patch.slack_channel_id if "slack_channel_id" in raw else _UNSET,
         discord_channel_id=patch.discord_channel_id if "discord_channel_id" in raw else _UNSET,
         telegram_chat_id=patch.telegram_chat_id if "telegram_chat_id" in raw else _UNSET,
+        google_chat_space=patch.google_chat_space if "google_chat_space" in raw else _UNSET,
         watched_entities=patch.watched_entities,
     )
     registry.invalidate()

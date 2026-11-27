@@ -14,8 +14,8 @@ from a terminal, sign it with the web app's private key:
 
 It signs as the operator (the owner at the controls) unless --email names
 the signed-in person to sign as. One assertion is good for one request: that
-method, that exact path and query (as sent, e.g. /audit/logs?limit=5), for 30
-seconds, once. Never print or store the private key.
+method, that exact path and query (as sent, e.g. /audit/logs?limit=5), for 2
+minutes, once. Never print or store the private key.
 """
 from __future__ import annotations
 

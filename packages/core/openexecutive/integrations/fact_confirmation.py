@@ -153,6 +153,77 @@ def authenticated_by_gmail(raw: str, from_addr: str) -> bool:
     return headers is not None and headers_authenticated(headers, from_addr)
 
 
+def why_not_authenticated(raw: str, from_addr: str) -> str:
+    """A short, fixed reason ``authenticated_by_gmail`` says no, for the log:
+    never the message's text, only which check failed and the authserv-id
+    and verdict of its newest Authentication-Results."""
+    headers = _raw_headers(raw)
+    if headers is None:
+        return "no raw message" if not raw else f"no raw section ({len(raw)} chars)"
+    _name, raw_from = parseaddr(str(headers.get("From", "")))
+    if raw_from.strip().lower() != from_addr.strip().lower():
+        return "From differs"
+    results = headers.get_all("Authentication-Results") or []
+    if not results:
+        return "no Authentication-Results"
+    if _relayed_by_a_list(headers):
+        return "list headers"
+    newest = " ".join(str(results[0]).split()).lower()
+    authserv = newest.partition(";")[0].strip()[:60]
+    verdict = re.search(r"dmarc=([a-z]+)", newest)
+    trusted = authserv == _GMAIL_AUTHSERV
+    return f"authserv={authserv!r} trusted={trusted} dmarc={verdict.group(1) if verdict else None}"
+
+
+UNSIGNED = "unsigned"
+DMARC_FAILED = "dmarc_failed"
+VIA_LIST = "via_list"
+
+
+def unproven_cause(raw: str, from_addr: str) -> str:
+    """Why the mailbox could not prove a message's sender, in terms a person
+    can act on: ``DMARC_FAILED`` (the domain's own check failed),
+    ``VIA_LIST`` (it carries list or group headers: a list resent it, or the
+    sender added them, which they can), ``UNSIGNED`` (the From domain
+    publishes no DMARC record and no signature of its own is on it: mail sent
+    from another account, such as Gmail's "Send mail as"), or "" when the
+    headers don't say. Reads only the topmost Authentication-Results, and only
+    a trusted authserv's, as ``authenticated_by_gmail`` does; a failed verdict
+    wins over list headers, which the sender may have written. None of these
+    rules out forgery: the card says so. Never raises."""
+    try:
+        headers = _raw_headers(raw)
+        if headers is None:
+            return ""
+        _name, raw_from = parseaddr(str(headers.get("From", "")))
+        address = from_addr.strip().lower()
+        if raw_from.strip().lower() != address or "@" not in address:
+            return ""
+        results = headers.get_all("Authentication-Results") or []
+        if not results:
+            return ""
+        newest = _strip_quotes_and_comments(" ".join(str(results[0]).split()).lower())
+        if newest is None:
+            return ""
+        authserv, _sep, rest = newest.partition(";")
+        if authserv.strip() != _GMAIL_AUTHSERV:
+            return ""
+        resinfo = [c.strip() for c in rest.split(";") if c.strip()]
+        verdicts = [c for c in resinfo if c.startswith("dmarc=")]
+        if len(verdicts) > 1:
+            return ""
+        if verdicts and re.match(r"dmarc=(fail|quarantine|reject)\b", verdicts[0]):
+            return DMARC_FAILED
+        if _relayed_by_a_list(headers):
+            return VIA_LIST
+        if not verdicts or _DMARC_NONE.fullmatch(verdicts[0]):
+            domain = address.rsplit("@", 1)[1]
+            return "" if _dkim_aligned(resinfo, domain) else UNSIGNED
+    except Exception:  # noqa: BLE001 - a card's wording only
+        logger.warning("fact_confirmation: could not read why a sender is unproven", exc_info=True)
+    return ""
+
+
 def headers_authenticated(headers: Message, from_addr: str) -> bool:
     """``authenticated_by_gmail`` over a message's parsed headers, in the
     order the message carries them (the Gmail API's own header list, say)."""

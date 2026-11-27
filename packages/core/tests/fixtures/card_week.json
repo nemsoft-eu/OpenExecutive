@@ -1,0 +1,518 @@
+{
+  "about": "A simulated week of cards on a made-up company, recorded from real turns with the model's tool calls kept as they were. Names and addresses are made up. tests/integration/test_card_week.py replays each event through the real gates with no model.",
+  "company": {
+    "exec_email": "exec@lakeview.example",
+    "people": [
+      {
+        "key": "sam",
+        "name": "Sam Rivera",
+        "email": "sam@lakeview.example",
+        "role": "Owner",
+        "owner": true
+      },
+      {
+        "key": "jordan",
+        "name": "Jordan Lee",
+        "email": "jordan@lakeview.example",
+        "role": "Operations lead"
+      },
+      {
+        "key": "leo",
+        "name": "Leo Park",
+        "email": "leo@brightwire.example",
+        "role": "Account manager, Brightwire Supply (vendor)",
+        "kind": "contact"
+      },
+      {
+        "key": "maya",
+        "name": "Maya Chen",
+        "email": "maya@chenortiz.example",
+        "role": "Outside accountant, Chen & Ortiz",
+        "kind": "contact"
+      },
+      {
+        "key": "dana",
+        "name": "Dana Price",
+        "email": "dana@northpeak.example",
+        "role": "Head of Purchasing, Northpeak Foods",
+        "kind": "contact"
+      }
+    ]
+  },
+  "events": [
+    {
+      "id": "a02-owner-asks-mail-to-a-contact",
+      "about": "Sam asks the Executive to tell Leo the holiday dock hours. Balanced: it goes.",
+      "settings": {
+        "level": "balanced"
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "sam",
+            "surface": "web",
+            "ask": "Tell Leo Park our holiday dock hours: closed Dec 25 and Jan 1, otherwise 7am to 3pm.",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Holiday dock hours",
+                  "body": "Hi Leo, our dock will be closed Dec 25 and Jan 1. The rest of those weeks we're open 7am to 3pm. Please schedule any deliveries accordingly.\n\nOpen Executive, on behalf of Lakeview"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "ran"
+            ],
+            "sent": 1,
+            "views": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "b02-careful-holds-the-owners-own-ask",
+      "about": "The same ask on Careful: it waits on Sam's card, and his tap sends exactly it.",
+      "settings": {
+        "level": "careful"
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "sam",
+            "surface": "web",
+            "ask": "Tell Leo Park our holiday dock hours.",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Holiday dock hours",
+                  "body": "Hi Leo, our dock will be closed Dec 25 and Jan 1."
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        },
+        {
+          "approve": "last",
+          "expect": {
+            "sent": 1,
+            "views": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "b14-careful-holds-a-teammates-ask-for-the-owner",
+      "about": "On Careful, Jordan asks the Executive to email Maya: Sam approves it.",
+      "settings": {
+        "level": "careful"
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "jordan",
+            "surface": "web",
+            "ask": "Can you find out from Maya when she needs the November bank statements?",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "maya@chenortiz.example",
+                  "subject": "November bank statements for month-end close",
+                  "body": "Hi Maya,\n\nJordan Lee asked me to check with you: when do you need the November bank statements for the month-end close?\n\nThanks,\nOpen Executive"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "c07-amount-rule-holds-a-reply-on-hands-off",
+      "about": "Leo asks for early payment of a $300 invoice. Hands-off, but the rule says amounts of $250 or more wait.",
+      "settings": {
+        "level": "hands_off",
+        "rules": [
+          {
+            "kind": "amount",
+            "value": "250"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "leo",
+            "surface": "email",
+            "thread": "bw-4471",
+            "ask": "Could you pay invoice BW-4471 ($300) early this month?",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Re: Early payment on invoice BW-4471",
+                  "body": "Hi Leo,\n\nThanks for flagging. I can't commit to moving the payment date on BW-4471 ($300) myself. Please send the fresh copy of the invoice so it's on file.\n\nBest,\nOpen Executive"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "c02-hands-off-sends-without-a-card",
+      "about": "On Hands-off, a reply with no amount goes on its own.",
+      "settings": {
+        "level": "hands_off",
+        "rules": [
+          {
+            "kind": "amount",
+            "value": "250"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "sam",
+            "surface": "web",
+            "ask": "Tell Leo the dock is closed Dec 25.",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Holiday dock hours",
+                  "body": "Hi Leo, our dock will be closed Dec 25 and Jan 1."
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "ran"
+            ],
+            "sent": 1,
+            "views": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "d02-training-holds-the-owners-own-ask-too",
+      "about": "In training, Sam's own chat ask waits on Sam's own card like anyone's: In training comes last, for everyone.",
+      "settings": {
+        "level": "balanced",
+        "training": true
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "sam",
+            "surface": "web",
+            "ask": "Tell Leo Park our holiday dock hours.",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Holiday dock hours",
+                  "body": "Hi Leo, our dock will be closed Dec 25 and Jan 1."
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        },
+        {
+          "approve": "last",
+          "expect": {
+            "sent": 1,
+            "views": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "d14-training-holds-a-teammates-ask-until-allowed",
+      "about": "In training, Jordan asks to email Maya: it waits on Sam's card. Sam approves with Do this on its own next time, and Jordan's next ask like it goes.",
+      "settings": {
+        "level": "balanced",
+        "training": true
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "jordan",
+            "surface": "web",
+            "ask": "Can you find out from Maya when she needs the November bank statements?",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "maya@chenortiz.example",
+                  "subject": "November bank statements for month-end close",
+                  "body": "Hi Maya,\n\nJordan Lee asked me to check with you: when do you need the November bank statements for the month-end close?\n\nThanks,\nOpen Executive"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        },
+        {
+          "approve": "last",
+          "allow": true,
+          "expect": {
+            "sent": 1,
+            "views": []
+          }
+        },
+        {
+          "turn": {
+            "who": "jordan",
+            "surface": "web",
+            "ask": "Ask Maya if she got the October statements.",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "maya@chenortiz.example",
+                  "subject": "October statements",
+                  "body": "Hi Maya,\n\nDid the October bank statements reach you?\n\nThanks,\nOpen Executive"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "ran"
+            ],
+            "sent": 1,
+            "views": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "e13-a-held-reply-and-a-raised-card-are-one-card",
+      "about": "Leo's $300 request: the reply waits on an Approve card, and the card the turn raises about the same mail joins it, so Sam sees one card.",
+      "settings": {
+        "level": "balanced",
+        "rules": [
+          {
+            "kind": "amount",
+            "value": "250"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "leo",
+            "surface": "email",
+            "thread": "bw-4471",
+            "ask": "Could you pay invoice BW-4471 ($300) early this month?",
+            "calls": [
+              {
+                "tool": "google_workspace__send_gmail_message",
+                "mcp": true,
+                "input": {
+                  "to": "leo@brightwire.example",
+                  "subject": "Re: Early payment on invoice BW-4471",
+                  "body": "Hi Leo,\n\nThanks for flagging. I can't commit to moving the payment date on BW-4471 ($300) myself.\n\nBest,\nOpen Executive"
+                }
+              },
+              {
+                "tool": "create_alert",
+                "input": {
+                  "subject": "Leo Park asks for early payment of invoice BW-4471 ($300)",
+                  "body": "Leo Park (Brightwire Supply) asks to pay invoice BW-4471, $300, early this month. Your rule says amounts of $250 or more wait for you.",
+                  "source": "email",
+                  "external_id": "bw-4471",
+                  "from_address": "leo@brightwire.example",
+                  "needs": "answer",
+                  "question": "Pay invoice BW-4471 early?"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "card",
+              "ran"
+            ],
+            "cards_for": [
+              "sam"
+            ],
+            "open_cards": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "lead",
+                "panel": "lead",
+                "need": "Needs your OK",
+                "buttons": []
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "e15-two-cards-raised-on-one-turn-are-one-card",
+      "about": "Dana's request: the turn raised a card, then raised it again with more detail. One card.",
+      "settings": {
+        "level": "balanced"
+      },
+      "steps": [
+        {
+          "turn": {
+            "who": "dana",
+            "surface": "email",
+            "thread": "pickup",
+            "ask": "Could we have 30 minutes Thursday after 1pm about the January pickup schedule?",
+            "calls": [
+              {
+                "tool": "create_alert",
+                "input": {
+                  "subject": "Dana Price wants 30 min Thursday after 1pm on January pickups",
+                  "body": "Dana Price (Northpeak Foods) asked for a 30-minute call Thursday after 1pm about the January pickup schedule.",
+                  "source": "email",
+                  "external_id": "pickup",
+                  "from_address": "dana@northpeak.example",
+                  "needs": "answer",
+                  "question": "Can you take the call Thursday after 1pm?"
+                }
+              },
+              {
+                "tool": "create_alert",
+                "input": {
+                  "subject": "Dana Price (Northpeak) asks for 30 min Thursday on January pickups",
+                  "body": "Dana Price, Head of Purchasing at Northpeak Foods, asked for a 30-minute call Thursday any time after 1pm to go over the January pickup schedule. She is waiting on a reply.",
+                  "source": "email",
+                  "external_id": "pickup",
+                  "from_address": "dana@northpeak.example",
+                  "needs": "answer",
+                  "question": "Can you take the call, or should Jordan?"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "steps": [
+              "ran",
+              "ran"
+            ],
+            "open_cards": [
+              "sam"
+            ],
+            "views": [
+              {
+                "kind": "ask",
+                "panel": "",
+                "need": "Needs your answer",
+                "buttons": [
+                  "menu:snooze:Snooze",
+                  "side:dismiss:Skip"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

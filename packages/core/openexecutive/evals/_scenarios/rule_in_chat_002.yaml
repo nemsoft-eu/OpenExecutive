@@ -1,0 +1,16 @@
+id: rule_in_chat_002
+domain: operations
+description: "The person says that from now on the Executive must check with them before emailing anyone at a supplier's domain. The Executive adds it as a Wait rule in Your rules (do_in_app add_waits_rule), not only as a memory note, and says it is in Your rules."
+company_context:
+  name: Maple Ridge Dental
+  industry: Dental practice
+  stage: Small business
+  headcount: 7
+query: "hey quick thing, we are in early talks with Northfield about switching suppliers. so from now on, before you email anyone at northfield-supply.com, check with me first. even quick replies."
+expected_topics:
+  - wait_rule_for_northfield_supply_com
+quality_criteria:
+  adds_a_wait_rule_in_your_rules_for_the_domain: true
+  does_not_keep_it_only_as_a_memory_note: true
+  says_the_rule_is_in_your_rules: true
+  brief: true

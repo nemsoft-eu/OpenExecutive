@@ -14,6 +14,7 @@ import {
   type WorkspaceMode,
 } from "@/lib/api";
 import { roleFormErrors, roleFormFrom, roleUpdate, type RoleForm } from "@/lib/principalRole";
+import { deviceTimeZone } from "@/lib/timeZone";
 
 // Settings → Workspace: who Open Executive is for (personal, or for your
 // team), your role when it's just you, and the time zone its briefs run in,
@@ -34,14 +35,6 @@ const SWITCH_EFFECT: Record<WorkspaceMode, string> = {
     "Department check-ins are paused and the sidebar shows your goals instead of departments. Nothing is deleted: your departments stay, as the areas your goals are grouped by, and switching back brings their check-ins back.",
 };
 
-function browserTimeZone(): string | null {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
-  } catch {
-    return null;
-  }
-}
-
 function allTimeZones(): string[] {
   try {
     return Intl.supportedValuesOf("timeZone");
@@ -56,7 +49,7 @@ export default function WorkspaceCard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const browserZone = useMemo(() => browserTimeZone(), []);
+  const browserZone = useMemo(() => deviceTimeZone(), []);
   const zones = useMemo(() => {
     const list = allTimeZones();
     // A stored zone the browser's list lacks (e.g. "UTC" in some engines)

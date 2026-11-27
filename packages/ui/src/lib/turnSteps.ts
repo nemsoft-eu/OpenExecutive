@@ -20,6 +20,20 @@ export function showSteps(steps: string[]): boolean {
   return steps.length >= STEPS_SHOWN_FROM;
 }
 
+// The one "still working" line a running turn shows: the long-turn steps
+// line once it has taken steps (or sent progress), else the plain status
+// when that has something to say. Never both, wherever the reply is.
+export function liveLineKind(input: {
+  isLoading: boolean;
+  steps: string[];
+  hasProgress: boolean;
+  inCommittee: boolean;
+  statusShown: boolean;
+}): "steps" | "status" | null {
+  if (input.isLoading && !input.inCommittee && (input.hasProgress || showSteps(input.steps))) return "steps";
+  return input.statusShown ? "status" : null;
+}
+
 // What a long turn shows while it works (`progress` events from the
 // backend's `show_progress`, orchestrator/turn_progress.py): the task, what it
 // is doing now, what it has used and what it has found so far. The card stays

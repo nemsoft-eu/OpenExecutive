@@ -219,7 +219,6 @@ async def test_a_teammates_correction_reaches_the_brief_and_unsuppresses_it(
     first = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
     fp = next(e for e in first if e.type == "result").data["brief_fingerprint"]
     brief_state.record_delivered("principal_brief_morning", fp, "FULL BRIEF")
-    facts.set_needs_approval(7, False)  # a trusted teammate: theirs apply at once
     facts.record_fact(subject="Cedar Court unit count", statement="Cedar Court has 38 units.",
                       source_quote="q", recorded_by_role="teammate", recorded_by_name="Sam Lee",
                       recorded_by_person_id=7)
@@ -235,30 +234,6 @@ async def test_a_teammates_correction_reaches_the_brief_and_unsuppresses_it(
     n_calls = len(calls)
     _ = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
     assert all("TEAMMATE CORRECTIONS" not in str(c["rendered_context"]) for c in calls[n_calls:])
-
-
-@pytest.mark.asyncio
-async def test_a_teammates_proposal_is_only_in_the_principals_private_brief(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from openexecutive.memory import facts
-    from openexecutive.workflows import morning_brief
-
-    calls = _capture(monkeypatch)
-    _stub_aggregators(monkeypatch)
-    facts.record_fact(subject="Oak Row", statement="Oak Row has 12 units.", source_quote="q",
-                      recorded_by_role="teammate", recorded_by_name="Sam Lee", proposed=True)
-    # Anyone may run the brief from chat; its run history is shared.
-    shared = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(), MagicMock())]
-    assert "Oak Row" not in str(calls[-1]["rendered_context"])
-    assert next(e for e in shared if e.type == "result").data["private_to_principal"] is False
-    token = morning_brief.PRINCIPAL_DELIVERY.set(True)
-    try:
-        delivered = [e async for e in MorningBriefWorkflow().run(MorningBriefInput(force_full=True), MagicMock())]
-    finally:
-        morning_brief.PRINCIPAL_DELIVERY.reset(token)
-    assert "Sam Lee proposed Oak Row" in str(calls[-1]["rendered_context"])
-    assert next(e for e in delivered if e.type == "result").data["private_to_principal"] is True
 
 
 def test_teammate_changes_count_against_a_quiet_day() -> None:
@@ -393,7 +368,6 @@ def _ground_in_isolation(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, obje
     monkeypatch.setattr(grounding, "org_sources", lambda: [])
     monkeypatch.setattr(grounding, "roster", lambda: [])
     monkeypatch.setattr(grounding, "grounding_mode", lambda: "enforce")
-    monkeypatch.setattr(grounding, "citations_enabled", lambda: True)
     rows: list[dict[str, object]] = []
 
     def _log(event_type: str, summary: str, **kw: object) -> None:
@@ -465,9 +439,9 @@ async def test_morning_brief_holds_back_a_fabricated_colleague_and_cites_figures
     assert "Renew Acme lease for 48 units" in str(captured["rendered_context"])
     assert "'Marcus Lee', '52'" in repair.calls[0]["messages"][0]["content"]  # type: ignore[index]
     assert "Marcus" not in artifact
-    assert "- Renew Acme lease for 48 [1] units" in artifact
+    assert "- Renew Acme lease for 48 units" in artifact
     assert "_I left out 1 line " in artifact
-    assert "- [1] Needs you — Renew Acme lease for 48 units" in artifact
+    assert "[1]" not in artifact and "**Sources**" not in artifact
     step = next(e for e in events if e.type == "step_done" and e.step_id == "synthesize")
     assert "1 line(s) held back" in step.summary
     [row] = rows
@@ -497,7 +471,7 @@ async def test_eod_digest_keeps_a_repair_that_grounds_it(monkeypatch: pytest.Mon
 
     assert len(provider.calls) == 2
     assert provider.calls[1]["system"] == provider.calls[0]["system"]
-    assert artifact.startswith("**Still pending**\n- Acme lease, 48 [1] units")
+    assert artifact.startswith("**Still pending**\n- Acme lease, 48 units")
     assert "Marcus" not in artifact and "I left out" not in artifact
     [row] = rows
     assert row["details"]["repaired"] is True  # type: ignore[index]

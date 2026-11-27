@@ -15,11 +15,11 @@ carrying the principal's authority. ``remember_fact`` is also open to a
 teammate on the People list talking from a surface that verified who they are
 (the web app signed in, their own Slack or Discord). Their fact is attributed
 — rendered "(per <name>)", so no prompt reads it as the principal's — and is
-held as a proposal until the principal approves it on the Memory page, unless
-the principal marked that teammate trusted ("needs my approval" off;
-``memory.facts``). Even a trusted teammate's fact that would replace one the
-principal set is held. A proposal never renders. Retiring a fact
-and editing the company profile stay the principal's alone.
+in force at once, as the principal's is: a teammate is a full user, and what
+the Executive may do with what it knows is Approvals' to decide, not a hold on
+the fact. A fact about the speaker alone (``about_me``: their own mailbox,
+sign-off, how they work) is kept private to them (``memory.facts``).
+Retiring a team fact and editing the company profile stay the principal's.
 The principal's own email (their primary address, DMARC passing, not mail
 they forwarded) is checked like chat, then held: the change applies only when
 a one-time token emailed to that address comes back in their reply
@@ -70,24 +70,43 @@ REMEMBER_FACT_TOOL: dict[str, Any] = {
         "wrong ('Maple House is 48 units, not 52'), or states one they want kept. "
         "One fact per call; correcting a listed STANDING FACT passes its id as "
         "replaces_fact_id (the same subject also replaces it). Business facts "
-        "only, never pay, health, performance or other personal matters. Who may "
+        "only, never pay, health, performance or other personal matters; the one "
+        "exception is how the speaker themselves wants their own work handled "
+        "(their mailbox, sign-off, how they like things done): pass about_me: "
+        "true and it is kept for them alone. Who may "
         "record one is checked when it runs: the principal from a verified "
         "conversation or by email from their own address (held until they "
         "confirm by reply); a teammate on the People list from the web app or "
-        "their own Slack or Discord, kept as theirs (per their name) and waiting "
-        "for the principal's approval unless trusted. source_quote must be the "
+        "their own Slack or Discord, kept as theirs (per their name) and in use "
+        "at once. source_quote must be the "
         "speaker's exact words from this message, and every figure, name and "
         "date you store must be one they wrote: never your own inference, a "
         "document's figure or a third party's words. For a company-profile field "
         "(industry, headcount, ARR, burn, runway, priorities, ...) use "
-        "update_company_profile instead (open_tools group memory). A decision "
+        "update_company_profile instead (open_tools group memory). A standing rule "
+        "for what must wait ('check with me before you email anyone at acme.com', "
+        "'always ask me before anything over $5,000') is not a fact: add it to Your rules "
+        "with do_in_app add_waits_rule (open_tools group app; id \"new\") so it holds "
+        "every step, and say so. With no do_in_app to call (the review after a chat), "
+        "raise it in the brief if raise_in_brief is offered. A decision "
         "the speaker states they made ('we're going with the Q1 hire', 'we "
         "won't renew Acme') is kept the same way with decision: true, so the "
-        "weekly review can ask later how it turned out."
+        "weekly review can ask later how it turned out. A decision made in the "
+        "speaker's own private conversation is kept private to them (the "
+        "result says so): tell them, and that they can share it with the team "
+        "by asking (do_in_app share_decision) or on the Memory page."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
+            "about_me": {
+                "type": "boolean",
+                "description": (
+                    "True when the fact is about the speaker alone, not the team's "
+                    "business: e.g. 'emails sent from my mailbox end with my title'. "
+                    "Kept private to them."
+                ),
+            },
             "decision": {
                 "type": "boolean",
                 "description": "True when this is a decision the speaker made, not a fact.",
@@ -322,6 +341,7 @@ def _gate(tool: str, *, teammates: bool = False) -> tuple[str | None, bool, Any]
     their People row); ``held`` is True on the principal's email, where the
     change waits for their confirming reply."""
     from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
+    from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
 
     session = _session()
     if not getattr(session, "unattended", False):
@@ -342,9 +362,9 @@ def _gate(tool: str, *, teammates: bool = False) -> tuple[str | None, bool, Any]
         tool,
         f"refused: {who} can change what the Executive keeps as fact, and this "
         "request did not come from a conversation that confirms who is asking. "
-        "Tell whoever asked that the principal needs to tell you — in the web "
-        "app, in their own Slack or Discord, or by email from their own address "
-        "(which they then confirm by reply).",
+        "Tell whoever asked, plainly, that the principal can tell you — in the "
+        "web app, in their own Slack or Discord, or by email from their own "
+        f"address (which they then confirm by reply). {PASS_ON_NOTHING}",
         refused=True, **_caller_context(session),
     ), False, None
 
@@ -593,6 +613,39 @@ def _provenance(session: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def own_chat_person(session: Any) -> int | None:
+    """The person whose own conversation this turn is
+    (``orchestrator.speaker.own_private_speaker``: the web chat not shared
+    with teammates, their own DM, a call with the Executive). None for a
+    shared chat or channel, a meeting with others, an email, a run nobody is
+    watching, or when it can't be told. A decision made there is private to them
+    (``memory.facts``), and their private decisions are read back there."""
+    from openexecutive.orchestrator.speaker import own_private_speaker
+
+    person = own_private_speaker(session) if session is not None else None
+    person_id = getattr(person, "id", None)
+    return person_id if isinstance(person_id, int) else None
+
+
+def private_owner(session: Any) -> int | None:
+    """Who what this turn makes is private to: ``own_chat_person`` on a team
+    install. A decision recorded or a task made in someone's own chat is
+    theirs (``memory.facts``, ``attunement.open_loops.visible_to``). A step
+    carried out from a card keeps the turn that held it
+    (``Session.private_to``). A solo install has nobody to keep it from."""
+    try:
+        from openexecutive.memory.workspace_settings import effective_workspace_mode
+
+        if effective_workspace_mode(session) == "solo":
+            return None
+    except Exception:  # noqa: BLE001 - unknown mode: treat as a team.
+        logger.warning("fact_tools: workspace mode unreadable", exc_info=True)
+    kept = getattr(session, "private_to", None) if session is not None else None
+    if isinstance(kept, int) and not isinstance(kept, bool):
+        return kept
+    return own_chat_person(session)
+
+
 def _remember_fact(tool_input: dict[str, Any]) -> str | _Hold:
     from openexecutive.memory import facts
 
@@ -639,21 +692,38 @@ def _remember_fact(tool_input: dict[str, Any]) -> str | _Hold:
         return _bad(tool, "replaces_fact_id must be the N of a listed '[fact N]'")
     if replaces is not None:
         existing = facts.get_fact(replaces)
-        if existing is None or existing.status != "active" or existing.kind == "profile":
+        if (
+            existing is None or existing.status != "active" or existing.kind == "profile"
+            # Someone else's private decision does not exist for this speaker.
+            or not facts.readable(existing, own_chat_person(session))
+        ):
             return _bad(tool, f"no standing fact {replaces}. Check the '[fact N]' ids and call again.")
 
     decision = tool_input.get("decision") is True
+    about_me = tool_input.get("about_me") is True
+    if about_me:
+        owner = _speaker_id(teammate)
+        if owner is None:
+            # Kept for them alone or not at all: never the team's by default.
+            return _bad(tool, "couldn't tell who is speaking, so this can't be kept for them alone. "
+                              "Tell them it wasn't saved.")
+    elif decision and not held:
+        # A decision made in the speaker's own chat is theirs until they
+        # share it. Not one held for an emailed confirmation (never a chat).
+        owner = private_owner(session)
+    else:
+        owner = None
     args: dict[str, Any] = {
         "subject": subject, "statement": statement, "source_quote": quote,
         "previous_statement": previous, "replaces_fact_id": replaces,
         # Left out (None), an edit of a decision stays one (record_fact).
         "decision": True if decision else None,
         "department": _department(tool_input) if decision else None,
+        "private_to_person_id": owner,
     }
     provenance = _provenance(session)
     if teammate is not None:
-        # Attributed. Whether the principal asked to approve this teammate's
-        # facts first is read by record_fact, in the write's own transaction.
+        # Attributed: rendered "(per <name>)" wherever it is read.
         provenance.update(
             recorded_by_person_id=teammate.id, recorded_by_role="teammate",
             recorded_by_name=teammate.full_name,
@@ -665,6 +735,22 @@ def _remember_fact(tool_input: dict[str, Any]) -> str | _Hold:
         )
         return _Hold(tool, {"tool": tool, "args": args, "provenance": provenance}, summary)
     return _apply_remember(args, provenance)
+
+
+def _speaker_id(teammate: Any) -> int | None:
+    """The People id of the verified speaker ``_gate`` let through: the
+    teammate, else the principal. None when it can't be told (an about-me
+    fact is then refused)."""
+    if teammate is not None:
+        return getattr(teammate, "id", None)
+    try:
+        from openexecutive.people import registry as people_registry
+
+        principal = people_registry.get_principal()
+        return principal.id if principal is not None else None
+    except Exception:  # noqa: BLE001 - nobody's: the caller refuses.
+        logger.warning("fact_tools: couldn't tell who the principal is", exc_info=True)
+        return None
 
 
 def _department(tool_input: dict[str, Any]) -> str:
@@ -682,14 +768,11 @@ def _department(tool_input: dict[str, Any]) -> str:
 
 def _apply_remember(args: dict[str, Any], provenance: dict[str, Any]) -> str:
     """Store a checked fact: at once from chat, or on the principal's
-    confirming reply to an emailed one. A teammate's fact is stored as a
-    proposal when the principal asked to approve theirs, or when it would
-    replace a fact the principal set (theirs outranks)."""
+    confirming reply to an emailed one."""
     from openexecutive.memory import facts
 
     tool = "remember_fact"
     subject, statement = args["subject"], args["statement"]
-    outranked: Any = None
     record: dict[str, Any] = {
         "subject": subject, "statement": statement, "source_quote": args["source_quote"],
         "previous_statement": args["previous_statement"],
@@ -697,20 +780,11 @@ def _apply_remember(args: dict[str, Any], provenance: dict[str, Any]) -> str:
         # A fact held for an emailed confirmation before decisions were facts
         # carries neither key.
         "decision": args.get("decision"), "department": args.get("department"),
+        "private_to_person_id": args.get("private_to_person_id"),
         **provenance,
     }
     try:
-        try:
-            fact, superseded = facts.record_fact(**record)
-        except facts.PrincipalFactConflict as conflict:
-            outranked = conflict.fact
-            fact, superseded = facts.record_fact(**record, proposed=True)
-    except facts.TooManyProposals:
-        return _bad(tool, (
-            f"{facts.MAX_PENDING_PROPOSALS_PER_PERSON} of this teammate's facts are already "
-            "waiting for the principal's approval. Tell them it will be kept once the "
-            "principal has reviewed those on the Memory page."
-        ))
+        fact, superseded = facts.record_fact(**record)
     except Exception as exc:
         logger.exception("remember_fact: write failed")
         _audit(tool, False, f"remember_fact FAILED: {type(exc).__name__}", {"error": repr(exc)[:300]})
@@ -719,7 +793,9 @@ def _apply_remember(args: dict[str, Any], provenance: dict[str, Any]) -> str:
                      "recorded; do not retry the same call unchanged."
         })
 
-    if fact.status == "active" and fact.decision and fact.department:
+    private = fact.private_to_person_id is not None
+    # A private decision is not the department's to remember.
+    if fact.status == "active" and fact.decision and fact.department and not private:
         from openexecutive.memory.episodic import _mirror_to_dept_honcho
 
         try:
@@ -731,42 +807,45 @@ def _apply_remember(args: dict[str, Any], provenance: dict[str, Any]) -> str:
             logger.warning("remember_fact: department mirror failed", exc_info=True)
     _audit(
         tool, True,
-        f"remember_fact {fact.id} ({fact.status}): {subject[:60]} — {statement[:80]}",
+        f"remember_fact {fact.id} (private)" if fact.private_to_person_id is not None
+        else f"remember_fact {fact.id} ({fact.status}): {subject[:60]} — {statement[:80]}",
         {
             "fact_id": fact.id, "kind": fact.kind, "status": fact.status,
             "decision": fact.decision, "department": fact.department,
-            "recorded_by_role": fact.recorded_by_role, "subject": subject,
-            "statement": statement, "previous": fact.previous_statement[:300],
+            "recorded_by_role": fact.recorded_by_role,
+            # Not what a private row says: the audit page is read by the
+            # principal, and it is its person's alone.
+            **({"private_to_person_id": fact.private_to_person_id} if private else {
+                "subject": subject, "statement": statement,
+                "previous": fact.previous_statement[:300],
+            }),
             "superseded_ids": [f.id for f in superseded],
-            **({"outranked_by": outranked.id} if outranked is not None else {}),
         },
     )
-    if fact.status == "proposed":
-        why = (
-            f"it would replace fact {outranked.id}, which the principal set themselves, "
-            "and the principal's facts outrank a teammate's"
-            if outranked is not None
-            else "the principal approves this teammate's facts before they are used"
-        )
-        return json.dumps({
-            "status": "awaiting_approval",
-            "fact_id": fact.id,
-            "subject": fact.subject,
-            "statement": fact.statement,
-            "message": (
-                f"Kept as a proposal, not in use yet: {why}. The principal approves "
-                "or declines it on the Memory page. Tell the person you are talking "
-                "to that, and do not describe it as in effect."
-            ),
-        })
     return json.dumps({
         "status": "ok",
         "fact_id": fact.id,
         "kind": fact.kind,
         "subject": fact.subject,
         "statement": fact.statement,
-        "replaced": [{"fact_id": f.id, "statement": f.statement} for f in superseded],
+        # A private row's earlier wording stays out of a result a shared
+        # conversation may read.
+        "replaced": [
+            {"fact_id": f.id, **({} if f.private_to_person_id is not None else {"statement": f.statement})}
+            for f in superseded
+        ],
         **({"attributed_to": fact.recorded_by_name} if fact.recorded_by_role == "teammate" else {}),
+        **({
+            "private": True,
+            "message": (
+                "Kept as their own decision: only they see it, in their chats, briefs "
+                "and Memory page. Tell them that in a few words, and that they can "
+                "share it with the team by asking you or on the Memory page."
+            ) if fact.decision else (
+                "Kept for them alone: it applies to their own chats, emails and "
+                "Memory page, and nobody else reads it."
+            ),
+        } if private else {}),
     })
 
 
@@ -791,7 +870,7 @@ def _forget_fact(tool_input: dict[str, Any]) -> str | _Hold:
     if quote_error:
         return _bad(tool, quote_error, fact_id=fact_id)
     existing = facts.get_fact(fact_id)
-    if existing is None or existing.kind == "profile":
+    if existing is None or existing.kind == "profile" or not facts.readable(existing, own_chat_person(session)):
         return _bad(tool, f"no standing fact {fact_id}")
     if existing.status != "active":
         return _bad(tool, f"fact {fact_id} is not active (already replaced or forgotten)")

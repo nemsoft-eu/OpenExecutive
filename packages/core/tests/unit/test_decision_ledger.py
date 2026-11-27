@@ -140,6 +140,39 @@ def test_idem_key_unique_index_raises(db: Path) -> None:
         _create(db, idem="key-abc")
 
 
+@pytest.mark.parametrize("status", ["failed", "rejected", "auto_no_response"])
+def test_a_step_that_never_happened_gives_its_key_up(db: Path, status: str) -> None:
+    """Asking again for a booking that failed (or was skipped or lapsed)
+    makes a new step: before, the old row kept the key and every retry failed
+    as "internal error recording proposal"."""
+    import sqlite3
+
+    from openexecutive.memory.episodic import _get_conn
+
+    first = _create(db, idem="key-again")
+    with _get_conn(db) as conn:
+        conn.execute("UPDATE decision_instances SET status = ? WHERE id = ?", (status, first))
+    second = _create(db, idem="key-again")
+    assert second != first
+    assert get_live_by_idem("key-again", db_path=db).id == second
+    with pytest.raises(sqlite3.IntegrityError):
+        _create(db, idem="key-again")
+
+
+@pytest.mark.parametrize("status", ["executed", "approved_unchanged", "closed_externally"])
+def test_a_step_that_went_keeps_its_key(db: Path, status: str) -> None:
+    """The key then says it was done: the same thing is not made again."""
+    import sqlite3
+
+    from openexecutive.memory.episodic import _get_conn
+
+    first = _create(db, idem="key-done")
+    with _get_conn(db) as conn:
+        conn.execute("UPDATE decision_instances SET status = ? WHERE id = ?", (status, first))
+    with pytest.raises(sqlite3.IntegrityError):
+        _create(db, idem="key-done")
+
+
 def test_get_live_by_idem(db: Path) -> None:
     iid = _create(db, idem="key-xyz")
     found = get_live_by_idem("key-xyz", db_path=db)

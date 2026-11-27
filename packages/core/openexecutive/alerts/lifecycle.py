@@ -7,7 +7,13 @@ a deterministic lifetime and one read helper every surface shares:
 
 - :func:`ttl_days_for` — per-category TTL (monitoring vs action), from
   settings; ``None`` for sources that own their own lifecycle (artifacts
-  persist in the gallery, decision-backed alerts end via approve/reject).
+  persist in the gallery, a roster request ends with its request). A waiting
+  step's card has a TTL too: past it, the step lapses (``settle``).
+- :func:`settle` — the one way the tidy-up closes a card on its own (the
+  sweep below and the review in ``alerts.review``): the card closes, a
+  waiting step behind it lapses (never ran, nothing learned), and the card
+  is stamped with when and why for its reader's Tidied up list, where Undo
+  puts it back (``POST /alerts/{id}/reopen``).
 - :func:`is_expired` — pure predicate over an ``Alert`` + ``now``.
 - :func:`list_live_alerts` — ``unread`` rows that are neither past their TTL
   nor snoozed. ``/today``, the chat ``<briefing>`` block, the briefs and the
@@ -48,6 +54,11 @@ _SWEEP_PAGE = 5000
 TTL_EXEMPT_SOURCES: frozenset[str] = frozenset(
     {"artifact", "decision_scheduling", "roster_request"}
 )
+# Of those, the ones that never expire. A waiting step's card does: past its
+# TTL the step lapses through ``settle``, the only path that closes the step
+# with its card.
+_NEVER_EXPIRE: frozenset[str] = frozenset({"artifact", "roster_request"})
+_DECISION_SOURCE = "decision_scheduling"
 
 
 def parse_aware(iso: str | None) -> datetime | None:
@@ -89,7 +100,7 @@ def ttl_days_for(alert: Alert, *, monitoring_days: int, action_days: int) -> int
     ``0`` (or a negative value) for a category disables expiry for it — the
     knob an operator uses to keep an old backlog when upgrading.
     """
-    if alert.source in TTL_EXEMPT_SOURCES:
+    if alert.source in _NEVER_EXPIRE:
         return None
     from openexecutive.briefing.ranking import categorize
 
@@ -159,12 +170,21 @@ def list_live_alerts(
     *,
     now: datetime | None = None,
     viewer: object | None = None,
+    chat_reader: int | None = None,
+    whole_board: bool = False,
 ) -> list[Alert]:
     """``unread`` alerts that are still live: not past TTL, not snoozed.
+
+    ``whole_board`` is the tidy-up's own read (``alerts.review``): every
+    live card, one person's included, because it shows none of them to
+    anyone; it keeps each one-person card to its own reader itself.
 
     A drafted artifact is its owner's alone (``models.visible_alert``): it is
     kept only for the ``viewer`` it belongs to, and left out with no viewer —
     the board the review, the reflection and the shared digests read.
+    A card from one person's own chat (``alerts.own_chat``) is kept for
+    that person and its approver alone, and left out with no viewer unless
+    ``chat_reader`` names whose build this is (the principal's own brief).
 
     Newest first, like ``store.list_alerts``. This is the read every
     user-facing surface shares; the sweep merely persists what this view
@@ -178,51 +198,125 @@ def list_live_alerts(
     # sweeps) freshly-expired rows are interleaved with live ones, so a
     # `limit`-sized page could come back short.
     rows = list_alerts(status="unread", limit=max(limit * 3, limit + 50), db_path=db_path)
+    from openexecutive.alerts import own_chat
+
+    own = own_chat.readers(rows)
     live = [
         a for a in rows
         if not is_expired(a, now, monitoring_days=monitoring_days, action_days=action_days)
         and not _is_snoozed(a, now)
-        and visible_alert(a, viewer)
+        and (whole_board or visible_alert(a, viewer, chat_reader=chat_reader, own_chat_readers=own))
     ]
     return live[:limit]
+
+
+def _lapse_step(alert: Alert, db_path: Path | None) -> tuple[bool, int | None]:
+    """A waiting step's card closes only with its step: lapse the step first.
+    (whether the card may close, the step lapsed now or None): it may close
+    with no step behind it, with the step lapsed now, or when the step was
+    already answered elsewhere and only its card was left."""
+    from openexecutive.memory import decision_ledger
+
+    instance_id = decision_ledger.instance_id_of(alert)
+    if instance_id is None:
+        return alert.source != _DECISION_SOURCE, None
+    if decision_ledger.lapse(instance_id, db_path=db_path):
+        return True, instance_id
+    found = decision_ledger.get_decision_instance(instance_id, db_path=db_path)
+    return found is None or found.status not in decision_ledger.OPEN_STATUSES, None
+
+
+def step_lapsed(instance_id: int, *, lapsed: bool, db_path: Path | None = None) -> None:
+    """Tell a waiting step's own class it lapsed (or, on Undo, waits again),
+    the way Skip runs its close-out (``decisions.after_lapse``). Best effort."""
+    try:
+        from openexecutive.api.routes.decisions import run_after_lapse
+
+        run_after_lapse(instance_id, lapsed=lapsed, db_path=db_path)
+    except Exception:
+        logger.warning("lifecycle: a lapsed step's close-out failed for %s", instance_id, exc_info=True)
+
+
+def unlapse_step(instance_id: int, *, db_path: Path | None = None) -> bool:
+    """Undo of a lapse: the step waits again, its class told so. False when
+    it was answered or asked for again since (``decision_ledger.unlapse``)."""
+    from openexecutive.memory import decision_ledger
+
+    if not decision_ledger.unlapse(instance_id, db_path=db_path):
+        return False
+    step_lapsed(instance_id, lapsed=False, db_path=db_path)
+    return True
+
+
+def settle(
+    alert: Alert,
+    status: str,
+    reason: str,
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Close one card on the Executive's own: to ``status`` (``resolved``,
+    ``dismissed`` or ``expired``), its waiting step lapsed, stamped with
+    ``reason`` for its reader's Tidied up list. False (and nothing changed)
+    when the card was answered meanwhile or its step is running."""
+    from openexecutive.alerts.store import set_status_if_open, stamp_tidied
+    from openexecutive.memory import decision_ledger
+
+    if alert.id is None:
+        return False
+    may_close, lapsed = _lapse_step(alert, db_path)
+    if not may_close:
+        return False
+    if not set_status_if_open(alert.id, status, db_path=db_path):
+        if lapsed is not None:
+            # Answered meanwhile: the step is not ours to have lapsed.
+            decision_ledger.unlapse(lapsed, db_path=db_path)
+        return False
+    if lapsed is not None:
+        step_lapsed(lapsed, lapsed=True, db_path=db_path)
+    stamp_tidied([alert.id], reason, at=(now or datetime.now(UTC)).isoformat(), db_path=db_path)
+    resolve_alert_outreach(alert, status)
+    return True
+
+
+def _age_reason(days: int) -> str:
+    return f"No change in {days} days."
 
 
 def expire_stale_alerts(
     now: datetime | None = None,
     db_path: Path | None = None,
 ) -> int:
-    """Flip every past-TTL ``unread`` alert to ``expired``. Returns the count.
+    """Settle every past-TTL ``unread`` alert as ``expired`` (:func:`settle`).
+    Returns the count.
 
     Audited as ``alert_sweep`` (actor ``scheduler``) whenever at least one row
     changed, with the ids so the reopen path is one click away. Never raises:
     a sweep failure is logged and reported as ``0`` so the scheduler tick
     continues.
     """
-    from openexecutive.alerts.store import bulk_set_status, list_alerts
+    from openexecutive.alerts.store import list_alerts
 
     now = now or datetime.now(UTC)
+    expired_ids: list[int] = []
+    monitoring_days, action_days = _ttl_settings()
     try:
-        monitoring_days, action_days = _ttl_settings()
         rows = list_alerts(status="unread", limit=_SWEEP_PAGE, db_path=db_path)
-        expired_ids = [
-            a.id for a in rows
-            if a.id is not None
-            and is_expired(a, now, monitoring_days=monitoring_days, action_days=action_days)
-        ]
-        if not expired_ids:
-            return 0
-        changed = bulk_set_status(
-            EXPIRED_STATUS, alert_ids=expired_ids, only_status="unread", db_path=db_path
-        )
-        count = len(changed)
+        for a in rows:
+            if a.id is None:
+                continue
+            days = ttl_days_for(a, monitoring_days=monitoring_days, action_days=action_days)
+            if days is None or not is_expired(
+                a, now, monitoring_days=monitoring_days, action_days=action_days
+            ):
+                continue
+            if settle(a, EXPIRED_STATUS, _age_reason(days), now=now, db_path=db_path):
+                expired_ids.append(a.id)
     except Exception:
+        # Each card settled on its own: still audit the ones that did.
         logger.exception("alerts.lifecycle: expiry sweep failed")
-        return 0
-    # An alert nobody acted on before its TTL didn't matter: void the review's
-    # DMs about it rather than leave them counted as ignored.
-    for alert_id in expired_ids:
-        resolve_alert_outreach(_AlertRef(alert_id), EXPIRED_STATUS)
-
+    count = len(expired_ids)
     if count:
         try:
             from openexecutive.audit import log_event as audit_log
@@ -261,15 +355,7 @@ def mute_pattern_for(alert: Alert) -> str | None:
     return tags[0] if tags else None
 
 
-class _AlertRef:
-    """Just enough of an Alert for :func:`resolve_alert_outreach` to void it."""
-
-    def __init__(self, alert_id: int) -> None:
-        self.id: int | None = alert_id
-        self.routed_to_person_id: int | None = None
-
-
-def resolve_alert_outreach(alert: Alert | _AlertRef, status: str) -> None:
+def resolve_alert_outreach(alert: Alert, status: str) -> None:
     """Resolve the Attunement outcome rows for review DMs about ``alert``.
 
     Acknowledged or resolved: the DMs to the person it is routed to (and to
@@ -375,6 +461,9 @@ __all__ = [
     "RESOLVED_STATUS",
     "TTL_EXEMPT_SOURCES",
     "expire_stale_alerts",
+    "settle",
+    "step_lapsed",
+    "unlapse_step",
     "is_expired",
     "is_live",
     "list_live_alerts",

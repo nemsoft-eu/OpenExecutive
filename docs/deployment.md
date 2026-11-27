@@ -29,8 +29,8 @@ containers. The UI is stateless and scales freely.
 
 | Component | Dockerfile | Published image | State |
 |---|---|---|---|
-| API | [docker/Dockerfile](../docker/Dockerfile) | `ghcr.io/sentelabsai/openexecutive-api` | One persistent volume at `/data` |
-| UI | [docker/Dockerfile.ui](../docker/Dockerfile.ui) | `ghcr.io/sentelabsai/openexecutive-ui` | Stateless |
+| API | [docker/Dockerfile](../docker/Dockerfile) | `ghcr.io/foreactlabs/openexecutive-api` | One persistent volume at `/data` |
+| UI | [docker/Dockerfile.ui](../docker/Dockerfile.ui) | `ghcr.io/foreactlabs/openexecutive-ui` | Stateless |
 
 The UI never talks to the API directly from the browser. It proxies through its
 own server (`/api/backend/*`), stamping the shared secret on each upstream call,
@@ -99,9 +99,13 @@ release. If the images fail, no release is
 created; re-running the failed job from the Actions UI creates it once the
 images succeed. A release that already exists for the tag is left alone.
 
-The images are `linux/amd64` only. The API image bakes the embedding models at
-build time (see the Dockerfile), which makes an emulated arm64 build
-impractically slow.
+The images are published for `linux/amd64` and `linux/arm64`: each tag is a
+multi-platform manifest list, so `docker pull` picks the host's platform. Each
+platform is built natively on its own GitHub-hosted runner (`ubuntu-24.04` and
+`ubuntu-24.04-arm`), never under QEMU, because the API image bakes torch and
+the embedding models at build time (see the Dockerfile), which would make an
+emulated build impractically slow. A tag appears only once both platforms of
+that image have built.
 
 > **First publish:** GitHub creates each package as private. An org admin makes
 > `openexecutive-api` and `openexecutive-ui` public once under the org's
@@ -396,9 +400,7 @@ No restart is needed. The address must be the owner's email on the People
 page, and it must not be the Executive's own `EXEC_EMAIL_ADDRESS`. Then turn
 it on in Delegate → Act as me; the setup status page shows the connection.
 
-**Team members (optional).** Set `DELEGATION_TEAM_MEMBERS=true` and the owner
-gets **Let team members use it** in Delegate → Act as me. Once they turn it
-on, each team member connects their own Gmail or Outlook the same way (the script with
+**Team members.** Each team member connects their own Gmail or Outlook the same way (the script with
 their own address, one file each in the same directory) and turns it on for
 themselves. A team member's mail, drafts, reply cards and audit rows are
 theirs alone: the owner sees only who uses it and how much.
@@ -436,8 +438,8 @@ host's Docker. Upgrade from the host instead.
    ```
 
    From the published images: change the image tags to the new release
-   (`ghcr.io/sentelabsai/openexecutive-api:X.Y.Z` and
-   `ghcr.io/sentelabsai/openexecutive-ui:X.Y.Z`), then
+   (`ghcr.io/foreactlabs/openexecutive-api:X.Y.Z` and
+   `ghcr.io/foreactlabs/openexecutive-ui:X.Y.Z`), then
 
    ```bash
    docker compose pull

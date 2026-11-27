@@ -241,3 +241,88 @@ async def test_company_broadcast_unknown_integration(isolated_db: Path) -> None:
     )
     assert "error" in result
     assert "unknown integration" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Google Chat (posted as the Chat app)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_department_message_google_chat_happy_path(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dept_store.update_department(
+        "finance", google_chat_space="spaces/AAAAfin", db_path=isolated_db
+    )
+    captured = _stub_post(monkeypatch, "_post_google_chat_space", {"status": "sent", "channel": "spaces/AAAAfin"})
+
+    result = json.loads(
+        await broadcast_tools.handle_send_department_message({
+            "department_slug": "finance",
+            "integration": "google_chat",
+            "text": "Budget review moved to Friday",
+        })
+    )
+
+    assert result["status"] == "sent"
+    assert captured["channel_id"] == "spaces/AAAAfin"
+
+
+@pytest.mark.asyncio
+async def test_company_broadcast_google_chat_posts_to_the_announcement_space(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.integrations import google_chat
+
+    monkeypatch.setattr(google_chat, "announce_space", lambda: "spaces/AAAAall")
+    captured = _stub_post(monkeypatch, "_post_google_chat_space", {"status": "sent", "channel": "spaces/AAAAall"})
+
+    result = json.loads(
+        await broadcast_tools.handle_send_company_broadcast({
+            "integration": "google_chat",
+            "text": "Q3 plan shipped",
+        })
+    )
+    assert result["status"] == "sent"
+    assert captured == {"channel_id": "spaces/AAAAall", "text": "Q3 plan shipped"}
+
+
+@pytest.mark.asyncio
+async def test_company_broadcast_google_chat_without_a_space_says_how_to_add_one(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.integrations import google_chat
+
+    monkeypatch.setattr(google_chat, "announce_space", lambda: None)
+
+    result = json.loads(
+        await broadcast_tools.handle_send_company_broadcast({
+            "integration": "google_chat",
+            "text": "hi",
+        })
+    )
+    assert "GOOGLE_CHAT_DEFAULT_SPACE" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_google_chat_post_goes_through_post_to_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.integrations import google_chat
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(google_chat, "post_to_space", lambda space, text: sent.append((space, text)))
+    assert await broadcast_tools._post_google_chat_space("spaces/AAAAx", "hello") == {
+        "status": "sent", "channel": "spaces/AAAAx",
+    }
+    assert sent == [("spaces/AAAAx", "hello")]
+
+    def _boom(space: str, text: str) -> None:
+        raise RuntimeError("403 https://chat.googleapis.com/v1/spaces/AAAAx/messages details")
+
+    monkeypatch.setattr(google_chat, "post_to_space", _boom)
+    # The raw error stays in the log, never in what the model reads.
+    assert await broadcast_tools._post_google_chat_space("spaces/AAAAx", "hello") == {"error": "google chat post failed"}
+
+
+def test_both_tools_offer_google_chat() -> None:
+    for tool in (broadcast_tools.SEND_DEPARTMENT_MESSAGE_TOOL, broadcast_tools.SEND_COMPANY_BROADCAST_TOOL):
+        assert "google_chat" in tool["input_schema"]["properties"]["integration"]["enum"]

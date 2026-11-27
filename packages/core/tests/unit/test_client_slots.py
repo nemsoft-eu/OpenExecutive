@@ -10,6 +10,7 @@ round-trip contract under test.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -233,14 +234,33 @@ async def test_create_from_current_snapshots_original_company(
     await create_client_slot(env.settings, display_name="My Real Co", source="current")
     assert snapshots == ["taken"]
 
-    # An existing backup is never overwritten by a later create.
+    # An older backup is never reused: a later create saves your company
+    # again, so unload brings back this copy and not the first one.
     backup = env.company / "_user_backup"
     backup.mkdir(exist_ok=True)
     (backup / "profile.yaml").write_text("name: Original\n")
     # Exit client mode, then re-enter via a fresh create-from-current.
     (env.company / "_client_slots" / ".active_client").unlink()
     await create_client_slot(env.settings, display_name="Second", source="current")
-    assert snapshots == ["taken"]  # no second snapshot
+    assert snapshots == ["taken", "taken"]
+
+
+async def test_create_from_current_stops_when_the_snapshot_fails(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entering client mode without a fresh copy of your company would let
+    unload bring back an older one, so a failed snapshot stops the create
+    before any client exists."""
+    _seed_live_company(env, "My Real Co")
+
+    def _fail(_settings: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(slots, "snapshot_user_state", _fail)
+    with pytest.raises(slots.ClientSnapshotError, match="Nothing was changed"):
+        await create_client_slot(env.settings, display_name="Acme", source="current")
+    assert not (env.company / "_client_slots" / "acme").exists()
+    assert get_active_client(env.settings) is None
 
 
 async def test_save_active_client_checkpoints_without_switching(env: SimpleNamespace) -> None:
@@ -644,3 +664,299 @@ async def test_executive_pause_survives_switch_to_a_pre_pause_slot(
     state = pause_store.get_pause_state()
     assert state.paused is True
     assert state.reason == "holiday"
+
+
+async def test_switch_forgets_the_old_clients_agent_overrides(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overrides are cached with no expiry; a switch must drop them."""
+    from openexecutive.agents import overrides
+
+    monkeypatch.setattr(overrides, "DB_PATH", env.db_path)
+    overrides.initialize_overrides_db(env.db_path)
+    _seed_live_company(env)
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    overrides.set_override("finance", instructions="Acme's voice.", instructions_set=True)
+    await create_client_slot(env.settings, display_name="Acme", source="current")
+    assert overrides.get_override("finance") is not None  # now in memory
+    await activate_client_slot(env.settings, "beta")
+    try:
+        assert overrides.get_override("finance") is None
+    finally:
+        overrides.invalidate_cache()
+
+
+async def test_every_slot_restore_forgets_the_cached_overrides(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rotation's recovery restores a slot without activate_client_slot,
+    so the restore itself must drop the cache."""
+    from openexecutive.agents import overrides
+
+    monkeypatch.setattr(overrides, "DB_PATH", env.db_path)
+    overrides.initialize_overrides_db(env.db_path)
+    _seed_live_company(env)
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    overrides.set_override("finance", instructions="Acme's voice.", instructions_set=True)
+    assert overrides.get_override("finance") is not None  # now in memory
+    await slots._restore_slot_state(env.settings, slots._slot_dir(env.settings, "beta"))
+    try:
+        assert overrides.get_override("finance") is None
+    finally:
+        overrides.invalidate_cache()
+
+
+async def test_blank_switch_empties_a_table_nobody_listed(env: SimpleNamespace) -> None:
+    """A blank slot gets the factory reset's sweep, so a table added later
+    doesn't carry the previous client's rows into it."""
+    _seed_live_company(env)
+    with sqlite3.connect(str(env.db_path)) as conn:
+        conn.execute("CREATE TABLE brand_new_feature (note TEXT)")
+        conn.execute("INSERT INTO brand_new_feature VALUES ('acme only')")
+    await create_client_slot(env.settings, display_name="Acme", source="current")
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    await activate_client_slot(env.settings, "beta")
+    with sqlite3.connect(str(env.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM brand_new_feature").fetchone()[0] == 0
+
+
+async def test_blank_switch_then_unload_brings_every_table_back(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first switch from your own company into a blank client sweeps
+    every table; unload must bring all of them back, not only the ones the
+    snapshot files cover."""
+    from openexecutive.cli import fixture_loader
+    from openexecutive.knowledge.store import ChromaDBStore
+
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+
+    class _NoStore:
+        def __init__(self, *a: Any, **k: Any) -> None: ...
+
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+    for name in dir(ChromaDBStore):
+        if name.endswith("_COLLECTION"):
+            setattr(_NoStore, name, getattr(ChromaDBStore, name))
+    monkeypatch.setattr("openexecutive.knowledge.store.ChromaDBStore", _NoStore)
+
+    _seed_live_company(env, "My Real Co")
+    with sqlite3.connect(str(env.db_path)) as conn:
+        conn.execute("CREATE TABLE brand_new_feature (note TEXT)")
+        conn.execute("INSERT INTO brand_new_feature VALUES ('mine')")
+        conn.execute("CREATE TABLE IF NOT EXISTS eval_scenarios (note TEXT)")
+        conn.execute("INSERT INTO departments_meta (key, value) VALUES ('mine_only', 'x')")
+    # A job mid-run when the copy is taken.
+    from openexecutive.memory import episodic
+
+    episodic.insert_scheduled_action(
+        run_at="2099-01-01T00:00:00+00:00", channel="email", channel_ref="pat@example.com",
+        intent_text="Call the bank", kind="reminder",
+    )
+    rotation_id = episodic.insert_scheduled_action(
+        run_at="2099-01-01T00:00:00+00:00", channel="__internal__", channel_ref="practice",
+        intent_text="Rotate clients", kind="client_rotation",
+    )
+    # Pending when saved, its time passed before unload: it would fire late.
+    overdue_id = episodic.insert_scheduled_action(
+        run_at="2020-01-01T00:00:00+00:00", channel="email", channel_ref="pat@example.com",
+        intent_text="Follow up with Pat", kind="ad_hoc",
+    )
+    future_id = episodic.insert_scheduled_action(
+        run_at="2099-01-01T00:00:00+00:00", channel="email", channel_ref="pat@example.com",
+        intent_text="Renewal reminder", kind="ad_hoc",
+    )
+    # Only a little late (a short time away, like the overnight rotation):
+    # it still runs.
+    just_due_id = episodic.insert_scheduled_action(
+        run_at=(datetime.now(UTC) - timedelta(minutes=10)).isoformat(), channel="email",
+        channel_ref="pat@example.com", intent_text="Call Pat back", kind="ad_hoc",
+    )
+    # Still running in this process when the copy comes back: its handler
+    # finishes it and chains the next run, so the restore leaves it alone.
+    in_flight_id = episodic.insert_scheduled_action(
+        run_at="2020-01-01T00:00:00+00:00", channel="__internal__", channel_ref="weekly",
+        intent_text="Scheduled run of dynamic workflow: Weekly", kind="dynamic_workflow",
+    )
+    from openexecutive.scheduler import runner
+
+    in_flight = episodic.get_scheduled_action(in_flight_id)
+    assert in_flight is not None
+    # Same id, another job: a row of another company's copy is not in flight.
+    monkeypatch.setattr(runner, "_inflight_actions", {
+        (in_flight_id, "dynamic_workflow", in_flight.run_at),
+        (rotation_id, "reminder", "2099-01-01T00:00:00+00:00"),
+    })
+    with sqlite3.connect(str(env.db_path)) as conn:
+        conn.execute(
+            "UPDATE scheduled_actions SET status = 'running' "
+            "WHERE kind IN ('reminder', 'client_rotation', 'dynamic_workflow')"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS audit_log (note TEXT)")
+        conn.execute("INSERT INTO audit_log VALUES ('mine')")
+        conn.execute("CREATE TABLE IF NOT EXISTS dynamic_workflows (name TEXT)")
+        conn.execute("INSERT INTO dynamic_workflows VALUES ('mine')")
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    await activate_client_slot(env.settings, "beta")
+    with sqlite3.connect(str(env.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM brand_new_feature").fetchone()[0] == 0
+        # Written while away: not the company's, so unload keeps it.
+        conn.execute("INSERT INTO eval_scenarios VALUES ('written meanwhile')")
+        # A blank client starts with no workflows; yours are in the snapshot.
+        assert conn.execute("SELECT COUNT(*) FROM dynamic_workflows").fetchone()[0] == 0
+        # The client's own: they stay in its slot, not in your company.
+        conn.execute("INSERT INTO audit_log VALUES ('beta')")
+        # A one-time marker describes the data saved with it, so the saved
+        # copy's own comes back, not whatever is live at unload.
+        conn.execute("INSERT OR REPLACE INTO departments_meta (key, value) VALUES ('mine_only', 'x')")
+        conn.execute("DELETE FROM departments_meta WHERE key = 'mine_only'")
+        conn.execute("INSERT INTO dynamic_workflows VALUES ('beta')")
+
+    summary = await fixture_loader.unload_fixture(env.settings)
+
+    assert summary["database_restored"] is True
+    # Used once: a second unload can't roll your work back to it.
+    assert not (env.company / "_user_backup" / "state.db").exists()
+    with sqlite3.connect(str(env.db_path)) as conn:
+        assert conn.execute("SELECT note FROM brand_new_feature").fetchall() == [("mine",)]
+    assert _decision_summaries(env.db_path) == ["My Real Co decision"]
+    assert get_active_client(env.settings) is None
+    with sqlite3.connect(str(env.db_path)) as conn:
+        assert conn.execute("SELECT note FROM eval_scenarios").fetchall() == [("written meanwhile",)]
+        assert conn.execute("SELECT note FROM audit_log").fetchall() == [("mine",)]
+        assert conn.execute("SELECT name FROM dynamic_workflows").fetchall() == [("mine",)]
+        assert conn.execute(
+            "SELECT value FROM departments_meta WHERE key = 'mine_only'"
+        ).fetchall() == [("x",)]
+        # A job running when the copy was saved finished here: it is closed,
+        # never run a second time (a rotation, a send).
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE kind = 'reminder'"
+        ).fetchall() == [("cancelled",)]
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE id = ?", (rotation_id,)
+        ).fetchall() == [("cancelled",)]
+        # Long-overdue rows are closed; one still to come stays the user's.
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE id = ?", (overdue_id,)
+        ).fetchall() == [("cancelled",)]
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE id = ?", (future_id,)
+        ).fetchall() == [("pending",)]
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE id = ?", (just_due_id,)
+        ).fetchall() == [("pending",)]
+        assert conn.execute(
+            "SELECT status FROM scheduled_actions WHERE id = ?", (in_flight_id,)
+        ).fetchall() == [("running",)]
+
+
+async def test_eval_scenarios_stay_across_every_switch(env: SimpleNamespace) -> None:
+    """The scenarios people wrote belong to the instance: switching into a
+    saved client keeps the live ones, as a blank switch and unload do."""
+    from openexecutive.evals.persistence import create_user_scenario
+
+    _seed_live_company(env)
+    await create_client_slot(env.settings, display_name="Acme", source="current")
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    await activate_client_slot(env.settings, "beta")
+    create_user_scenario("written-in-beta", "chat", "name: x\n", db_path=env.db_path)
+    # A copy saved before the table existed must still take the live rows.
+    with sqlite3.connect(str(env.company / "_client_slots" / "acme" / "state.db")) as conn:
+        conn.execute("DROP TABLE IF EXISTS eval_scenarios")
+    await activate_client_slot(env.settings, "acme")  # a saved slot
+    with sqlite3.connect(str(env.db_path)) as conn:
+        assert conn.execute("SELECT id FROM eval_scenarios").fetchall() == [("written-in-beta",)]
+
+
+async def test_every_first_activation_saves_your_company_again(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older backup is never reused: unload must bring back the company
+    as it was when you left it, not as it was the first time."""
+    _seed_live_company(env, "My Real Co")
+    backup = env.company / "_user_backup"
+    backup.mkdir()
+    (backup / "profile.yaml").write_text("name: Older copy\n")
+    snapshots: list[str] = []
+    monkeypatch.setattr(slots, "snapshot_user_state", lambda s: snapshots.append("taken"))
+
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    await activate_client_slot(env.settings, "beta")
+
+    assert snapshots == ["taken"]
+
+
+async def test_a_failed_snapshot_keeps_the_last_one_and_stops_the_switch(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The earlier backup stays until a new copy is complete, and a switch
+    that couldn't save your company doesn't go on to replace it."""
+    from openexecutive.cli import fixture_loader
+
+    _seed_live_company(env, "My Real Co")
+    fixture_loader.snapshot_user_state(env.settings)
+    saved = env.company / "_user_backup" / "state.db"
+    before = saved.read_bytes()
+
+    real_connect = sqlite3.connect
+
+    class _FailingVacuum:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            if sql.startswith("VACUUM INTO"):
+                raise sqlite3.OperationalError("database or disk is full")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        fixture_loader.sqlite3, "connect", lambda *a, **k: _FailingVacuum(real_connect(*a, **k))
+    )
+    await create_client_slot(env.settings, display_name="Beta", source="blank")
+    with pytest.raises(slots.ClientSlotError):
+        await activate_client_slot(env.settings, "beta")
+    monkeypatch.setattr(fixture_loader.sqlite3, "connect", real_connect)
+
+    assert saved.read_bytes() == before
+    assert get_active_client(env.settings) is None
+    assert _decision_summaries(env.db_path) == ["My Real Co decision"]
+
+
+async def test_the_scheduler_is_held_while_a_saved_company_is_put_back(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No tick may claim from the copy between the swap and the settle."""
+    import asyncio
+
+    from openexecutive.cli.fixture_loader import snapshot_user_state
+    from openexecutive.memory import episodic
+    from openexecutive.scheduler import runner
+
+    _seed_live_company(env, "My Real Co")
+    snapshot_user_state(env.settings)
+    held: list[bool] = []
+    real_restore = slots._restore_db_from_file
+    real_settle = episodic.settle_restored_queue
+
+    def _restore(src: Path) -> None:
+        held.append(runner._claim_lock.locked())
+        real_restore(src)
+
+    def _settle(*a: Any, **k: Any) -> int:
+        held.append(runner._claim_lock.locked())
+        return real_settle(*a, **k)
+
+    monkeypatch.setattr(slots, "_restore_db_from_file", _restore)
+    monkeypatch.setattr(episodic, "settle_restored_queue", _settle)
+    await asyncio.to_thread(
+        slots.restore_company_db,
+        env.company / "_user_backup" / "state.db",
+    )
+    assert held == [True, True]
+    assert not runner._claim_lock.locked()

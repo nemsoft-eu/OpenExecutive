@@ -33,6 +33,14 @@ CONTACT = {"full_name": "Mallory", "email": "mallory@evil.example", "kind": "con
 
 
 @pytest.fixture(autouse=True)
+def _careful_holds_no_asked_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite pins Approvals to Careful (tests/conftest.py), which holds
+    every acting step a turn asks for (take_the_lead._asked_hit); these
+    tests are about other checks, so that hold stays out."""
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     path = tmp_path / "episodic.db"
     monkeypatch.setattr(episodic, "DB_PATH", path)
@@ -315,7 +323,7 @@ def test_a_write_after_a_read_is_refused_for_the_rest_of_the_turn(audit: list[di
     )
     assert gateway.calls == [READ_DOC]
     assert _card(provider, "tu2")
-    rows = [r for r in audit if r["details"].get("held") == "outside_content"]
+    rows = [r for r in audit if r["details"].get("held") == "outside_read"]
     assert len(rows) == 1 and rows[0]["details"]["tool"] == WRITE_DOC["name"]
     assert rows[0]["details"]["sources"] == [oc.GATEWAY]
 
@@ -451,7 +459,7 @@ def _owners_mail(quoted: str) -> str:
     from openexecutive.orchestrator.content_trust import wrap_untrusted
 
     return (
-        "The mailbox authenticated this email as the principal's own. Their new text in it:\n"
+        "The mailbox authenticated this email as the sender's own. Their new text in it:\n"
         "Sorting this out now.\n\n"
         + wrap_untrusted(quoted, source="email_quoted", author="owner@co.example")
     )
@@ -472,8 +480,8 @@ def test_a_flagged_quote_in_the_owners_mail_holds_a_new_server_below_hands_off(
 ) -> None:
     # The owner's own mail counts as them, but a stranger's words they quote
     # or forward are checked like any outside read: Balanced holds a flagged
-    # one (a new server can't wait on a card, so it is not run), and Hands-off
-    # runs it, as for every other read.
+    # one (a new server can't wait on a card, so it is not run), and so does
+    # Hands-off: a flagged read drops the turn to Balanced.
     from openexecutive.orchestrator import outside_mode
 
     level = {"mode": outside_mode.OUTSIDERS}
@@ -488,7 +496,7 @@ def test_a_flagged_quote_in_the_owners_mail_holds_a_new_server_below_hands_off(
 
     level["mode"] = outside_mode.TRUST
     provider = _run([load], gateway=_Gateway(), message=message)
-    assert json.loads(_result(provider, "tu1")) == {"ok": True}
+    assert "was not run here" in json.loads(_result(provider, "tu1"))["error"]
 
 
 def test_a_reply_with_no_tool_call_still_flags_the_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,7 +673,7 @@ def test_someone_added_this_turn_gets_no_dm_or_invite() -> None:
         assert held is not None and "added to People" in json.loads(held)["error"]
         sent = json.loads(await schedule_tools.message_person({"person_id": pid, "text": "hi"}))
         assert "added to People" in sent["error"]
-        booked = calendar_tools._resolve_attendees([pid], include_principal=False, max_attendees=5)
+        booked = calendar_tools._resolve_attendees([pid], include_principal=False)
         assert isinstance(booked, dict) and "added to People" in booked["error"]
         oc.end_turn(state)
 
@@ -854,3 +862,71 @@ def test_a_search_of_the_company_drive_is_not_outside() -> None:
     assert oc.source_of("call_tool", {"name": "microsoft_365__search-onedrive-files", "arguments": {}}) is None
 
 
+
+
+def test_who_a_goes_rule_lets_go_is_not_someone_new_on_balanced(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import levels, outside_mode
+    from openexecutive.orchestrator import mcp_gateway as gw
+    from openexecutive.orchestrator import take_the_lead as ttl
+
+    level = {"now": outside_mode.OUTSIDERS}
+    monkeypatch.setattr(levels, "turn_level", lambda session=None: level["now"])
+    ttl.add_rule(ttl.SCOPE_COMPANY, ttl.RULE_PERSON, "pat.lane@vendor.example", created_by="t", effect=ttl.EFFECT_GO)
+    ttl.add_rule(ttl.SCOPE_COMPANY, ttl.RULE_DOMAIN, "partner.example", created_by="t", effect=ttl.EFFECT_GO)
+    ttl.add_rule(ttl.SCOPE_COMPANY, ttl.RULE_DOMAIN, "gmail.com", created_by="t", effect=ttl.EFFECT_GO)
+    ttl.add_rule(ttl.SCOPE_COMPANY, ttl.RULE_PERSON, "dana@vendor.example", created_by="t")
+
+    def send(to: str) -> str | None:
+        return gw._check_gmail_recipients(
+            "google_workspace__send_gmail_message", {"to": to, "subject": "Hello", "body": "Hi"},
+        )
+
+    def turn(**kw: Any) -> Any:
+        session = Session(**kw)
+        current_session.set(session)
+        return oc.begin_turn(session)
+
+    async def go() -> None:
+        state = turn()
+        assert send("Pat.Lane@vendor.example") is None
+        assert send("ann@partner.example") is None
+        # An invite and an Outlook send read the same list.
+        invite = {"action": "create", "attendees": ["ann@partner.example"]}
+        assert gw._check_calendar_attendees("google_workspace__manage_event", invite) is None
+        invite["attendees"] = ["ann@partner.example", "evil@x.example"]
+        assert gw._check_calendar_attendees("google_workspace__manage_event", invite) is not None
+        outlook = {"body": {"Message": {"toRecipients": [{"emailAddress": {"address": "ann@partner.example"}}]}}}
+        assert gw._check_m365_recipients("ms365__send_mail", outlook) is None
+        outlook["body"]["Message"]["toRecipients"].append({"emailAddress": {"address": "evil@x.example"}})
+        assert gw._check_m365_recipients("ms365__send_mail", outlook) is not None
+        # Someone no rule lets go, a Waits rule, a look-alike domain and a
+        # free-mail domain still wait.
+        for to in (
+            "leo@vendor.example", "dana@vendor.example", "ann@notpartner.example",
+            "ann@partner.example.evil", "anyone@gmail.com",
+        ):
+            assert send(to) is not None
+        # A domain rule matches one plain address, never a list in one string.
+        assert "evil@x.example,ann@partner.example" not in gw._roster_allow_set(goes=True)
+        # A share always waits: a Goes rule never lets anyone be given access.
+        assert "ann@partner.example" not in gw._roster_allow_set()
+        share = {"action": "share", "scope_type": "user", "scope_value": "pat.lane@vendor.example"}
+        assert gw._check_calendar_share("google_workspace__manage_calendar", share) is not None
+        # Careful: no Goes rule counts.
+        level["now"] = outside_mode.ASK
+        assert send("pat.lane@vendor.example") is not None
+        level["now"] = outside_mode.OUTSIDERS
+        oc.end_turn(state)
+        # Nor on a turn that read something from outside, nor one whose words
+        # may be someone else's, nor with no turn at all.
+        state = turn()
+        oc.mark(oc.SENDER)
+        assert send("pat.lane@vendor.example") is not None
+        oc.end_turn(state)
+        state = turn(from_host=True)
+        assert send("pat.lane@vendor.example") is not None
+        oc.end_turn(state)
+        current_session.set(None)
+        assert send("pat.lane@vendor.example") is not None
+
+    asyncio.run(go())

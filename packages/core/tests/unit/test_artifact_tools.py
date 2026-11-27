@@ -378,6 +378,11 @@ async def test_get_artifact_returns_display_content_truncated(
                                                 "max_chars": 200}))
     assert len(cut["content"]) == 200 and cut["truncated"] is True
 
+    # Asked for nothing less, a long one comes back whole.
+    longer = await _draft(document="word " * 30_000)
+    whole = json.loads(await handle_get_artifact({"id": longer["artifact_id"]}))
+    assert len(whole["content"]) >= 150_000 - 10 and whole["truncated"] is False
+
 
 async def test_get_artifact_html_returns_text_not_markup(
     db: Path, audit_calls: list[dict],

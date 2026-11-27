@@ -65,11 +65,14 @@ returned: their next message is them asking again, having read the reply.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
 # outside_content imports this module only inside functions, so this stays safe.
 from openexecutive.orchestrator.outside_content import ASK_AGAIN_TONE
+
+logger = logging.getLogger(__name__)
 
 # What runs once the turn has read the owner's mail: everything but a door
 # to the open internet or to everyone. Each send here is fenced on its own.
@@ -81,6 +84,7 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "get_artifact",
     "list_artifacts",
     "list_department_goals",
+    "list_my_activity",
     "list_open_loops",
     "list_people",
     "list_saved_tools",
@@ -132,9 +136,6 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "cancel_calendar_event",
     # A reminder to the speaker alone, as fixed text with no links.
     "remind_me",
-    # A watch on the speaker's own mailbox that tells them alone when an
-    # awaited email lands (sender name and subject, cleaned).
-    "watch_for_email",
     # Cards and drafts a person approves before anything happens.
     "propose_actions",
     # The inbox's work turn hands its result back to the reply card it
@@ -149,6 +150,9 @@ MAIL_TOUCHED_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "remember_fact",
     "forget_fact",
     "update_company_profile",
+    # A figure kept for the speaker alone, private when the turn read their
+    # mail (figure_tools, memory.worked_out).
+    "keep_figure",
     # The speaker's own bookkeeping (correction_tools: their own follow-ups
     # and drafts; a brief item kept out only in the principal's quoted words).
     "cancel_followup",
@@ -363,6 +367,31 @@ def speaker_named_contact(tool_input: Any) -> bool:
         return False
 
 
+def own_inbox_watch(tool_name: str, tool_input: Any) -> bool:
+    """Whether a watch-list call sets up or changes a watch on the speaker's
+    own inbox (``monitoring.mailbox``). Unlike the watch list's other kinds
+    it fetches no address: whose inbox is set in code, and its trigger is
+    addresses and words. So, like the old ``watch_for_email``, it runs after
+    their mail was read ("check Dana's email and tell me when she replies").
+    Never raises; False when unsure."""
+    try:
+        if not isinstance(tool_input, dict):
+            return False
+        from openexecutive.monitoring import mailbox
+        from openexecutive.monitoring.models import SOURCE_KIND_MAILBOX
+
+        if tool_name == "add_watchlist_entry":
+            return str(tool_input.get("signal_type") or "").strip() == SOURCE_KIND_MAILBOX
+        if tool_name == "tune_watchlist_entry":
+            from openexecutive.monitoring import store
+
+            item = store.get_watchlist_item_by_slug(str(tool_input.get("slug") or "").strip())
+            return item is not None and mailbox.is_mailbox(item)
+    except Exception:
+        logger.warning("lockdown: couldn't tell whether a watch is on an inbox", exc_info=True)
+    return False
+
+
 def mail_touched_withholds(tool_name: str, tool_input: Any) -> bool:
     """Whether a call to ``tool_name`` is refused once the turn has read the
     owner's mail. Anything unclassified is (fail closed)."""
@@ -372,7 +401,7 @@ def mail_touched_withholds(tool_name: str, tool_input: Any) -> bool:
         return not private_turn_allows_mcp_call(tool_input)
     if tool_name == "upsert_person":
         return not speaker_named_contact(tool_input)
-    if tool_name in MAIL_TOUCHED_ALLOWED_TOOLS:
+    if tool_name in MAIL_TOUCHED_ALLOWED_TOOLS or own_inbox_watch(tool_name, tool_input):
         return False
     from openexecutive.orchestrator.extensions import allowed_after_mail_read
 
@@ -415,6 +444,35 @@ def mail_lock_holds(pinned: Any, *, reading_now: bool = False) -> bool:
         return True
 
 
+# Opening a page in the person's own browser: on Balanced it waits after a
+# mail read only until every read the model has seen was checked clean
+# (``_page_open_waits``). A page opened in the same round as the read was
+# asked for before the model saw what the mail said, so it carries none of it.
+PAGE_OPENS: frozenset[str] = frozenset({"browser_navigate", "browser_open_tab"})
+
+
+def _page_open_waits(pinned: Any) -> bool:
+    """Whether opening a page waits for the mail this turn read: at Careful,
+    on a turn with no safety state (a workflow, a script outside chat), once
+    a read was flagged or too big to check, or while a read from an earlier
+    round is still unvetted (a script ran beside it). Only this round's own
+    read, not yet seen by the model, lets it go. Never raises; fails closed."""
+    from openexecutive.orchestrator import outside_content, outside_mode
+
+    try:
+        state = outside_content.current()
+        if state is None:
+            return True
+        if state.mode == outside_mode.ASK and not outside_content.go_turn(state):
+            return True
+        if getattr(pinned, "mail_held", False) is True or getattr(pinned, "unchecked_mail", False) is True:
+            return True
+        # A read from an earlier round the model has seen but no check cleared.
+        return getattr(pinned, "read_mail", False) is True and getattr(pinned, "mail_vetted", False) is not True
+    except Exception:
+        return True
+
+
 def mail_turn_withholds(
     tool_name: str, tool_input: Any, *, reading_now: bool = False, pinned: Any = None,
 ) -> bool:
@@ -434,6 +492,8 @@ def mail_turn_withholds(
         if pinned is None or not (getattr(pinned, "read_mail", False) is True or reading_now):
             return False
         if mail_lock_holds(pinned, reading_now=reading_now):
+            if tool_name in PAGE_OPENS and not _page_open_waits(pinned):
+                return False
             return mail_touched_withholds(tool_name, tool_input) or tool_name in MAIL_PRIVATE_WITHHELD_TOOLS
         # By the owner's level: Hands-off holds nothing. Below it, a read the
         # check cleared still keeps the posts to everyone and the roster
@@ -485,7 +545,7 @@ def outside_reach_reason(name: str, tool_input: Any = None) -> str | None:
     # turn has read anything from outside the team (outside_content).
     try:
         if outside_content.read_outside() and outside_content.outside_withholds(name, tool_input):
-            return levels.STRANGER if outside_content.answers_off_team_mail() else levels.OUTSIDE
+            return levels.STRANGER if outside_content.answers_off_team_mail() else levels.outside_reason()
         return None
     except Exception:
         return levels.OUTSIDE

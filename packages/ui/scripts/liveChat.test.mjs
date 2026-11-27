@@ -94,3 +94,12 @@ test("people line", () => {
   assert.equal(peopleLine(["Riya Patel", "Alex Kim"]), "You, Riya and Alex");
   assert.equal(peopleLine(["A", "B", "C"]), "You and 3 others");
 });
+
+test("a reply written again replaces what streamed before it", () => {
+  let step = applyLiveEvent(EMPTY_LIVE, started, opts());
+  step = applyLiveEvent(step.state, { type: "chunk", turn_key: "t1", content: "Made it green." }, opts());
+  step = applyLiveEvent(step.state, { type: "rewrite", turn_key: "t1" }, opts());
+  assert.equal(step.state.turn?.reply, "");
+  step = applyLiveEvent(step.state, { type: "chunk", turn_key: "t1", content: "It isn't green yet." }, opts());
+  assert.equal(step.state.turn?.reply, "It isn't green yet.");
+});

@@ -42,9 +42,34 @@ def test_markdown_requires_document() -> None:
         af.build_artifact("markdown", {"document": "   "})
 
 
-def test_document_cap_enforced() -> None:
-    with pytest.raises(af.ArtifactInputError, match="limit"):
+def test_a_long_document_is_kept_whole() -> None:
+    built = af.build_artifact("markdown", {"document": "x" * 250_000})
+    assert "x" * 250_000 in str(built)
+
+
+def test_more_than_one_artifact_holds_is_refused_before_it_fills_memory() -> None:
+    import time
+
+    with pytest.raises(af.ArtifactInputError, match="split it"):
         af.build_artifact("markdown", {"document": "x" * (af.MAX_DOCUMENT_CHARS + 1)})
+    # A script can hand over one row repeated: it is counted, not expanded.
+    row = ["x"] * 16_000
+    started = time.monotonic()
+    with pytest.raises(af.ArtifactInputError, match="split it"):
+        af.build_artifact("xlsx", {"sheets": [{"columns": ["a"] * 16_000, "rows": [row] * 1_000}] * 20})
+    assert time.monotonic() - started < 10
+
+
+def test_a_sheet_at_what_one_artifact_holds_renders() -> None:
+    cols = 100
+    rows = [[f"=v{r}" if c % 2 else r for c in range(cols)] for r in range(af.MAX_TOTAL_CELLS // cols)]
+    built = af.build_artifact("xlsx", {"sheets": [{"name": "Big", "columns": [f"c{c}" for c in range(cols)], "rows": rows}]})
+    wb = load_workbook(io.BytesIO(af.sheets_to_xlsx(built.stored)), read_only=True)
+    got = list(wb["Big"].iter_rows(values_only=True))
+    assert len(got) == af.MAX_TOTAL_CELLS // cols + 1
+    first = got[1]
+    # Strings stay strings: a cell that starts with '=' is not a formula.
+    assert first[0] == 0 and first[1] == "=v0"
 
 
 def test_unknown_format_rejected() -> None:

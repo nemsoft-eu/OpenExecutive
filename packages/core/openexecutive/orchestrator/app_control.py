@@ -12,7 +12,7 @@ me": three tools in the ``app`` tool group (``tool_groups``) do these.
 button calls, as a function, with a request that names the speaker
 (``_as_speaker``). The route's own checks decide what this person may do: a
 chat that isn't theirs is a 404 here as it is on the page. The speaker is the
-one the chat surface verified (``correction_tools._speaker``); a turn with
+one the chat surface verified (``orchestrator.speaker``); a turn with
 none (an email, an unattended run) gets a refusal. Some routes check nothing
 about the caller because their page is the principal's; those actions are
 ``principal_only``.
@@ -238,7 +238,7 @@ def _session() -> Any:
 
 
 def _speaker() -> Any:
-    from openexecutive.orchestrator.correction_tools import _speaker as speaker
+    from openexecutive.orchestrator.speaker import speaker
 
     return speaker()
 
@@ -497,10 +497,10 @@ async def handle_do_in_app(tool_input: dict[str, Any]) -> str:
     except Refused as exc:
         return _error(str(exc))
     except HTTPException as exc:
-        if held and exc.status_code == 409 and "caller_signing_required" in str(exc.detail):
-            # Hands-off ran it, but the route wants the person's own signed
-            # request (turning on something that sends as them): their tap
-            # on a card is that request.
+        if exc.status_code == 409 and "caller_signing_required" in str(exc.detail):
+            # The route wants the person's own signed request (turning on
+            # something that sends as them, changing Your rules), which a
+            # chat turn never is: their tap on a card is that request.
             return _card_result(person.id, session, action, item_id, value, title or "", details)
         _audit("app_action_refused", f"{action.name} refused", {**details, "status": exc.status_code})
         return _error(refusal_text(exc))
@@ -526,10 +526,7 @@ def _card_result(
         "status": "waiting_for_approval",
         "decision_id": decision_id,
         "card": card,
-        "note": (
-            "Nothing has happened yet. A card is under this reply in the web app for "
-            "them to confirm. Tell them it is waiting for their OK."
-        ),
+        "note": waiting_note(session),
     })
 
 
@@ -559,12 +556,48 @@ async def handle_open_in_app(tool_input: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def shown_here(session: Any = None) -> bool:
+    """Whether a card left on this turn shows in the chat it was asked in
+    (the web chat and the phone app, or a chat app with Approve and Skip
+    buttons). Never raises: an error is no."""
+    from openexecutive.integrations.channel_cards import card_here
+
+    try:
+        return card_here(session if session is not None else _session())
+    except Exception:
+        logger.warning("app_control: couldn't tell where the card shows", exc_info=True)
+        return False
+
+
+def waiting_note(session: Any = None) -> str:
+    """What the Executive tells the person about a card it just left: under
+    the reply where the chat shows it, else on Needs you."""
+    if shown_here(session):
+        return (
+            "Nothing has happened yet. A card is under this reply for them to confirm. "
+            "Tell them it is waiting for their OK."
+        )
+    return (
+        "Nothing has happened yet. This chat can't show the card, so it is on Needs you in the web "
+        "and phone app for them to confirm. Tell them it is waiting there for their OK."
+    )
+
+
 def _leave_card(
     person_id: int, session: Any, action: Action, item_id: str, value: str, title: str, card: str,
 ) -> int:
-    from openexecutive.memory.decision_ledger import create_decision_instance
+    """Leave the card for ``person_id``, theirs alone. Where the chat can't
+    show it (a call, mail, a chat app without buttons) it also goes on their
+    Needs you, so a card is never left where nobody sees it: if that fails,
+    the card is closed and this raises, so the tool says it couldn't."""
+    from openexecutive.alerts import own_chat
+    from openexecutive.memory.decision_ledger import (
+        close_externally,
+        create_decision_instance,
+        put_on_needs_you,
+    )
 
-    return create_decision_instance(
+    decision_id = create_decision_instance(
         decision_class=DECISION_CLASS,
         department="",
         originating_session_id=getattr(session, "session_id", None),
@@ -576,6 +609,22 @@ def _leave_card(
         approver_person_id=person_id,
         confidence=None,
     )
+    if not own_chat.keep_with(decision_id, person_id):
+        # Not kept to its person, it would show to everyone: never left so.
+        close_externally(decision_id, reason="not_kept_with_person")
+        raise RuntimeError(f"couldn't keep card {decision_id} with its person")
+    if not shown_here(session):
+        first, _, rest = card.partition("\n")
+        try:
+            put_on_needs_you(
+                decision_id, DECISION_CLASS, headline=first or title, body=rest.strip() or first,
+                suggested_action=first or title, approver_person_id=person_id,
+            )
+        except Exception:
+            logger.exception("app_control: couldn't put card %d on Needs you", decision_id)
+            close_externally(decision_id, reason="not_on_needs_you")
+            raise
+    return decision_id
 
 
 def leave_card(person_id: int, action: str, item_id: str, value: str, title: str, card: str) -> int:

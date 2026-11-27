@@ -126,6 +126,17 @@ export function cardActionFor(method: string, url: string, body?: unknown): Card
   return null;
 }
 
+/** The card a chat send approves (POST /chat `approve_card`), or null. */
+export function approveCardOf(body: unknown): number | null {
+  if (typeof body !== "string") return null;
+  try {
+    const id = (JSON.parse(body) as { approve_card?: unknown }).approve_card;
+    return typeof id === "number" && Number.isInteger(id) && id > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The chat message a send carries (JSON or a form), cut short, or "". */
 export function messageOf(body: unknown): string {
   let message: unknown = null;
@@ -178,6 +189,10 @@ export function frameActionFor(
   const path = backendPath(url);
   if (path === null || HARMLESS.test(path)) return null;
   if (verb === "POST" && CHAT_SENDS.has(path)) {
+    // Approve on a card under a reply goes through the chat: ask as that
+    // card's own Approve does, naming it.
+    const approving = approveCardOf(body);
+    if (approving !== null) return cardActionFor("POST", `${BACKEND}/decisions/${approving}/approve`);
     const words = messageOf(body);
     return {
       verb: "change",

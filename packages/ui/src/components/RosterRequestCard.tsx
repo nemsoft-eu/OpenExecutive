@@ -102,6 +102,18 @@ export default function RosterRequestCard({
 
   const ignore = () => void run(() => declineRosterRequest(request.id));
   const title = request.display_name ? `Who is ${request.display_name}?` : "Someone new wrote in";
+  // What they wrote, in full (the server keeps each message whole, with its
+  // paragraphs): on the card and again beside the answer in the panel.
+  const wrote = (spacing: string) =>
+    request.previews.length > 0 ? (
+      <div className={`${spacing} space-y-3 rounded-xl border border-line bg-surface/40 px-3.5 py-2.5`}>
+        {request.previews.slice(0, 3).map((line, i) => (
+          <p key={i} className="text-sm leading-relaxed text-fg whitespace-pre-wrap break-words">
+            {line}
+          </p>
+        ))}
+      </div>
+    ) : null;
   const fieldClass =
     "min-h-[44px] rounded-xl border border-line bg-surface px-3 text-[15px] text-fg focus:outline-none focus:ring-2 focus:ring-accent/40 disabled:opacity-50";
 
@@ -127,6 +139,7 @@ export default function RosterRequestCard({
           </span>
         )}
       </div>
+      {wrote("mt-3")}
       {error && !panelOpen && <p className="mt-2 text-sm text-rose-600 dark:text-rose-300">{error}</p>}
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <Button variant="primary" onClick={() => setPanelOpen(true)} disabled={busy}>
@@ -177,15 +190,7 @@ export default function RosterRequestCard({
           waiting message{request.message_count === 1 ? " is" : "s are"} answered.
         </p>
 
-        {request.previews.length > 0 && (
-          <div className="mb-4 space-y-1.5 rounded-xl border border-line bg-surface/40 px-3.5 py-2.5">
-            {request.previews.slice(0, 3).map((line, i) => (
-              <p key={i} className="text-sm text-fg-muted whitespace-pre-wrap break-words">
-                {line}
-              </p>
-            ))}
-          </div>
-        )}
+        {wrote("mb-4")}
 
         <div className="mb-4 flex flex-col gap-2" role="radiogroup" aria-label="Who they are">
           <label className="flex min-h-[44px] items-center gap-2.5 rounded-xl border border-line px-3 text-[15px] text-fg">

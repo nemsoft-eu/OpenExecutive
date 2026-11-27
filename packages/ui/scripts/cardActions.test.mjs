@@ -254,3 +254,15 @@ test("a Request's own method counts, not just init's", async () => {
   await assert.rejects(call, CardActionNotConfirmed);
   assert.deepEqual(sent, []);
 });
+
+test("Approve on a card under a reply, sent through the chat, asks as that card's own Approve", () => {
+  const body = JSON.stringify({ message: "Approved", session_id: "s1", approve_card: 43 });
+  const action = frameActionFor("POST", "/api/backend/chat", body, CALLS);
+  assert.equal(action.verb, "approve");
+  assert.equal(action.decisionId, 43);
+  assert.equal(action.page, "/cards/43");
+  // A plain chat send still asks as a message.
+  const plain = frameActionFor("POST", "/api/backend/chat", JSON.stringify({ message: "hi" }), CALLS);
+  assert.equal(plain.decisionId, null);
+  assert.match(plain.what, /^Send "hi"/);
+});

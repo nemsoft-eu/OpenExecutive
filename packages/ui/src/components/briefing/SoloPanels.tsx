@@ -3,165 +3,20 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import Button from "@/components/ui/Button";
 import InfoTip from "@/components/InfoTip";
 import {
-  deleteInitiative,
-  getPersonOpenLoops,
   getTopThree,
   getWeeklyReview,
-  listInitiatives,
-  updateInitiative,
-  type Initiative,
-  type OpenLoop,
   type TopThreeToday,
   type WeeklyReviewSummary,
 } from "@/lib/api";
-import { dueSoon, loopText } from "@/lib/dueSoon";
+import { loopText } from "@/lib/dueSoon";
 import { reviewExcerpt, reviewRanLabel, topThreeSlot, topThreeWhy } from "@/lib/rhythmCards";
 
-import { PanelIntro, RankBadge, TONE_TEXT } from "./shared";
-import { PageSpinner } from "@/components/ui/Spinner";
+import { PanelIntro, RankBadge } from "./shared";
 
-// Solo's parts of Home (Due soon is on every Home). Each loads its own data
-// through a hook here, so the tile row can count it before its side panel is
-// opened.
-
-// ── Your projects ─────────────────────────────────────────────────────────
-// The projects (initiatives) the Executive is tracking as active — the solo
-// stand-in for Departments. "Done" marks one completed (PATCH), which is what
-// takes it out of the Executive's active context; "Drop" deletes it after a
-// confirm, since there is no "dropped" status the rest of the system treats
-// as closed.
-export function useActiveProjects(enabled: boolean) {
-  const [projects, setProjects] = useState<Initiative[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!enabled) return;
-    let cancelled = false;
-    listInitiatives()
-      .then((all) => {
-        if (!cancelled) setProjects(all.filter((i) => i.status === "active"));
-      })
-      .catch(() => {
-        if (!cancelled) setError("Couldn't load your projects.");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled]);
-
-  return { projects, setProjects, error, setError };
-}
-
-export function ProjectsPanelBody({ state }: { state: ReturnType<typeof useActiveProjects> }) {
-  const { projects, setProjects, error, setError } = state;
-  const [busyId, setBusyId] = useState<number | null>(null);
-  // Drop asks first, in the row itself.
-  const [confirmDrop, setConfirmDrop] = useState<number | null>(null);
-
-  const close = async (project: Initiative, how: "done" | "drop") => {
-    setBusyId(project.id);
-    setError(null);
-    try {
-      if (how === "done") await updateInitiative(project.id, { status: "completed" });
-      else await deleteInitiative(project.id);
-      setProjects((prev) => (prev ?? []).filter((p) => p.id !== project.id));
-    } catch {
-      setError(how === "done" ? "Couldn't mark it done — try again." : "Couldn't drop it — try again.");
-    } finally {
-      setBusyId(null);
-      setConfirmDrop(null);
-    }
-  };
-
-  return (
-    <>
-      <PanelIntro>
-        The projects you&apos;re running that the Executive is keeping track of. Mention a new one in chat and it
-        appears here.
-      </PanelIntro>
-      {error && <p className={`mb-2 text-sm ${TONE_TEXT.rose}`}>{error}</p>}
-      {projects === null ? (
-        !error && <PageSpinner />
-      ) : projects.length === 0 ? (
-        <p className="py-2 text-[15px] text-fg-muted">
-          No active projects. Tell the Executive about one you&apos;re running and it will keep track of it here.
-        </p>
-      ) : (
-        <div className="divide-y divide-line">
-          {projects.map((p) => (
-            <div key={p.id} className="py-3.5">
-              <div className="flex items-start gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="text-[15px] font-medium text-fg break-words">{p.title}</div>
-                  {p.summary && (
-                    <div className="mt-0.5 text-sm text-fg-muted line-clamp-2" title={p.summary}>
-                      {p.summary}
-                    </div>
-                  )}
-                </div>
-                {confirmDrop !== p.id && (
-                  <div className="flex flex-shrink-0 items-center gap-1.5">
-                    <Button size="sm" variant="secondary" onClick={() => void close(p, "done")} disabled={busyId !== null}>
-                      Done
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => setConfirmDrop(p.id)} disabled={busyId !== null}>
-                      Drop
-                    </Button>
-                  </div>
-                )}
-              </div>
-              {confirmDrop === p.id && (
-                <div role="alert" className="mt-2 rounded-xl border border-rose-500/30 bg-rose-500/5 px-3 py-2.5">
-                  <p className="text-sm text-fg">
-                    Drop &ldquo;{p.title}&rdquo;? The Executive stops tracking it, and it is removed from Memory.
-                  </p>
-                  <div className="mt-2 flex gap-2">
-                    <Button size="sm" variant="danger" onClick={() => void close(p, "drop")} disabled={busyId !== null}>
-                      {busyId === p.id ? "Dropping…" : "Drop it"}
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => setConfirmDrop(null)} disabled={busyId !== null}>
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-    </>
-  );
-}
-
-// ── Due soon ──────────────────────────────────────────────────────────────
-// What you own that is due within a week or overdue — what you promised by a
-// date and what others asked of you. Read from your open loops
-// (GET /people/{id}/open-loops); "Done" closes one (POST
-// /open-loops/{id}/close), which also stops the Executive reminding you.
-export function useOpenLoops(principalId: number | null) {
-  const [loops, setLoops] = useState<OpenLoop[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (principalId == null) return;
-    let cancelled = false;
-    getPersonOpenLoops(principalId)
-      .then((all) => {
-        if (!cancelled) setLoops(all);
-      })
-      .catch(() => {
-        if (!cancelled) setError("Couldn't load what's due.");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [principalId]);
-
-  return { loops, setLoops, error, setError, view: loops === null ? null : dueSoon(loops) };
-}
+// Solo's parts of Home: this week's review (behind its line at the foot of
+// Home) and the top three.
 
 // ── This week's review ────────────────────────────────────────────────────
 // The latest weekly review (GET /today/weekly-review) — when it ran and next

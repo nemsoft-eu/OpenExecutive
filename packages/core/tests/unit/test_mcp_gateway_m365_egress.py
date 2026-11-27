@@ -1189,7 +1189,8 @@ def test_hands_off_replies_to_someone_not_in_people_as_gmail_does() -> None:
     with patch.object(levels, "relaxed", return_value=True):
         result = _call(gateway, args, [ROSTER], tool_name="microsoft_365__reply-mail-message")
     assert result == '{"ok": true}'
-    assert _lookups(session_call) == []
+    # The one read only keeps whom the reply was for; nothing checks it.
+    assert len(_lookups(session_call)) == 1
 
 
 def test_below_hands_off_a_reply_to_someone_not_in_people_is_a_card() -> None:

@@ -106,10 +106,10 @@ def _reset_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolated: P
     return _settings_stub(tmp_path)
 
 
-def _run_reset(settings: Any) -> None:
+def _run_reset(settings: Any, keep: tuple[str, ...] = ()) -> None:
     with patch.object(ChromaDBStore, "delete_company_docs", lambda self: None), \
          patch.object(ChromaDBStore, "delete_documents", lambda self, **kw: None):
-        asyncio.run(fixture_loader.reset_all_state(settings))
+        asyncio.run(fixture_loader.reset_all_state(settings, keep=keep))
 
 
 def test_reset_returns_to_team_defaults_and_rebootstraps(_reset_harness: Any, _isolated: Path) -> None:
@@ -124,14 +124,9 @@ def test_reset_path_bootstrap_honours_solo(
     _reset_harness: Any, _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The solo check lives inside bootstrap_cadences, so the reset's own call
-    honours it too (here the workspace is set to solo where the reset would
-    return it to the defaults, after the table wipe and before the bootstraps)."""
-    monkeypatch.setattr(
-        ws,
-        "reset_workspace_settings",
-        lambda db_path=None: ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo")),
-    )
-    _run_reset(_reset_harness)
+    honours it too (here the workspace is held at solo through the reset)."""
+    ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo"))
+    _run_reset(_reset_harness, keep=("workspace_settings",))
     assert ws.get_workspace().mode == "solo"
     assert _count(_isolated, "dept_cadence") == 0
     # The principal's own rhythm is still seeded.

@@ -1,13 +1,14 @@
 """Shared helpers for workflows that run an Executive tool-use loop.
 
 Both ``executive_reflection`` and ``executive_research`` drive the
-Executive through a short tool-use loop with the full outbound toolkit.
+Executive through a tool-use loop with the full outbound toolkit.
 The two helpers below are the bits both loops share:
 
-- ``execute_tool_calls`` dispatches any tool_use blocks in a provider
-  response against ``_ALL_SKILL_HANDLERS`` and returns one summary per
-  call (tool, input_preview, result_preview, ok). Failures are caught +
-  summarized so the loop survives a single tool crash.
+- ``execute_tool_call`` runs one tool call against the pass's handlers
+  and returns its summary (tool, input_preview, result_preview, ok) with
+  the whole result for the model. Failures are caught + summarized so the
+  loop survives a single tool crash. The loop itself is
+  ``orchestrator.rounds.run_rounds``.
 - ``extract_artifact_from_response`` pulls the concatenated text-block
   content from a provider response — the model's narrative summary
   emitted alongside or after its tool calls.
@@ -26,103 +27,54 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-async def execute_tool_calls(
-    response: Any,
+def _skipped(name: str, tool_input: Any, why: str, *, ran: bool = False) -> tuple[dict[str, Any], str]:
+    return {"tool": name, "input_preview": str(tool_input)[:120], "result_preview": why, "ok": False, "ran": ran}, why
+
+
+async def execute_tool_call(
+    name: str,
+    tool_input: dict[str, Any],
     handlers: dict[str, Any],
     *,
-    budget_remaining: int | None = None,
-    free_tools: frozenset[str] | None = None,
-    result_chars: int = 160,
-    wide_results: dict[str, int] | None = None,
-) -> list[dict[str, Any]]:
-    """Invoke any tool_use blocks in the LLM response.
+    over_budget: bool = False,
+) -> tuple[dict[str, Any], Any]:
+    """Run one tool call of a pass (``orchestrator.rounds.run_rounds``'s
+    ``run_call``).
 
-    Returns one summary entry per call:
-    ``{tool, input_preview, result_preview, ok}``. Failures are caught
-    + summarized so a single tool crash does not abort the workflow's
-    iteration loop.
-
-    ``budget_remaining`` (optional) caps how many handlers actually
-    run. Once budget hits zero, remaining tool_use blocks are NOT
-    invoked — their summary entries are still appended with
-    ``result_preview = 'over budget — skipped'`` so the model sees a
-    tool_result acknowledgement on the next turn. Default ``None``
-    leaves the loop unmetered (executive_reflection's behaviour).
-
-    ``free_tools`` (optional) names tools that are exempt from the
-    budget — read-only context lookups (e.g. ``lookup_person``) the
-    model must call to PREPARE a routing decision. They always execute
-    and never decrement ``budget_remaining``, so the Executive can't
-    spend its outbound budget on lookups and then have no budget left
-    to actually route (the "looks up people but never DMs" failure).
-
-    ``result_chars`` caps each result the model sees back: short for a
-    pass that only routes, longer for one that must read what a tool found
-    (Take the lead's search_tools results, a created file's id).
-    ``wide_results`` raises that cap for the named tools whose result is
-    the point of calling them (``search_knowledge``'s passages).
+    Returns its summary for the pass's record and artifact
+    (``{tool, input_preview, result_preview, ok, ran}``; ``ran`` is whether
+    the handler ran, error or not) and the result the model
+    reads back, whole: the pass's reading sizes it (orchestrator.reading).
+    A failure is caught and summarized, so one tool crash does not end the
+    pass. ``over_budget`` refuses the call without running it (a pass's own
+    count of the outbound calls it may make).
     """
-    free_tools = free_tools or frozenset()
-    summaries: list[dict[str, Any]] = []
-    if not getattr(response, "content", None):
-        return summaries
-    for block in response.content:
-        if getattr(block, "type", "") != "tool_use":
-            continue
-        name = getattr(block, "name", "")
-        tool_input = getattr(block, "input", {}) or {}
-        is_free = name in free_tools
-        if budget_remaining is not None and budget_remaining <= 0 and not is_free:
-            # Refuse without executing. Surfaces in the next user-turn
-            # tool_result so the model knows further calls are blocked.
-            # Free (read-only) tools are never refused on budget grounds.
-            summaries.append({
-                "tool": name,
-                "input_preview": str(tool_input)[:120],
-                "result_preview": "over budget — skipped",
-                "ok": False,
-            })
-            continue
-        handler = handlers.get(name)
-        if handler is None:
-            summaries.append({
-                "tool": name,
-                "input_preview": str(tool_input)[:120],
-                "result_preview": "unknown tool — skipped",
-                "ok": False,
-            })
-            continue
-        try:
-            result = await handler(tool_input)
-        except Exception as exc:
-            logger.exception("synthesis: tool %s raised", name)
-            summaries.append({
-                "tool": name,
-                "input_preview": str(tool_input)[:120],
-                "result_preview": f"raised: {exc}"[:160],
-                "ok": False,
-            })
-            if budget_remaining is not None and not is_free:
-                budget_remaining -= 1
-            continue
-        ok = True
-        try:
-            parsed = json.loads(result) if isinstance(result, str) else result
-            if isinstance(parsed, dict) and "error" in parsed:
-                ok = False
-        except (ValueError, TypeError):
-            # Non-JSON result — treat as success since we have no
-            # signal otherwise (same as action_chips).
-            pass
-        summaries.append({
-            "tool": name,
-            "input_preview": str(tool_input)[:120],
-            "result_preview": str(result)[: max(result_chars, (wide_results or {}).get(name, 0))],
-            "ok": ok,
-        })
-        if budget_remaining is not None and not is_free:
-            budget_remaining -= 1
-    return summaries
+    if over_budget:
+        return _skipped(name, tool_input, "over budget — skipped")
+    handler = handlers.get(name)
+    if handler is None:
+        return _skipped(name, tool_input, "unknown tool — skipped")
+    try:
+        result = await handler(tool_input)
+    except Exception as exc:
+        logger.exception("synthesis: tool %s raised", name)
+        return _skipped(name, tool_input, f"raised: {exc}"[:160], ran=True)
+    ok = True
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+        if isinstance(parsed, dict) and "error" in parsed:
+            ok = False
+    except (ValueError, TypeError):
+        # Non-JSON result — treat as success since we have no
+        # signal otherwise (same as action_chips).
+        pass
+    return {
+        "tool": name,
+        "input_preview": str(tool_input)[:120],
+        "result_preview": str(result)[:160],
+        "ok": ok,
+        "ran": True,
+    }, result
 
 
 def extract_artifact_from_response(response: Any) -> str:
@@ -143,4 +95,4 @@ def extract_artifact_from_response(response: Any) -> str:
     return "\n\n".join(chunks).strip()
 
 
-__all__ = ["execute_tool_calls", "extract_artifact_from_response"]
+__all__ = ["execute_tool_call", "extract_artifact_from_response"]

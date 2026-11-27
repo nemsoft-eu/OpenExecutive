@@ -33,12 +33,15 @@ const EXEMPT_PREFIXES = ["/signin", "/onboard", "/api", "/shared"];
 const EXEMPT_EXACT = new Set(["/"]);
 
 // Human-readable labels for path segments shown in the breadcrumb.
-// Dynamic segments (slugs / ids) are rendered raw and truncated by CSS.
+// A dynamic segment shows the name its page gives it (``usePageCrumb``); one
+// that is only an id (``looksLikeId``) and has no name is left out, never
+// shown raw. Other slugs render as they are, truncated by CSS.
 // `company-profile` is the team label; TopBar names it for the mode and
 // role, as the sidebar does.
 const SEGMENT_LABELS: Record<string, string> = {
   today: "Today",
   review: "Review",
+  shared: "Shared with you",
   proposals: "Proposals",
   people: "People",
   departments: "Departments",
@@ -46,7 +49,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   memories: "Memory",
   knowledge: "Knowledge",
   jobs: "Workflows",
-  artifacts: "Documents",
+  artifacts: "Made for you",
   chats: "Chats",
   runs: "Runs",
   new: "New",
@@ -59,6 +62,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   demo: "Company Simulator",
   onboard: "Setup",
   watchlist: "Watch list",
+  schedule: "Schedule",
   tasks: "Tasks",
   settings: "Settings",
   status: "Setup status",
@@ -73,6 +77,15 @@ const SEGMENT_LABELS: Record<string, string> = {
   clients: "Client Companies",
   cards: "Card",
 };
+
+// A record's id in the URL (a chat, a run, a person's number), never a name.
+function looksLikeId(segment: string): boolean {
+  return (
+    /^\d+$/.test(segment) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment) ||
+    /^[0-9a-f]{16,}$/i.test(segment)
+  );
+}
 
 function labelFor(segment: string): string {
   return SEGMENT_LABELS[segment] ?? segment;
@@ -225,18 +238,20 @@ function TopBar({
   // navigable pages, so we render them as plain text to avoid linking
   // to a 404. Dynamic segments (slugs/uuids) also render as-is — pages
   // own their own H1 with the entity name.
-  const pageCrumbs = segments.map((segment, idx) => {
+  const pageCrumbs = segments.flatMap((segment, idx) => {
     const linkable = idx === 0;
     const href = linkable ? "/" + segment : null;
-    return {
+    const named = idx === segments.length - 1 && idx > 0 && pageLabel;
+    // An id with no name from its page is left out rather than shown raw.
+    if (!named && idx > 0 && looksLikeId(segment)) return [];
+    return [{
       href,
-      label:
-        idx === segments.length - 1 && idx > 0 && pageLabel
-          ? pageLabel
-          : idx === 0 && segment === "company-profile"
-            ? profileLabel
-            : labelFor(segment),
-    };
+      label: named
+        ? pageLabel
+        : idx === 0 && segment === "company-profile"
+          ? profileLabel
+          : labelFor(segment),
+    }];
   });
   // The Advanced pages (Agent Council, Audit log, ...) live at their own
   // paths but are opened from Settings → Advanced: show that way back.

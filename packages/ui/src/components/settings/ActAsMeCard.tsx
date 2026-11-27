@@ -3,9 +3,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 import Icon from "@/components/Icon";
-import { AsYouTrainingCard, ReachCard } from "@/components/settings/ReachCard";
+import { Check, ReachCard, useReachSave } from "@/components/settings/ReachCard";
 import SettingsCard from "@/components/settings/SettingsCard";
 import { LearnedSection } from "@/components/settings/TrainingCard";
+import { TrainingLine } from "@/components/settings/TrainingStep";
 import type { DelegationLoad } from "@/components/settings/useDelegation";
 import Switch from "@/components/Switch";
 import Button from "@/components/ui/Button";
@@ -17,9 +18,9 @@ import {
   learnVoiceProfile,
   refreshVoiceSignature,
   resetVoiceProfile,
-  setDelegationTeam,
   setInboxWatch,
   setReadMyCalendar,
+  setTraining,
   updateVoiceProfile,
   type DelegationSettings,
   type DelegationTeam,
@@ -29,6 +30,7 @@ import {
   type ReadMyCalendar,
   type VoiceProfile,
 } from "@/lib/api";
+import { MAILBOX_BROKEN, MAILBOX_BROKEN_DETAIL, mailboxNeedsReconnecting } from "@/lib/reconnect";
 import { formatAgo } from "@/lib/setupStatus";
 import { addPhrase, markNew, STYLE_PHRASES, styleSentences } from "@/lib/voiceStyle";
 import { PageSpinner } from "@/components/ui/Spinner";
@@ -37,12 +39,11 @@ import { PageSpinner } from "@/components/ui/Spinner";
 // own mailbox, when you ask it to and, at Your inbox, for mail that needs
 // you; Approvals and In training decide which of those go on their own.
 // Backed by GET /delegation, PUT /delegation/reach (ReachCard) and
-// /delegation/voice. Not offered to anyone who can't have it (the owner can,
-// and team members once the owner lets them: PUT /delegation/team).
+// /delegation/voice. Offered to everyone on the team.
 //
 // The As you tab, in two columns: How far it goes as you (the mailbox on its
 // first line, the inbox watcher's status under Your inbox), Read my calendar
-// and the page's `side` (Let team members use it, Say it was written with
+// and the page's `side` (Team members, Say it was written with
 // AI, what it sent); then In training (the switch, who goes on their own,
 // Learn from my edits) and How it learns from you (How you write, how you
 // write to each person).
@@ -126,8 +127,7 @@ export default function ActAsMeCard({
     return (
       <SettingsCard>
         <p className="text-[15px] text-fg-muted leading-relaxed">
-          As you isn&apos;t available to you here. The owner of this Open Executive can turn it
-          on for team members.
+          As you isn&apos;t available to you here. It&apos;s for people on the team.
         </p>
       </SettingsCard>
     );
@@ -170,7 +170,14 @@ export default function ActAsMeCard({
     </div>
   ) : (
     <div className="rounded-xl border border-line px-4 py-3">
-      <p className="text-[15px] text-fg">{settings.gmail.message}</p>
+      {mailboxNeedsReconnecting(settings.gmail.status) ? (
+        <>
+          <p className="text-[15px] font-semibold text-fg">{MAILBOX_BROKEN}</p>
+          <p className="text-sm text-fg-muted">{MAILBOX_BROKEN_DETAIL}</p>
+        </>
+      ) : (
+        <p className="text-[15px] text-fg">{settings.gmail.message}</p>
+      )}
       <div className="mt-3 space-y-3">
         {settings.gmail.status === "not_configured" && (
           <details className="group">
@@ -203,8 +210,8 @@ export default function ActAsMeCard({
 
   // Two columns where the page is wide enough (the page sets the container):
   // how far it goes as you (the mailbox on its first line), your calendar and
-  // `side`; then In training (its own card, first in the second column) and
-  // how it learns from you.
+  // `side`; then In training's state (its switch is on Approvals) and how it
+  // learns from you.
   return (
     <div className="grid gap-4 @4xl:grid-cols-2 @4xl:items-start">
       <div className="space-y-4">
@@ -241,7 +248,7 @@ export default function ActAsMeCard({
       </div>
 
       <div className="space-y-4">
-        <AsYouTrainingCard settings={settings} onSettings={setSettings} />
+        {settings.training && <TrainingLine side="you" on={Boolean(settings.training.training)} />}
         <HowItLearnsCard settings={settings} onSettings={setSettings} connected={connected} outlook={outlook} />
       </div>
     </div>
@@ -250,8 +257,8 @@ export default function ActAsMeCard({
 
 // How it learns from you: everything it picked up as you, in one card. How
 // you write (the style, Describe it, Learn again, Fine-tune details) and how
-// you write to each person (from Learn from my edits). In training, who goes on their
-// own and Learn from my edits are on the In training card above it. Shown
+// you write to each person, and Learn from my edits, which fills it. In
+// training and who goes on their own are on Delegate → Approvals. Shown
 // once a mailbox is connected, or while it still keeps something learned.
 function HowItLearnsCard({
   settings,
@@ -264,6 +271,7 @@ function HowItLearnsCard({
   connected: boolean;
   outlook: boolean;
 }) {
+  const { busy, error, save } = useReachSave(onSettings);
   const training = settings.training;
   if (!connected && !training?.learned.some((item) => item.setting === "drafts")) return null;
   return (
@@ -279,56 +287,38 @@ function HowItLearnsCard({
             empty="Nothing yet. Change a draft and tick “Do it like this next time”."
           />
         )}
+        {training && (
+          <div className="border-t border-line pt-5">
+            <Check
+              checked={Boolean(training.drafts)}
+              disabled={busy}
+              onChange={(learn) => void save(() => setTraining({ drafts: learn }))}
+              label="Learn from my edits"
+              help="Change a draft, tick Do it like this next time, and it learns how you write to that person."
+            />
+          </div>
+        )}
       </div>
+      {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
     </SettingsCard>
   );
 }
 
-// The owner's "Let team members use Act as me" (PUT /delegation/team), shown
-// only to the owner and only where the install allows it. Each member
-// connects their own Gmail and turns it on for themselves; the owner sees
-// counts only, never their mail, drafts or reply cards.
+// Who on the team uses As you, shown only to the owner. Each member
+// connects their own Gmail or Outlook and turns it on for themselves; the
+// owner sees counts only, never their mail, drafts or reply cards.
 export function TeamSection({
   team,
-  onSettings,
 }: {
   team: DelegationTeam;
-  onSettings: (next: DelegationSettings) => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const toggle = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      onSettings(await setDelegationTeam(!team.enabled));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the setting.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <SettingsCard
-      title="Let team members use it"
+      title="Team members"
       titleId="act-as-me-team-label"
-      description={
-        team.enabled
-          ? "On: each team member can connect their own Gmail or Outlook and turn it on for themselves. Their mail, drafts and replies stay theirs alone. You see only who uses it and how much."
-          : "Off: only you can use As you."
-      }
-      action={
-        <Switch
-          checked={team.enabled}
-          onChange={() => void toggle()}
-          disabled={busy}
-          labelledBy="act-as-me-team-label"
-        />
-      }
+      description="Each team member can connect their own Gmail or Outlook and turn it on for themselves. Their mail, drafts and replies stay theirs alone. You see only who uses it and how much."
     >
-      {team.enabled && team.members.length > 0 && (
+      {team.members.length > 0 && (
         <ul className="divide-y divide-line">
           {team.members.map((m) => (
             <li key={m.person_id} className="py-2 text-sm text-fg-muted">
@@ -339,7 +329,6 @@ export function TeamSection({
           ))}
         </ul>
       )}
-      {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
     </SettingsCard>
   );
 }

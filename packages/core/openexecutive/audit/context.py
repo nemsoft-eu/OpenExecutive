@@ -133,7 +133,7 @@ _rows_on_principal_turn: ContextVar[bool] = ContextVar(
     "audit_rows_on_principal_turn", default=False
 )
 # Which AI app asked for the work, for a turn another app asked over Open
-# Executive's own MCP server and allowed to act (``Session.mcp_client_may_act``).
+# Executive's own MCP server (``Session.from_mcp_client``).
 # Every row written inside ``rows_via`` carries it as ``details["via"]``, so
 # the record shows the change came from that app, not from Open Executive.
 _rows_via: ContextVar[str | None] = ContextVar("audit_rows_via", default=None)

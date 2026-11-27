@@ -36,9 +36,10 @@ def test_no_db_path_default_is_bound_at_import() -> None:
         if fn.__module__ == episodic.__name__
         and "db_path" in inspect.signature(fn).parameters
     }
-    # Not vacuous: `_get_conn` is wrapped by @contextmanager, and signature()
-    # follows its __wrapped__ to the real parameters.
-    assert {"_get_conn", "initialize_db", "format_for_prompt"} <= defaults.keys()
+    # Not vacuous. `_get_conn` is `utils.db.opener`'s, which resolves the path
+    # on every call, so it is checked on its own.
+    assert {"initialize_db", "format_for_prompt"} <= defaults.keys()
+    assert inspect.signature(episodic._get_conn).parameters["db_path"].default is None
     bound = sorted(
         name
         for name, default in defaults.items()

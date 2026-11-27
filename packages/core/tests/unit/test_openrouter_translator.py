@@ -657,7 +657,8 @@ def test_response_usage_reads_nested_prompt_tokens_details() -> None:
             },
         }
     )
-    assert msg.usage.input_tokens == 10339
+    # prompt_tokens counts the cached part too; input_tokens is the rest.
+    assert msg.usage.input_tokens == 21
     assert msg.usage.output_tokens == 60
     assert msg.usage.cache_read_input_tokens == 10318
     assert msg.usage.cache_creation_input_tokens == 0
@@ -686,6 +687,7 @@ def test_response_usage_reports_cache_write_on_first_turn() -> None:
             },
         }
     )
+    assert msg.usage.input_tokens == 21
     assert msg.usage.cache_read_input_tokens == 0
     assert msg.usage.cache_creation_input_tokens == 10318
 
@@ -1055,6 +1057,7 @@ def test_stream_accumulator_finalize_extracts_cache_tokens_from_nested_usage() -
         )
     )
     final = acc.finalize()
+    assert final.usage.input_tokens == 21
     assert final.usage.cache_read_input_tokens == 10318
     assert final.usage.cache_creation_input_tokens == 0
 
@@ -1674,10 +1677,10 @@ def test_turn_message_keeps_its_shape_once_the_loop_marker_moves() -> None:
     in the same shape on both calls, or the second call cannot read the first
     call's write and pays for the question again."""
     from openexecutive.orchestrator.executive import (
-        _apply_loop_cache_marker,
         _clear_turn_marker,
         _mark_turn_message,
     )
+    from openexecutive.orchestrator.reading import apply_loop_cache_marker
     from openexecutive.providers.translator import _anthropic_messages_to_openai
 
     messages: list[dict] = [
@@ -1695,7 +1698,7 @@ def test_turn_message_keeps_its_shape_once_the_loop_marker_moves() -> None:
     messages.append(
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "found it"}]}
     )
-    assert _apply_loop_cache_marker(messages, caller_count)
+    assert apply_loop_cache_marker(messages, caller_count)
     _clear_turn_marker(turn)
     second = _anthropic_messages_to_openai(messages)
 

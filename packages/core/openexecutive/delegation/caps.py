@@ -1,8 +1,9 @@
-"""Act as me: the daily limit on drafts written as one person, shared by chat
-(``ghostwrite_email``) and the inbox watcher.
+"""Act as me: the most drafts a day written as one person, from chat
+(``ghostwrite_email``), follow-ups and workflow sends.
 
 ``DELEGATION_MAX_DRAFTS_PER_DAY`` a UTC day, counted from ``delegation_drafts``
-(every draft saved, from either place) with a floor of what this process saved
+(every draft saved, except the inbox watcher's replies, which no daily count
+holds or uses up) with a floor of what this process saved
 today, so a row that failed to write never lifts the limit. A slot is taken
 synchronously, before the first await: a chat round's calls run concurrently,
 so otherwise each would pass the check before any of them counted.
@@ -29,13 +30,13 @@ def _utc_day() -> str:
 
 
 def drafts_today(person_id: int) -> int | None:
-    """Drafts saved as ``person_id`` since UTC midnight, from chat and the
-    inbox; None when they can't be counted. Never raises."""
+    """Drafts saved as ``person_id`` since UTC midnight, but not the inbox
+    watcher's replies; None when they can't be counted. Never raises."""
     from openexecutive.delegation import drafts
 
     start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        counted = drafts.count_since(person_id, start)
+        counted = drafts.count_since(person_id, start, but_not=drafts.SOURCE_INBOX)
     except Exception:
         logger.warning("delegation.caps: can't count today's drafts — refusing", exc_info=True)
         return None

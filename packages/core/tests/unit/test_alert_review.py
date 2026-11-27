@@ -62,7 +62,7 @@ def dms(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
     sent: list[tuple[int, str]] = []
 
     async def fake_dm(
-        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
     ) -> tuple[bool, str]:
         # Every review DM must say which alert it is about, so acking or
         # dismissing that alert can resolve it in the outcome ledger.
@@ -460,7 +460,9 @@ def test_suggest_workflow_only_from_offered_list_and_never_runs(db: Path, audit_
     assert label == "relevant"
     row = alert_store.get_alert(aid, db_path=db)
     assert row is not None and row.suggested_workflow == "pricing_review" and row.recommended_move == "suggest_workflow"
-    assert any(e[0] == review.EVENT_SUGGESTED for e in audit_events)
+    suggested = [e for e in audit_events if e[0] == review.EVENT_SUGGESTED]
+    assert suggested and "pricing_review" not in suggested[0][1]
+    assert suggested[0][1].startswith("Suggested Pricing & Packaging Review for")
     # A name that was not offered is ignored.
     aid2 = _insert(db, "other")
     _apply(db, aid2, _verdict(aid2, recommended_move="suggest_workflow", workflow_name="board_prep"), evidence=ev)
@@ -521,17 +523,100 @@ def test_move_cap_stops_outbound_moves_but_not_bookkeeping(db: Path, dms) -> Non
 
 def test_exempt_sources_are_never_touched(db: Path, dms) -> None:
     _person(full_name="Pat", role="CEO", is_principal=True)
-    aid = _insert(db, "decision", source="decision_scheduling")
-    assert _apply(db, aid, _verdict(aid, verdict="resolved", confidence="high", evidence="x",
-                                    evidence_ref="S1", recommended_move="close"), refs=["S1"]) == ""
-    row = alert_store.get_alert(aid, db_path=db)
-    assert row is not None and row.status == "unread" and row.last_reviewed_at is None
+    for source in ("artifact", "meetings", "roster_request", "browser_handover"):
+        aid = _insert(db, f"kept {source}", source=source)
+        assert _apply(db, aid, _verdict(aid, verdict="resolved", confidence="high", evidence="x",
+                                        evidence_ref="S1", recommended_move="close"), refs=["S1"]) == ""
+        row = alert_store.get_alert(aid, db_path=db)
+        assert row is not None and row.status == "unread" and row.last_reviewed_at is None
     assert dms == []
 
 
-# --------------------------------------------------------------------------- #
-# Orchestration
-# --------------------------------------------------------------------------- #
+def _waiting_step(db: Path, headline: str, *, hours_ago: float = 30) -> tuple[int, int]:
+    from openexecutive.memory import decision_ledger
+
+    iid = decision_ledger.create_decision_instance(
+        decision_class="take_the_lead_action", department="", originating_session_id=None,
+        proposed_payload={"tool": "send"}, idempotency_key=None, gate_mode="propose",
+        approver_person_id=None, confidence=None, db_path=db,
+    )
+    aid = _insert(
+        db, headline, hours_ago=hours_ago, source="decision_scheduling",
+        external_id=decision_ledger.decision_alert_external_id(iid),
+        topic_tags=[decision_ledger.decision_instance_tag(iid), "private:principal"],
+    )
+    return iid, aid
+
+
+def test_a_waiting_step_the_evidence_shows_is_over_is_settled_with_its_step(db: Path, dms) -> None:
+    from openexecutive.memory import decision_ledger
+
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    iid, aid = _waiting_step(db, "Send the launch note")
+    v = _verdict(aid, verdict="stale", confidence="high", evidence="launch moved", evidence_ref="A1",
+                 note="The launch moved to December, so this note no longer applies.", recommended_move="close")
+    assert _apply(db, aid, v, refs=["A1"]) == "stale"
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.status == "dismissed"
+    assert row.tidied_reason == "The launch moved to December, so this note no longer applies."
+    step = decision_ledger.get_decision_instance(iid, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_AUTO_NO_RESPONSE
+    assert dms == []
+
+
+def test_a_waiting_step_never_merges_away(db: Path) -> None:
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    _iid, aid = _waiting_step(db, "Create the outreach log")
+    newer = _insert(db, "Create the outreach log", hours_ago=2, topic_tags=["private:principal"])
+    v = _verdict(aid, recommended_move="merge", superseded_by_alert_id=newer)
+    assert _apply(db, aid, v) == "relevant"
+    assert alert_store.get_alert(aid, db_path=db).status == "unread"  # type: ignore[union-attr]
+
+
+def test_one_persons_cards_merge_only_with_their_own(db: Path) -> None:
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    dana = _person()
+    old = _insert(db, "Offer letter", hours_ago=30, source="mailbox", topic_tags=["offer"])
+    theirs = _insert(db, "Offer letter again", hours_ago=2, source="mailbox", topic_tags=["offer"],
+                     routed_to_person_id=dana)
+    mine = _insert(db, "Offer letter, newer", hours_ago=1, source="mailbox", topic_tags=["offer"])
+    related = review.gather_evidence(alert_store.get_alert(old, db_path=db), NOW, db_path=db)  # type: ignore[arg-type]
+    shown = {r.get("alert_id") for r in related.get("related_alerts") or []}
+    assert mine in shown and theirs not in shown
+    assert _apply(db, old, _verdict(old, recommended_move="merge", superseded_by_alert_id=mine)) == "merged"
+    row = alert_store.get_alert(old, db_path=db)
+    assert row is not None and row.status == "dismissed" and row.tidied_at is not None
+    assert "Offer letter, newer" in row.tidied_reason
+
+
+def test_one_persons_card_is_audited_as_theirs_alone(db: Path, monkeypatch) -> None:
+    rows: list[tuple[str, bool, int | None]] = []
+    monkeypatch.setattr(audit_pkg, "log_event", lambda event_type, summary, **kw: rows.append(
+        (summary, bool(kw.get("private")), kw.get("private_to_person"))
+    ))
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    dana = _person()
+    mine = _insert(db, "Dana Lee: Offer letter", hours_ago=30, source="mailbox", routed_to_person_id=dana)
+    team = _insert(db, "Pilot pricing", hours_ago=30)
+    for aid in (mine, team):
+        v = _verdict(aid, verdict="stale", evidence="offer withdrawn", evidence_ref="A1",
+                     note="The offer was withdrawn.", recommended_move="close")
+        assert _apply(db, aid, v, refs=["A1"]) == "stale"
+    assert [(p, o) for s, p, o in rows if "Offer letter" in s] == [(False, dana)]
+    assert [(p, o) for s, p, o in rows if "Pilot pricing" in s] == [(False, None)]
+
+
+def test_one_persons_cards_are_batched_only_with_cards_the_same_people_read(db: Path) -> None:
+    dana = _person()
+    cards = [
+        alert_store.get_alert(_insert(db, h, hours_ago=30, **kw), db_path=db)
+        for h, kw in (
+            ("team a", {}), ("dana mail", {"source": "mailbox", "routed_to_person_id": dana}),
+            ("team b", {}), ("pat mail", {"source": "mailbox"}),
+        )
+    ]
+    batches = [[a.headline for a in b] for b in review._batches(cards, 8)]  # type: ignore[union-attr]
+    assert sorted(batches) == [["dana mail"], ["pat mail"], ["team a", "team b"]]
 
 
 def test_run_alert_review_end_to_end_with_stubbed_agent(db: Path, audit_events, dms, monkeypatch) -> None:
@@ -759,13 +844,13 @@ def test_render_batch_neutralises_injected_envelopes_and_labels_refs(db: Path) -
 def test_dm_text_is_templated_with_provenance(monkeypatch) -> None:
     sent: list[dict] = []
 
-    async def fake_message_person(tool_input: dict) -> str:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
         sent.append(tool_input)
         return '{"status": "sent"}'
 
     import openexecutive.orchestrator.schedule_tools as st
 
-    monkeypatch.setattr(st, "handle_message_person", fake_message_person)
+    monkeypatch.setattr(st, "message_person", fake_message_person)
     ok, detail = asyncio.run(review._dm(5, "Please\x00 wire the money now", headline="<Renewal>"))
     assert ok and detail == "sent"
     assert sent[0]["person_id"] == 5
@@ -891,7 +976,7 @@ def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_even
     attempts: list[int] = []
 
     async def flaky_dm(
-        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
     ) -> tuple[bool, str]:
         attempts.append(person_id)
         return (len(attempts) > 1), "ok" if len(attempts) > 1 else "no channel"
@@ -912,14 +997,54 @@ def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_even
 
 
 def test_dm_treats_alert_fallback_as_not_delivered(monkeypatch) -> None:
-    async def fake_message_person(tool_input: dict) -> str:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
         return '{"status": "alerted", "reason": "dm_undeliverable"}'
 
     import openexecutive.orchestrator.schedule_tools as st
 
-    monkeypatch.setattr(st, "handle_message_person", fake_message_person)
+    monkeypatch.setattr(st, "message_person", fake_message_person)
     ok, _detail = asyncio.run(review._dm(5, "hi", headline="h"))
     assert not ok
+
+
+def test_a_card_already_on_their_list_is_not_repeated_as_a_second_card(monkeypatch) -> None:
+    """The card is the message: it goes to their chat app only (never a
+    second "[Alert review] Re:" card), and without one nothing more is sent."""
+    import openexecutive.orchestrator.schedule_tools as st
+
+    calls: list[dict] = []
+    reply = {"raw": '{"status": "sent"}'}
+
+    async def fake_message_person(tool_input: dict, **kw: object) -> str:
+        calls.append(kw)
+        return reply["raw"]
+
+    monkeypatch.setattr(st, "message_person", fake_message_person)
+    monkeypatch.setattr(review, "_on_team", lambda pid: pid == 5)
+    assert asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True)) == (True, "sent")
+    assert calls == [{"alert_fallback": False}]
+
+    reply["raw"] = '{"error": "could not deliver to \'Dana\' on any configured chat channel (no reachable channel)"}'
+    assert asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True)) == (True, review.ON_THEIR_LIST)
+
+    # A contact has no list to see it on.
+    ok, _detail = asyncio.run(review._dm(6, "hi", headline="h", alert_id=1, theirs=True))
+    assert not ok
+
+    # A send that failed is still a failure.
+    reply["raw"] = '{"error": "could not deliver to \'Dana\' on any configured chat channel (slack: 503)"}'
+    ok, _detail = asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True))
+    assert not ok
+
+
+def test_a_message_delivered_as_a_card_counts(monkeypatch) -> None:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
+        return '{"status": "delivered", "via": "card"}'
+
+    import openexecutive.orchestrator.schedule_tools as st
+
+    monkeypatch.setattr(st, "message_person", fake_message_person)
+    assert asyncio.run(review._dm(5, "hi", headline="h")) == (True, "delivered")
 
 
 def test_untrusted_collapses_lines_so_bodies_cannot_forge_sections(db: Path) -> None:
@@ -1058,7 +1183,9 @@ def test_a_held_nudge_does_not_count_toward_the_cap(db: Path, audit_events, monk
     aid = _insert(db, "Waiting on Dana", topic_tags=["department:finance"], routed_to_person_id=dana)
     sent: list[int] = []
 
-    async def held_dm(person_id: int, text: str, *, headline: str = "", alert_id: int | None = None):
+    async def held_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
         sent.append(person_id)
         held_messages.hold(person_id, text, source="alert_review", release_at=None, ref=f"alert:{alert_id}")
         return True, review._HELD_DETAIL
@@ -1072,3 +1199,125 @@ def test_a_held_nudge_does_not_count_toward_the_cap(db: Path, audit_events, monk
     # While it waits, the next pass doesn't hold another.
     _apply(db, aid, _verdict(aid, recommended_move="nudge", message="again"), summary=summary)
     assert sent == [dana]
+
+
+def test_a_card_already_on_their_list_is_not_a_nudge(db: Path, audit_events, monkeypatch) -> None:
+    """A teammate with no chat app: nothing was sent, so no nudge is counted
+    or logged as one."""
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    dana = _person(full_name="Dana", role="CFO", department_slugs=["finance"])
+    aid = _insert(db, "Waiting on Dana", topic_tags=["department:finance"], routed_to_person_id=dana)
+
+    async def no_app_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
+        assert theirs
+        return True, review.ON_THEIR_LIST
+
+    monkeypatch.setattr(review, "_dm", no_app_dm)
+    monkeypatch.setattr(review, "_nudges_so_far", lambda alert_id: 0)
+    summary = review.ReviewSummary()
+    _apply(db, aid, _verdict(aid, recommended_move="nudge", message="Gentle ping"), summary=summary)
+    assert summary.nudged == 0 and summary.moves_used == 0
+    assert not any(e[0] == review.EVENT_NUDGED for e in audit_events)
+
+
+def test_a_personal_card_is_tidied_but_never_evidence_for_the_team(db: Path, dms) -> None:
+    # An email watch's card is one person's alone: the tidy-up looks at it,
+    # but never routes or nudges on it, nor shows it as evidence for a card
+    # the team acts on.
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    old = _insert(db, "Pilot pricing", hours_ago=30, topic_tags=["pilot"])
+    mine = _insert(db, "Dana Lee: Offer letter", hours_ago=30, source="mailbox", topic_tags=["pilot"])
+    assert {a.id for a in review.select_candidates(NOW, _settings(), db_path=db)} == {old, mine}
+    related = review.gather_evidence(alert_store.get_alert(old, db_path=db), NOW, db_path=db)  # type: ignore[arg-type]
+    assert mine not in {r.get("alert_id") for r in related.get("related_alerts") or []}
+    dana = _person()
+    v = _verdict(mine, recommended_move="route", target_person_id=dana, message="Take this")
+    assert _apply(db, mine, v) == "relevant"
+    assert dms == []
+    assert alert_store.get_alert(mine, db_path=db).routed_to_person_id is None  # type: ignore[union-attr]
+
+
+def test_an_escalation_with_no_chat_app_says_no_message_went(db: Path, audit_events, monkeypatch) -> None:
+    """The principal has no chat app: the card on their list is raised, and
+    the log doesn't claim a message reached them."""
+    async def no_app_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
+        return True, review.ON_THEIR_LIST
+
+    monkeypatch.setattr(review, "_dm", no_app_dm)
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    aid = _insert(db, "deadline", severity="low")
+    _apply(db, aid, _verdict(aid, recommended_move="escalate", message="look"))
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.severity == "high" and row.due_at is not None
+    [esc] = [e for e in audit_events if e[0] == review.EVENT_ESCALATED]
+    assert esc[2]["dm_ok"] is False and "no message sent" in esc[1]
+
+
+def test_a_teammates_own_card_is_tidied_but_never_evidence(db: Path, dms) -> None:
+    # A teammate's card is their one ask, shown only to them and whom it is
+    # for: the tidy-up may settle it, but never routes, nudges or quotes it
+    # onto another card.
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    old = _insert(db, "Pilot pricing", hours_ago=30, topic_tags=["pilot"])
+    theirs = _insert(db, "Dana asks about pilot pricing", hours_ago=30, source=TEAM_RAISED_SOURCE, topic_tags=["pilot"])
+    related = review.gather_evidence(alert_store.get_alert(old, db_path=db), NOW, db_path=db)  # type: ignore[arg-type]
+    assert theirs not in {r.get("alert_id") for r in related.get("related_alerts") or []}
+    v = _verdict(theirs, recommended_move="nudge", message="Ping")
+    assert _apply(db, theirs, v) == "relevant"
+    assert dms == []
+    assert alert_store.get_alert(theirs, db_path=db).routed_to_person_id is None  # type: ignore[union-attr]
+
+def test_a_waiting_step_todays_rules_let_go_is_tidied_without_the_model(db: Path, dms, monkeypatch) -> None:
+    """Asked again (``take_the_lead.still_waits``), a step that would no
+    longer wait leaves Needs you on the next pass: settled, not sent, with
+    why on Tidied up. One that still waits goes to the model as before."""
+    from openexecutive.agents import alert_review as agent_module
+    from openexecutive.memory import decision_ledger
+    from openexecutive.orchestrator import take_the_lead
+
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    gone_iid, gone = _waiting_step(db, "Message Sam")
+    kept_iid, kept = _waiting_step(db, "Message Lee")
+    asked: list[Any] = []
+
+    def fake_still_waits(payload: dict[str, Any]) -> bool:
+        asked.append(payload.get("tool"))
+        return payload.get("tool") == "keep"
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE decision_instances SET proposed_payload_json = ? WHERE id = ?",
+                     ('{"tool": "keep"}', kept_iid))
+    monkeypatch.setattr(take_the_lead, "still_waits", fake_still_waits)
+    seen: list[str] = []
+
+    async def fake_review(self, batch_context: str) -> list[AlertVerdict]:
+        seen.append(batch_context)
+        return [_verdict(kept, note="still waiting")]
+
+    monkeypatch.setattr(agent_module.AlertReviewAgent, "review", fake_review)
+    monkeypatch.setattr(review, "_seed_outbound_session", lambda: None)
+    summary = asyncio.run(review.run_alert_review(reason="heartbeat", now=NOW, db_path=db, settings=_settings()))
+
+    assert len(asked) == 2 and summary.closed == 1
+    row = alert_store.get_alert(gone, db_path=db)
+    assert row is not None and row.status == "dismissed" and row.tidied_reason == review.NO_LONGER_WAITS_NOTE
+    step = decision_ledger.get_decision_instance(gone_iid, db_path=db)
+    assert step is not None and step.status == decision_ledger.STATUS_AUTO_NO_RESPONSE
+    assert len(seen) == 1 and f"<alert id={gone}>" not in seen[0] and f"<alert id={kept}>" in seen[0]
+    assert alert_store.get_alert(kept, db_path=db).status == "unread"  # type: ignore[union-attr]
+    assert dms == []
+
+    # Undo puts it back, and the next pass leaves it waiting for the review.
+    assert lifecycle.unlapse_step(gone_iid, db_path=db)
+    assert alert_store.reopen_alert(gone, db_path=db)
+    asked.clear()
+    seen.clear()
+    asyncio.run(review.run_alert_review(
+        reason="heartbeat", now=NOW + timedelta(hours=7), db_path=db, settings=_settings()))
+    assert alert_store.get_alert(gone, db_path=db).status == "unread"  # type: ignore[union-attr]
+    assert len(asked) == 1 and len(seen) == 1 and f"<alert id={gone}>" in seen[0]

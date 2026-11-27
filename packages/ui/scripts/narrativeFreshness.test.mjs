@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  BRIEFING_REFRESH_INTERVAL_MS,
+  BRIEFING_TICK_MS,
   FOCUS_REFRESH_MIN_GAP_MS,
   narrativeRepollDelay,
+  newestAnswer,
   narrativeUpdatedLabel,
   shouldRefreshOnFocus,
+  shouldRefreshOnTick,
 } from "../src/lib/narrativeFreshness.ts";
 
 test("re-polls a few times while the header is rewritten, then stops", () => {
@@ -19,6 +23,43 @@ test("re-polls a few times while the header is rewritten, then stops", () => {
 test("focus refresh is throttled", () => {
   assert.equal(shouldRefreshOnFocus(0, FOCUS_REFRESH_MIN_GAP_MS - 1), false);
   assert.equal(shouldRefreshOnFocus(0, FOCUS_REFRESH_MIN_GAP_MS), true);
+});
+
+test("timed refresh comes a minute after the last pull of any kind", () => {
+  assert.equal(shouldRefreshOnTick(0, BRIEFING_REFRESH_INTERVAL_MS - 1), false);
+  assert.equal(shouldRefreshOnTick(0, BRIEFING_REFRESH_INTERVAL_MS), true);
+  // A pull at 31 s (Approve, focus): the next timed one is due at 91 s and
+  // the tick catches it within one tick, so nothing waits much past a minute.
+  const due = 31_000 + BRIEFING_REFRESH_INTERVAL_MS;
+  const tick = Math.ceil(due / BRIEFING_TICK_MS) * BRIEFING_TICK_MS;
+  assert.equal(shouldRefreshOnTick(31_000, tick), true);
+  assert.ok(tick - 31_000 < BRIEFING_REFRESH_INTERVAL_MS + BRIEFING_TICK_MS);
+});
+
+test("an older /today answer never overwrites a newer one already shown", () => {
+  const pulls = newestAnswer();
+  const timed = pulls.begin();
+  const approve = pulls.begin();
+  assert.equal(pulls.accept(approve), true); // Approve's pull lands first: card gone
+  assert.equal(pulls.accept(timed), false); // the older timed pull is dropped
+});
+
+test("an older answer still shows while the newer pull hasn't landed or failed", () => {
+  const pulls = newestAnswer();
+  const first = pulls.begin(); // slow first load
+  pulls.begin(); // a focus pull starts, then fails (never accepted)
+  assert.equal(pulls.accept(first), true);
+  const later = pulls.begin();
+  assert.equal(pulls.accept(later), true);
+});
+
+test("a change made on the page drops every pull already under way", () => {
+  const pulls = newestAnswer();
+  const timed = pulls.begin(); // left before the row was dismissed
+  pulls.changedHere();
+  assert.equal(pulls.accept(timed), false);
+  const next = pulls.begin();
+  assert.equal(pulls.accept(next), true);
 });
 
 test("updated label reads as recency, then as a local clock time", () => {

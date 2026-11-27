@@ -4,9 +4,15 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useSession } from "next-auth/react";
 import Message from "./Message";
 import HeldStepsCard, { APPROVE_MESSAGE } from "./HeldStepsCard";
+import { APPROVED_MESSAGE } from "./ChatHeldActionCard";
+import BrowserExtensionCard, { BROWSER_GO_AHEAD } from "./browser/BrowserExtensionCard";
+import BrowserWelcomeCard from "./browser/BrowserWelcomeCard";
+import { browserWelcomeClosed, closeBrowserWelcome, showBrowserWelcome } from "@/lib/browserWelcome";
 import BrandMark from "./BrandMark";
 import TurnStatusRow, { useTurnClock } from "./TurnStatusRow";
 import TurnSteps from "./TurnSteps";
+import HandOverAsk from "./HandOverAsk";
+import { toHandOverAsk, type HandOverAsk as HandOverAskState } from "@/lib/handOverAsk";
 import Icon from "./Icon";
 import MicButton from "./MicButton";
 import InfoTip from "./InfoTip";
@@ -24,6 +30,8 @@ import {
   CommitteePhase,
   DebugEvent,
   FALLBACK_ACTIVITY_LABEL,
+  getBrowserStarters,
+  getBrowserStatus,
   getFollowupSuggestion,
   getSessionMessages,
   getSessionPeople,
@@ -58,7 +66,7 @@ import {
   addReads,
   addStep,
   applyProgress,
-  showSteps,
+  liveLineKind,
   type ReadCounts,
   type TurnProgress,
 } from "@/lib/turnSteps";
@@ -73,6 +81,7 @@ import RepeatOfferCard from "@/components/jobs/RepeatOfferCard";
 import type { RepeatOffer } from "@/lib/api";
 import { turnStatus } from "@/lib/turnStatus";
 import { isNearBottom, lastUserIndex, pinScrollTop, pinSpacerHeight } from "@/lib/chatPin";
+import { isImeComposing } from "@/lib/imeComposing";
 
 interface ChatProps {
   onDebugEvent?: (event: DebugEvent) => void;
@@ -177,6 +186,24 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   const [isConsulting, setIsConsulting] = useState(false);
   // The reply whose held steps the person put off with Not now (its index).
   const [heldDismissed, setHeldDismissed] = useState<number | null>(null);
+  const [browserDismissed, setBrowserDismissed] = useState<number | null>(null);
+  // "Your browser is connected" on a new chat
+  // (components/browser/BrowserWelcomeCard.tsx): asked once per page.
+  const [browserWelcome, setBrowserWelcome] = useState<string[] | null>(null);
+  const [browserWelcomeShut, setBrowserWelcomeShut] = useState(false);
+  const browserWelcomeWanted = !member && !(initialMessages && initialMessages.length > 0);
+  useEffect(() => {
+    if (!browserWelcomeWanted || browserWelcomeClosed()) return;
+    const ctrl = new AbortController();
+    getBrowserStatus()
+      .then(async (status) => {
+        if (!status.connected || status.available === false || ctrl.signal.aborted) return;
+        const starters = await getBrowserStarters(ctrl.signal);
+        if (!ctrl.signal.aborted) setBrowserWelcome(starters);
+      })
+      .catch(() => undefined);
+    return () => ctrl.abort();
+  }, [browserWelcomeWanted]);
   const [activityLabel, setActivityLabel] = useState<string | null>(null);
   // The running turn's steps (lib/turnSteps.ts), and whether the person
   // pressed I'll finish it and the turn is writing up what it has.
@@ -190,6 +217,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   const [liveLine, setLiveLine] = useState<string | null>(null);
   const [writingReply, setWritingReply] = useState(false);
   const [handingOver, setHandingOver] = useState(false);
+  // A step in their browser only they can do, asked here with Done and Stop
+  // while the turn waits (components/HandOverAsk.tsx).
+  const [handOverAsk, setHandOverAsk] = useState<HandOverAskState | null>(null);
   const [committeeEnabled, setCommitteeEnabled] = useState(false);
   const [committeePhase, setCommitteePhase] = useState<CommitteePhase | null>(null);
   const turnClock = useTurnClock(isLoading);
@@ -568,7 +598,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
 
   // `queuedFollowup`: the leftovers of a turn, sent on their own. They carry
   // no files and leave alone whatever is being typed in the composer now.
-  async function handleSend(text?: string, memoryText?: string, queuedFollowup = false) {
+  async function handleSend(
+    text?: string,
+    memoryText?: string,
+    queuedFollowup = false,
+    approveCard?: { id: number; input?: Record<string, string> },
+  ) {
     // Carrying on in the chat ends the find, so the reply scrolls into view.
     closeFind();
     if (isLoading && text === undefined) {
@@ -615,6 +650,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setLiveLine(null);
     setWritingReply(false);
     setHandingOver(false);
+    setHandOverAsk(null);
     setCommitteePhase(null);
     const { clientTurnId, signal } = beginTurn();
     turnIdRef.current = clientTurnId;
@@ -641,6 +677,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     // Steps the turn held for an outside read; sent once, just before `done`.
     let turnHeld: string[] | undefined;
     let turnFlags: string[] | undefined;
+    let turnBrowser: { store_url: string | null } | undefined;
     let wasStopped = false;
     // Row id of the persisted reply, from `done`; it is what makes the reply
     // rateable with 👍/👎.
@@ -668,6 +705,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         clientTurnId,
         signal,
         memoryText: turnMemoryText,
+        approveCard,
       })) {
         turnClock.markEvent();
         if (item.type === "debug_event") {
@@ -681,13 +719,22 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           if (roundText >= WRITING_FROM_CHARS) setWritingReply(true);
           setIsConsulting(false);
           setActivityLabel(null);
+          // Words of the reply: the step it asked about is over.
+          setHandOverAsk(null);
           setStreamingContent(accumulated);
+        } else if (item.type === "rewrite") {
+          // Written again whole: the next chunks replace what came so far.
+          accumulated = "";
+          roundText = 0;
+          setStreamingContent("");
         } else if (item.type === "activity") {
           // Arrives immediately before `thinking`, so the label is in place
           // before the indicator turns on. Deliberately not cleared by
           // `action_taken`: a chip can land while the same round is still
           // running, and clearing there would flicker the line off and on.
           setActivityLabel(item.label);
+          // A new round: the ask the last one waited on was answered.
+          setHandOverAsk(null);
           setTurnSteps((prev) => addStep(prev, item.label));
           setTurnReads((prev) => addReads(prev, item.reads));
           // The turn's own words for this round, when it sent them just
@@ -705,6 +752,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           }
         } else if (item.type === "handing_over") {
           setHandingOver(true);
+        } else if (item.type === "hand_over") {
+          setHandOverAsk(toHandOverAsk(item));
         } else if (item.type === "thinking") {
           setIsConsulting(true);
         } else if (item.type === "phase" && item.phase) {
@@ -726,6 +775,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           turnHeld = item.steps.length > 0 ? item.steps : undefined;
         } else if (item.type === "flags") {
           turnFlags = item.flags.length > 0 ? item.flags : undefined;
+        } else if (item.type === "browser_needed") {
+          turnBrowser = { store_url: item.store_url ?? null };
         } else if (item.type === "message_added") {
           setQueued(markTaken(queuedRef.current, item.ids));
         } else if (item.type === "stopped") {
@@ -786,6 +837,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             id: replyId,
             held_steps: turnHeld,
             flags: turnFlags,
+            browser_needed: turnBrowser,
           },
         ]);
         // Only a complete, persisted reply gets a follow-up: a stopped one
@@ -857,6 +909,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       setLiveLine(null);
       setWritingReply(false);
       setHandingOver(false);
+      setHandOverAsk(null);
       setCommitteePhase(null);
       textareaRef.current?.focus();
     }
@@ -985,16 +1038,37 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     fallbackLabel: FALLBACK_ACTIVITY_LABEL,
   });
 
-  const stepsShown = isLoading && (turnProgress !== null || showSteps(turnSteps)) && !committeePhase;
-  const turnStepsLine = (
-    <TurnSteps
-      progress={turnProgress}
-      reads={turnReads}
-      liveLine={writingReply ? "Writing the answer" : liveLine}
-      elapsed={status.elapsed}
-      handingOver={handingOver}
-    />
-  );
+  // One "still working" line a turn: the steps line on a long turn, else the
+  // plain status. Never both (lib/turnSteps.ts liveLineKind).
+  const liveKind = liveLineKind({
+    isLoading,
+    steps: turnSteps,
+    hasProgress: turnProgress !== null,
+    inCommittee: committeePhase !== null,
+    statusShown: status.show,
+  });
+  const liveStatus =
+    liveKind === "steps" ? (
+      <TurnSteps
+        progress={turnProgress}
+        reads={turnReads}
+        liveLine={writingReply ? "Writing the answer" : liveLine}
+        elapsed={status.elapsed}
+        handingOver={handingOver}
+      />
+    ) : liveKind === "status" ? (
+      <TurnStatusRow status={status} committeePhase={committeePhase} showMark={Boolean(streamingContent)} />
+    ) : null;
+  // The ask the turn waits on, under the line.
+  const liveSlot =
+    liveStatus || (isLoading && handOverAsk) ? (
+      <>
+        {liveStatus}
+        {isLoading && handOverAsk && (
+          <HandOverAsk key={handOverAsk.id} ask={handOverAsk} onAnswered={() => setHandOverAsk(null)} />
+        )}
+      </>
+    ) : null;
 
   // Fill the composer with the suggestion without sending it, so the user
   // can edit first. The suggestion is kept: clearing the box shows it again.
@@ -1024,7 +1098,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       acceptFollowup();
       return;
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !isImeComposing(e) && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
@@ -1261,6 +1335,26 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       </button>
                     ))}
               </div>
+              {browserWelcome &&
+                showBrowserWelcome({
+                  landing: isEmpty,
+                  connected: true,
+                  starters: browserWelcome,
+                  closed: browserWelcomeShut,
+                }) && (
+                  <BrowserWelcomeCard
+                    starters={browserWelcome}
+                    onPick={(text) => {
+                      setBrowserWelcomeShut(true);
+                      closeBrowserWelcome();
+                      setInput(text);
+                    }}
+                    onClose={() => {
+                      setBrowserWelcomeShut(true);
+                      closeBrowserWelcome();
+                    }}
+                  />
+                )}
             </div>
           ) : (
             <>
@@ -1298,6 +1392,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       ? (v) => handleFeedback(i, v)
                       : undefined
                   }
+                  // Sent on its own (`queuedFollowup`): no files from the composer,
+                  // which would take the upload route that approves nothing.
+                  onApproveCard={
+                    member ? undefined : (id, input) => handleSend(APPROVED_MESSAGE, undefined, true, { id, input })
+                  }
+                  approveDisabled={isLoading}
                   onRetry={canRedo && i === turn.replyIndex ? () => void handleRetry() : undefined}
                   onEdit={canRedo && !editing && i === turn.userIndex ? startEdit : undefined}
                   memory={
@@ -1324,6 +1424,17 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       onDismiss={() => setHeldDismissed(i)}
                     />
                   )}
+                {msg.role === "assistant" && i === messages.length - 1 && browserDismissed !== i && msg.browser_needed && (
+                  <BrowserExtensionCard
+                    storeUrl={msg.browser_needed.store_url}
+                    onDismiss={() => setBrowserDismissed(i)}
+                    disabled={isLoading}
+                    onGoAhead={() => {
+                      setBrowserDismissed(i);
+                      void handleSend(BROWSER_GO_AHEAD);
+                    }}
+                  />
+                )}
                 </div>
               ))}
 
@@ -1338,45 +1449,27 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 </div>
               ))}
 
-              {stepsShown &&
-                (streamingContent ? (
-                  <div className="pl-12">{turnStepsLine}</div>
-                ) : (
-                  <div className="flex gap-4">
+              {streamingContent ? (
+                <Message
+                  role="assistant"
+                  content={streamingContent}
+                  isStreaming
+                  paused={status.show}
+                  actions={streamingActions.length > 0 ? streamingActions : undefined}
+                  status={liveSlot ?? undefined}
+                />
+              ) : (
+                liveSlot && (
+                  <div className="flex gap-4 mb-8">
                     <div className="flex-shrink-0 mt-1">
                       <BrandMark size="md" consulting />
                     </div>
                     <div className="flex-1 pt-1.5">
                       <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
-                      {turnStepsLine}
+                      {liveSlot}
                     </div>
                   </div>
-                ))}
-
-              {streamingContent && (
-                <Message
-                  role="assistant"
-                  content={streamingContent}
-                  isStreaming
-                  actions={streamingActions.length > 0 ? streamingActions : undefined}
-                  status={
-                    status.show ? (
-                      <TurnStatusRow status={status} committeePhase={committeePhase} />
-                    ) : undefined
-                  }
-                />
-              )}
-
-              {status.show && !streamingContent && !stepsShown && (
-                <div className="flex gap-4 mb-8">
-                  <div className="flex-shrink-0 mt-1">
-                    <BrandMark size="md" consulting />
-                  </div>
-                  <div className="flex-1 pt-1.5">
-                    <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
-                    <TurnStatusRow status={status} committeePhase={committeePhase} showMark={false} />
-                  </div>
-                </div>
+                )
               )}
 
               {/* Someone else's turn, as it happens. */}
@@ -1510,7 +1603,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
               {fileError}
             </p>
           )}
-          <div className="relative flex items-end gap-1.5 sm:gap-2 bg-surface-elevated border border-line-strong rounded-2xl p-1.5 sm:p-2 shadow-sm focus-within:border-accent/60 transition-colors">
+          <div className="ask-box relative flex items-end gap-1.5 sm:gap-2 rounded-2xl p-1.5 sm:p-2 transition-shadow">
             <input
               ref={fileInputRef}
               type="file"

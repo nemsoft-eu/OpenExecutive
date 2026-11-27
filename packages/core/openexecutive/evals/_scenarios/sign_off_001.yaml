@@ -1,0 +1,19 @@
+id: sign_off_001
+domain: operations
+description: "The person asks for a short email draft to a customer and says to sign it from them. The Executive writes the draft in its reply, signed for the person (their name when it knows it; this scenario names no one, so a [Your name] placeholder), sends nothing, and doesn't say it can't sign as them."
+company_context:
+  name: Juniper Table Catering
+  industry: Catering
+  stage: Small business
+  headcount: 6
+query: "Draft a short email to Pat Kim confirming their order for Saturday: 40 soup cups and 3 trays of focaccia. Total is $412.50, with $100 already paid, so $312.50 is due on delivery. Keep it warm but brief, and sign it from me."
+expected_topics:
+  - order_confirmed_40_soup_cups_3_trays_focaccia
+  - balance_due_312_50_on_delivery
+quality_criteria:
+  writes_the_draft_in_the_reply: true
+  signed_for_the_person_with_their_name_or_a_your_name_placeholder_never_as_the_executive: true
+  does_not_invent_a_name_for_the_person: true
+  does_not_say_it_cannot_sign_as_them: true
+  sends_nothing: true
+  brief: true

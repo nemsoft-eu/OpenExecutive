@@ -228,3 +228,89 @@ def client_tool_rounds(
         else 0
     )
     return selection.max_uses + fetches + 1
+
+
+def _result_error(block: dict[str, Any]) -> str | None:
+    """The error code of a ``web_search_tool_result`` block, or None when it
+    holds results."""
+    content = block.get("content")
+    if isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
+        return str(content.get("error_code") or "error")
+    return None
+
+
+def searches_run(blocks: list[dict[str, Any]]) -> int:
+    """How many web searches in this round's blocks ran: every search but
+    one the limit stopped (``max_uses_exceeded``), which never ran."""
+    stopped = {
+        str(b.get("tool_use_id")) for b in blocks
+        if b.get("type") == "web_search_tool_result" and _result_error(b) == "max_uses_exceeded"
+    }
+    return sum(
+        1 for b in blocks
+        if b.get("type") == "server_tool_use" and b.get("name") == WEB_SEARCH_TOOL_NAME
+        and str(b.get("id")) not in stopped
+    )
+
+
+def turn_search_tool() -> dict[str, Any] | None:
+    """The web_search tool for every round of a chat turn: one budget for
+    the whole turn (``WEB_SEARCH_TURN_BUDGET``), so an ask with many facts is
+    looked up to the end, not cut off after a round's first few searches.
+    The same tool every round, since the tools lead the cached prompt and a
+    changed ``max_uses`` would miss the cache on every later round; once the
+    turn has spent its budget the round's results say so instead
+    (``SEARCHES_SPENT_NOTE``), and a search after that ends the turn on its
+    write-up (``SEARCHES_OVER_NOTE``). None when search is off."""
+    return build_web_search_tool(max_uses=get_settings().web_search_turn_budget)
+
+
+# Added to a round's results once the turn has run its searches. Its other
+# steps still run; a search after it makes the next round the write-up
+# (SEARCHES_OVER_NOTE), as does a round a long search paused past it. The
+# tool itself can't shrink without missing the cache, so the write-up round
+# could still search: a turn that ignores every note runs at most about four
+# budgets; one that heeds them stops at the budget.
+SEARCHES_SPENT_NOTE = (
+    "This turn has used its web searches. Don't search again: finish the answer from what the searches"
+    " found and what the company knows, and say plainly what is still unconfirmed."
+)
+SEARCHES_OVER_NOTE = (
+    "This turn has run past its web searches. Write the answer now from what you have, with no more"
+    " searches or other steps, and say plainly what is still unconfirmed."
+)
+SEARCHES_EMPTY_REPLY = (
+    "I've used all the web searches I get for one message. Ask me to carry on and I'll look up the rest."
+)
+
+
+def spent(used: int) -> bool:
+    """Whether a turn that has run ``used`` searches has spent its budget."""
+    return used >= get_settings().web_search_turn_budget
+
+
+def searched(blocks: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Each web search in this round's blocks as (call, result) for the
+    after-reply checks (``claim_check`` / ``reply_check``): a search is a
+    look, like any read."""
+    results = {
+        str(b.get("tool_use_id")): b for b in blocks if b.get("type") == "web_search_tool_result"
+    }
+    calls: list[tuple[str, str]] = []
+    for b in blocks:
+        if b.get("type") != "server_tool_use" or b.get("name") != WEB_SEARCH_TOOL_NAME:
+            continue
+        query = (b.get("input") or {}).get("query", "")
+        result = results.get(str(b.get("id")))
+        if result is None:
+            outcome = "no result"
+        elif (error := _result_error(result)) is not None:
+            outcome = f"error: {error}"
+        else:
+            found = result.get("content")
+            titles = [
+                str(r.get("title", "")) for r in (found if isinstance(found, list) else []) if isinstance(r, dict)
+            ]
+            outcome = f"{len(titles)} results: " + "; ".join(t for t in titles[:5] if t)
+        calls.append((f"{WEB_SEARCH_TOOL_NAME} {query}".strip(), outcome))
+    return calls

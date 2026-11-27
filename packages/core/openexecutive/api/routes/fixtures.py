@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-router = APIRouter()
+
+def _principal_writes(request: Request) -> Iterator[None]:
+    """Every write here replaces or wipes the whole company: the principal's
+    (``chat.principal_writes``)."""
+    from openexecutive.api.routes.chat import principal_writes
+
+    yield from principal_writes(request)
+
+
+router = APIRouter(dependencies=[Depends(_principal_writes)])
 
 _SAFE_NAME = re.compile(r"^[a-z0-9_-]+$")
 
@@ -116,6 +126,7 @@ async def fixtures_unload(request: Request) -> dict:
 async def load_fixture(name: str, request: Request) -> dict:
     from openexecutive.cli.fixture_loader import (
         FixtureNotFoundError,
+        FixtureSnapshotError,
         load_fixture_any,
     )
     from openexecutive.config import get_settings
@@ -130,6 +141,8 @@ async def load_fixture(name: str, request: Request) -> dict:
         result = await load_fixture_any(name, settings)
     except FixtureNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FixtureSnapshotError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     # If the app has a shared store in state, replace it with a fresh instance
     # so the new company_docs collection is visible to subsequent requests.

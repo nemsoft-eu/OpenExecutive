@@ -50,16 +50,22 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # the wording was tightened (same rules, ~27% shorter) to cut the cached prefix.
 # And again: People is checked first when asked how to reach someone.
 # And again: a name that fits more than one person is never picked silently.
+# And again: Approvals is the one gate (no department authority, no "propose,
+# do not wait").
+# And again: a greeting gets a greeting back, not a status report.
+# And again: Big jobs (do the whole job; a one-line heads-up for a long one).
+# And again: an email reply may quote a draft signed by the sender for them to send.
+# And again: Doing what was asked (a figure that looks off goes through, with the doubt said).
 #
-# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-11-03 and 2026-11-12):
-# this digest necessarily differs from upstream's. The fork adds a
+# FORK DELTA (2026-10-07 upstream sync, recomputed 2026-11-03, 2026-11-12 and
+# 2026-11-24): this digest necessarily differs from upstream's. The fork adds a
 # "## Consulting Your Leadership Team" section — the local model ignores
 # `tool_choice`, so the persona has to ask for the consult in prose — and it
 # lives in the SHARED _PERSONA_TAIL so BOTH the team and solo prompts carry
 # it. Upstream's value is
-# 86ed4f8ebf8a1040978dd63d30a507a71cc4abe4e498c709fd56f0c5a43c1b73.
+# d078430adb4412899b8e812aa0b74195386eca88f09941452e9aef8de2939ba0.
 # The test keeps its purpose: any *unintended* byte change still fails here.
-TEAM_PERSONA_SHA256 = "61faf6b91bded0ff64fd1b968e53de44213cc1c8f1b757c2b77d8311e1196962"
+TEAM_PERSONA_SHA256 = "1652f8ed3ed4690980904a4263046132b4920a41f5d855d83d56583147e2026c"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",
@@ -71,7 +77,16 @@ TEAM_ONLY_HEADINGS = (
     "## You Are a Member of This Executive Team",
     "## Choosing Who to Tell",
     "## Departments & Org Coordination",
+    "## Other People's Private Things",
 )
+
+
+@pytest.fixture(autouse=True)
+def _careful_holds_no_asked_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite pins Approvals to Careful (tests/conftest.py), which holds
+    every acting step a turn asks for (take_the_lead._asked_hit); these
+    tests are about other checks, so that hold stays out."""
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -155,7 +170,7 @@ def test_solo_persona_speaks_to_one_principal_of_any_role() -> None:
     assert "not that they work without people" in solo
     for person in ("their manager", "direct reports", "board"):
         assert person in solo
-    assert "Treat them as contacts." in solo
+    assert "Treat them as contacts" in solo
     # The goal-update discipline carries over word for word where it matters.
     assert "Update goals **one at a time, each backed by a specific thing that happened.**" in solo
     assert "Do not sweep." in solo

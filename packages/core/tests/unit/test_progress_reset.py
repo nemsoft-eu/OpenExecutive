@@ -22,10 +22,10 @@ from openexecutive.memory.company_tables import PER_COMPANY_TABLES
 from .test_company_tables import env  # noqa: F401
 
 
-def _admit(db: Path) -> None:
+def _admit(db: Path, summary: str = "Positioning draft is done.") -> None:
     update = CleanUpdate(
         topic="GTM plan", topic_key="gtm plan", status="on_track",
-        summary="Positioning draft is done.", ask=None, link=None, idempotency_key=None,
+        summary=summary, ask=None, link=None, idempotency_key=None,
     )
     assert progress_store.admit("marketing-planner", update, db_path=db).id is not None
     assert progress_store.latest_per_topic(db_path=db)
@@ -65,14 +65,17 @@ def test_a_fixture_unload_empties_what_the_demo_received(
     with_memory_json: bool, env: Any,  # noqa: F811
 ) -> None:
     """With or without a ``memory.json`` in the fixture: the wipe must not
-    hang off the fixture's own files."""
+    hang off the fixture's own files. Unload puts the user's whole saved
+    database back (``_user_backup/state.db``), so their own update returns
+    and the one the demo received does not."""
     if with_memory_json:
         (fixture_loader.FIXTURES_ROOT / "demo" / "memory.json").write_text("{}\n")
     _admit(env.db)
     asyncio.run(fixture_loader.load_fixture("demo", env.settings))
     assert progress_store.latest_per_topic(db_path=env.db) == []
 
-    _admit(env.db)
+    _admit(env.db, summary="Sent to the demo company.")
     asyncio.run(fixture_loader.unload_fixture(env.settings))
 
-    assert progress_store.latest_per_topic(db_path=env.db) == []
+    summaries = [u.summary for u in progress_store.latest_per_topic(db_path=env.db)]
+    assert summaries == ["Positioning draft is done."]

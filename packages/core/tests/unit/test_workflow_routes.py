@@ -456,6 +456,8 @@ def test_run_detail_strips_the_resume_payload(
     assert "resume_state_json" not in detail
     assert detail["resume_progress"]["gate_step_id"] == "gate"
     assert detail["resume_progress"]["completed_step_ids"] == []
+    # The run page names its workflow in words, never by its key.
+    assert detail["workflow_title"] == "Gate route"
 
 
 def test_run_detail_resume_progress_is_null_for_a_pause_only_run(
@@ -870,3 +872,69 @@ def test_http_run_keeps_a_private_artifact_out_of_run_history(temp_db: Path) -> 
     run = get_run(run_id, db_path=temp_db)
     assert run is not None and run["status"] == "done"
     assert run["artifact"] == PRIVATE_RUN_ARTIFACT
+
+
+class _CrashingWorkflow(_GateRouteWorkflow):
+    """A workflow whose run fails with internal detail in the exception."""
+
+    name = "crashing_route"
+
+    async def run(self, inputs, store):  # noqa: ANN001, ANN201
+        raise RuntimeError("cannot open /srv/data/secret.db as oe-admin")
+        yield  # pragma: no cover - makes this an async generator
+
+
+def test_an_unexpected_failure_shows_plain_text_not_the_exception(
+    temp_db: Path,
+) -> None:
+    """The person running a workflow sees a plain message, and the stored
+    run says the same; the exception's own text stays in the log."""
+    from openexecutive.utils.public_errors import GENERIC_FAILURE
+
+    with patch("openexecutive.workflows.persistence.DB_PATH", temp_db), \
+         patch("openexecutive.api.routes.workflows.create_run",
+               side_effect=lambda **kw: create_run(db_path=temp_db, **kw)), \
+         patch("openexecutive.api.routes.workflows.get_workflow",
+               lambda name: _CrashingWorkflow()):
+        app = create_app()
+        with TestClient(app) as c:
+            r = c.post("/workflows/crashing_route/runs", json={"topic": "x"})
+
+    assert "secret.db" not in r.text
+    errors = [e for e in _sse_events(r.text) if e.get("type") == "error"]
+    assert errors and errors[-1]["message"] == GENERIC_FAILURE
+    run = get_run(errors[-1]["run_id"], db_path=temp_db)
+    assert run is not None
+    assert run["status"] == "error"
+    assert run["error"] == GENERIC_FAILURE
+
+
+class _RefusingWorkflow(_GateRouteWorkflow):
+    """A workflow that fails with text written for the person."""
+
+    name = "refusing_route"
+
+    async def run(self, inputs, store):  # noqa: ANN001, ANN201
+        from openexecutive.utils.public_errors import PublicError
+
+        raise PublicError("Add a topic first.")
+        yield  # pragma: no cover - makes this an async generator
+
+
+def test_a_public_error_reaches_the_person_with_its_own_text(
+    temp_db: Path,
+) -> None:
+    with patch("openexecutive.workflows.persistence.DB_PATH", temp_db), \
+         patch("openexecutive.api.routes.workflows.create_run",
+               side_effect=lambda **kw: create_run(db_path=temp_db, **kw)), \
+         patch("openexecutive.api.routes.workflows.get_workflow",
+               lambda name: _RefusingWorkflow()):
+        app = create_app()
+        with TestClient(app) as c:
+            r = c.post("/workflows/refusing_route/runs", json={"topic": "x"})
+
+    errors = [e for e in _sse_events(r.text) if e.get("type") == "error"]
+    assert errors and errors[-1]["message"] == "Add a topic first."
+    run = get_run(errors[-1]["run_id"], db_path=temp_db)
+    assert run is not None
+    assert run["error"] == "Add a topic first."

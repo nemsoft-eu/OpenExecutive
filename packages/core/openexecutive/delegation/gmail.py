@@ -121,8 +121,8 @@ STATUS_MESSAGES: dict[str, str] = {
         "scripts/connect-own-gmail.py or scripts/connect-own-outlook.py."
     ),
     "mismatch": (
-        "The connected mailbox isn't the address on your People entry. Connect that "
-        "account, or correct your email on the People page."
+        "The saved sign-in now opens a different mailbox from the one you connected. "
+        "Connect your mailbox again."
     ),
     "no_email": "Your People entry has no email address. Add it on the People page first.",
     "shared_mailbox": (
@@ -467,6 +467,30 @@ def credential_provider(email: str, *, directory: Path | None = None) -> str:
     except (OSError, ValueError):
         return PROVIDER
     return "microsoft" if isinstance(data, dict) and data.get("provider") == "microsoft" else PROVIDER
+
+def mailbox_field(email: str | None, mailbox: str | None) -> dict[str, str]:
+    """A credential file's ``mailbox`` entry (``mailbox_of``): only when the
+    mailbox's address isn't ``email`` itself."""
+    address, opened = normalize_email(email), normalize_email(mailbox)
+    return {"mailbox": opened} if opened and opened != address else {}
+
+
+def mailbox_of(email: str | None, *, directory: Path | None = None) -> str:
+    """The address ``email``'s own mailbox sends from: the ``mailbox`` their
+    credential file names, else ``email`` itself. A person may connect a
+    mailbox whose address isn't the one they sign in with (a Gmail sign-in, an
+    Outlook mailbox): the file stays filed under their own address, and this
+    is the address the mail service must report on every use
+    (``gmail_status``) and that marks their own mail in a thread."""
+    address = normalize_email(email)
+    if not address:
+        return ""
+    try:
+        data = json.loads(credential_path(address, directory=directory).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return address
+    mailbox = normalize_email(str(data.get("mailbox") or "")) if isinstance(data, dict) else ""
+    return mailbox or address
 
 
 def load_credential(email: str, *, directory: Path | None = None) -> GmailCredential | None:
@@ -928,7 +952,7 @@ def mailbox_link(
     its message id; Outlook opens the draft itself (``draft_id``, else
     ``message_id``), as Outlook on the web has no link to a conversation."""
     if credential_provider(email) != "microsoft":
-        return gmail_link(email, thread_id=thread_id, message_id=message_id)
+        return gmail_link(mailbox_of(email), thread_id=thread_id, message_id=message_id)
     from openexecutive.delegation.outlook import load_credential as load_outlook
     from openexecutive.delegation.outlook import outlook_link
 
@@ -978,6 +1002,11 @@ class DelegateGmail:
         self._credential = credential
         self._transport = transport
         self._timeout = timeout
+
+    @property
+    def mailbox(self) -> str:
+        """The address this mailbox sends from (``mailbox_of``)."""
+        return mailbox_of(self.email)
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
@@ -1192,7 +1221,7 @@ class DelegateGmail:
             data = await self._get(client, "/settings/sendAs")
         entries = [e for e in data.get("sendAs") or [] if isinstance(e, dict)]
         primary = next((e for e in entries if e.get("isPrimary")), None) or next(
-            (e for e in entries if normalize_email(str(e.get("sendAsEmail") or "")) == self.email),
+            (e for e in entries if normalize_email(str(e.get("sendAsEmail") or "")) == self.mailbox),
             None,
         )
         return html_to_text(str((primary or {}).get("signature") or ""))
@@ -1244,6 +1273,25 @@ class DelegateGmail:
         found = await self.list_message_ids(
             f"from:{target} -in:chats newer_than:{int(days)}d", max_results=max(1, min(int(limit), 25)),
         )
+        messages: list[MailMessage] = []
+        for message_id, _thread in found:
+            try:
+                messages.append(await self.get_message(message_id))
+            except GmailNotFound:
+                continue  # deleted since it was listed
+        return messages
+
+    async def received_since(
+        self, after: datetime, *, before: datetime | None = None, limit: int = 25,
+    ) -> list[MailMessage]:
+        """Mail that reached the inbox since ``after`` (and before
+        ``before``, when given), every tab (a sign-up notice lands in
+        Updates), not the person's own, newest first, at most ``limit``
+        (capped at 50). An email watch reads this, a page at a time."""
+        query = f"in:inbox -in:chats -from:me after:{int(after.timestamp())}"
+        if before is not None:
+            query += f" before:{int(before.timestamp())}"
+        found = await self.list_message_ids(query, max_results=max(1, min(int(limit), 50)))
         messages: list[MailMessage] = []
         for message_id, _thread in found:
             try:
@@ -1423,7 +1471,7 @@ class DelegateGmail:
         skipped = 0
         if spec.forward is not None and not spec.attachments:
             spec, skipped = await self._with_forwarded_files(spec)
-        message: dict[str, Any] = {"raw": build_raw(self.email, spec)}
+        message: dict[str, Any] = {"raw": build_raw(self.mailbox, spec)}
         if spec.thread_id:
             message["threadId"] = spec.thread_id
         async with self._client() as client:
@@ -1556,7 +1604,7 @@ class DelegateGmail:
                     mine = next((a for a in attendees if a.get("self") is True), None)
                     if mine is None:
                         mine = next(
-                            (a for a in attendees if normalize_email(str(a.get("email") or "")) == self.email),
+                            (a for a in attendees if normalize_email(str(a.get("email") or "")) == self.mailbox),
                             None,
                         )
                     if mine is None:
@@ -1648,7 +1696,8 @@ async def _gmail_status(address: str, *, gmail: Any = None) -> GmailStatus:
     except Exception:
         logger.warning("delegation.gmail: settings unreadable — refusing", exc_info=True)
         return "error"
-    if address == exec_address:
+    expected = mailbox_of(address)
+    if exec_address in (address, expected):
         return "shared_mailbox"
     client = gmail if gmail is not None else gmail_for(address)
     try:
@@ -1660,4 +1709,4 @@ async def _gmail_status(address: str, *, gmail: Any = None) -> GmailStatus:
     except Exception:
         logger.warning("delegation.gmail: status check failed", exc_info=True)
         return "error"
-    return "connected" if opened == address else "mismatch"
+    return "connected" if opened == expected else "mismatch"

@@ -409,7 +409,7 @@ def test_routes_answer_the_owner(client: TestClient, monkeypatch: pytest.MonkeyP
 
     assert (people.status_code, channels.status_code, lookup.status_code) == (200, 200, 200)
     body = people.json()
-    assert set(body) == {"slack", "discord", "telegram"}
+    assert set(body) == {"slack", "discord", "telegram", "google_chat"}
     assert body["discord"] == {
         "configured": False, "ok": True, "options": [], "truncated": False, "members_available": None,
     }
@@ -455,3 +455,39 @@ async def test_telegram_option_says_who_already_has_the_chat(monkeypatch: pytest
     options = {o.id: o.detail for o in (await chat_directory.list_directory("people")).telegram.options}
     assert options["42"].endswith("already linked to Olive")
     assert "already linked" not in options["77"]
+
+
+@pytest.mark.asyncio
+async def test_google_chat_lists_the_apps_group_spaces_as_rooms(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.integrations import google_chat
+
+    monkeypatch.delenv("GOOGLE_CHAT_PROJECT_NUMBER", raising=False)
+    listing = await chat_directory.list_directory("channels")
+    assert listing.google_chat.configured is False
+
+    monkeypatch.setenv("GOOGLE_CHAT_PROJECT_NUMBER", "123456789012")
+    monkeypatch.setattr(google_chat, "group_spaces", lambda: [
+        {"space": "spaces/ALL", "title": "Everyone", "announce": True},
+        {"space": "spaces/OPS", "title": "", "announce": False},
+    ])
+    listing = await chat_directory.list_directory("channels")
+    assert [(o.id, o.name, o.detail) for o in listing.google_chat.options] == [
+        ("spaces/ALL", "Everyone", "Announcements"),
+        ("spaces/OPS", "Unnamed space", ""),
+    ]
+    # People are reached by DM, never picked.
+    assert (await chat_directory.list_directory("people")).google_chat.configured is False
+
+
+@pytest.mark.asyncio
+async def test_google_chat_listing_failure_reads_as_not_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.integrations import google_chat
+
+    monkeypatch.setenv("GOOGLE_CHAT_PROJECT_NUMBER", "123456789012")
+
+    def _boom() -> list[dict[str, Any]]:
+        raise RuntimeError("403")
+
+    monkeypatch.setattr(google_chat, "group_spaces", _boom)
+    listing = await chat_directory.list_directory("channels")
+    assert listing.google_chat.configured is True and listing.google_chat.ok is False

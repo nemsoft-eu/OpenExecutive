@@ -15,13 +15,7 @@ import {
 } from "@/lib/api";
 import { goalCounts } from "@/lib/goalGroups";
 import { PageSpinner } from "@/components/ui/Spinner";
-
-// The Approvals level each department's work runs at.
-const AUTHORITY_LABELS: Record<string, string> = {
-  auto_execute: "Hands-off",
-  propose_only: "Balanced",
-  escalate: "Careful",
-};
+import { isImeComposing } from "@/lib/imeComposing";
 
 const AUTHORITY_DOT: Record<string, string> = {
   auto_execute: "bg-emerald-500",
@@ -85,7 +79,7 @@ function AddDepartmentModal({ onCreated, onCancel }: AddDepartmentModalProps) {
             ref={titleRef}
             value={form.title}
             onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))}
-            onKeyDown={(e) => { if (e.key === "Enter" && form.title.trim()) handleCreate(); }}
+            onKeyDown={(e) => { if (e.key === "Enter" && !isImeComposing(e) && form.title.trim()) handleCreate(); }}
             className={`${INPUT_CLS} h-11`}
             placeholder="Customer Success"
           />
@@ -162,7 +156,7 @@ export default function DepartmentsPage() {
                     </div>
                     <span className="flex-shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-line text-[13px] font-medium text-fg">
                       <span aria-hidden="true" className={`h-2 w-2 rounded-full ${AUTHORITY_DOT[cfg.authority_level] ?? "bg-fg-subtle"}`} />
-                      {AUTHORITY_LABELS[cfg.authority_level] ?? cfg.authority_level}
+                      {cfg.approvals}
                     </span>
                   </div>
                   <div className="text-[15px] text-fg-muted mt-1.5">{cfg.charter.mission.slice(0, 80)}{cfg.charter.mission.length > 80 ? "…" : ""}</div>

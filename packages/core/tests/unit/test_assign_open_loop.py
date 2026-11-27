@@ -129,7 +129,7 @@ def test_refusals(team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_due_date_resolves_to_local_five_pm_and_is_clamped(team: SimpleNamespace) -> None:
-    tz = open_loops._user_tz()
+    tz = open_loops.workspace_settings.get_user_timezone()
     today = datetime.now(tz).date()
     target = today + timedelta(days=3)
     result = _assign(team.sara, team.principal, due=target)
@@ -193,6 +193,15 @@ async def test_tool_teammate_assigns_anyone_on_the_team(team: SimpleNamespace) -
     assert (await _tool(person_id=team.principal, task="the Q3 numbers"))["status"] == "assigned"
 
 
+async def test_tool_teammate_assigns_from_their_proven_email(team: SimpleNamespace) -> None:
+    _speak(team.sara, from_web_chat=False, origin_channel="email", email_from="sara@northwind.test",
+           email_sender_authenticated=True)
+    assert (await _tool(person_id=team.ben, task="send me the Q3 numbers"))["status"] == "assigned"
+    _speak(team.sara, from_web_chat=False, origin_channel="email", email_from="sara@northwind.test",
+           email_sender_authenticated=False)
+    assert (await _tool(person_id=team.ben, task="send me the Q3 numbers"))["status"] == "refused"
+
+
 @pytest.mark.parametrize(
     ("who", "surface"),
     [
@@ -213,6 +222,31 @@ async def test_tool_refuses_unverified_or_unrostered_speakers(
     out = await _tool(person_id=team.ben, task="send me the Q3 numbers")
     assert out["status"] == "refused"
     assert open_loops.count_open_loops(team.ben) == 0
+
+
+async def test_an_approved_own_card_assigns_for_the_person_who_asked(team: SimpleNamespace) -> None:
+    """A teammate's ask held on their own card: their tap is them asking, so
+    carrying it out (an unattended session, no message) assigns the task for
+    them. The owner's own card the same. A card with no one on the team
+    behind it assigns nothing."""
+    from openexecutive.orchestrator import levels
+    from openexecutive.orchestrator.session import Session
+
+    current_session.set(Session(unattended=True))  # type: ignore[arg-type]
+    with levels.approved(team.sara):
+        out = await _tool(person_id=team.sara, task="call Leo Park tomorrow")
+    assert out["status"] == "assigned"
+    [loop] = open_loops.list_open_loops(person_id=team.sara)
+    assert "call Leo Park tomorrow" in loop.description
+    with levels.approved(team.principal):
+        out = await _tool(person_id=team.ben, task="send the deck")
+    assert out["status"] == "assigned"
+    with levels.approved(None):
+        out = await _tool(person_id=team.ben, task="send the other deck")
+    assert out["status"] == "refused"
+    with levels.approved(team.gina):
+        out = await _tool(person_id=team.ben, task="send a third deck")
+    assert out["status"] == "refused"
 
 
 async def test_tool_requires_the_speakers_own_words(team: SimpleNamespace) -> None:
@@ -400,13 +434,13 @@ async def test_a_lookalike_closing_tag_in_the_backstory_is_not_the_speakers_word
     assert open_loops.count_open_loops(team.ben) == 0
 
 
-async def test_a_teammate_cannot_tell_a_contact_from_no_one(team: SimpleNamespace) -> None:
+async def test_a_teammate_hears_a_contact_is_a_contact(team: SimpleNamespace) -> None:
     _speak(team.sara)
     contact = await _tool(person_id=team.carl, task="send me the Q3 numbers")
     _speak(team.sara)
     nobody = await _tool(person_id=9999, task="send me the Q3 numbers")
-    assert contact == nobody
-    assert contact["reason"] == "unknown_owner"
+    assert contact["reason"] == "owner_is_contact"
+    assert nobody["reason"] == "unknown_owner"
 
 
 # --------------------------------------------------------------------------- #

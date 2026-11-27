@@ -3,7 +3,7 @@
 Two tools live here:
 
 * ``send_department_message`` — post to a department's configured team
-  room on the named integration (slack / discord / telegram). Falls back
+  room on the named integration (slack / discord / telegram / google_chat). Falls back
   to an error string the model can read and route around when the
   department has no channel configured.
 * ``send_company_broadcast`` — post to the integration's
@@ -31,6 +31,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# The chat apps the broadcast tools post to, in the order a department's
+# notice tries them.
+INTEGRATIONS: tuple[str, ...] = ("slack", "discord", "telegram", "google_chat")
 
 
 # --- Privacy backstop (defence-in-depth for "Choosing Who to Tell") ----------
@@ -101,7 +105,7 @@ SEND_DEPARTMENT_MESSAGE_TOOL: dict[str, Any] = {
     "name": "send_department_message",
     "description": (
         "Post a message to a department's configured team room (Slack / "
-        "Discord / Telegram). Use when the matter is department-scoped "
+        "Discord / Telegram / Google Chat space). Use when the matter is department-scoped "
         "and has no single owner — a Goal flipping at-risk, a cadence "
         "summary, departmental coordination. Falls back with a clear "
         '"no <integration> channel configured" error if the department '
@@ -117,7 +121,7 @@ SEND_DEPARTMENT_MESSAGE_TOOL: dict[str, Any] = {
             },
             "integration": {
                 "type": "string",
-                "enum": ["slack", "discord", "telegram"],
+                "enum": list(INTEGRATIONS),
                 "description": "Which integration's channel to post to.",
             },
             "text": {
@@ -134,7 +138,8 @@ SEND_COMPANY_BROADCAST_TOOL: dict[str, Any] = {
     "name": "send_company_broadcast",
     "description": (
         "Post a message to the company-wide default room on Slack / "
-        "Discord / Telegram. Use sparingly — only for things that "
+        "Discord / Telegram, or the Google Chat space for "
+        "announcements (posted as the Chat app). Use sparingly — only for things that "
         "genuinely belong in front of the whole team and have no clear "
         "single owner (e.g. 'Q3 plan shipped', cross-cutting status). "
         "For decisions involving comp, board, or legal scopes, prefer "
@@ -148,7 +153,7 @@ SEND_COMPANY_BROADCAST_TOOL: dict[str, Any] = {
         "properties": {
             "integration": {
                 "type": "string",
-                "enum": ["slack", "discord", "telegram"],
+                "enum": list(INTEGRATIONS),
                 "description": "Which integration's default room to broadcast on.",
             },
             "text": {
@@ -240,6 +245,23 @@ async def _post_telegram_chat(chat_id: str, text: str) -> dict[str, Any]:
     return {"status": "sent", "channel": str(chat_id_int)}
 
 
+async def _post_google_chat_space(space: str, text: str) -> dict[str, Any]:
+    """Post to a Google Chat space as the Chat app (``google_chat.post_to_space``)."""
+    import asyncio
+
+    from openexecutive.integrations import google_chat
+
+    try:
+        await asyncio.to_thread(google_chat.post_to_space, space, text)
+    except Exception as exc:
+        if isinstance(exc, google_chat.NotAppSpace):
+            logger.warning("broadcast_tools: %s isn't a Google Chat space the app is in", space)
+            return {"error": "that isn't a Google Chat space the app is in"}
+        logger.exception("broadcast_tools: google chat post failed")
+        return {"error": "google chat post failed"}
+    return {"status": "sent", "channel": space}
+
+
 async def _dispatch(
     integration: str, channel_id: str, text: str
 ) -> dict[str, Any]:
@@ -252,6 +274,8 @@ async def _dispatch(
         return await _post_discord_channel(channel_id, text)
     if integration == "telegram":
         return await _post_telegram_chat(channel_id, text)
+    if integration == "google_chat":
+        return await _post_google_chat_space(channel_id, text)
     return {"error": f"unknown integration {integration!r}"}
 
 
@@ -309,7 +333,7 @@ async def handle_send_department_message(tool_input: dict[str, Any]) -> str:
     if err is not None or text is None:
         return json.dumps({"error": err})
 
-    if integration not in ("slack", "discord", "telegram"):
+    if integration not in INTEGRATIONS:
         return json.dumps({"error": f"unknown integration {integration!r}"})
 
     sensitive = _privacy_backstop_violation(text)
@@ -330,6 +354,7 @@ async def handle_send_department_message(tool_input: dict[str, Any]) -> str:
         "slack": cfg.slack_channel_id,
         "discord": cfg.discord_channel_id,
         "telegram": cfg.telegram_chat_id,
+        "google_chat": cfg.google_chat_space,
     }[integration]
     if not channel_id:
         _audit(tool="send_department_message", ok=False, integration=integration,
@@ -347,6 +372,18 @@ async def handle_send_department_message(tool_input: dict[str, Any]) -> str:
            target=slug, text_len=len(text),
            reason=None if ok else str(result.get("error", ""))[:120])
     return json.dumps(result)
+
+
+async def _google_chat_announce_space() -> str | None:
+    import asyncio
+
+    from openexecutive.integrations import google_chat
+
+    try:
+        return await asyncio.to_thread(google_chat.announce_space)
+    except Exception:
+        logger.exception("broadcast_tools: couldn't find the Google Chat announcement space")
+        return None
 
 
 async def handle_send_company_broadcast(tool_input: dict[str, Any]) -> str:
@@ -367,7 +404,7 @@ async def handle_send_company_broadcast(tool_input: dict[str, Any]) -> str:
     if err is not None or text is None:
         return json.dumps({"error": err})
 
-    if integration not in ("slack", "discord", "telegram"):
+    if integration not in INTEGRATIONS:
         return json.dumps({"error": f"unknown integration {integration!r}"})
 
     sensitive = _privacy_backstop_violation(text)
@@ -378,11 +415,24 @@ async def handle_send_company_broadcast(tool_input: dict[str, Any]) -> str:
         return _privacy_refusal(sensitive)
 
     settings = get_settings()
-    channel_id: str | None = {
-        "slack": settings.slack_default_channel_id,
-        "discord": settings.discord_default_channel_id,
-        "telegram": settings.telegram_default_chat_id,
-    }[integration]
+    channel_id: str | None
+    if integration == "google_chat":
+        channel_id = await _google_chat_announce_space()
+    else:
+        channel_id = {
+            "slack": settings.slack_default_channel_id,
+            "discord": settings.discord_default_channel_id,
+            "telegram": settings.telegram_default_chat_id,
+        }[integration]
+    if not channel_id and integration == "google_chat":
+        _audit(tool="send_company_broadcast", ok=False, integration=integration,
+               target="<unset>", text_len=len(text), reason="no announcement space")
+        return json.dumps({
+            "error": (
+                "no Google Chat space for announcements: add the Chat app to a space, or "
+                "set GOOGLE_CHAT_DEFAULT_SPACE to the one announcements go to"
+            )
+        })
     if not channel_id:
         _audit(tool="send_company_broadcast", ok=False, integration=integration,
                target="<unset>", text_len=len(text), reason="no default channel")
@@ -440,6 +490,7 @@ async def post_department_notice(
         ("slack", cfg.slack_channel_id),
         ("discord", cfg.discord_channel_id),
         ("telegram", cfg.telegram_chat_id),
+        ("google_chat", cfg.google_chat_space),
     ):
         if not channel_id:
             continue

@@ -108,6 +108,13 @@ class Note:
     correction: str | None
     corrected_at: str | None
 
+    @property
+    def corrected(self) -> str:
+        """The correction as the Executive reads it, in note form
+        (:func:`note_form`); empty when there is none. Every reader that
+        hands a correction to a model uses this, never ``correction``."""
+        return note_form(self.correction) if self.correction else ""
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -144,6 +151,81 @@ _COLUMNS = (
     "id, person_id, visibility, source, channel, conversation_key, counterpart, subject, kind, "
     "summary, quote, due_date, trust, occurred_at, created_at, expires_at, pinned, correction, corrected_at"
 )
+
+
+# Past-tense verbs a note can start with. A known list, not any word ending
+# in "ed", so a name (Fred, Ahmed) or a noun (Seed) is never read as a verb.
+# Words often used as adjectives ("Expected revenue …", "Used car …") are
+# left out.
+_REGULAR_VERBS = frozenset({
+    "accepted", "added", "agreed", "announced", "answered", "approved", "asked",
+    "assigned", "booked", "called", "cancelled", "canceled", "changed", "checked",
+    "closed", "committed", "completed", "complained", "confirmed", "created",
+    "decided", "declined", "delayed", "delegated", "delivered", "emailed",
+    "explained", "finished", "fixed", "followed",
+    "forwarded", "hired", "introduced", "invited", "launched", "liked",
+    "listed", "mentioned", "moved", "needed", "noted", "offered", "opened",
+    "ordered", "owed", "postponed", "priced",
+    "promised", "published", "purchased", "quoted", "raised",
+    "received", "recommended", "rejected", "reminded",
+    "removed", "replied", "reported", "requested", "reviewed",
+    "shared", "shipped", "signed", "started", "submitted", "suggested",
+    "tested", "wanted", "warned", "worked",
+    "clarified", "stated", "corrected",
+    "rescheduled", "responded", "advised", "arranged",
+    "provided", "acknowledged", "thanked", "informed", "notified", "pushed",
+})
+_IRREGULAR_VERBS = frozenset({
+    "said", "told", "sent", "gave", "took", "made", "wrote", "put", "got",
+    "kept", "met", "paid", "bought", "sold", "chose", "thought", "felt",
+    "found", "brought", "began", "ran", "came", "went", "did", "had",
+    "were", "let", "built", "spent", "lent", "meant", "heard",
+    "held", "quit", "forgot", "became", "knew", "saw", "showed",
+    "understood", "taught", "caught", "dealt", "drove", "flew", "fought", "hid",
+    "lost", "rang", "sought", "spoke", "stood", "swore", "threw",
+    "wore", "withdrew", "undertook", "overtook", "forgave", "forbade", "froze",
+})
+
+
+def shown_summary(summary: str) -> str:
+    """A note's summary as its owner reads it: "You said the price list goes
+    out Friday." A note is always about the person who owns it, and only
+    they see it, so the summary is stored starting with the verb ("Said …")
+    and the screens put "You" in front. Text that doesn't start with a
+    past-tense verb from the known list (which holds no names, so "Fred
+    asked …" is left alone) is shown as it is. A correction is shown as
+    typed."""
+    text = (summary or "").strip()
+    first = text.split(" ", 1)[0]
+    if not first[:1].isupper() or not _past_tense(first):
+        return summary
+    return "You " + first[:1].lower() + text[1:]
+
+
+# Past tenses spelled like the present: as the first word they read as an order.
+_SAME_AS_PRESENT = frozenset({"put", "let", "quit"})
+
+
+def note_form(text: str) -> str:
+    """Text as the Executive reads it: a note, never "You said …". The
+    screens put "You" in front of a note (:func:`shown_summary`), so a
+    correction typed over that text starts with "You told …"; the Executive
+    reads it as "Told …", the way it reads every note. A verb spelled like
+    its present ("You put Dana in charge") keeps "You", or the note would
+    read as an order ("Put Dana in charge")."""
+    words = (text or "").strip().split(" ", 2)
+    if (
+        len(words) > 1 and words[0].lower() == "you" and _past_tense(words[1])
+        and words[1].rstrip(",.;:").lower() not in _SAME_AS_PRESENT
+    ):
+        rest = " ".join(words[1:])
+        return rest[:1].upper() + rest[1:]
+    return text
+
+
+def _past_tense(word: str) -> bool:
+    w = word.rstrip(",.;:").lower()
+    return w in _REGULAR_VERBS or w in _IRREGULAR_VERBS
 
 
 def _now(now: datetime | None) -> datetime:
@@ -599,7 +681,12 @@ def list_notes(
         f"SELECT {_COLUMNS} FROM {NOTES_TABLE} WHERE person_id = ? AND {_live_clause()}"  # noqa: S608 — constant table name and columns
     )
     params: list[Any] = [person_id, _now(now).isoformat()]
-    words = [w for w in (query or "").lower().split() if len(w) > 1][:6]
+    # The leading "You" is only in the shown text ("You said …",
+    # shown_summary), never stored, so a search typed from the screen drops it.
+    typed = (query or "").lower().split()
+    if len(typed) > 1 and typed[0] == "you":
+        typed = typed[1:]
+    words = [w for w in typed if len(w) > 1][:6]
     for word in words:
         like = f"%{word.replace('%', '').replace('_', '')}%"
         sql += (

@@ -40,3 +40,14 @@ test("words can only wait; amount, person and company can go", () => {
   assert.equal(kindGoes("words"), false);
   for (const kind of ["amount", "person", "domain"]) assert.equal(kindGoes(kind), true);
 });
+
+test("a topic rule names the topic, and every topic can go or wait", async () => {
+  const { TOPICS } = await import("../src/lib/leadRules.ts");
+  assert.equal(describeRule({ kind: "topic", value: "share", effect: "go" }), "Anything about sharing");
+  assert.equal(describeRule({ kind: "topic", value: "delete", effect: "wait" }), "Anything about deleting or cancelling");
+  assert.equal(kindGoes("topic"), true);
+  assert.deepEqual(
+    TOPICS.map((t) => t.value),
+    ["money", "contracts", "people_decisions", "delete", "share", "someone_new", "big_send"],
+  );
+});

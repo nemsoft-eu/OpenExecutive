@@ -127,7 +127,7 @@ export default function ArtifactDetailPage() {
       <main className="flex-1 overflow-y-auto px-4 sm:px-6 py-8">
         <div className="max-w-4xl mx-auto space-y-6">
           <Link href="/artifacts" className="text-sm text-fg-muted hover:text-fg">
-            ← Documents
+            ← Made for you
           </Link>
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0">

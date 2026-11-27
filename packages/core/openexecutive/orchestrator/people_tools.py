@@ -350,15 +350,26 @@ def _audit(tool: str, kind: str, ok: bool, summary: str, details: dict[str, Any]
 
 # Surfaces that verify who sent every message: the web chat (the signed-in
 # Google account, stamped by the UI proxy), and Slack / Discord (the platform's
-# own user id, over an authenticated connection). Email (an unauthenticated
-# From header), the CLI, the MCP server (unless the turn may act:
-# `Session.mcp_client_may_act`) and unattended runs (scheduler, workflows,
+# own user id, over an authenticated connection), and Open Executive's own MCP
+# server (the caller the API verified). Email (an unauthenticated
+# From header), the CLI and unattended runs (scheduler, workflows,
 # alert review) don't. Telegram only sometimes — see
 # `_is_verified_speaker_surface`. A channel adapter this module doesn't know
 # counts when it verified the sender itself (`Session.speaker_verified`, with
 # the `caller_person_id` it resolved), as Google Chat does for a sender on
 # People (by the Google account email on Google's signed event).
 _VERIFIED_SPEAKER_CHANNELS = frozenset({"slack", "discord"})
+
+
+def email_sender_proven(session: Any) -> bool:
+    """Whether this turn's inbound email is proven to come from its sender's
+    own address: the owner's (``Session.email_authenticated``) or a
+    teammate's (``Session.email_sender_authenticated``), as the email poller
+    checked them. The one answer for "is this email really them"."""
+    return (
+        getattr(session, "email_authenticated", False) is True
+        or getattr(session, "email_sender_authenticated", False) is True
+    )
 
 
 def _adapter_verified_turn(session: Any) -> bool:
@@ -385,24 +396,20 @@ def _is_verified_speaker_surface(session: Any) -> bool:
     if bool(getattr(session, "from_web_chat", False)):
         return True
     # Another AI app over Open Executive's own MCP server: its caller is the
-    # one the API verified (`api.caller`), as for the web chat, but only a
-    # turn allowed to act (`Session.mcp_client_may_act`) counts it, so each
-    # tool's own owner-only and person checks then decide. A read-only one
-    # never does.
+    # one the API verified (`api.caller`), as for the web chat.
     if getattr(session, "from_mcp_client", False) is True:
-        return getattr(session, "mcp_client_may_act", False) is True and _adapter_verified_turn(session)
+        return _adapter_verified_turn(session)
     if getattr(session, "speaker_verified", False) is True and _adapter_verified_turn(session):
         return True
     channel = str(getattr(session, "origin_channel", "") or "")
     if channel in _VERIFIED_SPEAKER_CHANNELS:
         return True
-    # The principal's own mail, which their mail service authenticated as
-    # coming from their address (``Session.email_authenticated``, set by the
-    # email poller): they are signed in there as on any other channel, so
-    # their Approvals level decides what runs. Anyone else's mail, or a From
-    # header nothing proved, still isn't.
+    # Mail from someone on the team that their mail service authenticated as
+    # coming from their own address (``email_sender_proven``): they are signed
+    # in there as on any other channel, so their Approvals level decides what
+    # runs. A From header nothing proved still isn't.
     if channel == "email":
-        return getattr(session, "email_authenticated", False) is True
+        return email_sender_proven(session)
     if channel != "telegram":
         return False
     # Telegram identifies the chat, not the sender, and its webhook is exempt
@@ -444,19 +451,33 @@ def contacts_reachable_now() -> bool:
     """Whether contacts exist for this turn at all — may be listed, named,
     emailed, invited or messaged.
 
-    Contacts are private to the principal: only a turn the principal started
-    on a verified surface (the web app, their own Slack or Discord, a verified
-    private Telegram chat), or code inside ``grant_contact_egress``, sees them.
-    Everywhere else — an inbound email (a From header proves nothing), a
-    teammate's turn, an unattended run (scheduler, workflows, alert review) —
-    a contact is indistinguishable from someone who is not on the roster, so
-    no refusal, listing or error message can reveal that one exists.
+    Contacts are the team's: a turn someone on the team started on a
+    verified surface (the principal or a teammate: the web app, their own
+    Slack or Discord, a verified private Telegram chat, their own email its
+    mail service proved), an unattended run
+    (Approvals decides what it sends, as Take the lead's gate does), or code
+    inside ``grant_contact_egress`` sees them. A turn whose words may come
+    from someone not in People (an inbound email nothing proved — a From header
+    alone proves nothing — a page in another app, someone else's AI app) does not:
+    there a contact is indistinguishable from someone who is not on the
+    roster, so no refusal, listing or error message can reveal that one
+    exists.
     """
     if _contact_egress_granted.get():
         return True
     from openexecutive.orchestrator.schedule_tools import current_session
 
-    return is_principal_on_verified_surface(current_session.get())
+    session = current_session.get()
+    if is_principal_on_verified_surface(session):
+        return True
+    if session is None:
+        return False
+    if getattr(session, "unattended", False) is True:
+        return not (
+            getattr(session, "sender_off_team", False) is True
+            or bool(getattr(session, "email_from", None))
+        )
+    return teammate_on_verified_surface(session) is not None
 
 
 # Set only around SENDING content that unattended code built as private to
@@ -598,10 +619,7 @@ def teammate_turn_owner(session: Any) -> int | None:
         or getattr(session, "private_to_principal", False)
     ):
         return None
-    if getattr(session, "email_from", ""):
-        if getattr(session, "email_sender_authenticated", False) is not True:
-            return None
-    elif not _is_verified_speaker_surface(session):
+    if not _is_verified_speaker_surface(session):
         return None
     return team_member_id(getattr(session, "caller_person_id", None))
 
@@ -816,7 +834,10 @@ def _names_a_contact(payloads: tuple[Any, ...]) -> bool:
 
 
 def _roster_refusal_reason(session: Any) -> str | None:
-    """None when this turn may change the roster, else what to tell the asker."""
+    """None when this turn may change the roster, else what to tell the asker.
+    Said plainly to the person who asked, and passed to no one: the
+    Executive never messages anyone or makes a card about it for them."""
+    from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
     from openexecutive.people.store import is_principal_or_self
 
     from_web = bool(getattr(session, "from_web_chat", False))
@@ -824,8 +845,8 @@ def _roster_refusal_reason(session: Any) -> str | None:
         return (
             "Only the company's owner can change the People list, and this request "
             "did not come from somewhere I can confirm it is them. Tell whoever "
-            "asked that the owner needs to make this change, from the web app or "
-            "their own Slack or Discord."
+            "asked, plainly, that the owner can make this change from the web app or "
+            f"their own Slack or Discord. {PASS_ON_NOTHING}"
         )
     caller = getattr(session, "caller_person_id", None)
     try:
@@ -840,13 +861,39 @@ def _roster_refusal_reason(session: Any) -> str | None:
             "owner — the People page refuses them for the same reason. If it is the "
             "owner, they should sign in with the email on their own People entry, or, "
             "if that entry has none yet, run the setup interview again (it adds the "
-            "email they signed in with) and then ask again."
+            f"email they signed in with) and then ask again. {PASS_ON_NOTHING}"
         )
     return (
         "Only the company's owner can add, change or remove people or set "
         "department heads, and this request came from someone else. Tell them "
-        "the owner needs to make this change."
+        f"that plainly; they ask the owner themselves. {PASS_ON_NOTHING}"
     )
+
+
+def approved_speaker() -> Any:
+    """The person whose own card is being carried out right now
+    (``orchestrator.levels.approved``): their tap on their own card is them
+    asking, so a step that needs to know who asked (assign a task, record a
+    fact) acts for them as it would have in their turn. None outside an
+    approved step, for a card nobody on the team asked for (mail from
+    someone not on People), or when the lookup fails."""
+    try:
+        from openexecutive.orchestrator import levels
+
+        if not levels.is_approved():
+            return None
+        who = levels.approved_requester()
+        if who is None:
+            return None
+        from openexecutive.people.store import get_person
+
+        person = get_person(int(who))
+        if person is None or person.archived or person.kind != "team":
+            return None
+        return person
+    except Exception:
+        logger.warning("people_tools: couldn't tell whose card this is", exc_info=True)
+        return None
 
 
 def is_principal_on_verified_surface(session: Any) -> bool:
@@ -854,9 +901,13 @@ def is_principal_on_verified_surface(session: Any) -> bool:
     verified it is them — the rule for roster writes above, as a yes/no for
     other principal-only actions (e.g. solo mode's meeting auto-booking, and
     whether the principal's private contacts exist for this turn — see
-    ``contacts_reachable_now``).
+    ``contacts_reachable_now``). The owner's own approved card counts
+    (``approved_speaker``).
     Fails closed: no session, an unverified surface, someone else, or an
     unreadable roster all answer False."""
+    speaker = approved_speaker()
+    if speaker is not None:
+        return bool(getattr(speaker, "is_principal", False))
     try:
         return _roster_refusal_reason(session) is None
     except Exception:
@@ -868,14 +919,18 @@ def teammate_on_verified_surface(session: Any) -> Any:
     """The rostered teammate talking, when this turn is one a teammate may act
     in on their own account (record an attributed fact, assign a task): a team
     member (not a contact, not archived, not the principal) on a surface that
-    verified who they are — the web app signed in, their own Slack or Discord —
-    in a turn someone is watching, that no email started. None otherwise, or
-    when the lookup fails (fails closed)."""
+    verified who they are — the web app signed in, their own Slack or Discord,
+    their own email proven theirs (``email_sender_proven``) — in a turn
+    someone is watching, or their own card being carried out
+    (``approved_speaker``). None otherwise, or when the lookup fails (fails
+    closed)."""
+    speaker = approved_speaker()
+    if speaker is not None:
+        return None if getattr(speaker, "is_principal", False) else speaker
     if (
         session is None
         or getattr(session, "unattended", False)
         or getattr(session, "private_to_principal", False)
-        or getattr(session, "email_from", "")
         or not _is_verified_speaker_surface(session)
     ):
         return None

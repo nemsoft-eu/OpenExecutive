@@ -690,7 +690,7 @@ async def test_long_run_titles_come_back_whole(db: Path, title: str) -> None:
 def test_workflow_label_for_switched_off_and_deleted_workflows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from openexecutive.workflows import dynamic_store
+    from openexecutive.workflows import dynamic_store, workflow_label
 
     def fake_get_definition(name: str, db_path: Path | None = None) -> Any:
         if name == "weekly_book_restock":
@@ -699,7 +699,7 @@ def test_workflow_label_for_switched_off_and_deleted_workflows(
 
     monkeypatch.setattr(dynamic_store, "get_definition", fake_get_definition)
     # Switched off: its saved title.
-    assert artifacts_route.workflow_label("weekly_book_restock") == "Restock the bookshelf"
+    assert workflow_label("weekly_book_restock") == "Restock the bookshelf"
     # Deleted: its key in words, never the code name.
-    assert artifacts_route.workflow_label("weekly_laptop_restock") == "Weekly laptop restock"
+    assert workflow_label("weekly_laptop_restock") == "Weekly laptop restock"
 

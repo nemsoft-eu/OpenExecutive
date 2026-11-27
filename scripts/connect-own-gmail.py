@@ -23,8 +23,10 @@ The file lands in $DELEGATION_GOOGLE_CREDENTIALS_DIR (default:
 ./delegation-credentials). Copy it onto the API's volume, into the directory
 the API's DELEGATION_GOOGLE_CREDENTIALS_DIR points at (Docker:
 /data/delegation_google/). No restart is needed — it is read on each use.
-Sign in as the address on your People entry: any other account is refused
-when it is used. Do NOT commit the file — it holds your refresh token.
+--email is the address on your People entry. Sign in to any mailbox of
+yours: signing in shows it's yours, and the file saves the mailbox you
+signed in to, which is checked on each use. Do NOT commit the file — it
+holds your refresh token.
 """
 from __future__ import annotations
 
@@ -52,13 +54,22 @@ def email_key(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
 
 
+def mailbox_field(email: str, mailbox: str | None) -> dict[str, str]:
+    """The file's ``mailbox`` entry: the mailbox signed in to, when it isn't
+    ``email`` — must match delegation.gmail.mailbox_field."""
+    address = (mailbox or "").strip().lower()
+    return {"mailbox": address} if address and address != email.strip().lower() else {}
+
+
 def credential_payload(
-    email: str, refresh_token: str, client_id: str, client_secret: str, *, scopes: list[str] | None = None
+    email: str, refresh_token: str, client_id: str, client_secret: str, *, scopes: list[str] | None = None,
+    mailbox: str | None = None,
 ) -> dict[str, Any]:
     """The file's content — the format delegation.gmail.load_credential reads."""
     return {
         "version": CREDENTIAL_VERSION,
         "email": email.strip().lower(),
+        **mailbox_field(email, mailbox),
         "scopes": scopes or SCOPES,
         "authorized_user": {
             "refresh_token": refresh_token,
@@ -128,14 +139,16 @@ def main() -> int:
     if not creds.refresh_token:
         sys.exit("error: Google returned no refresh token — run it again (it asks for consent each time).")
     opened = _profile_email(creds.token)
+    if "@" not in opened:
+        sys.exit("error: couldn't read the address of the mailbox you signed in to — run it again.")
     if opened != email:
-        sys.exit(f"error: you signed in as {opened}, not {email}. Run it again as {email}.")
+        print(f"Saving {opened} as the mailbox for {email}.")
 
     directory = pathlib.Path(
         os.environ.get("DELEGATION_GOOGLE_CREDENTIALS_DIR") or pathlib.Path.cwd() / "delegation-credentials"
     )
     path = write_credential(
-        directory, email, credential_payload(email, creds.refresh_token, client_id, client_secret, scopes=scopes)
+        directory, email, credential_payload(email, creds.refresh_token, client_id, client_secret, scopes=scopes, mailbox=opened)
     )
     print(f"Saved {path}")
     print("Copy it into the API's DELEGATION_GOOGLE_CREDENTIALS_DIR (Docker: /data/delegation_google/),")

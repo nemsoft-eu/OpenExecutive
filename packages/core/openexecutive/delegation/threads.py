@@ -2,9 +2,12 @@
 what the composer is shown of it, and who the reply goes to. Shared by chat
 (``orchestrator.delegation_tools``) and the inbox watcher (``delegation.inbox``).
 
-Recipients are decided here, never by a model: a reply goes to the last
-message's sender (never its ``Reply-To``), with the thread's other recipients
-only on ``reply_all``.
+Who a reply answers: the message they name (``message_id``), else the latest
+message from someone they named (``to``), else the newest message from
+someone else, as a mail app's Reply would. It goes to that message's sender
+(never its ``Reply-To``), or to the people they named, with the message's
+other recipients on ``reply_all``. It always stays in the thread. Sending is
+decided by Approvals, not here.
 
 The composer may restate what the writer already said in the thread, so which
 words are theirs is never written inside the thread text, where a sender's
@@ -22,6 +25,9 @@ from typing import Any
 MAX_RECIPIENTS = 10
 THREAD_MESSAGES = 6
 THREAD_MESSAGE_CHARS = 1500
+# Messages forwarded inside the thread's (``email_poller.readable_text``),
+# all together, the newest first.
+THREAD_FORWARDED_CHARS = 6000
 
 _HEADER_LINE_RE = re.compile(r"^(\s*)(\[\s*\d+\s*\]\s*From\s*:)", re.IGNORECASE | re.MULTILINE)
 
@@ -38,25 +44,37 @@ def _shown_messages(thread: Any) -> list[Any]:
 
 def mine(message: Any, own: str) -> bool:
     """Whether the writer wrote ``message``: their own mailbox sent it. A
-    From header alone can name anyone."""
-    return message.from_addr == own and "SENT" in message.labels
+    From header alone can name anyone. ``own`` is their address; their mail
+    comes from their mailbox's (``gmail.mailbox_of``)."""
+    from openexecutive.delegation.gmail import mailbox_of
+
+    return message.from_addr == mailbox_of(own) and "SENT" in message.labels
 
 
 def thread_text(thread: Any, own: str) -> str:
-    """The last few messages of the thread, each only its sender's own words,
-    all labelled alike: nothing here says which are the writer's
-    (``writer_said`` does)."""
+    """The last few messages of the thread, each its sender's own words and
+    any email they forwarded (one shared budget, the newest first), all
+    labelled alike: nothing here says which are the writer's (``writer_said``
+    does)."""
     from openexecutive.delegation.ghostwriter import one_line
-    from openexecutive.integrations.email_poller import sender_new_text
+    from openexecutive.integrations.email_poller import FORWARDED_HEADING, split_forward
     from openexecutive.utils.prompt_blocks import plain
 
+    shown = _shown_messages(thread)
     parts = []
-    for i, m in enumerate(_shown_messages(thread), 1):
+    budget = THREAD_FORWARDED_CHARS
+    for i in range(len(shown), 0, -1):
+        m = shown[i - 1]
         who = one_line(m.from_name or m.from_addr, 120)
+        own_words, forwarded = split_forward(
+            m.text or "", m.subject, max_chars=THREAD_MESSAGE_CHARS, forwarded_chars=budget,
+        )
+        budget -= len(forwarded)
+        said = f"{own_words}\n\n{FORWARDED_HEADING}\n{forwarded}".strip() if forwarded else own_words
         # Plain first, so no hidden or look-alike character dodges the quoting.
-        text = _quote_headers(plain(sender_new_text(m.text or "")[:THREAD_MESSAGE_CHARS]))
+        text = _quote_headers(plain(said))
         parts.append(f"[{i}] From: {who} — {one_line(m.date, 60)}\n{text}")
-    return "\n\n".join(parts)
+    return "\n\n".join(reversed(parts))
 
 
 def writer_said(thread: Any, own: str) -> str:
@@ -73,40 +91,69 @@ def writer_said(thread: Any, own: str) -> str:
     return "\n\n".join(parts)
 
 
-def plan_reply(thread: Any, own: str, reply_all: bool) -> dict[str, Any] | str:
-    """Recipients, subject and threading headers for a reply, or why not."""
-    from openexecutive.delegation.gmail import references_header
+def plan_reply(
+    thread: Any, own: str, reply_all: bool, *, to: list[str] | None = None, message_id: str | None = None,
+) -> dict[str, Any] | str:
+    """Recipients, subject and threading headers for a reply, or why not.
 
-    received = [
-        m for m in thread.messages
-        if m.from_addr and m.from_addr != own and not {"SENT", "DRAFT"} & set(m.labels)
-    ]
-    if not received:
-        return "There's no message from anyone else in that thread to reply to."
-    last = received[-1]
+    ``message_id`` picks the message of the thread it answers; ``to`` (already
+    checked addresses) names who it goes to and, without ``message_id``,
+    answers the latest message from one of them. Without either it answers the
+    newest message from someone else; with no such message, their own latest,
+    to the people that went to. ``own`` is their address; their mail comes
+    from their mailbox's (``gmail.mailbox_of``)."""
+    from openexecutive.delegation.gmail import mailbox_of, references_header
+
+    own = mailbox_of(own)
+    wanted = [a for a in dict.fromkeys(a.strip().lower() for a in to or []) if a and a != own]
+    if to and not wanted:
+        return "A reply can't go only to them. Pass who it goes to in `to`."
+    shown = [m for m in thread.messages if "DRAFT" not in m.labels]
+    received = [m for m in shown if m.from_addr and m.from_addr != own and "SENT" not in m.labels]
+    target = None
+    if message_id:
+        target = next((m for m in shown if m.id == message_id), None)
+        if target is None:
+            return "That message_id isn't a message of this thread. Leave it out, or pass one read_my_email listed."
+    elif wanted:
+        target = next((m for m in reversed(shown) if (m.from_addr or "").lower() in wanted), None)
+    if target is None:
+        target = received[-1] if received else (shown[-1] if shown else None)
+    if target is None:
+        return "There's no message in that thread to reply to."
+    from_me = target.from_addr == own
     flags: list[str] = []
-    if last.reply_to and last.reply_to != last.from_addr:
+    if not from_me and target.reply_to and target.reply_to != target.from_addr:
         flags.append("reply_to_ignored")
-    if last.mailing_list:
+    if target.mailing_list:
         flags.append("mailing_list")
-    newest = [m for m in thread.messages if "DRAFT" not in m.labels]
-    if newest and newest[-1].from_addr == own:
+    if shown and shown[-1].from_addr == own:
         flags.append("you_replied_last")
+    if wanted:
+        recipients = wanted
+    elif from_me:
+        recipients = [a for a in dict.fromkeys(target.to) if a != own]
+    else:
+        recipients = [target.from_addr]
+    if not recipients:
+        return "Nobody to send that reply to. Pass `to`."
     cc: list[str] = []
     if reply_all:
-        cc = [a for a in dict.fromkeys([*last.to, *last.cc]) if a not in (own, last.from_addr)]
+        everyone = [target.from_addr, *target.to, *target.cc]
+        cc = [a for a in dict.fromkeys(everyone) if a and a != own and a not in recipients]
         if len(cc) > MAX_RECIPIENTS:
             cc = cc[:MAX_RECIPIENTS]
             flags.append("cc_trimmed")
-    subject = last.subject or next((m.subject for m in thread.messages if m.subject), "")
+    subject = target.subject or next((m.subject for m in thread.messages if m.subject), "")
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}".strip()
     return {
-        "to": [last.from_addr],
+        "to": recipients[:MAX_RECIPIENTS],
         "cc": cc,
         "subject": subject,
-        "in_reply_to": last.message_id_header or None,
-        "references": references_header(last.references, last.message_id_header),
+        "in_reply_to": target.message_id_header or None,
+        "references": references_header(target.references, target.message_id_header),
         "flags": flags,
-        "last_text": last.text,
+        "last_text": target.text,
+        "message_id": target.id,
     }

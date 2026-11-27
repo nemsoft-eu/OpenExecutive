@@ -226,15 +226,11 @@ def test_the_live_stream_starts_ready_and_ends_when_access_goes(
 
 def test_a_shared_web_chat_is_no_private_conversation() -> None:
     from openexecutive.delegation.settings import private_conversation
-    from openexecutive.memory.history_chat import private_chat
-    from openexecutive.orchestrator.open_loop_tools import _is_private_surface
 
     own = SimpleNamespace(from_web_chat=True, shared_chat=False, session_id="web-1")
     shared = SimpleNamespace(from_web_chat=True, shared_chat=True, session_id="web-1")
-    assert private_conversation(own) and _is_private_surface(own) and private_chat(own)
+    assert private_conversation(own)
     assert not private_conversation(shared)
-    assert not _is_private_surface(shared)
-    assert not private_chat(shared)
 
 
 def test_a_teammate_reads_none_of_their_mail_in_a_shared_chat(

@@ -182,7 +182,8 @@ def _out(principal: Any) -> LeadOut:
             *take_the_lead.list_allowed(feature=take_the_lead.FEATURE_ACT_AS_ME, person_id=principal.id),
         ]
         suggested = take_the_lead.suggestions()
-        jobs = take_the_lead.list_jobs()
+        # Only the caller's own: a person's standing jobs are theirs alone.
+        jobs = take_the_lead.list_jobs(created_by=f"person:{principal.id}")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Couldn't read the rules.") from exc
     week = take_the_lead.job_week()
@@ -357,7 +358,7 @@ def add_job(request: Request, body: JobIn) -> LeadOut:
         job = take_the_lead.add_job(body.text, created_by=f"person:{principal.id}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _audit("Standing job added", {"job_id": job.id})
+    _audit("Standing work added", {"job_id": job.id})
     return _out(principal)
 
 
@@ -366,9 +367,9 @@ def stop_job(request: Request, job_id: int) -> LeadOut:
     from openexecutive.orchestrator import take_the_lead
 
     principal = _principal(request)
-    job = take_the_lead.stop_job(job_id)
+    job = take_the_lead.stop_job(job_id, created_by=f"person:{principal.id}")
     if job is None:
-        raise HTTPException(status_code=404, detail="That standing job isn't there.")
+        raise HTTPException(status_code=404, detail="That standing work isn't there.")
     if job.stopped_at is None:
-        _audit("Standing job stopped", {"job_id": job_id})
+        _audit("Standing work stopped", {"job_id": job_id})
     return _out(principal)

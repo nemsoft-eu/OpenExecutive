@@ -53,6 +53,7 @@ from openexecutive.api.routes import (
     reflection,
     review,
     saved_tools,
+    schedule,
     scheduled,
     sessions,
     setup_status,
@@ -464,56 +465,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for _w in _org_warnings:
             logging.getLogger("openexecutive").warning("org-completeness: %s", _w)
 
-    from openexecutive.departments.cadence import (
-        bootstrap_cadences,
-        cancel_orphaned_cadences,
-    )
-    # Sweep first: cancel cadence actions left behind by deleted departments
-    # so they stop firing check-in alerts, then enqueue for live departments.
-    cancel_orphaned_cadences()
-    bootstrap_cadences()
-
-    if settings.nudge_scan_enabled:
-        from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
-        bootstrap_nudge_scan()
-
-    # External-condition monitor — init the watchlist / external_signals
-    # tables, then seed the heartbeat row so the scheduler picks it up
-    # on its next tick. Same shape as nudge_scan above.
+    from openexecutive.departments.cadence import cancel_orphaned_cadences
     from openexecutive.monitoring.store import (
         initialize_db as initialize_monitoring_db,
     )
+    from openexecutive.scheduler.runner import seed_recurring_jobs
+
+    # Sweep first: cancel cadence actions left behind by deleted departments
+    # so they stop firing check-in alerts. The monitoring tables must exist
+    # before its heartbeat is seeded.
+    cancel_orphaned_cadences()
     initialize_monitoring_db()
-    if settings.external_monitor_enabled:
-        from openexecutive.monitoring.pipeline import (
-            bootstrap_external_monitor_scan,
-        )
-        bootstrap_external_monitor_scan()
-
-    # Watchlist research cron — periodic re-run gated by a state-hash
-    # check so quiet days cost nothing. Mirrors the external_monitor
-    # heartbeat above.
-    if settings.watchlist_research_enabled:
-        from openexecutive.monitoring.research.scheduler import (
-            bootstrap_watchlist_research_scan,
-        )
-        bootstrap_watchlist_research_scan()
-
-    if settings.notion_sync_enabled:
-        from openexecutive.knowledge.notion_sync import bootstrap_notion_sync_scan
-        bootstrap_notion_sync_scan()
-    if settings.drive_sync_enabled:
-        from openexecutive.knowledge.drive_sync import bootstrap_drive_sync_scan
-
-        bootstrap_drive_sync_scan()
-    if settings.onedrive_sync_enabled:
-        from openexecutive.knowledge.onedrive_sync import bootstrap_onedrive_sync_scan
-
-        bootstrap_onedrive_sync_scan()
-    if settings.confluence_sync_enabled:
-        from openexecutive.knowledge.confluence_sync import bootstrap_confluence_sync_scan
-
-        bootstrap_confluence_sync_scan()
+    # Every recurring job, from the one list a reset and the scheduler's
+    # start also use, so a job added there comes back after each of them.
+    seed_recurring_jobs()
 
     audit_logger = AuditLogger()
     app.state.audit = audit_logger
@@ -623,6 +588,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # constraint — do not run in more than one process against the same DB).
     from openexecutive.workflows.resumer import run_resumer
     resumer_task = asyncio.create_task(run_resumer())
+
+    # Browser hand-overs live in the process: a "Waiting on you" card the last
+    # one left open can't be answered any more, so it closes now.
+    from openexecutive.browser import handover as browser_handover
+
+    await asyncio.to_thread(browser_handover.close_leftover_cards)
 
     # Discord gateway bot. Embedded in the lifespan (rather than a sibling
     # service) because the bot needs direct access to the same SQLite + ChromaDB
@@ -899,7 +870,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.7.2",  # x-release-please-version
+        version="0.7.8",  # x-release-please-version
         lifespan=lifespan,
     )
 
@@ -945,8 +916,8 @@ def create_app() -> FastAPI:
             provided = request.headers.get("x-api-key", "")
             if not provided or not hmac.compare_digest(provided, shared_secret):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
-            # What the MCP server reads before it lets a request turn on
-            # "may act" (mcp_server.may_act): this request passed the check.
+            # read by the MCP server's post_progress_update
+            # (mcp_server.SHARED_SECRET_OK): this request passed the check.
             request.state.shared_secret_ok = True
             return await call_next(request)
     else:
@@ -1027,10 +998,16 @@ def create_app() -> FastAPI:
     app.include_router(chat_directory.router, tags=["people"])
     app.include_router(today.router, tags=["today"])
     app.include_router(scheduled.router, tags=["scheduled"])
+    app.include_router(schedule.router, tags=["schedule"])
     app.include_router(executive.router, tags=["executive"])
     app.include_router(workspace.router, tags=["workspace"])
     app.include_router(notifications.router, tags=["notifications"])
     app.include_router(watchlist.router, tags=["watchlist"])
+    # The browser extension's relay: steps the Executive takes in the
+    # person's own browser (browser.relay).
+    from openexecutive.api.routes import browser as browser_route
+
+    app.include_router(browser_route.router, tags=["browser"])
     app.include_router(google_chat_router, tags=["google-chat"])
     app.include_router(telegram_router, tags=["telegram"])
     app.include_router(slack_events_router, tags=["slack"])

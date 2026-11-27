@@ -8,12 +8,11 @@ budget on the lookups, and the loop terminated before a single DM was
 sent: "looks up people but never routes."
 
 The fix treats read-only context lookups (``_NON_ROUTING_TOOLS``) as
-free: they are passed to ``execute_tool_calls`` as ``free_tools`` (never
-refused, never decrement the budget) and excluded from the budget-
-accounting counts via ``_routing_ok``.
+free: they are never refused as over budget and are excluded from the
+budget-accounting counts via ``_routing_ok``.
 
 Two levels:
-  - ``execute_tool_calls`` mechanism (hermetic, no provider).
+  - ``execute_tool_call`` (hermetic, no provider).
   - ``_executive_synthesis_loop`` end-to-end with a stubbed provider —
     reproduces the original 5-lookups-then-no-DM failure.
 """
@@ -24,8 +23,9 @@ from typing import Any
 
 import pytest
 
+from openexecutive.orchestrator.reading import STEPS_NOTE
 from openexecutive.workflows import executive_research as er
-from openexecutive.workflows._synthesis import execute_tool_calls
+from openexecutive.workflows._synthesis import execute_tool_call
 
 # --------------------------------------------------------------------- #
 # Fake provider response shapes
@@ -68,77 +68,62 @@ class _SequenceProvider:
 
 
 # --------------------------------------------------------------------- #
-# Level A — execute_tool_calls free_tools mechanism
+# Level A — one call over budget, and free lookups
 # --------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_free_tool_runs_even_when_budget_is_zero() -> None:
-    """With budget exhausted, a free tool still executes; a metered tool
-    is refused with the 'over budget' stub."""
+async def test_a_call_over_budget_is_refused_without_running() -> None:
     calls: list[str] = []
-
-    async def _lookup(_inp: dict[str, Any]) -> str:
-        calls.append("lookup_person")
-        return '{"matches": []}'
 
     async def _dm(_inp: dict[str, Any]) -> str:
         calls.append("send_slack_dm")
         return '{"status": "sent"}'
 
-    resp = _Resp(
-        [
-            _ToolUse("lookup_person", {"query": "head of sales"}, "a"),
-            _ToolUse("send_slack_dm", {"user_id": "U1", "text": "hi"}, "b"),
-        ],
-        "tool_use",
+    summary, result = await execute_tool_call(
+        "send_slack_dm", {"user_id": "U1"}, {"send_slack_dm": _dm}, over_budget=True,
     )
-    summaries = await execute_tool_calls(
-        resp,
-        {"lookup_person": _lookup, "send_slack_dm": _dm},
-        budget_remaining=0,
-        free_tools=frozenset({"lookup_person"}),
-    )
-
-    assert calls == ["lookup_person"]  # DM refused, lookup ran
-    by_tool = {s["tool"]: s for s in summaries}
-    assert by_tool["lookup_person"]["ok"] is True
-    assert by_tool["send_slack_dm"]["ok"] is False
-    assert by_tool["send_slack_dm"]["result_preview"] == "over budget — skipped"
+    assert calls == []
+    assert summary["ok"] is False and result == summary["result_preview"] == "over budget — skipped"
 
 
 @pytest.mark.asyncio
-async def test_free_tool_does_not_decrement_budget() -> None:
-    """A budget of 1 must still be spendable on the one outbound call even
-    when free lookups precede it in the same response."""
-    calls: list[str] = []
+async def test_lookups_still_run_once_the_routing_calls_are_made(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Free lookups are never refused, even after the run's routing calls."""
+    fired: list[str] = []
 
     async def _lookup(_inp: dict[str, Any]) -> str:
-        calls.append("lookup_person")
+        fired.append("lookup_person")
         return '{"matches": []}'
 
-    async def _dm(_inp: dict[str, Any]) -> str:
-        calls.append("send_slack_dm")
-        return '{"status": "sent"}'
+    async def _route(_inp: dict[str, Any]) -> str:
+        fired.append("create_alert")
+        return json.dumps({"status": "created"})
 
-    resp = _Resp(
-        [
-            _ToolUse("lookup_person", {"query": "a"}, "1"),
-            _ToolUse("lookup_person", {"query": "b"}, "2"),
-            _ToolUse("send_slack_dm", {"user_id": "U1", "text": "hi"}, "3"),
-        ],
-        "tool_use",
-    )
-    summaries = await execute_tool_calls(
-        resp,
-        {"lookup_person": _lookup, "send_slack_dm": _dm},
-        budget_remaining=1,
-        free_tools=frozenset({"lookup_person"}),
-    )
+    from openexecutive.orchestrator import executive
 
-    # Two lookups did NOT eat the budget; the single DM still ran.
-    assert calls == ["lookup_person", "lookup_person", "send_slack_dm"]
-    assert all(s["ok"] for s in summaries)
+    monkeypatch.setitem(executive._ALL_SKILL_HANDLERS, "lookup_person", _lookup)
+    monkeypatch.setitem(executive._ALL_SKILL_HANDLERS, "create_alert", _route)
+    monkeypatch.setattr("openexecutive.people.store.list_people", lambda: [])
+    n = er._MAX_ROUTING_TOOLS_PER_RUN
+    seq = _SequenceProvider([
+        _Resp(
+            [
+                *(_ToolUse("create_alert", {"headline": f"h{i}"}, f"a{i}") for i in range(n + 1)),
+                _ToolUse("lookup_person", {"query": "x"}, "l"),
+            ],
+            "tool_use",
+        ),
+        _Resp([_Text("done")], "end_turn"),
+    ])
+    from openexecutive import providers
+
+    monkeypatch.setattr(providers, "get_provider", lambda _model: seq)
+    _narrative, tool_calls = await er._executive_synthesis_loop([_finding()])
+    assert fired.count("create_alert") == n and fired.count("lookup_person") == 1
+    assert tool_calls[n]["result_preview"] == "over budget — skipped"
 
 
 def test_routing_ok_excludes_read_only_lookups() -> None:
@@ -232,12 +217,11 @@ async def test_synthesis_routes_after_lookups(
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stops_when_iteration_makes_no_progress(
+async def test_synthesis_writes_up_after_its_rounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fully-failed iteration (every call failed) must terminate the
-    loop instead of spinning to the iteration ceiling — and must not let
-    a failed outbound iteration reset its budget on the next round."""
+    """A pass that never wraps up writes up after its rounds
+    (_MAX_SYNTHESIS_ITERATIONS), with a closing summary and no tools."""
     call_count = {"n": 0}
 
     async def _failing_route(_inp: dict[str, Any]) -> str:
@@ -248,21 +232,15 @@ async def test_synthesis_stops_when_iteration_makes_no_progress(
 
     monkeypatch.setitem(executive._ALL_SKILL_HANDLERS, "create_alert", _failing_route)
     monkeypatch.setattr("openexecutive.people.store.list_people", lambda: [])
-
-    provider_calls = {"n": 0}
+    seen: list[dict[str, Any]] = []
 
     class _CountingProvider:
         async def messages_create(self, **kwargs: Any) -> Any:
+            seen.append({**kwargs, "messages": list(kwargs["messages"])})
             if kwargs.get("tool_choice") == {"type": "none"}:
-                # The closing-summary ask after the loop stops.
                 return _Resp([_Text("Nothing could be flagged.")], "end_turn")
-            provider_calls["n"] += 1
-            # Always asks for one (failing) outbound call and never wraps
-            # up — left to itself this would run the full iteration ceiling.
-            return _Resp(
-                [_ToolUse("create_alert", {"headline": "x"}, "d")],
-                "tool_use",
-            )
+            # Always asks for the same failing call and never wraps up.
+            return _Resp([_ToolUse("create_alert", {"headline": "x"}, f"d{len(seen)}")], "tool_use")
 
     from openexecutive import providers
 
@@ -270,11 +248,10 @@ async def test_synthesis_stops_when_iteration_makes_no_progress(
 
     narrative, tool_calls = await er._executive_synthesis_loop([_finding()])
 
-    # Loop stopped after the first no-progress iteration: one routing
-    # call, one (failed) outbound attempt — not the full 3-iteration ceiling.
-    assert provider_calls["n"] == 1
+    assert call_count["n"] == er._MAX_SYNTHESIS_ITERATIONS
+    assert len(seen) == er._MAX_SYNTHESIS_ITERATIONS + 1
+    assert seen[-1]["messages"][-1]["content"][-1] == {"type": "text", "text": STEPS_NOTE}
     assert narrative == "Nothing could be flagged."
-    assert call_count["n"] == 1
     assert all(not t["ok"] for t in tool_calls)
 
 
@@ -341,7 +318,7 @@ def _finding(title: str = "Competitor cut prices") -> er.ResearchFinding:
 async def test_a_run_cut_off_mid_routing_still_gets_its_closing_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the routing budget runs out, the loop stops with the model
+    """When the routing calls are made, the pass stops with the model
     mid-routing. Its working notes (written beside the tool calls) never
     become the write-up; one closing call with no tools on offer writes the
     summary instead. Each routed call carries a plain label for the
@@ -365,7 +342,7 @@ async def test_a_run_cut_off_mid_routing_still_gets_its_closing_summary(
 
     class _Provider:
         async def messages_create(self, **kwargs: Any) -> Any:
-            seen.append(kwargs)
+            seen.append({**kwargs, "messages": list(kwargs["messages"])})
             if kwargs.get("tool_choice") == {"type": "none"}:
                 return _Resp([_Text("Stripe is changing its fees; it's on your brief.")], "end_turn")
             return spend
