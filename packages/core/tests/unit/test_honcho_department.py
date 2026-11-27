@@ -240,7 +240,7 @@ def test_prefetch_department_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == ""
 
 
-def test_prefetch_department_disabled_audits_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prefetch_department_disabled_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     _enable(monkeypatch)
     monkeypatch.setenv("HONCHO_ENABLED", "false")
     captured: list[dict[str, Any]] = []
@@ -253,19 +253,14 @@ def test_prefetch_department_disabled_audits_disabled(monkeypatch: pytest.Monkey
             honcho_client.prefetch_department("q", department_slug="marketing")
         )
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    details = peer_rows[0]["details"]
-    assert details["op"] == "prefetch_department"
-    assert details["outcome"] == "disabled"
-    assert details["department_slug"] == "marketing"
+    assert peer_rows == []  # a no-op writes no row
 
 
-def test_sync_department_turn_disabled_schedules_nothing_and_audits_disabled(
+def test_sync_department_turn_disabled_schedules_nothing_and_logs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HONCHO_ENABLED=false: sync_department_turn short-circuits — no task is
-    scheduled and one peer_memory audit row lands with outcome=disabled.
-    Full-parity guard so the off path can't silently regress."""
+    scheduled and no peer_memory row is written for the no-op."""
     monkeypatch.setenv("HONCHO_ENABLED", "false")
     captured: list[dict[str, Any]] = []
 
@@ -280,13 +275,10 @@ def test_sync_department_turn_disabled_schedules_nothing_and_audits_disabled(
 
     assert not honcho_client._pending_sync_tasks
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    assert peer_rows[0]["details"]["op"] == "sync_department_turn"
-    assert peer_rows[0]["details"]["outcome"] == "disabled"
-    assert peer_rows[0]["details"]["department_slug"] == "marketing"
+    assert peer_rows == []  # a no-op writes no row
 
 
-def test_prefetch_department_no_slug_audits_no_department(
+def test_prefetch_department_no_slug_logs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
@@ -298,8 +290,7 @@ def test_prefetch_department_no_slug_audits_no_department(
     with patch.object(honcho_client, "audit_log", _spy):
         asyncio.run(honcho_client.prefetch_department("q", department_slug=None))
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    assert peer_rows[0]["details"]["outcome"] == "no_department"
+    assert peer_rows == []  # a no-op writes no row
 
 
 def test_prefetch_department_ok_audits_with_dept_slug(
@@ -558,7 +549,7 @@ def test_sync_department_turn_safe_from_sync_context(
 # --------------------------------------------------------------------------- #
 
 
-def test_append_department_note_no_slug_audits_no_department(
+def test_append_department_note_no_slug_logs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
@@ -572,8 +563,7 @@ def test_append_department_note_no_slug_audits_no_department(
             department_slug=None, kind="decision", body="something"
         )
     peer_rows = [r for r in captured if r["event_type"] == "peer_memory"]
-    assert len(peer_rows) == 1
-    assert peer_rows[0]["details"]["outcome"] == "no_department"
+    assert peer_rows == []  # a no-op writes no row
 
 
 def test_append_department_note_empty_body_short_circuits(

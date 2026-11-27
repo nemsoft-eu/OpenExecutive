@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.config import get_settings
+from openexecutive.utils.public_errors import PublicError
 
 if TYPE_CHECKING:
     from openexecutive.orchestrator.mcp_gateway import MCPGateway
@@ -57,6 +58,7 @@ _READ_VERBS = (
     "get_", "list_", "search_", "read_", "query_", "find_",
     "check_", "describe_", "inspect_", "debug_",
 )
+
 _WRITE_WORDS = frozenset({
     "add", "append", "apply", "approve", "archive", "assign", "book", "cancel",
     "clear", "close", "comment", "commit", "copy", "create", "delete", "deploy",
@@ -137,7 +139,7 @@ class ToolInfo:
         return {"name": self.name, "description": self.description[:1024], "input_schema": schema}
 
 
-class ToolCatalogError(RuntimeError):
+class ToolCatalogError(PublicError):
     """A tool lookup could not be completed (e.g. no gateway). Fixed-string."""
 
 

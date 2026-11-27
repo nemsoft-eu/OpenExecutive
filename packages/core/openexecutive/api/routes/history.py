@@ -143,7 +143,10 @@ def _can_note_replies(person: Person) -> bool:
 
 
 def _note_out(note: history.Note) -> NoteOut:
-    return NoteOut(**note.as_dict())
+    return NoteOut(**{
+        **note.as_dict(),
+        "summary": history.shown_summary(note.summary),
+    })
 
 
 def _state(person: Person, query: str | None = None) -> HistoryOut:

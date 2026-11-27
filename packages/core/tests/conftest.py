@@ -88,12 +88,20 @@ def stored_department_levels(monkeypatch: pytest.MonkeyPatch):
     one department per level. No department, or an unknown one, is
     Balanced's."""
     from openexecutive.departments import authority
-    from openexecutive.departments import registry as dept_registry
+    from openexecutive.departments import store as dept_store
     from openexecutive.departments.models import AuthorityLevel
 
+    # Reads the column itself: every department read now asks
+    # ``department_level``, so going through the registry would call back here.
     def stored(slug: str) -> AuthorityLevel:
-        state = dept_registry.get_state(slug) if slug else None
-        return state.config.authority_level if state is not None else AuthorityLevel.PROPOSE_ONLY
+        if not slug:
+            return AuthorityLevel.PROPOSE_ONLY
+        with dept_store._get_conn() as conn:
+            row = conn.execute("SELECT authority_level FROM departments WHERE slug = ?", (slug,)).fetchone()
+        try:
+            return AuthorityLevel(row[0]) if row is not None else AuthorityLevel.PROPOSE_ONLY
+        except ValueError:
+            return AuthorityLevel.PROPOSE_ONLY
 
     monkeypatch.setattr(authority, "department_level", stored)
 

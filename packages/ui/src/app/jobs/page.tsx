@@ -25,6 +25,7 @@ import {
   stopWorkflowRun,
 } from "@/lib/api";
 import RepeatOfferCard from "@/components/jobs/RepeatOfferCard";
+import ScheduleLink from "@/components/schedule/ScheduleLink";
 import StartHere from "@/components/jobs/StartHere";
 import { buttonClass } from "@/components/ui/Button";
 import OverflowMenu, { type OverflowItem } from "@/components/ui/OverflowMenu";
@@ -39,6 +40,7 @@ import {
 } from "@/lib/runStatus";
 import { cadenceLabel, cardAction, lastRunAt } from "@/lib/workflowCards";
 import { starterPicksFor } from "@/lib/workflowStarters";
+import { noteRunOnArrival, opensHere, stepCount } from "@/lib/workflowRun";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import { PageSpinner } from "@/components/ui/Spinner";
 
@@ -293,6 +295,7 @@ function JobsPageInner() {
         <h2 className="text-xl font-bold tracking-tight text-fg">
           {tab === "runs" ? "Runs" : "Your workflows"}
         </h2>
+        {tab === "catalog" && <ScheduleLink kind="workflow" className="mr-auto" />}
         <ViewSwitch
           tab={tab}
           runsLabel={openRuns > 0 ? `Runs (${openRuns} open)` : `Runs (${runs.length})`}
@@ -451,6 +454,8 @@ function YourWorkflows({
   onBrowse: () => void;
 }) {
   const cadenceByName = new Map(customDefs.map((d) => [d.name, d.cadence] as const));
+  // Its creator or the principal deletes a workflow; the server says who.
+  const canDelete = new Map(customDefs.map((d) => [d.name, d.can_delete] as const));
 
   if (workflows.length === 0 && offWorkflows.length === 0) {
     return (
@@ -491,7 +496,9 @@ function YourWorkflows({
                 label={`More for ${d.title}`}
                 items={[
                   { label: "Edit", href: `/jobs/new?edit=${encodeURIComponent(d.name)}` },
-                  { label: "Delete", danger: true, onSelect: () => onDeleteCustom(d.name) },
+                  ...(d.can_delete === false
+                    ? []
+                    : [{ label: "Delete", danger: true, onSelect: () => onDeleteCustom(d.name) }]),
                 ]}
               />
             </div>
@@ -504,13 +511,15 @@ function YourWorkflows({
         const last = lastRunAt(w.name, runs);
         const cadence = cadenceLabel(cadenceByName.get(w.name));
         const meta = [
-          cadence || `${w.steps.length} steps`,
+          cadence || stepCount(w.steps),
           last ? `last run ${formatRelativeTime(last)}` : "not run yet",
         ].join(" · ");
         const more: OverflowItem[] = [
           ...(action.kind === "signoff" ? [{ label: "Run again", href }] : []),
           { label: "Edit", href: `/jobs/new?edit=${encodeURIComponent(w.name)}` },
-          { label: "Delete", danger: true, onSelect: () => onDeleteCustom(w.name) },
+          ...(canDelete.get(w.name) === false
+            ? []
+            : [{ label: "Delete", danger: true, onSelect: () => onDeleteCustom(w.name) }]),
         ];
         return (
           <div key={w.name} className={cardCls}>
@@ -538,7 +547,11 @@ function YourWorkflows({
                   Review
                 </Link>
               ) : (
-                <Link href={href} className={buttonClass("primary", "md")}>
+                <Link
+                  href={href}
+                  onClick={(e) => opensHere(e) && noteRunOnArrival(w.name)}
+                  className={buttonClass("primary", "md")}
+                >
                   Run
                 </Link>
               )}
@@ -568,7 +581,7 @@ function CatalogCard({ workflow: w, useFor }: { workflow: WorkflowMeta; useFor?:
             Quick
           </span>
         ) : null}
-        {w.quick ? "One question, one document" : `${w.steps.length} steps`} · ~
+        {w.quick ? "One question, one document" : stepCount(w.steps)} · ~
         {w.estimated_minutes} min
       </span>
     </Link>

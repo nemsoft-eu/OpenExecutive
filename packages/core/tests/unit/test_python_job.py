@@ -116,6 +116,28 @@ def test_the_download_route_is_the_principals(company: Path, sandbox: list, monk
     assert client.get(f"/python-jobs/{job_id}/{name}").status_code == 403
 
 
+def test_a_picture_goes_out_as_an_image_and_nothing_else_does(
+    company: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chart shows in the chat as an <img>, so it is served as its image
+    type; other files, SVG included, stay downloads."""
+    monkeypatch.setattr("openexecutive.api.routes.people.caller_is_principal", lambda _r: True)
+    job = python_job.jobs_dir() / ("a" * 32)
+    job.mkdir(parents=True)
+    for name in ("chart.png", "photo.JPG", "notes.txt", "logo.svg"):
+        (job / name).write_bytes(b"x")
+    app = FastAPI()
+    app.include_router(route.router)
+    client = TestClient(app)
+    types = {n: client.get(f"/python-jobs/{'a' * 32}/{n}").headers["content-type"]
+             for n in ("chart.png", "photo.JPG", "notes.txt", "logo.svg")}
+    assert types == {"chart.png": "image/png", "photo.JPG": "image/jpeg",
+                     "notes.txt": "application/octet-stream", "logo.svg": "application/octet-stream"}
+    resp = client.get(f"/python-jobs/{'a' * 32}/chart.png")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "sandbox"
+
+
 def test_the_tool_is_principal_only_and_withheld_where_scripts_are() -> None:
     from openexecutive.delegation.lockdown import MAIL_TOUCHED_ALLOWED_TOOLS
     from openexecutive.orchestrator.content_trust import PRINCIPAL_ONLY_TOOLS
@@ -150,6 +172,18 @@ def test_links_are_url_encoded(company: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(python_job, "run_job", fake)
     [f] = _run({"code": "1"})["files"]
     assert f["link"].endswith("/My%20report%20%28v2%29.pdf")
+
+
+def test_an_image_comes_back_ready_to_show(company: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chart shows in the chat only from its link, never its handle, so an
+    image result carries the markdown line to put in the answer."""
+    async def fake(*a: Any, **k: Any) -> dict[str, Any]:
+        return {"files": {"Monthly sales.png": base64.b64encode(b"x").decode(), "data.csv": base64.b64encode(b"a").decode()}}
+    monkeypatch.setattr(python_job, "run_job", fake)
+    files = {f["name"]: f for f in _run({"code": "1"})["files"]}
+    png = files["Monthly sales.png"]
+    assert png["show"] == f"![Monthly sales.png]({png['link']})"
+    assert files["data.csv"]["show"] == f"[data.csv]({files['data.csv']['link']})"
 
 
 async def test_the_api_stops_reading_a_flood(monkeypatch: pytest.MonkeyPatch) -> None:

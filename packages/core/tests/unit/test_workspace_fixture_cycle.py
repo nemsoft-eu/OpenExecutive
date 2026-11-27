@@ -14,6 +14,7 @@ import pytest
 from openexecutive.cli import fixture_loader
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
+from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.memory import episodic, honcho_client
 from openexecutive.memory import workspace_settings as ws
 from openexecutive.people import store as people_store
@@ -22,8 +23,12 @@ USER = ws.WorkspaceSettings(mode="solo", timezone="America/Chicago")
 
 
 class _FakeStore:
-    RESEARCH_COLLECTION = "recent_research"
-    COMPANY_COLLECTION = "company_docs"
+    # The real collection names: a sync module first imported while this
+    # stands in for the store reads them at import (its ``SOURCE``), so a
+    # missing one failed these tests whenever they ran before that import.
+    locals().update(
+        {k: v for k, v in vars(ChromaDBStore).items() if k.endswith("_COLLECTION")}
+    )
 
     def __init__(self, **_kw: object) -> None: ...
 
@@ -155,22 +160,6 @@ def test_bad_zone_in_fixture_file_does_not_abort_the_load(settings: Any, tmp_pat
     assert "Demo Co" in settings.company_profile_path.read_text()  # the load completed
 
 
-def test_a_failed_first_snapshot_aborts_the_load(
-    settings: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The load wipes the user's tables, so with no snapshot unload would have
-    nothing to restore: it must not go ahead."""
-    def _fail(_settings: Any) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr(fixture_loader, "snapshot_user_state", _fail)
-    people_store.upsert_person(full_name="Me Myself", is_principal=True)
-    with pytest.raises(OSError):
-        _load(settings)
-    assert "My Co" in settings.company_profile_path.read_text()
-    assert [p.full_name for p in people_store.list_people()] == ["Me Myself"]
-
-
 def test_a_failed_wipe_leaves_the_outgoing_company_whole(
     settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,7 +186,7 @@ def test_a_snapshot_that_fails_part_way_is_retaken_on_the_next_load(
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(fixture_loader, "_dump_people", _fail)
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(fixture_loader.FixtureSnapshotError):
         _load(settings)
     assert not (_backup(settings) / "profile.yaml").exists()
 
@@ -205,3 +194,102 @@ def test_a_snapshot_that_fails_part_way_is_retaken_on_the_next_load(
     _load(settings)
     _unload(settings)
     assert [p.full_name for p in people_store.list_people()] == ["Me Myself"]
+
+
+def test_load_and_unload_forget_cached_agent_overrides(
+    settings: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overrides are cached with no expiry, so a load or unload, which changes
+    the tables under them, must drop the cache."""
+    import sqlite3
+
+    from openexecutive.agents import overrides
+
+    db = tmp_path / "episodic.db"
+    monkeypatch.setattr(overrides, "DB_PATH", db)
+    overrides.initialize_overrides_db(db)
+
+    def _cached_then_gone(step: Any) -> None:
+        overrides.set_override("finance", instructions="Old voice.", instructions_set=True)
+        assert overrides.get_override("finance") is not None  # now in memory
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute("DELETE FROM agent_overrides")
+        step(settings)
+        assert overrides.get_override("finance") is None
+
+    try:
+        _cached_then_gone(_load)
+        _cached_then_gone(_unload)
+    finally:
+        overrides.invalidate_cache()
+
+
+def test_a_failed_snapshot_stops_the_load(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a fresh copy, unload would bring back an older one, so the
+    load doesn't go ahead and nothing live changes."""
+
+    def _fail(*_a: object, **_k: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(fixture_loader, "snapshot_user_state", _fail)
+    people_store.upsert_person(full_name="Me Myself", is_principal=True)
+    with pytest.raises(fixture_loader.FixtureSnapshotError, match="Nothing was changed"):
+        _load(settings)
+    assert not fixture_loader._fixture_active_sentinel(settings).exists()
+    assert "My Co" in settings.company_profile_path.read_text()
+    assert [p.full_name for p in people_store.list_people()] == ["Me Myself"]
+
+
+def test_a_failed_database_copy_leaves_the_earlier_backup_whole(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The database copy goes first, so a full disk can't leave today's
+    files next to an older database for unload to bring back."""
+    fixture_loader.snapshot_user_state(settings)
+    backup = _backup(settings)
+    saved_db = (backup / "state.db").read_bytes()
+    settings.company_profile_path.write_text("name: My Co Renamed\n")
+
+    real_connect = fixture_loader.sqlite3.connect
+
+    class _FullDisk:
+        def __init__(self, path: str) -> None:
+            self._conn = real_connect(path)
+
+        def execute(self, sql: str, *args: object) -> Any:
+            if sql.startswith("VACUUM INTO"):
+                raise OSError("disk full")
+            return self._conn.execute(sql, *args)
+
+        def close(self) -> None:
+            self._conn.close()
+
+    monkeypatch.setattr(fixture_loader.sqlite3, "connect", _FullDisk)
+    with pytest.raises(OSError):
+        fixture_loader.snapshot_user_state(settings)
+    monkeypatch.undo()
+    assert "My Co Renamed" not in (backup / "profile.yaml").read_text()
+    assert (backup / "state.db").read_bytes() == saved_db
+
+
+def test_unload_brings_back_work_done_between_two_loads(settings: Any) -> None:
+    """Each load saves the company again, so a second unload brings back
+    what changed after the first one, not the copy from the first load."""
+    import sqlite3
+
+    db = episodic.DB_PATH
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE only_in_the_database (note TEXT)")
+    _load(settings)
+    _unload(settings)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("INSERT INTO only_in_the_database VALUES ('written after the first demo')")
+    _load(settings)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("DELETE FROM only_in_the_database")  # what a demo might do
+    _unload(settings)
+    with sqlite3.connect(str(db)) as conn:
+        rows = conn.execute("SELECT note FROM only_in_the_database").fetchall()
+    assert rows == [("written after the first demo",)]

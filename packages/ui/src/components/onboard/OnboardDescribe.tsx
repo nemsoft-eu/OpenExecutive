@@ -27,23 +27,15 @@ import {
 //
 // Continue reads the text once (POST /onboard/interview/understand) and saves
 // what it can tell straight away: Personal or Team (Personal when it can't
-// tell, since nothing is lost and switching is easy), the browser's time zone
-// and, for Personal, the role the text gave. The review screen shows the
-// choice on one line with a Change link, and Settings keeps the switch. Then
+// tell, since nothing is lost and switching is easy) and, for Personal, the
+// role the text gave. The company's time zone is saved with the setup itself
+// (commitOnboardDraft). The review screen shows the choice on one line with a Change link, and Settings keeps the switch. Then
 // the interview opens with the same text and asks only about what is missing.
 
 const MAX_FILES = 8;
 
 const EXAMPLE =
   "e.g. I'm Head of Customer Success at a 300-person software company and report to the COO. My team of twelve looks after renewals. This year I want net revenue retention above 110% and a cleaner handoff from sales.";
-
-function browserTimeZone(): string | undefined {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 export interface DescribeResult {
   mode: WorkspaceMode;
@@ -82,14 +74,7 @@ export default function OnboardDescribe({ onReady, onLater }: DescribeProps) {
 
   async function saveWorkspace(u: OnboardUnderstanding | null): Promise<WorkspaceMode> {
     const mode = inferredMode(u);
-    const timezone = browserTimeZone();
-    try {
-      await updateWorkspace(timezone ? { mode, timezone } : { mode });
-    } catch (err) {
-      // A zone the server does not know must not block setup.
-      if (!timezone || (err instanceof Error && /principal/i.test(err.message))) throw err;
-      await updateWorkspace({ mode });
-    }
+    await updateWorkspace({ mode });
     const role = understoodRole(u);
     if (mode === "solo" && Object.keys(role).length > 0) {
       // Best effort: the interview asks about the role anyway.

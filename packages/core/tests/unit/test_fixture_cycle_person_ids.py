@@ -1,12 +1,9 @@
-"""A fixture load then unload gives the user's people back under NEW ids.
+"""A fixture load then unload gives the user's people back under the SAME ids.
 
-Backup and restore are YAML-only: ``_dump_people`` writes no ids,
-``_seed_people`` deletes every row and re-inserts, and ``people.id`` is
-``AUTOINCREMENT`` with nothing resetting ``sqlite_sequence``. So the restored
-principal is the same person by name and role, but under a fresh id, and any
-state still keyed by the old id would point at nobody. The swap paths wipe
-that person-keyed state (``memory/company_tables.py``), which is why the
-demo and clients pages say it comes back empty.
+The snapshot carries the whole database (``_user_backup/state.db``), and
+unload restores it over what the YAML files seeded, so the principal comes
+back as the same row and state keyed by their id still points at them. (Before
+the 2026-11-24 upstream sync the backup was YAML-only and gave fresh ids.)
 """
 from __future__ import annotations
 
@@ -19,13 +16,14 @@ import pytest
 from openexecutive.cli import fixture_loader
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
+from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.memory import episodic, honcho_client
 from openexecutive.people import store as people_store
 
 
-class _FakeStore:
-    RESEARCH_COLLECTION = "recent_research"
-    COMPANY_COLLECTION = "company_docs"
+class _FakeStore(ChromaDBStore):
+    """The real store's collection names (the sync modules read them at
+    import), with no vector store behind it."""
 
     def __init__(self, **_kw: object) -> None: ...
 
@@ -81,7 +79,7 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     })()
 
 
-def test_unload_restores_the_principal_under_a_new_id(settings: Any) -> None:
+def test_unload_restores_the_principal_under_the_same_id(settings: Any) -> None:
     before = people_store.upsert_person(full_name="Me Myself", role="Owner", is_principal=True)
 
     asyncio.run(fixture_loader.load_fixture("demo", settings))
@@ -90,6 +88,4 @@ def test_unload_restores_the_principal_under_a_new_id(settings: Any) -> None:
     principal = people_store.find_principal_person()
     assert principal is not None
     assert (principal.full_name, principal.role) == ("Me Myself", "Owner")
-    # Pins today's behaviour, not a requirement: a backup that kept ids would
-    # rightly fail this, and should then flip it to ==.
-    assert principal.id != before
+    assert principal.id == before

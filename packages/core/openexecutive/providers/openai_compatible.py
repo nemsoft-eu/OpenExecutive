@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from openexecutive.providers.feature_gate import (
+    NON_CLAUDE_MAX_OUTPUT_TOKENS,
     FeatureSpec,
     apply_feature_gates,
     fit_claude_generation,
@@ -105,6 +106,7 @@ class OpenAICompatibleProvider:
         model_resolver: Callable[[str], tuple[str, FeatureSpec] | None] | None = None,
         reasoning_effort: str | None = None,
         include_usage_accounting: bool = False,
+        stream_usage: bool = True,
         temperature: float | None = None,
         top_p: float | None = None,
     ) -> None:
@@ -131,6 +133,11 @@ class OpenAICompatibleProvider:
         # behind a LiteLLM gateway), which rejects an unrecognized top-level
         # `usage` field outright rather than ignoring it.
         self._include_usage_accounting = include_usage_accounting
+        # Whether a streaming request asks for the final usage chunk
+        # (`stream_options.include_usage`). Standard OpenAI, so on by default;
+        # see LOCAL_STREAM_USAGE. Without it the accumulator's usage dict stays
+        # empty and the turn is audited as 0 tokens.
+        self._stream_usage = stream_usage
         # Top-level `reasoning_effort` for thinking-only backends
         # (LOCAL_REASONING_EFFORT). None = not sent. Only the local backend
         # sets it; OpenRouter uses the translator's nested `reasoning`.
@@ -161,6 +168,7 @@ class OpenAICompatibleProvider:
                 supports_web_search=False,
                 supports_tool_use=True,
                 supports_pdf_input=False,
+                max_output_tokens=NON_CLAUDE_MAX_OUTPUT_TOKENS,
             ),
         )
         return slug, spec
@@ -285,19 +293,14 @@ class OpenAICompatibleProvider:
         self._extend_body(slug, body)
         _announce_reasoning(slug, body)
         body["stream"] = True
-        # Opt in to the usage block: without it a plain OpenAI-compatible
-        # backend (Ollama, LM Studio, vLLM) sends no usage at all on a streamed
-        # response, and StreamAccumulator.finalize then reports prompt_tokens 0
-        # rather than "unknown" — so the Executive's own chat turn, the call
-        # carrying the full system prompt and RAG context, logged a fabricated
-        # zero. This makes the number exist on backends that honour the flag;
-        # it does not fix the fabrication itself, which lives in finalize.
-        # Set here rather than in `to_openai_request` because that builder is
-        # shared with the non-streaming path and the OpenAI spec rejects
-        # `stream_options` when `stream` is false. The sibling accounting flag
-        # `usage: {"include": true}` is set there; see the audit invariant in
-        # architecture-facts.yaml for how the two relate.
-        body["stream_options"] = {"include_usage": True}
+        # The OpenAI SSE spec sends no usage block while streaming unless the
+        # request opts in, so without this every streamed turn is recorded as
+        # 0 input / 0 output tokens. `StreamAccumulator.feed` reads `usage`
+        # before its `choices` guard, so the usage-only final chunk (which
+        # carries an empty `choices`) is captured. Distinct from the
+        # OpenRouter-only top-level `usage` field set in to_openai_request.
+        if self._stream_usage:
+            body["stream_options"] = {"include_usage": True}
         return _OpenAICompatibleStream(
             client=self._client,
             body=body,

@@ -46,6 +46,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 TABLE = "person_notification_settings"
@@ -104,12 +106,7 @@ class NotificationSettings(BaseModel):
 # Storage
 # --------------------------------------------------------------------------- #
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:

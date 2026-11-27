@@ -273,6 +273,22 @@ def test_chat_only_leaves_email_out_of_the_plan(monkeypatch: pytest.MonkeyPatch)
     assert "email" in plans[1], "without chat_only the same person also gets email"
 
 
+def test_email_only_never_goes_to_a_chat_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mail_configured(monkeypatch)
+    mcp_gateway.set_gateway_supervisor(_Supervisor(gateway=object()))
+    plans: list[tuple[list[str], str]] = []
+
+    async def _send(person: Person, plan: list[str], text: str, *, label: str) -> runner.PrincipalDelivery:
+        plans.append((plan, label))
+        return runner.PrincipalDelivery(True, "sent", "delivered")
+
+    monkeypatch.setattr(runner, "_send_on_plan", _send)
+
+    asyncio.run(runner.deliver_to_person(_owner(slack_user_id="U1"), "ALERT", label="Vendor outage", email_only=True))
+
+    assert plans == [(["email"], "Vendor outage")]
+
+
 def test_every_channel_failing_says_what_each_said(monkeypatch: pytest.MonkeyPatch) -> None:
     _mail_configured(monkeypatch)
 

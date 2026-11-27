@@ -1,0 +1,27 @@
+id: artifacts_005
+domain: artifacts
+description: "Principal refers to the Made for you page; Executive treats it as its document library, points there by that name, and calls the deliverable a document, never an \"artifact\"."
+company_context:
+  stage: "Series A"
+  industry: "B2B SaaS"
+  headcount: 45
+  arr: 3500000
+# The UI names the library "Made for you" (Work → Made for you); "Knowledge"
+# is the company's own files. The persona tells the Executive to use that
+# name with the user. This checks the principal's "Made for you" maps to
+# list_artifacts / get_artifact (not the company files), and the reply says
+# "document", not "artifact".
+# `expected_tool_calls` is documentation for now (matches
+# mcp_tool_call_001.yaml convention).
+query: "You put a hiring plan in Made for you last week. Pull it up and tell me how many engineers it has us adding in Q1."
+expected_tool_calls:
+  - list_artifacts
+  - get_artifact
+expected_topics:
+  - finds_hiring_plan
+  - states_q1_engineering_headcount
+quality_criteria:
+  treats_made_for_you_as_document_library: true
+  does_not_search_company_knowledge_instead: true
+  never_says_artifact_to_user: true
+  brief: true

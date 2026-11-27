@@ -79,3 +79,19 @@ def test_quiet_hours_hold_a_high_alert_but_let_an_urgent_one_through(
     assert asyncio.run(dispatcher.dispatch_slack_dm(_alert("high"))) is False
     assert asyncio.run(dispatcher.dispatch_slack_dm(_alert("urgent"))) is True
     assert asked == [False, True] and len(sent) == 1
+
+
+def test_a_personal_card_goes_to_its_person_or_no_one(
+    monkeypatch: pytest.MonkeyPatch, sent: list[Any],
+) -> None:
+    # An email watch's card for Ben, who was archived meanwhile: his inbox's
+    # sender and subject never move on to the principal.
+    def card(routed: int | None) -> Alert:
+        return _alert(routed=routed).model_copy(update={"source": "mailbox"})
+
+    assert asyncio.run(dispatcher.dispatch_slack_dm(card(2))) is True
+    gone = SimpleNamespace(id=2, full_name="Ben Teammate", archived=True)
+    monkeypatch.setattr(people_store, "get_person", lambda pid: {1: OWNER, 2: gone}.get(pid))
+    assert asyncio.run(dispatcher.dispatch_slack_dm(card(2))) is False
+    assert asyncio.run(dispatcher.dispatch_slack_dm(card(None))) is False
+    assert [p for p, _, _ in sent] == [BEN]

@@ -1,14 +1,16 @@
 import { useId } from "react";
 
-type BrandMarkSize = "sm" | "md" | "lg";
+type BrandMarkSize = "xs" | "sm" | "md" | "lg";
 
 const BOX_CLASSES: Record<BrandMarkSize, string> = {
+  xs: "w-5 h-5 rounded-full bg-indigo-600 flex items-center justify-center",
   sm: "w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20",
   md: "w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20",
   lg: "w-12 h-12 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-xl shadow-indigo-500/25",
 };
 
 const MARK_CLASSES: Record<BrandMarkSize, string> = {
+  xs: "w-5 h-5 text-white",
   sm: "w-7 h-7 text-white",
   md: "w-7 h-7 text-white",
   lg: "w-12 h-12 text-white",

@@ -7,12 +7,14 @@ connect it again, and before this they only found out mid-question, when a
 search or a draft failed.
 
 So each time a mailbox status check (``gmail.gmail_status``, the same for
-Gmail and Outlook) finds ``needs_reconnect``, :func:`record` hands it to
+Gmail and Outlook) finds it broken (``needs_reconnect``, or ``mismatch`` when the sign-in now opens another mailbox), :func:`record` hands it to
 :func:`note` in the background, which records the break off the event loop;
 the first time for a break it sends the person one message, the way their
 reminders reach them (``scheduler.runner.deliver_to_person``), saying how to
-connect it again. A check that finds the mailbox connected clears the record,
-so the next break is told again. Nothing goes to anyone else, and the row
+connect it again. A check that finds the mailbox connected, or no longer
+connected at all, clears the record, so the next break is told again. While
+the record stands, Home lists the mailbox as needing reconnecting
+(:func:`broken_since`, ``briefing.needs_reconnecting``). Nothing goes to anyone else, and the row
 holds only the address and two times.
 
 Never raises: a notice that can't go is logged and tried again on the next
@@ -26,11 +28,13 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 TABLE = "delegation_sign_in_notices"
 MESSAGE = (
-    "Your mailbox stopped accepting the sign-in I use, so I can't read your mail "
+    "Your mailbox stopped working with the sign-in I use, so I can't read your mail "
     "or calendar, or save drafts in it, until you connect it again. You can do "
     "that in Delegate → As you."
 )
@@ -38,12 +42,7 @@ MESSAGE = (
 _tasks: set[asyncio.Task[bool]] = set()
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:
@@ -96,6 +95,35 @@ def _clear(email: str, db_path: Path | None) -> None:
         conn.close()
 
 
+def broken_since(email: str, db_path: Path | None = None) -> str | None:
+    """When ``email``'s own mailbox stopped taking its sign-in (ISO), or None
+    while no check has found it broken. Never raises."""
+    if not email:
+        return None
+    try:
+        conn = _connect(db_path)
+        try:
+            row = conn.execute(
+                f"SELECT broken_at FROM {TABLE} WHERE email = ?", (email,),  # noqa: S608
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("sign_in_notice: couldn't read the break", exc_info=True)
+        return None
+    return str(row[0]) if row else None
+
+
+# Statuses that say the mailbox is not broken any more: connected again, or
+# no longer connected at all (nothing to reconnect).
+_SETTLED = frozenset({"connected", "not_configured", "no_email", "shared_mailbox"})
+
+# Statuses that say it is broken: its saved sign-in is refused, or now opens
+# another mailbox. The web reads the same two as "Needs
+# reconnecting" (lib/reconnect.ts).
+BROKEN = frozenset({"needs_reconnect", "mismatch"})
+
+
 async def _send(email: str, db_path: Path | None) -> None:
     from openexecutive.audit import log_event
     from openexecutive.audit.context import private_rows, rows_for_person
@@ -131,16 +159,16 @@ async def note(
     email: str, status: str, *, now: datetime | None = None, db_path: Path | None = None,
 ) -> bool:
     """Record what a status check of ``email``'s own mailbox found. On a new
-    break (``needs_reconnect``) send the one notice; on ``connected`` clear
-    the break. The database work runs off the event loop. Returns True when
+    break (:data:`BROKEN`) send the one notice; once it is connected
+    again, or not connected at all, clear the break. The database work runs off the event loop. Returns True when
     a notice was tried. Never raises."""
     try:
         if not email:
             return False
-        if status == "connected":
+        if status in _SETTLED:
             await asyncio.to_thread(_clear, email, db_path)
             return False
-        if status != "needs_reconnect":
+        if status not in BROKEN:
             return False
         if not await asyncio.to_thread(_claim, email, now or datetime.now(UTC), db_path):
             return False

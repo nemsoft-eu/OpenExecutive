@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.delegation.schema import VOICE_HISTORY_TABLE, VOICE_TABLE, ensure_schema
+from openexecutive.utils import db
 
 if TYPE_CHECKING:
     from openexecutive.people.models import Person
@@ -122,12 +123,7 @@ class StoredVoice:
 # --------------------------------------------------------------------------- #
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _profile_from_json(raw: str | None) -> VoiceProfile:

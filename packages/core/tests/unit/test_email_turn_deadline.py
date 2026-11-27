@@ -223,3 +223,90 @@ def test_the_cut_off_row_says_a_reply_may_have_gone() -> None:
         asyncio.run(poller._handle_email(gateway, "m1", "t1", EXEC))
     cut = next(r for r in rows if r["details"].get("outcome") == "turn_timeout")
     assert "may already have gone" in cut["summary"]
+
+
+def _busy() -> Exception:
+    import anthropic
+    import httpx
+
+    request = httpx.Request("POST", "https://ai.example/v1/messages")
+    return anthropic.RateLimitError("busy", response=httpx.Response(429, request=request), body=None)
+
+
+def test_a_turn_the_ai_service_refused_before_sending_is_not_run() -> None:
+    """Busy before anything went out: TurnNotRun, so the message stays unread."""
+    class _Busy:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def chat(self, **_kwargs: Any) -> str:
+            raise _busy()
+
+    _a, b, c, d = _run_executive_patches()
+    with (
+        patch("openexecutive.orchestrator.executive.Executive", new=_Busy),
+        b, c, d,
+        patch.object(poller, "get_settings", return_value=_settings(timeout_s=5)),
+        pytest.raises(poller.TurnNotRun) as info,
+    ):
+        asyncio.run(poller._run_executive(
+            gateway=AsyncMock(),
+            raw_email=f"Subject: hi\nFrom: {TEAMMATE}\n\n--- BODY ---\nhello\n",
+            message_id="m1",
+            thread_id="t1",
+            from_addr=TEAMMATE,
+        ))
+    assert info.value.sender == TEAMMATE and info.value.thread_id == "t1"
+
+
+def test_a_refused_turn_that_already_sent_is_not_run_again() -> None:
+    """A reply already went out: run again it could answer twice."""
+    class _SentThenBusy:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def chat(self, *, session: Any, **_kwargs: Any) -> str:
+            session.mail_sent_to.add(TEAMMATE)
+            raise _busy()
+
+    _a, b, c, d = _run_executive_patches()
+    with (
+        patch("openexecutive.orchestrator.executive.Executive", new=_SentThenBusy),
+        b, c, d,
+        patch.object(poller, "get_settings", return_value=_settings(timeout_s=5)),
+        pytest.raises(Exception) as info,
+    ):
+        asyncio.run(poller._run_executive(
+            gateway=AsyncMock(),
+            raw_email=f"Subject: hi\nFrom: {TEAMMATE}\n\n--- BODY ---\nhello\n",
+            message_id="m1",
+            thread_id="t1",
+            from_addr=TEAMMATE,
+        ))
+    assert not isinstance(info.value, poller.TurnNotRun)
+
+
+def test_a_refused_turn_stays_unread_and_gets_a_card_when_it_never_runs() -> None:
+    gateway = AsyncMock()
+    gateway.call_tool = AsyncMock(
+        return_value=f"Subject: Pilot\nFrom: {TEAMMATE}\nTo: {EXEC}\n\n--- BODY ---\nhello\n"
+    )
+    refused = poller.TurnNotRun(sender=TEAMMATE, sender_name="Alice", thread_id="t-m1", subject="Pilot")
+    mark_read = AsyncMock()
+    cards: list[dict[str, Any]] = []
+    with (
+        patch.object(poller, "get_settings", return_value=_settings()),
+        patch.object(poller, "_handle_email", new=AsyncMock(side_effect=refused)),
+        patch.object(poller, "_mark_read", new=mark_read),
+        patch("openexecutive.integrations.unanswered_mail.file_card", side_effect=lambda **kw: cards.append(kw)),
+    ):
+        # Each poll but the last leaves it unread for the next one.
+        for attempt in range(1, poller._MAX_ATTEMPTS):
+            asyncio.run(poller.poll_once(gateway, _Provider(["m1"])))  # type: ignore[arg-type]
+            assert poller._failed_attempts == {"m1": attempt}
+            mark_read.assert_not_awaited()
+            assert cards == []
+        asyncio.run(poller.poll_once(gateway, _Provider(["m1"])))  # type: ignore[arg-type]
+    mark_read.assert_awaited_once()
+    [card] = cards
+    assert card["sender_name"] == "Alice" and card["sender_address"] == TEAMMATE and not card["from_principal"]

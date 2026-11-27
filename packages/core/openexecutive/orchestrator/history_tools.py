@@ -3,7 +3,7 @@ speaker's own notes (``memory.history``).
 
 A note is private to its person, so the tool joins the toolkit only on a turn
 where that person is speaking, verified (``memory.history_chat.verified_speaker``),
-in a conversation nobody else can read (``history_chat.private_chat``: the web
+in a conversation nobody else can read (``delegation.settings.private_conversation``: the web
 chat signed in, a Slack or Discord DM, a private Telegram chat, or one its
 adapter marked private), and only once they turned on "Keep track of what
 happens". Act as me isn't needed: any team member on the People list may
@@ -77,9 +77,9 @@ def recall_person(session: Any) -> Any:
     verified, in a conversation private to them, on an interactive turn, with
     "Keep track of what happens" on. Never raises."""
     try:
-        from openexecutive.delegation.settings import turn_delegation
+        from openexecutive.delegation.settings import private_conversation, turn_delegation
         from openexecutive.memory.history import can_keep_notes, person_settings
-        from openexecutive.memory.history_chat import private_chat, verified_speaker
+        from openexecutive.memory.history_chat import verified_speaker
         from openexecutive.people.store import get_person
 
         pinned = turn_delegation(session)
@@ -88,7 +88,7 @@ def recall_person(session: Any) -> Any:
         person = get_person(pinned.person_id)
         if person is None or not can_keep_notes(person) or not verified_speaker(session, person):
             return None
-        if not private_chat(session):
+        if not private_conversation(session):
             return None
         if not person_settings(person.id).reply_notes:
             return None
@@ -140,7 +140,7 @@ def render_notes(notes: list[Any]) -> str:
         where = clean(note.channel, 40)
         line = f"[{note.occurred_at[:10]}] {where}, with {who}: " if who else f"[{note.occurred_at[:10]}] {where}: "
         if note.correction:
-            line += f"{clean(note.correction, 400)} (as you corrected it)"
+            line += f"{clean(note.corrected, 400)} (as you corrected it)"
         else:
             # Their own words first; the summary is only how it was noted.
             line += f'your words: "{clean(note.quote, 400)}" (noted as: {clean(note.summary, 400)})'

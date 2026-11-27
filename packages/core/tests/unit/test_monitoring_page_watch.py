@@ -81,9 +81,37 @@ def test_html_to_text_strips_markup_and_scripts() -> None:
 
 
 def test_diff_reports_percent_and_added_text() -> None:
-    pct, added = _diff("the price is ten", "the price is twenty now")
+    pct, added, _changes = _diff("the price is ten", "the price is twenty now")
     assert "twenty" in added
     assert 0 < pct <= 100
+
+
+def test_diff_says_what_a_rewrite_replaced() -> None:
+    old = "Use it in examples only with written permission from us. More information"
+    new = "Use it in examples without needing permission. More information"
+    _pct, added, changes = _diff(old, new)
+    assert added == "without needing permission."
+    assert changes == 'was "only with written permission from us." now "without needing permission."'
+    assert _diff("a b c", "a c")[2] == 'removed "b"'
+    assert _diff("a c", "a b c")[2] == 'added "b"'
+    # A long passage is cut on its own side; the other side stays whole.
+    long_old = "word " * 40
+    line = _diff(f"x {long_old}y", "x short y")[2]
+    assert line.endswith('now "short"') and "…" in line
+
+
+@pytest.mark.asyncio
+async def test_the_summary_names_the_rewrite_not_an_addition_before_it(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _Page(b"<html><body><p>Terms: use only with written permission.</p></body></html>")
+    _install(monkeypatch, page)
+    src = PageWatchSource()
+    item = _make_item(config={"label": "Terms"})
+    await src.poll(item, db_path=db)
+    page.body = b"<html><body><p>Holiday sale! Terms: use without needing permission.</p></body></html>"
+    [sig] = await src.poll(item, db_path=db)
+    assert 'changed: was "only with written" now "without needing"' in sig.normalized_summary
 
 
 # --------------------------------------------------------------------- #
@@ -142,6 +170,9 @@ async def test_changed_poll_emits_signal_and_updates_state(
     assert sig.provenance_url == "https://acme.example/pricing"
     assert sig.normalized_summary.startswith("[Acme pricing] page changed —")
     assert "45" in sig.raw_payload["added_text"]
+    # Whoever reads it sees what the price was as well as what it is now.
+    assert sig.raw_payload["summary"] == 'was "$30/mo" now "$45/mo"'
+    assert "changed: was" in sig.normalized_summary
     assert sig.dedup_key.startswith("page_watch:")
 
     # State advanced to the new hash.
@@ -470,7 +501,7 @@ async def test_old_baseline_without_links_reports_none_as_new(
     _install(monkeypatch, page)
     [sig] = await PageWatchSource().poll(_make_item(target="https://news.example/"), db_path=db)
     assert sig.raw_payload["new_links"] == []
-    assert "new text:" in sig.normalized_summary
+    assert 'changed: was "old text" now' in sig.normalized_summary
     assert ms.get_page_watch_state("page-acme", db_path=db)["links"]
 
 

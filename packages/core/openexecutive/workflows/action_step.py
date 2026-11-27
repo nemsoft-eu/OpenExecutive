@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import re
@@ -54,6 +53,15 @@ from typing import Any
 
 from openexecutive.agents.workflow_actor import WORKFLOW_ACTOR_AGENT_ID, WorkflowActorAgent
 from openexecutive.config import get_settings
+from openexecutive.orchestrator import turn_live
+from openexecutive.orchestrator.reading import (
+    REPEAT_LIMIT,
+    TurnReadingBudget,
+    call_key,
+    with_turn_limits,
+)
+from openexecutive.providers.feature_gate import ReadingLimits
+from openexecutive.providers.registry import reading_limits_for
 from openexecutive.providers.translator import reasoning_replay_block
 from openexecutive.workflows import step_script, tool_catalog
 from openexecutive.workflows.approved_targets import approved_values, normalize_value
@@ -66,9 +74,6 @@ _MAX_TOKENS = 4096
 # Model turns allowed beyond the tool budget: one for the final report, a
 # little slack for a turn that only talks.
 _EXTRA_TURNS = 3
-# A step that gets the same result from the same call this many times has
-# found nothing new: it stops and reports what it has.
-REPEAT_LIMIT = 4
 # The longest a step may run, model turns and tool calls together.
 STEP_MAX_S = 15 * 60
 # A long web search can pause the model's turn (``pause_turn``); a paused
@@ -349,6 +354,27 @@ _CREATED_KEY_RE = re.compile(r"(^id$|_id$|[a-z0-9]Id$|link$|Link$|url$|Url$)")
 _MIN_CREATED_VALUE = 6
 
 
+def people_addresses() -> set[str]:
+    """Every address of someone on the team, archived left out. Contacts
+    are not in it: some are added on their own (a meeting's guests, people
+    the owner mailed), and a workflow's step has no rules or In training
+    around it, so a contact is asked about once like anyone outside. Never
+    raises: an error is none."""
+    try:
+        from openexecutive.people.store import list_people
+
+        return {
+            a.strip().lower()
+            for p in list_people()
+            if getattr(p, "kind", "team") == "team"
+            for a in [p.email or "", *p.email_aliases]
+            if a and "@" in a
+        }
+    except Exception:
+        logger.warning("action_step: couldn't read People's addresses", exc_info=True)
+        return set()
+
+
 class TargetPolicy:
     """Which targets a run may write to without asking. One per run.
 
@@ -356,6 +382,8 @@ class TargetPolicy:
     - values approved for this workflow before (``approved_targets``) — by the
       owner answering a held write, never by anything the model or a page can
       write;
+    - the addresses of the team (``people_addresses``): only an admin adds
+      a teammate;
     - in a workflow that writes or reads as its creator, their own addresses
       and the addresses in the goal of a step that emails as them
       (``workflow_email.chosen_recipients``):
@@ -384,7 +412,10 @@ class TargetPolicy:
     ) -> TargetPolicy:
         from openexecutive.delegation.workflow_email import chosen_recipients
 
-        return cls(approved=approved_values(defn.name) | chosen_recipients(defn), created=created)
+        return cls(
+            approved=approved_values(defn.name) | chosen_recipients(defn) | people_addresses(),
+            created=created,
+        )
 
     def _trusted(self, value: str) -> bool:
         norm = normalize_value(value)
@@ -563,6 +594,8 @@ class _StepCalls:
         self._policy = policy
         self._actions = actions
         self._holds = _Holds()
+        # The step's reading limits, for a tool that sizes its own parts.
+        self.limits: ReadingLimits | None = None
         self._events: list[StepYield] = []
         # A tool stopped the step (``extensions.workflow_hold`` / ``_wait``).
         self.stopped = False
@@ -600,11 +633,10 @@ class _StepCalls:
         return self.ended is not None
 
     def _note_repeat(self, name: str, arguments: dict[str, Any], content: str) -> None:
-        """Count a call that came back exactly as before; end the step at
+        """Count a call that came back as before (``reading.call_key``: a new
+        id or time is still the same result); end the step at
         ``REPEAT_LIMIT``."""
-        key = hashlib.sha256(
-            json.dumps([name, arguments, content], sort_keys=True, default=str).encode()
-        ).hexdigest()
+        key = call_key(name, arguments, content)
         seen = self._repeats.get(key, 0) + 1
         self._repeats[key] = seen
         if seen >= REPEAT_LIMIT and self.ended is None:
@@ -633,7 +665,10 @@ class _StepCalls:
             writes = info.read_only is not True
             if writes:
                 targets = _target_digest(arguments)
-            decision = self._holds.decide(name, arguments, self._policy if writes else None)
+            # A tool that asks through Approvals itself (the browser) isn't
+            # held twice: one check, one card.
+            checked = writes and not _asks_through_approvals(name)
+            decision = self._holds.decide(name, arguments, self._policy if checked else None)
             if isinstance(decision, str):
                 (content, is_error), outcome = _refusal(decision), "refused: target check"
             elif decision is not None:
@@ -645,12 +680,18 @@ class _StepCalls:
                 content, is_error, outcome = HELD_TOOL_RESULT, False, "held for approval"
             else:
                 budget.used += 1
-                self._events.append(("progress", _counted(progress_line(name, arguments), budget)))
+                line = progress_line(name, arguments)
+                self._events.append(("progress", _counted(line, budget)))
+                # A run started from chat says it there as it happens.
+                turn_live.say(line)
                 from openexecutive.orchestrator import extensions
 
                 try:
                     with extensions.collect_workflow_signals() as signals:
-                        content, is_error = await _call_tool(name, arguments, info, self._workflow_name)
+                        call = _call_tool(name, arguments, info, self._workflow_name)
+                        content, is_error = await (
+                            with_turn_limits(self.limits, call) if self.limits is not None else call
+                        )
                 except asyncio.CancelledError:
                     # Stopped mid-call (a script's clock, or the run): it may
                     # have taken effect, so it still gets its audit row.
@@ -771,8 +812,10 @@ async def run_action_step(
     from openexecutive.delegation import workflow_reads
 
     # A workflow that reads its creator's mail is locked down for all of its
-    # steps (delegation.workflow_reads): checked again here, and no scripts.
+    # steps below Hands-off (delegation.workflow_reads): checked again here,
+    # and no scripts.
     reads_mail, refused = workflow_reads.run_rules(workflow_name)
+    reads_mail = reads_mail and not workflow_reads.hands_off()
     if refused is not None:
         yield ("error", f"step {step.id!r} cannot run: {refused}")
         return
@@ -834,6 +877,10 @@ async def run_action_step(
         actions=actions,
     )
 
+    # How much the step's reads may hold, from its model; a long result
+    # comes back in parts (orchestrator.reading).
+    reading = TurnReadingBudget(reading_limits_for(resolved_model))
+    calls.limits = reading.limits
     max_turns = step.max_tool_calls + _EXTRA_TURNS
     fanout_hinted = False
     turn = 0
@@ -885,10 +932,23 @@ async def run_action_step(
 
         _append_assistant(messages, blocks)
         results: list[dict[str, Any]] = []
+        # A repeat of a call whose result came in parts gets the next part;
+        # a call that may change something drops the parts held from before.
+        replays = {str(u["id"]): r for u in tool_uses if (r := reading.replay(u)) is not None}
+        if len(replays) == len(tool_uses):
+            # Only next parts of what the step already read: nothing ran, so
+            # the round leaves the step's turns for the work it reads for.
+            turn -= 1
+        reading.ran(tool_uses)
         for use in tool_uses:
             name = str(use["name"])
             arguments = use["input"] if isinstance(use["input"], dict) else {}
-            if scripts and name == step_script.RUN_SCRIPT_TOOL:
+            replayed = replays.get(str(use["id"]))
+            if replayed is not None:
+                # The next part of a long result the step already has: the
+                # tool does not run again.
+                content, is_error = replayed, False
+            elif scripts and name == step_script.RUN_SCRIPT_TOOL:
                 yield ("progress", "Running a script…")
                 content, is_error = json.dumps({"error": "the script did not finish"}), True
                 stats: dict[str, Any] = {}
@@ -922,7 +982,7 @@ async def run_action_step(
                 {
                     "type": "tool_result",
                     "tool_use_id": use["id"],
-                    "content": _truncate(str(content), settings.tool_result_max_chars),
+                    "content": reading.cap(name, use["input"], str(content), str(use["id"])),
                     "is_error": is_error,
                 }
             )
@@ -1107,6 +1167,18 @@ def drop_held_calls(workflow_name: str, step_id: str, held: list[HeldCall], reas
     return f"{len(held)} held write(s) were not run"
 
 
+def _asks_through_approvals(name: str) -> bool:
+    """Whether a step's tool decides Approvals and holds on its own card
+    (``extensions.asks_through_approvals``). Never raises: an error is False."""
+    try:
+        from openexecutive.orchestrator import extensions
+
+        return extensions.asks_through_approvals(name)
+    except Exception:
+        logger.warning("action_step: couldn't tell whether %s asks itself", name, exc_info=True)
+        return False
+
+
 def _held_where(call: HeldCall) -> str:
     """What a held call does or where it writes, as the owner reads it."""
     if call.why:
@@ -1144,6 +1216,17 @@ def _words(name: str) -> str:
     return " ".join(name.replace("-", "_").split("_")).strip()
 
 
+def _described(name: str, arguments: Any) -> str | None:
+    """What a call of a built-in tool says it is doing, in its own plain
+    words (``extensions.described``), or None."""
+    from openexecutive.orchestrator import extensions
+    from openexecutive.workflows.tool_catalog import BUILTIN_PREFIX
+
+    if not name.startswith(BUILTIN_PREFIX):
+        return None
+    return extensions.described(name[len(BUILTIN_PREFIX):], arguments)
+
+
 def plain_tool_name(name: str) -> str:
     """A tool's name in plain words for the person reading a run: an app's
     tool reads "Google Workspace: get events", a built-in one "Send telegram
@@ -1168,7 +1251,7 @@ _PROGRESS_MAX = 80
 
 def progress_line(name: str, arguments: Any) -> str:
     """What a running step is doing, in plain words, for the run's progress
-    card: "Opening example.com…", 'Searching my inbox for "invoice"…'. Reads
+    card: "Opening example.com…", 'Searching my email for "invoice"…'. Reads
     the same wording as the chat's activity line, never the raw tool name.
     The arguments are the model's, and a label must never fail a run, so any
     error falls back to the tool's plain name."""
@@ -1186,6 +1269,9 @@ def _progress_line(name: str, arguments: Any) -> str:
 
     if name == step_script.RUN_SCRIPT_TOOL:
         return "Running a script…"
+    said = _described(name, arguments)
+    if said:
+        return said
     doing = ""
     if name.startswith(BUILTIN_PREFIX):
         bare = name[len(BUILTIN_PREFIX):]

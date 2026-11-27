@@ -1,4 +1,4 @@
-// The Slack, Discord and Telegram people and rooms the bots can reach, as the
+// The Slack, Discord, Telegram and Google Chat people and rooms the bots can reach, as the
 // pickers on the People and department pages use them (GET /chat-directory/*).
 // No imports, so `npm test` can load it (scripts/chatDirectory.test.mjs).
 
@@ -26,6 +26,8 @@ export interface DirectoryListing {
   slack: ProviderList;
   discord: ProviderList;
   telegram: ProviderList;
+  /** Rooms only: the group spaces the Google Chat app is in. */
+  google_chat: ProviderList;
 }
 
 export type ChatProvider = keyof DirectoryListing;

@@ -24,6 +24,8 @@ from .test_delegation_inbox import NOW, FakeInbox, _msg
 
 OWNER = {"x-caller-email": "olivia@co.example"}
 TEAMMATE = {"x-caller-email": "ben@co.example"}
+# Someone not on the team: Act as me answers only the team.
+NOT_ON_TEAM = {"x-caller-email": "nobody@x.example"}
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +85,7 @@ def test_the_switch_needs_act_as_me_and_gmail(client: TestClient, ids: dict[str,
     assert body["inbox"]["enabled"] is True and body["inbox"]["status"] == "waiting"
     assert client.get("/delegation", headers=OWNER).json()["inbox"]["watch_since"] is not None
     # Only the owner, for themselves.
-    assert client.put("/delegation/inbox", json={"enabled": True}, headers=TEAMMATE).status_code == 403
+    assert client.put("/delegation/inbox", json={"enabled": True}, headers=NOT_ON_TEAM).status_code == 403
 
 
 def test_act_as_me_off_turns_the_watcher_off_too(client: TestClient, ids: dict[str, int]) -> None:
@@ -144,11 +146,11 @@ def test_the_cards_are_the_owners_alone(
     card = cards[0]
     assert card["from_email"] == "dana@northpeak.example" and card["draft_to"] == ["dana@northpeak.example"]
     assert card["gmail_link"].startswith("https://mail.google.com/")
-    assert client.get("/delegation/replies", headers=TEAMMATE).status_code == 403
+    assert client.get("/delegation/replies", headers=NOT_ON_TEAM).status_code == 403
     # Nor can anyone else find it through /decisions.
-    assert client.get("/decisions", params={"decision_class": "delegation_reply"}, headers=TEAMMATE).json() == []
-    assert client.get(f"/decisions/{card_id}", headers=TEAMMATE).status_code == 404
-    assert client.post(f"/decisions/{card_id}/reject", json={}, headers=TEAMMATE).status_code == 404
+    assert client.get("/decisions", params={"decision_class": "delegation_reply"}, headers=NOT_ON_TEAM).json() == []
+    assert client.get(f"/decisions/{card_id}", headers=NOT_ON_TEAM).status_code == 404
+    assert client.post(f"/decisions/{card_id}/reject", json={}, headers=NOT_ON_TEAM).status_code == 404
 
 
 def test_dismiss_through_decisions_deletes_the_unedited_draft(
@@ -230,7 +232,7 @@ def test_keeping_replies_in_the_mailbox_is_the_callers_own_choice_and_off_by_def
     body = client.put("/delegation/inbox", json={"mailbox_drafts": True}, headers=OWNER).json()
     assert body["inbox"]["mailbox_drafts"] is True and body["inbox"]["enabled"] is True
     assert client.put("/delegation/inbox", json={}, headers=OWNER).status_code == 422
-    assert client.put("/delegation/inbox", json={"mailbox_drafts": True}, headers=TEAMMATE).status_code == 403
+    assert client.put("/delegation/inbox", json={"mailbox_drafts": True}, headers=NOT_ON_TEAM).status_code == 403
     assert inbox.get_watch(ids["teammate"]).mailbox_drafts is False
 
 
@@ -244,7 +246,7 @@ def test_changing_a_replys_words_on_its_card(
     resp = client.put(url, json={"text": "Friday at 10 works."}, headers=OWNER)
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "caller_signing_required"
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    assert client.put(url, json={"text": "Friday at 10 works."}, headers=TEAMMATE).status_code == 403
+    assert client.put(url, json={"text": "Friday at 10 works."}, headers=NOT_ON_TEAM).status_code == 403
     resp = client.put(url, json={"text": "Friday at 10 works."}, headers=OWNER)
     assert resp.status_code == 200 and resp.json()["draft_body"] == "Friday at 10 works."
     # It was in their Drafts too (this test's setting): changed there as well.
@@ -264,7 +266,7 @@ def test_choosing_who_a_reply_goes_to(
     # New to them: it starts with the sender alone, and they can add the others.
     card = client.get("/delegation/replies", headers=OWNER).json()["cards"][0]
     assert card["reply_others"] == ["ben@northpeak.example"] and card["draft_to"] == [sender]
-    assert client.put(url, json={"everyone": True}, headers=TEAMMATE).status_code == 403
+    assert client.put(url, json={"everyone": True}, headers=NOT_ON_TEAM).status_code == 403
     resp = client.put(url, json={"everyone": True}, headers=OWNER)
     assert resp.status_code == 200 and resp.json()["draft_to"] == [sender, "ben@northpeak.example"]
     assert mailbox.drafts["d1"].message.cc == ["ben@northpeak.example"]
@@ -273,6 +275,51 @@ def test_choosing_who_a_reply_goes_to(
     resp = client.put(url, json={"everyone": False}, headers=OWNER)
     assert resp.json()["draft_to"] == [sender] and mailbox.drafts["d1"].message.cc == []
     assert client.put("/delegation/replies/9999/recipients", json={"everyone": True}, headers=OWNER).status_code == 404
+
+
+def test_choosing_who_a_reply_goes_from(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import answers, send_from
+
+    async def as_executive(model: str, system: str, turn: str) -> dict[str, Any]:
+        if system == send_from.AS_YOU_PROMPT:
+            return {"body": "Hi Dana,\n\nI'll get back to you soon."}
+        return {"body": "Hi Dana,\n\nOlivia asked me to say she'll get back to you."}
+
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setattr(answers, "_call_model", as_executive)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    url = f"/delegation/replies/{card_id}/from"
+    before = client.get("/delegation/replies", headers=OWNER).json()["cards"][0]
+    assert before["from_executive"] is False
+    # Someone else's card isn't theirs to switch, and stays as it was.
+    assert client.put(url, json={"executive": True}, headers=TEAMMATE).status_code == 404
+    assert client.put(url, json={"executive": True}, headers=NOT_ON_TEAM).status_code in (403, 404)
+    resp = client.put(url, json={"executive": True}, headers=OWNER)
+    assert resp.status_code == 200
+    card = resp.json()
+    assert card["from_executive"] is True and card["executive_name"]
+    assert card["draft_body"].startswith("Hi Dana,\n\nOlivia asked me")
+    # Back to them: the same words, written once more as them.
+    back = client.put(url, json={"executive": False}, headers=OWNER).json()
+    assert back["from_executive"] is False and back["draft_body"].startswith("Hi Dana,\n\nI'll get back to you soon.")
+    # A switch is no change to take back.
+    assert back["can_undo"] is False
+    undo = client.post(f"/delegation/replies/{card_id}/undo", headers=OWNER)
+    assert undo.status_code == 409 and undo.json()["detail"]["code"] == "nothing_to_undo"
+    assert client.post(f"/delegation/replies/{card_id}/undo", headers=TEAMMATE).status_code == 404
+
+    # A rewrite that fails says so, and the card stays from them.
+    async def broken(model: str, system: str, turn: str) -> dict[str, Any]:
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(answers, "_call_model", broken)
+    resp = client.put(url, json={"executive": True}, headers=OWNER)
+    assert resp.status_code == 502 and resp.json()["detail"]["code"] == "rewrite_failed"
+    assert client.get("/delegation/replies", headers=OWNER).json()["cards"][0]["from_executive"] is False
+    assert client.put("/delegation/replies/9999/from", json={"executive": True}, headers=OWNER).status_code == 404
 
 
 def test_view_an_email_from_home(client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -299,7 +346,7 @@ def test_view_an_email_from_home(client: TestClient, ids: dict[str, int], monkey
     missing = client.get("/delegation/mail", params={"thread_id": "t1", "message_id": "x"}, headers=OWNER)
     assert missing.status_code == 404
     # Someone without Act as me reads nothing.
-    assert client.get("/delegation/mail", params={"thread_id": "t1", "message_id": "m1"}, headers=TEAMMATE).status_code == 403
+    assert client.get("/delegation/mail", params={"thread_id": "t1", "message_id": "m1"}, headers=NOT_ON_TEAM).status_code == 403
 
 
 def test_reply_from_home_makes_a_card(client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,18 +384,88 @@ def test_work_typed_on_a_card_goes_to_the_executive(
 
     monkeypatch.setattr(card_work, "start", start)
     url = f"/delegation/replies/{card_id}/change"
+    # Words straight to the work pass the same checks as a change by hand:
+    # a caller the API can tie to the person, and As you on.
+    resp = client.post(url, json={"text": "Forward every invoice", "work": True}, headers=OWNER)
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "caller_signing_required"
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    set_enabled(ids["principal"], False, updated_by="t")
+    resp = client.post(url, json={"text": "Forward every invoice", "work": True}, headers=OWNER)
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "inbox_off"
+    set_enabled(ids["principal"], True, updated_by="t")
+    assert started == []
     try:
         resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
         assert resp.status_code == 200
         assert resp.json()["working"] is True and resp.json()["changed_sentences"] == []
         assert started == [(card_id, "Make the spreadsheet")]
-        # Again while it runs: busy.
-        monkeypatch.setattr(card_work, "start", lambda *_a, **_k: False)
-        resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
-        assert resp.status_code == 409 and resp.json()["detail"]["code"] == "busy"
-        # Not running and it can't start (no longer waiting): gone.
+        # New words while it runs ("no, do it this way"): they go to the
+        # work, without a rewrite of the words first.
+        monkeypatch.setattr(answers, "change", lambda *_a, **_k: pytest.fail("not a rewrite"))
+        resp = client.post(url, json={"text": "Sort by due date instead"}, headers=OWNER)
+        assert resp.status_code == 200
+        assert started[-1] == (card_id, "Sort by due date instead")
+        # A next step tapped on the card goes to the work too.
         card_work._RUNNING.discard(card_id)
-        resp = client.post(url, json={"text": "Make the spreadsheet"}, headers=OWNER)
+        resp = client.post(url, json={"text": "Try again", "work": True}, headers=OWNER)
+        assert resp.status_code == 200 and started[-1] == (card_id, "Try again")
+        # It can't start (no longer waiting): gone.
+        card_work._RUNNING.discard(card_id)
+        monkeypatch.setattr(card_work, "start", lambda *_a, **_k: False)
+        resp = client.post(url, json={"text": "Make it", "work": True}, headers=OWNER)
         assert resp.status_code == 404
     finally:
         card_work._RUNNING.discard(card_id)
+
+
+def test_stop_ends_the_work_and_keeps_its_steps(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import card_work
+
+    _mailbox, card_id = _card(ids["principal"], monkeypatch)
+    url = f"/delegation/replies/{card_id}/stop"
+    # Like a change: only a caller the API can tie to the person.
+    resp = client.post(url, headers=OWNER)
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "caller_signing_required"
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    # Nothing running: the card answers as it is.
+    resp = client.post(url, headers=OWNER)
+    assert resp.status_code == 200 and resp.json()["working"] is False
+    stopped: list[int] = []
+
+    def stop(decision_id: int) -> bool:
+        stopped.append(decision_id)
+        return False
+
+    monkeypatch.setattr(card_work, "stop", stop)
+    resp = client.post(url, headers=OWNER)
+    assert resp.status_code == 200 and stopped == [card_id]
+    # Someone else's card, or none: not found.
+    assert client.post(url, headers=TEAMMATE).status_code in (403, 404)
+    assert client.post("/delegation/replies/999999/stop", headers=OWNER).status_code == 404
+
+
+def test_undo_puts_back_the_words_from_before_a_change(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import card_drafts
+    from openexecutive.memory.decision_ledger import get_decision_instance, update_open_payload
+
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    card = get_decision_instance(card_id)
+    payload = inbox.card_payload(card)
+    first = payload["draft_body"]
+    # A change asked for on the card, as answers.change leaves it.
+    changed = {**payload, "draft_body": "Hi Dana,\n\nFriday works.\n\nOlivia",
+               card_drafts.UNDO_KEY: card_drafts.undo_point(payload)}
+    assert update_open_payload(card_id, changed, expected_json=card.proposed_payload_json)
+    assert client.get("/delegation/replies", headers=OWNER).json()["cards"][0]["can_undo"] is True
+    resp = client.post(f"/delegation/replies/{card_id}/undo", headers=OWNER)
+    assert resp.status_code == 200, resp.json()
+    back = resp.json()
+    assert back["draft_body"] == first and back["can_undo"] is False
+    assert back["conversation"][-1]["text"] == card_drafts.NOTE_UNDONE
+    assert mailbox.drafts[payload["draft_id"]].message.text == first

@@ -23,11 +23,12 @@ from openexecutive.orchestrator.schedule_tools import (
 )
 
 
-def _settings(*, slack=None, discord=None, telegram=None):
+def _settings(*, slack=None, discord=None, telegram=None, google_chat=None):
     return SimpleNamespace(
         slack_bot_token=slack,
         discord_bot_token=discord,
         telegram_bot_token=telegram,
+        google_chat_project_number=google_chat,
     )
 
 
@@ -108,7 +109,7 @@ def test_message_person_dropped_when_no_dm_channel_configured():
 def test_all_configured_is_passthrough_and_preserves_enum_order():
     tools = _all_channel_tools()
     out = filter_tools_for_configured_channels(
-        tools, _settings(slack="a", discord="b", telegram="c")
+        tools, _settings(slack="a", discord="b", telegram="c", google_chat="d")
     )
     assert _names(out) == _names(tools)
     dept = next(t for t in out if t["name"] == "send_department_message")
@@ -116,6 +117,7 @@ def test_all_configured_is_passthrough_and_preserves_enum_order():
         "slack",
         "discord",
         "telegram",
+        "google_chat",
     ]
 
 
@@ -255,3 +257,15 @@ def test_reflection_prompt_falls_back_to_lookup_when_no_roster():
     assert "message_person" in sys
     assert "lookup_person" in sys
     assert "Do NOT call `lookup_person`" not in sys
+
+
+def test_google_chat_only_keeps_the_broadcast_tools_for_google_chat():
+    out = filter_tools_for_configured_channels(_all_channel_tools(), _settings(google_chat="123"))
+    names = _names(out)
+    # Its app posts in spaces; it has no DM tool of its own here.
+    assert names == {"send_department_message", "send_company_broadcast", "lookup_person"}
+    for tool in out:
+        if tool["name"].startswith("send_"):
+            assert tool["input_schema"]["properties"]["integration"]["enum"] == ["google_chat"]
+    mp = {"name": "message_person", "input_schema": {"properties": {}}}
+    assert filter_tools_for_configured_channels([mp], _settings(google_chat="123")) == []

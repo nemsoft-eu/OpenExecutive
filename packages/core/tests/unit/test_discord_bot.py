@@ -243,7 +243,7 @@ async def test_handle_message_calls_audit_log():
         mock_exec_instance = MagicMock()
         mock_exec_instance.chat = AsyncMock(return_value=executive_response)
         MockExec.return_value = mock_exec_instance
-        MockSession.return_value = MagicMock(seen_channel_refs=set())
+        MockSession.return_value = MagicMock()
 
         await _handle_message(
             text="hello",
@@ -263,88 +263,6 @@ async def test_handle_message_calls_audit_log():
         details = call_kwargs.kwargs["details"]
         assert details["channel"] == "discord"
         assert details["discord_user"] == "111"
-
-
-@pytest.mark.asyncio
-async def test_handle_message_dm_seeds_channel_ref():
-    send_fn = AsyncMock()
-    session_mock = MagicMock()
-    session_mock.seen_channel_refs = set()
-
-    with (
-        patch("openexecutive.people.store.find_person_by_discord_id", return_value=MagicMock(id=42)),
-        patch("openexecutive.alerts.pipeline.schedule_evaluation"),
-        patch("openexecutive.knowledge.retriever.retrieve", return_value=""),
-        patch("openexecutive.memory.episodic.format_for_prompt", return_value=""),
-        patch("openexecutive.onboarding.profile_builder.load_or_create_profile") as mock_profile,
-        patch("openexecutive.orchestrator.executive.Executive") as MockExec,
-        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None),
-        patch("openexecutive.orchestrator.session.Session", return_value=session_mock),
-        patch("openexecutive.audit.log_event"),
-        patch("openexecutive.memory.session_store.load_messages", return_value=[]),
-        patch("openexecutive.memory.session_store.create_session"),
-        patch("openexecutive.memory.session_store.save_message"),
-        patch("openexecutive.memory.session_store.update_session_timestamp"),
-    ):
-        mock_profile.return_value.is_empty.return_value = True
-        mock_exec_instance = MagicMock()
-        mock_exec_instance.chat = AsyncMock(return_value="response")
-        MockExec.return_value = mock_exec_instance
-
-        await _handle_message(
-            text="hello",
-            discord_user_id="user42",
-            discord_channel="ch1",
-            message_id="msg1",
-            thread_id=None,
-            send_fn=send_fn,
-            is_dm=True,
-            session_id="discord:dm:user42",
-            session_title="Discord DM (rufus)",
-        )
-
-        assert ("discord_dm", "user42") in session_mock.seen_channel_refs
-
-
-@pytest.mark.asyncio
-async def test_handle_message_non_dm_does_not_seed_channel_ref():
-    send_fn = AsyncMock()
-    session_mock = MagicMock()
-    session_mock.seen_channel_refs = set()
-
-    with (
-        patch("openexecutive.people.store.find_person_by_discord_id", return_value=MagicMock(id=42)),
-        patch("openexecutive.alerts.pipeline.schedule_evaluation"),
-        patch("openexecutive.knowledge.retriever.retrieve", return_value=""),
-        patch("openexecutive.memory.episodic.format_for_prompt", return_value=""),
-        patch("openexecutive.onboarding.profile_builder.load_or_create_profile") as mock_profile,
-        patch("openexecutive.orchestrator.executive.Executive") as MockExec,
-        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None),
-        patch("openexecutive.orchestrator.session.Session", return_value=session_mock),
-        patch("openexecutive.audit.log_event"),
-        patch("openexecutive.memory.session_store.load_messages", return_value=[]),
-        patch("openexecutive.memory.session_store.create_session"),
-        patch("openexecutive.memory.session_store.save_message"),
-        patch("openexecutive.memory.session_store.update_session_timestamp"),
-    ):
-        mock_profile.return_value.is_empty.return_value = True
-        mock_exec_instance = MagicMock()
-        mock_exec_instance.chat = AsyncMock(return_value="response")
-        MockExec.return_value = mock_exec_instance
-
-        await _handle_message(
-            text="hello",
-            discord_user_id="user42",
-            discord_channel="ch1",
-            message_id="msg1",
-            thread_id=None,
-            send_fn=send_fn,
-            is_dm=False,
-            session_id="discord:thread:ch1",
-            session_title="Discord thread",
-        )
-
-        assert ("discord_dm", "user42") not in session_mock.seen_channel_refs
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +341,7 @@ async def test_handle_message_long_response_split_into_multiple_sends():
         mock_exec_instance = MagicMock()
         mock_exec_instance.chat = AsyncMock(return_value=long_response)
         MockExec.return_value = mock_exec_instance
-        MockSession.return_value = MagicMock(seen_channel_refs=set())
+        MockSession.return_value = MagicMock()
 
         await _handle_message(
             text="tell me everything",
@@ -503,7 +421,6 @@ def test_compute_session_id_mention_thread_create_failed_falls_back_to_msg():
 def _persist_patches():
     """Common patches needed to exercise the persistence path without DB / API."""
     session_mock = MagicMock()
-    session_mock.seen_channel_refs = set()
     session_mock.conversation_history = []
     session_mock.created_at = MagicMock()
     session_mock.created_at.isoformat = MagicMock(return_value="2026-05-22T00:00:00")
@@ -2110,7 +2027,7 @@ async def test_a_dm_after_the_gap_is_saved_and_titled_as_the_next_conversation()
         MockExec = stack.enter_context(patch("openexecutive.orchestrator.executive.Executive"))
         stack.enter_context(patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None))
         stack.enter_context(patch("openexecutive.orchestrator.session.Session",
-                                  return_value=MagicMock(seen_channel_refs=set())))
+                                  return_value=MagicMock()))
         stack.enter_context(patch("openexecutive.memory.session_store.load_messages", return_value=[]))
         stack.enter_context(patch("openexecutive.memory.session_store.create_session",
                                   side_effect=lambda sid, *_a, **_k: saved.append(sid)))

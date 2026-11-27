@@ -1066,3 +1066,35 @@ def test_an_older_read_only_credential_keeps_asking_for_read(tmp_path: Path) -> 
     older = load_credential(EMAIL, directory=tmp_path)
     assert older is not None
     assert unquote(_refresh_form(older)["scope"]).endswith("https://graph.microsoft.com/Calendars.Read")
+
+
+def test_the_outlook_script_saves_the_mailbox_they_signed_in_to(tmp_path: Path) -> None:
+    script = _script()
+    payload = script.credential_payload(EMAIL, "r", "cid", "consumers", personal=True, mailbox="Work@Contoso.Example")
+    assert payload["mailbox"] == "work@contoso.example"
+    assert "mailbox" not in script.credential_payload(EMAIL, "r", "cid", "consumers", personal=True, mailbox=EMAIL)
+    script.write_credential(tmp_path, EMAIL, payload)
+    assert gm.mailbox_of(EMAIL, directory=tmp_path) == "work@contoso.example"
+
+
+def test_received_since_reads_one_window_of_their_inbox() -> None:
+    # An email watch (monitoring.sources.mailbox) reads a page at a time.
+    from datetime import timedelta, timezone
+
+    graph = FakeGraph()
+    graph.listing = [_msg("in2"), _msg("own", sender=EMAIL), _msg("in1")]
+    after = datetime(2026, 10, 1, 4, 0, tzinfo=timezone(timedelta(hours=-5)))  # 09:00Z
+    found = asyncio.run(graph.client().received_since(after, limit=500))
+    assert [m.id for m in found] == ["in2", "in1"]  # never their own mail
+    call = graph.graph_calls()[-1]
+    assert call.url.path == "/v1.0/me/mailFolders/inbox/messages"
+    assert call.url.params["$filter"] == "receivedDateTime ge 2026-10-01T09:00:00Z"
+    assert call.url.params["$orderby"] == "receivedDateTime desc"
+    assert call.url.params["$top"] == "50"
+    before = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
+    asyncio.run(graph.client().received_since(after, before=before, limit=10))
+    call = graph.graph_calls()[-1]
+    assert call.url.params["$filter"] == (
+        "receivedDateTime ge 2026-10-01T09:00:00Z and receivedDateTime lt 2026-10-01T10:00:00Z"
+    )
+    assert call.url.params["$top"] == "10"

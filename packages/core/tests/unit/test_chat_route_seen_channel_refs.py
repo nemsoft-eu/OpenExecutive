@@ -1,17 +1,7 @@
-"""The web chat route must seed the caller's own channel refs on the session.
+"""Scheduling a follow-up from the web chat, driven through the real route.
 
-`schedule_followup` refuses to queue a send to a `(channel, channel_ref)` the
-session has not seen. That gate is what stops an injected "email this to
-attacker@evil" in an alert body from becoming a scheduled send.
-
-The chat adapters populate `seen_channel_refs` from the inbound message.
-Nothing populated it for a browser turn, and it did not show: tool handlers
-read the session off `current_session`, which was `None` on every SSE step
-past the first, so the gate read `seen is None` and skipped itself — web could
-schedule to any address at all. Binding the session for the whole stream made
-the gate reachable and it read an empty set, refusing even the principal's own
-address. Seeding the caller's own refs is what makes the gate mean the same
-thing on web as on every other surface.
+Who a follow-up may go to is not checked when it is scheduled: when it fires,
+its send runs through the one gate (``take_the_lead.gate``) like any other.
 """
 from __future__ import annotations
 
@@ -121,41 +111,16 @@ def test_caller_can_schedule_to_their_own_address(
     assert '"status": "scheduled"' in result
 
 
-def test_an_address_the_caller_never_used_is_refused(
+def test_mail_to_a_contact_is_scheduled_without_their_address_seen_first(
     env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Alerts are minted from inbound mail, so an alert body can ask the
-    Executive to schedule a send to an address the principal never chose.
-    Before the session was bound for the whole stream this was ALLOWED on
-    web — the gate saw no session and skipped itself."""
-    result = _schedule_from_stream_step("attacker@evil.example", monkeypatch)
+    """Scheduling mail to a contact never waits for the address to come up
+    in the chat first: the send meets Approvals when it fires."""
+    people_store.upsert_person(full_name="Dana Price", email="dana@client.example", kind="contact")
+    result = _schedule_from_stream_step("dana@client.example", monkeypatch)
 
-    assert "error" in result
-    assert "not seen in this session" in result
-
-
-def test_the_session_carries_the_callers_refs(
-    env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _schedule_from_stream_step(_CALLER_EMAIL, monkeypatch)
-
-    assert len(chat_route._sessions) == 1
-    session = next(iter(chat_route._sessions.values()))
-    assert ("email", _CALLER_EMAIL) in session.seen_channel_refs
-
-
-def test_seeding_survives_an_unresolvable_caller(
-    env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A lookup failure must not take down the turn — it just seeds nothing,
-    which leaves the gate at its safe default of refusing."""
-    monkeypatch.setattr(
-        chat_route, "_resolve_caller_person_id", lambda _request: None
-    )
-
-    result = _schedule_from_stream_step(_CALLER_EMAIL, monkeypatch)
-
-    assert "not seen in this session" in result
+    assert "error" not in result, result
+    assert '"status": "scheduled"' in result
 
 
 # --------------------------------------------------------------------- #
@@ -305,23 +270,3 @@ def test_the_row_keeps_who_scheduled_it(
     owner = people_store.find_person_by_email(_CALLER_EMAIL)
     assert row is not None and owner is not None
     assert row.created_by_person_id == owner.id
-
-
-def test_each_speaker_gets_only_their_own_addresses(env: Path) -> None:
-    """A shared chat keeps one session for everyone in it. A teammate who
-    speaks after the principal must not inherit the principal's addresses,
-    or they could schedule a message to the principal worded by them."""
-    from openexecutive.orchestrator.session import Session
-
-    teammate = people_store.upsert_person(full_name="Sam", email="sam@example.com")
-    owner = people_store.find_person_by_email(_CALLER_EMAIL)
-    assert owner is not None and owner.id is not None
-    session = Session()
-
-    chat_route._seed_seen_channel_refs(session, owner.id)
-    chat_route._seed_seen_channel_refs(session, teammate)
-
-    assert session.seen_channel_refs == {("email", "sam@example.com")}
-
-    chat_route._seed_seen_channel_refs(session, None)
-    assert session.seen_channel_refs == set()

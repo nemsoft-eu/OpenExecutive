@@ -38,13 +38,13 @@ def company(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("ONEDRIVE_SYNC_ENABLED", "true")
     monkeypatch.setenv("ONEDRIVE_SYNC_FOLDERS", "b!AbC-12_x/01ROOTFOLDER")
     monkeypatch.setattr(onedrive_sync, "_RUN_LOCK", asyncio.Lock())
-    monkeypatch.setattr(onedrive_sync, "_last_finished_at", None)
+    monkeypatch.setattr(onedrive_sync.SOURCE, "last_finished_at", None)
     # Fresh locks per test: a module-level asyncio.Lock binds to the first
     # loop that waits on it.
     monkeypatch.setattr(drive_sync, "_RUN_LOCK", asyncio.Lock())
     monkeypatch.setattr(notion_sync, "_RUN_LOCK", asyncio.Lock())
-    monkeypatch.setattr(drive_sync, "_last_finished_at", None)
-    monkeypatch.setattr(notion_sync, "_last_finished_at", None)
+    monkeypatch.setattr(drive_sync.SOURCE, "last_finished_at", None)
+    monkeypatch.setattr(notion_sync.SOURCE, "last_finished_at", None)
     root = tmp_path / "company"
     (root / "docs" / "drive").mkdir(parents=True)
     (root / "docs" / "notion").mkdir(parents=True)

@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import AnswerSourcesFooter from "@/components/AnswerSourcesFooter";
 import BrandMark from "@/components/BrandMark";
 import type { AnswerSources } from "@/lib/answerSources";
+import { htmlLinks } from "@/lib/htmlLinks";
 import type { ActionTaken } from "@/lib/api";
 import { dropReplaced, groupActions, opensDetails, type ChipGroup } from "@/lib/actionChips";
 import { linkCardMentions } from "@/lib/cardMentions";
@@ -42,6 +43,9 @@ interface MessageProps {
   // Shown under the text while the reply streams, e.g. the "still working"
   // line when the Executive goes quiet mid-reply to run a tool.
   status?: ReactNode;
+  // The reply is waiting on a step: the typing cursor hides until the words
+  // flow again.
+  paused?: boolean;
   // The chat's last reply only: take the turn back and ask again.
   onRetry?: () => void;
   // The user's last message only: put it back in the composer to change.
@@ -51,6 +55,10 @@ interface MessageProps {
   author?: { name: string; mine: boolean };
   // Under a finished reply, after its action chips: the "Memory updated" chip.
   memory?: ReactNode;
+  // Approve a card under this reply from the chat itself: the chat carries
+  // on from there (ChatHeldActionCard). Off while a turn runs.
+  onApproveCard?: (id: number, input?: Record<string, string>) => Promise<void> | void;
+  approveDisabled?: boolean;
 }
 
 // The small text buttons under a message (Copy, Try again, Edit).
@@ -271,10 +279,13 @@ export default function Message({
   feedback,
   onFeedback,
   status,
+  paused,
   onRetry,
   onEdit,
   author,
   memory,
+  onApproveCard,
+  approveDisabled,
 }: MessageProps) {
   const executiveName = useExecutiveName();
   // Approval cards this reply left, shown under it (ActionCards).
@@ -334,7 +345,13 @@ export default function Message({
 
       {/* Content */}
       <div className="flex-1 min-w-0">
-        <div className="text-xs text-fg-muted mb-2 font-medium tracking-wide uppercase">{executiveName}</div>
+        {/* On phones the avatar column is hidden, so the logo heads the name. */}
+        <div className="flex items-center gap-2 text-xs text-fg-muted mb-2 font-medium tracking-wide uppercase">
+          <span className="sm:hidden">
+            <BrandMark size="xs" />
+          </span>
+          {executiveName}
+        </div>
         <div className="prose prose-invert prose-sm max-w-none
           prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:bg-surface-overlay prose-code:before:content-none prose-code:after:content-none
           prose-pre:bg-surface-overlay prose-pre:text-fg prose-pre:border
@@ -360,9 +377,9 @@ export default function Message({
                 ) : null,
             }}
           >
-            {linkCardMentions(content)}
+            {linkCardMentions(htmlLinks(content))}
           </ReactMarkdown>
-          {isStreaming && (
+          {isStreaming && !paused && (
             <span className="inline-block w-0.5 h-4 bg-accent cursor-blink ml-0.5 align-text-bottom rounded-full" />
           )}
         </div>
@@ -373,7 +390,7 @@ export default function Message({
 
         {memory}
 
-        {cardIds.length > 0 && <ChatActionCards ids={cardIds} />}
+        {cardIds.length > 0 && <ChatActionCards ids={cardIds} onApprove={onApproveCard} approveDisabled={approveDisabled} />}
 
         {!isStreaming && chatDrafts.map((d) => <ChatDraftCard key={d.row} draft={d} />)}
 

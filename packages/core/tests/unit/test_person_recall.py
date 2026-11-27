@@ -52,6 +52,14 @@ def test_own_memory_finds_matching_notes_and_style() -> None:
     assert "customer review" in pr.own_memory(1, "what do you know about me?")
 
 
+def test_own_memory_reads_a_correction_as_a_note() -> None:
+    _add(1, "Told Dana the venue is booked.")
+    [note] = h.list_notes(1)
+    h.correct_note(1, note.id, "You said Dana the venue might move.")
+    text = pr.own_memory(1, "venue")
+    assert "Said Dana the venue might move." in text and "You said" not in text
+
+
 def test_own_memory_is_only_their_own() -> None:
     _add(2, "The venue is booked.")
     assert "venue" not in pr.own_memory(1, "venue")

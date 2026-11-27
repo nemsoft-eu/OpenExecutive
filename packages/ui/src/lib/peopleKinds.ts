@@ -19,19 +19,6 @@ export function isContact(person: Pick<Person, "kind">): boolean {
   return person.kind === "contact";
 }
 
-/** The tabs this viewer gets: Contacts is the principal's alone. */
-export function tabsFor(viewerIsPrincipal: boolean): PeopleTab[] {
-  return viewerIsPrincipal ? ["team", "contacts"] : ["team"];
-}
-
-/**
- * Where the page opens: using it just for yourself, the people the principal
- * adds are mostly contacts. Anyone else only ever has the Team tab.
- */
-export function defaultPeopleTab(mode: WorkspaceMode, viewerIsPrincipal = true): PeopleTab {
-  return viewerIsPrincipal && mode === "solo" ? "contacts" : "team";
-}
-
 /**
  * The people a tab lists. In solo mode the Team tab is just the principal:
  * there is no team to show.
@@ -46,11 +33,6 @@ export function peopleForTab<P extends KindFields>(people: P[], tab: PeopleTab, 
 export function hiddenTeamCount(people: KindFields[], mode: WorkspaceMode): number {
   if (mode !== "solo") return 0;
   return people.filter((p) => !isContact(p) && !p.is_principal).length;
-}
-
-/** The kind the add form starts on: whatever the open tab lists. */
-export function defaultKindForTab(tab: PeopleTab): PersonKind {
-  return tab === "contacts" ? "contact" : "team";
 }
 
 /**
@@ -75,24 +57,4 @@ export function effectiveKind(kind: PersonKind, isPrincipal: boolean): PersonKin
  */
 export function shouldSwitchToTeam(mode: WorkspaceMode, kind: PersonKind, isPrincipal: boolean): boolean {
   return mode === "solo" && effectiveKind(kind, isPrincipal) === "team" && !isPrincipal;
-}
-
-export type CardStatusTone = "ok" | "warn" | "muted";
-
-/**
- * The one status a People card shows. A contact: whether there's an email to
- * reach them on. A team member on leave: until when (an ISO date, compared
- * with `today` as YYYY-MM-DD). Anyone else on the team: how fast they're
- * expected to reply. Their approval scopes are on their own page.
- */
-export function personCardStatus(
-  person: Pick<Person, "kind" | "email" | "on_leave_until" | "response_sla_hours">,
-  today: string,
-): { label: string; tone: CardStatusTone } {
-  if (isContact(person)) {
-    return person.email ? { label: "Email on file", tone: "ok" } : { label: "No email", tone: "muted" };
-  }
-  const leave = person.on_leave_until?.slice(0, 10);
-  if (leave && leave >= today) return { label: `On leave until ${leave}`, tone: "warn" };
-  return { label: `Replies within ${person.response_sla_hours}h`, tone: "ok" };
 }

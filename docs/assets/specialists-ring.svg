@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="120 40 640 520" width="640" height="520" role="img" aria-label="The Executive at the center, with nine specialists around it: Strategy, Finance, People, Legal, Operations, Marketing, Product, Sales, Board">
+<style>.t{fill:#1f2328;font:600 22px -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}.c{fill:#fff;font:700 20px -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}.ring{stroke:#4f46e5}.dot{fill:#4f46e5}@media (prefers-color-scheme:dark){.t{fill:#e6edf3}.ring{stroke:#818cf8}.dot{fill:#818cf8}}</style>
+<defs><mask id="gaps" maskUnits="userSpaceOnUse" x="0" y="0" width="880" height="600"><rect width="880" height="600" fill="#fff"/>
+<circle cx="440.0" cy="130.0" r="33" fill="#000"/>
+<circle cx="549.3" cy="169.8" r="33" fill="#000"/>
+<circle cx="607.4" cy="270.5" r="33" fill="#000"/>
+<circle cx="587.2" cy="385.0" r="33" fill="#000"/>
+<circle cx="498.1" cy="459.7" r="33" fill="#000"/>
+<circle cx="381.9" cy="459.7" r="33" fill="#000"/>
+<circle cx="292.8" cy="385.0" r="33" fill="#000"/>
+<circle cx="272.6" cy="270.5" r="33" fill="#000"/>
+<circle cx="330.7" cy="169.8" r="33" fill="#000"/>
+</mask></defs>
+<circle class="ring" cx="440" cy="300" r="170" fill="none" stroke-width="6" mask="url(#gaps)"/>
+<circle class="dot" cx="440.0" cy="130.0" r="24"/>
+<text class="t" x="440.0" y="88.0" text-anchor="middle">Strategy</text>
+<circle class="dot" cx="549.3" cy="169.8" r="24"/>
+<text class="t" x="577.6" y="144.1" text-anchor="start">Finance</text>
+<circle class="dot" cx="607.4" cy="270.5" r="24"/>
+<text class="t" x="650.7" y="270.8" text-anchor="start">People</text>
+<circle class="dot" cx="587.2" cy="385.0" r="24"/>
+<text class="t" x="625.3" y="415.0" text-anchor="start">Legal</text>
+<circle class="dot" cx="498.1" cy="459.7" r="24"/>
+<text class="t" x="513.2" y="509.1" text-anchor="start">Operations</text>
+<circle class="dot" cx="381.9" cy="459.7" r="24"/>
+<text class="t" x="366.8" y="509.1" text-anchor="end">Marketing</text>
+<circle class="dot" cx="292.8" cy="385.0" r="24"/>
+<text class="t" x="254.7" y="415.0" text-anchor="end">Product</text>
+<circle class="dot" cx="272.6" cy="270.5" r="24"/>
+<text class="t" x="229.3" y="270.8" text-anchor="end">Sales</text>
+<circle class="dot" cx="330.7" cy="169.8" r="24"/>
+<text class="t" x="302.4" y="144.1" text-anchor="end">Board</text>
+<circle class="dot" cx="440" cy="300" r="62"/>
+<text class="c" x="440" y="307" text-anchor="middle">Executive</text>
+</svg>

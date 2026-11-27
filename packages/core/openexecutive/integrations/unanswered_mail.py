@@ -24,6 +24,7 @@ Never raises: a card left unfiled costs the card, never the email.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,72 @@ def _one_line(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
 
+_HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+
+
+def _domain(address: str) -> str:
+    """The address's domain when it is a plain hostname, else "" (and the
+    card keeps its plain wording)."""
+    domain = address.strip().lower().rpartition("@")[2]
+    return domain if "." in domain and _HOSTNAME.fullmatch(domain) else ""
+
+
+def _why_unproven(cause: str, address: str, who: str) -> str:
+    """One or two sentences on why the mailbox could not prove ``who`` sent
+    it, or "" when the cause is unknown. ``who`` is a name, or "you". The
+    headers can't tell a forgery from the benign case, so each says both."""
+    from openexecutive.integrations import fact_confirmation as fc
+
+    domain = _domain(address)
+    if not domain:
+        return ""
+    if cause == fc.UNSIGNED:
+        return (
+            f"The mailbox could not prove {who} sent it: {domain} didn't sign it. "
+            "It may be forged, or sent from another account, such as Gmail's "
+            f"“Send mail as”, with no {domain} signature. "
+        )
+    if cause == fc.DMARC_FAILED:
+        return (
+            f"The mailbox could not prove {who} sent it: it failed {domain}'s own "
+            f"sender check (DMARC). It may be forged, or sent through a service "
+            f"{domain} hasn't approved. "
+        )
+    if cause == fc.VIA_LIST:
+        return (
+            f"The mailbox could not prove {who} sent it: it came through a mailing list "
+            "or group, which resends mail under its own name, or claims to. "
+            "It may also be forged. "
+        )
+    return ""
+
+
+def _fix(cause: str, address: str, who: str) -> str:
+    """What makes the next email from that address provable, if it really is
+    theirs, or ""."""
+    from openexecutive.integrations import fact_confirmation as fc
+
+    domain = _domain(address)
+    if not domain:
+        return ""
+    if_sent = "If you sent it: " if who == "you" else f"If {who} sent it: "
+    if cause == fc.UNSIGNED:
+        step = (
+            f"send from the {domain} mailbox itself, or have whoever manages {domain} "
+            "turn on DKIM signing there."
+        )
+    elif cause == fc.DMARC_FAILED:
+        step = (
+            f"send from the {domain} mailbox itself, or have whoever manages {domain} "
+            "add the sending service to its SPF or DKIM setup."
+        )
+    elif cause == fc.VIA_LIST:
+        step = "send to the Executive directly, not through the group."
+    else:
+        return ""
+    return f"\n\n{if_sent}{step}"
+
+
 def file_card(
     *,
     thread_key: str,
@@ -61,6 +128,8 @@ def file_card(
     principal_address: bool = False,
     subject: str = "",
     answer: str = "",
+    sender_address: str = "",
+    cause: str = "",
 ) -> int | None:
     """File (or bump) the card for an email whose sender got no reply.
 
@@ -68,7 +137,9 @@ def file_card(
     sender's address). ``from_principal`` only for mail proven to be the
     principal's; ``subject`` and ``answer`` (what the Executive wrote) are
     kept only then. ``verified`` False says the mail only claims to be from
-    ``sender_name``. Returns the card's id, or None when nothing was filed."""
+    ``sender_name``; ``cause`` (``fact_confirmation.unproven_cause``) then
+    says why, and what fixes it, for ``sender_address``'s domain. Returns the
+    card's id, or None when nothing was filed."""
     from openexecutive.alerts import store
     from openexecutive.alerts.models import PRIVATE_ALERT_TAG
 
@@ -94,18 +165,23 @@ def file_card(
         action = f"Reply to {name}."
     elif principal_address:
         headline = "An email from your address got no reply"
+        why = _why_unproven(cause, sender_address, "you")
         body = (
             "An email from your address reached the Executive and no reply went out. "
-            "The mailbox could not prove you sent it. If you did not, someone may be "
-            "using your address."
+            + (why or "The mailbox could not prove you sent it. ")
+            + "If you did not send it, someone may be using your address."
+            + _fix(cause, sender_address, "you")
         )
         action = "Check that you sent it."
     else:
         name = _one_line(sender_name, 80) or "someone on the team"
         headline = f"An email from {name}'s address got no reply"
+        why = _why_unproven(cause, sender_address, name)
         body = (
             f"An email from {name}'s address reached the Executive and no reply went out. "
-            "The mailbox could not prove they sent it, so check with them before acting on it."
+            + (why or "The mailbox could not prove they sent it. ")
+            + "Check with them before acting on it."
+            + _fix(cause, sender_address, name)
         )
         action = f"Check with {name}."
     dedup_key = _dedup_key(thread_key)

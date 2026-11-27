@@ -60,7 +60,9 @@ ANSWERS_PER_HOUR = 30
 # The card's conversation (CONVERSATION_KEY): what came in after the draft,
 # what the person asked to change, and what the Executive said it did. Each
 # is a dict with "kind" ("news", "asked" or "note") and "text"; news also
-# has its sender, time and message id.
+# has its sender, time, message id and its files' names ("files"); a note
+# that ends a run of the work (delegation.card_work) also has how it ended
+# ("state": done, stopped or stuck), its "steps" and the "choices" to tap.
 CONVERSATION_KEY = "conversation"
 CONVERSATION_MAX = 20
 # Newer mail in the conversation the draft was brought up to date with: the
@@ -133,6 +135,27 @@ writer, as their assistant ("I"), saying what you changed and why. With \
 reading a file, making a spreadsheet or document, looking something up, \
 booking or sending something), set needs_tools true and return the draft as \
 it was: the Executive does that work with its tools. Never say you can't.
+12. When <change> is a question to you rather than a change ("who signed \
+the LOI?", "what did we quote them?"), set question true and return the \
+draft as it was, word for word: a question never edits the reply. Answer it \
+in note, from what <draft>, <answers> and <recipients> say. When answering \
+needs looking something up, also set needs_tools true.
+13. When <change> only asks who the email goes from: from you, their \
+assistant, instead of them ("send it from you", "you send it and cc me"), \
+set send_from to "executive"; back from them ("send it as me"), set it to \
+"me". Return the draft as it was: the card switches who sends it and \
+rewrites it. When it asks for that and a change of words, do only the words \
+and still set send_from.
+14. When <change> only tells you to go ahead and send the reply as it is \
+("send it", "yes, looks good, send"), set send_now true and return the \
+draft as it was: the card asks them to confirm the send. That is never \
+needs_tools. With who it goes from too ("send it from you"), also set \
+send_from. A change of words with it is not send_now: do the change.
+15. <sender>, when given, says the email goes from the assistant, not the \
+writer, and who "I" is in it. Follow it in every sentence you write or \
+change, and keep <draft> written that way; it overrides rule 6 on who "I" \
+is. A <change> about whose name a sentence uses ("say you, not John") is a \
+change of words: do it.
 
 Return the new body (and gist, note, questions) through rewrite_reply."""
 
@@ -146,6 +169,9 @@ _REWRITE_TOOL: dict[str, Any] = {
             "gist": {"type": "string"},
             "note": {"type": "string"},
             "needs_tools": {"type": "boolean"},
+            "question": {"type": "boolean"},
+            "send_from": {"type": "string", "enum": ["executive", "me"]},
+            "send_now": {"type": "boolean"},
             "questions": {
                 "type": "array",
                 "items": {
@@ -165,7 +191,35 @@ _REWRITE_TOOL: dict[str, Any] = {
 
 class NeedsWork(Exception):
     """What the person typed on the card is work for the Executive's tools,
-    not a change of words (``delegation.card_work``)."""
+    not a change of words (``delegation.card_work``). ``question`` when it
+    asks something rather than asking for a change."""
+
+    def __init__(self, ask: str, *, question: bool = False) -> None:
+        super().__init__(ask)
+        self.question = question
+
+
+# Not kept on the card: how ``rewrite`` hands ``change`` who it goes from.
+_SEND_FROM_ASKED = "_send_from_asked"
+
+
+class SendFrom(Exception):
+    """What the person typed on the card asks who the reply goes from
+    (``delegation.send_from``): from the Executive when ``executive``."""
+
+    def __init__(self, *, executive: bool) -> None:
+        super().__init__("send_from")
+        self.executive = executive
+
+
+class SendNow(Exception):
+    """What the person typed on the card only says to send it as it is
+    ("send it"), from the Executive when ``executive`` is True, from them
+    when False, as it is set when None."""
+
+    def __init__(self, *, executive: bool | None) -> None:
+        super().__init__("send_now")
+        self.executive = executive
 
 
 @dataclass(frozen=True)
@@ -317,6 +371,17 @@ def _slot_text(at: datetime) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def questions_left(payload: dict[str, Any]) -> int:
+    """How many questions with answers to tap are still open: Send waits for
+    them, unless the words were changed by hand (``QUESTIONS_SETTLED``). A
+    question with no choices never holds Send back."""
+    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
+
+    if payload.get(QUESTIONS_SETTLED) is True:
+        return 0
+    return sum(1 for q in questions_for(payload) if q["choices"] and not q["answer"].strip())
+
+
 def questions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """The card's open questions as the person sees them: each one's text,
     choices, where they came from and the answer given (""). A card made
@@ -339,17 +404,6 @@ def questions_for(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "answer": answer if isinstance(answer, str) else "",
         })
     return out
-
-
-def questions_left(payload: dict[str, Any]) -> int:
-    """How many offered choices still wait for the person, which is what holds
-    the web card's Send (``questionsLeft`` in the UI's ``replyCards.ts``). None
-    once they changed the words by hand (``card_drafts.QUESTIONS_SETTLED``)."""
-    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED
-
-    if payload.get(QUESTIONS_SETTLED) is True:
-        return 0
-    return sum(1 for q in questions_for(payload) if q["choices"] and not q["answer"].strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -429,7 +483,7 @@ def _today(now: datetime | None) -> str:
 
 def _render_turn(
     writer_name: str, recipients: list[str], draft: str, pairs: list[_Pair], today: str, gist: str = "",
-    change: str = "", news: list[dict[str, Any]] | None = None,
+    change: str = "", news: list[dict[str, Any]] | None = None, sender: str = "",
 ) -> str:
     from openexecutive.delegation.ghostwriter import one_line
     from openexecutive.utils.prompt_blocks import no_tags, plain, scrub_block_line
@@ -445,12 +499,14 @@ def _render_turn(
     newer = "\n\n".join(
         f"From: {one_line(str(n.get('from_name') or n.get('from_email') or ''), 120)} — "
         f"{one_line(str(n.get('at') or ''), 60)}\n{plain(str(n.get('text') or ''))}"
+        + (f"\nFiles: {', '.join(one_line(str(f), 120) for f in n['files'])}" if n.get("files") else "")
         for n in news or []
     )
     return "\n\n".join([
         block("today", today),
         block("writer", f"Name: {one_line(writer_name, 120)}"),
         block("recipients", "\n".join(f"- {r}" for r in recipients) or "(none)"),
+        *([block("sender", sender)] if sender else []),
         # The draft was written from other people's email: it can't open or
         # close a tag either.
         block("draft", draft),
@@ -482,13 +538,17 @@ async def _call_model(model: str, system: str, turn: str) -> dict[str, Any]:
 
 async def rewrite(
     person: Any, payload: dict[str, Any], answers: list[Answer], *, now: datetime | None = None,
-    change: str = "", news: list[dict[str, Any]] | None = None,
+    change: str = "", news: list[dict[str, Any]] | None = None, send_now: bool = False,
 ) -> tuple[str, dict[str, Any], list[str]]:
     """The card's draft rewritten with ``answers``, with what the person
     asked to ``change``, or with ``news`` (newer email in the conversation,
     ``catch_up``): the new body, the payload fields to keep with it, and the
-    sentences that are new. Raises ``SendRefused``."""
+    sentences that are new. A ``change`` that is a question gets its answer
+    in the conversation and the body back unchanged. ``send_now``: a card
+    that can confirm a send takes "send it" as a go (``SendNow``); anywhere
+    else it leaves the words as they are. Raises ``SendRefused``."""
     from openexecutive.config import get_settings
+    from openexecutive.delegation import send_from
     from openexecutive.delegation.ghostwriter import (
         _drop_name_before_signature,
         clean_gist,
@@ -527,7 +587,8 @@ async def rewrite(
     stored = get_voice(person.id)
     names = (person.full_name or "").split()
     body = str(payload.get("draft_body") or "")
-    main, tail = _split_tail(body, stored.profile.signature)
+    # The card's one version, for whoever sends it (``send_from``).
+    main, tail = send_from.split(person, payload, body)
     recipients = [a for a in payload.get("draft_to") or [] if isinstance(a, str)]
     system = REWRITE_PROMPT + "\n\n" + (
         render_voice_block(stored.profile, first_name=names[0] if names else "them")
@@ -536,15 +597,35 @@ async def rewrite(
     gist = str(payload.get("gist") or "")
     turn = _render_turn(
         " ".join(names) or str(person.email or ""), recipients, main, pairs, _today(now), gist,
-        change=change, news=news,
+        change=change, news=news, sender=send_from.writer_note(payload),
     )
     try:
         written = await _call_model(composer_model(), system, turn)
     except Exception as exc:
         logger.warning("delegation.answers: the rewrite failed (%s)", type(exc).__name__)
         written = {}
+    asked_only = bool(change and not pairs and not news and written.get("question") is True)
+    sender = written.get("send_from") if change and not pairs and not news else None
+    if send_now and change and not pairs and not news and written.get("send_now") is True and not asked_only:
+        raw_words = written.get("body")
+        if not isinstance(raw_words, str) or raw_words.strip() == main.strip():
+            # Only a go: the words stay, and the card asks to confirm the send.
+            raise SendNow(executive=sender == "executive" if sender in ("executive", "me") else None)
+    if sender in ("executive", "me") and not asked_only:
+        # Who it goes from is the card's to switch (it rewrites the words
+        # itself), after any change of words asked with it.
+        raw_words = written.get("body")
+        if not isinstance(raw_words, str) or raw_words.strip() == main.strip():
+            raise SendFrom(executive=sender == "executive")
+    else:
+        sender = None
     if change and not pairs and not news and written.get("needs_tools") is True:
-        raise NeedsWork(change)
+        raise NeedsWork(change, question=asked_only)
+    if asked_only:
+        # A question gets an answer and leaves the reply word for word.
+        if not str(written.get("note") or "").strip():
+            raise SendRefused(502, "rewrite_failed", "Couldn't answer that. Try asking again.")
+        return body, _turns(payload, written, change=change, news=[], now=now, changed=[]), []
     raw = written.get("body")
     if not isinstance(raw, str) or not raw.strip():
         raise SendRefused(502, "rewrite_failed", "Couldn't write that into your reply. Try again, or tap Edit.")
@@ -575,28 +656,43 @@ async def rewrite(
     if gist:
         new_gist = written.get("gist")
         extra["gist"] = clean_gist(new_gist) if isinstance(new_gist, str) else ""
+    new = changed_sentences(main, new_main)
     if change or news:
-        extra.update(_turns(payload, written, change=change, news=news or [], now=now))
+        extra.update(_turns(payload, written, change=change, news=news or [], now=now, changed=new))
+    if sender is not None:
+        # Asked with a change of words: ``change`` switches it after saving.
+        extra[_SEND_FROM_ASKED] = sender
     if news:
         extra.update(_new_questions(payload, written.get("questions")))
-    return new_body, extra, changed_sentences(main, new_main)
+    return new_body, extra, new
 
 
-def conversation(payload: dict[str, Any]) -> list[dict[str, str]]:
-    """The card's conversation as stored (``CONVERSATION_KEY``), each turn's
-    fields as strings; anything malformed is left out."""
+# A note's ``changed``: the sentences its change made new, quoted under it
+# on the card so nobody has to look for them in the reply.
+_TURN_LISTS = ("files", "steps", "choices", "changed")
+
+
+def conversation(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """The card's conversation as stored (``CONVERSATION_KEY``): each turn's
+    fields as strings, and its lists (``_TURN_LISTS``) as lists of strings;
+    anything malformed is left out."""
     raw = payload.get(CONVERSATION_KEY)
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for turn in raw if isinstance(raw, list) else []:
         if not isinstance(turn, dict) or turn.get("kind") not in {"news", "asked", "note"}:
             continue
-        out.append({k: str(v) for k, v in turn.items() if isinstance(v, str)})
+        kept: dict[str, Any] = {k: str(v) for k, v in turn.items() if isinstance(v, str)}
+        for key in _TURN_LISTS:
+            value = turn.get(key)
+            if isinstance(value, list):
+                kept[key] = [str(v) for v in value if isinstance(v, str)]
+        out.append(kept)
     return out
 
 
 def _turns(
     payload: dict[str, Any], written: dict[str, Any], *, change: str, news: list[dict[str, Any]],
-    now: datetime | None,
+    now: datetime | None, changed: list[str],
 ) -> dict[str, Any]:
     from openexecutive.delegation.ghostwriter import clean_gist
 
@@ -609,12 +705,16 @@ def _turns(
         "kind": "note",
         "text": note or ("I brought your reply up to date." if news else "I changed your reply."),
         "at": (now or datetime.now(UTC)).isoformat(),
+        **({"changed": changed} if changed else {}),
     })
     return {CONVERSATION_KEY: turns[-CONVERSATION_MAX:]}
 
 
-def _clean(text: str) -> bool:
-    """Whether ``text`` has no link or email address in it."""
+def no_link(text: str) -> bool:
+    """Whether ``text`` has no link or email address in it. Every choice
+    to tap that was written after reading someone else's email passes this
+    (a catch-up's new questions, the card work's next steps), so the email
+    can't put an address in the person's mouth."""
     from openexecutive.delegation.ghostwriter import lint, one_line
 
     line = one_line(text, 300)
@@ -641,14 +741,14 @@ def _new_questions(payload: dict[str, Any], raw: Any) -> dict[str, Any]:
         if added >= MAX_NEW_QUESTIONS or len(questions) >= MAX_QUESTIONS or not isinstance(item, dict):
             break
         text = one_line(str(item.get("text") or ""), 300)
-        if not text or text in questions or not _clean(text):
+        if not text or text in questions or not no_link(text):
             continue
         choices = item.get("choices")
         # Written after reading other people's email: a choice with a link or
         # address in it never becomes something the person can tap into the
         # reply (a tapped answer counts as theirs for the lint).
         picked = [
-            one_line(c, 120) for c in choices if isinstance(c, str) and c.strip() and _clean(c)
+            one_line(c, 120) for c in choices if isinstance(c, str) and c.strip() and no_link(c)
         ][:4] if isinstance(choices, list) else []
         questions.append(text)
         shaped.append({"choices": picked, "about": "", "source": ""})
@@ -679,25 +779,201 @@ async def answer(
     return saved, changed
 
 
+NOTE_TAP_SEND = "Tap Send when it looks right."
+NOTE_CONFIRM_SEND = "Here it is. Check who it goes to, then send it."
+NOTE_ANSWER_FIRST = "Answer the question above first, then send it."
+
+
 async def change(
     instance: Any, *, caller: Any, resolver: int | None, text: str, gmail: Any = None, now: datetime | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], bool]:
     """Rewrite the reply on ``instance`` the way the person asked in their
     own words ("make it shorter", "offer Thursday instead"), on their tap:
-    the card's payload as it now is, and the sentences that are new. Their
-    words and the Executive's line on what it changed join the card's
-    conversation. Raises ``SendRefused``. Sends nothing."""
-    from openexecutive.delegation import card_drafts
+    the card's payload as it now is, the sentences that are new, and
+    whether they said to send it (a go, ``replan.said_go``, the same as for
+    every card: the card then asks to confirm the send, as a tap on Send
+    does). Their words and the Executive's line on what it changed join the
+    card's conversation. Raises ``SendRefused``. Sends nothing."""
+    from openexecutive.alerts import replan
+    from openexecutive.delegation import card_drafts, send_from
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.memory.decision_ledger import get_decision_instance
 
     changed: list[str] = []
+    asked: list[str] = []
 
     async def write(person: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        body, extra, new = await rewrite(person, payload, [], change=text, now=now)
+        body, extra, new = await rewrite(person, payload, [], change=text, now=now, send_now=True)
         changed[:] = new
+        sender = extra.pop(_SEND_FROM_ASKED, None)
+        if isinstance(sender, str):
+            asked.append(sender)
         return body, extra
 
-    saved = await card_drafts.edit(instance, caller=caller, resolver=resolver, gmail=gmail, rewrite=write)
-    return saved, changed
+    try:
+        saved = await card_drafts.edit(instance, caller=caller, resolver=resolver, gmail=gmail, rewrite=write)
+    except SendFrom as ask:
+        # Only who it goes from: the card switches, and says so.
+        saved = await send_from.switch(
+            instance, caller=caller, resolver=resolver, executive=ask.executive, gmail=gmail, asked=text,
+        )
+        return saved, [], False
+    except SendNow as ask:
+        from openexecutive.delegation.inbox import card_payload
+
+        payload = card_payload(instance)
+        if ask.executive is not None and ask.executive != send_from.is_from_executive(payload):
+            # "Send it from you": who it goes from switches, and says so. The
+            # send waits: the new wording is theirs to read first.
+            saved = await send_from.switch(
+                instance, caller=caller, resolver=resolver, executive=bool(ask.executive), gmail=gmail, asked=text,
+            )
+            return saved, [], False
+        go = False
+        if questions_left(payload):
+            # Send waits for the card's open questions, whatever was said.
+            note = NOTE_ANSWER_FIRST
+        else:
+            try:
+                go = await replan.said_go(
+                    str(payload.get("draft_body") or ""), text, caller_key=str(getattr(caller, "email", "") or ""),
+                )
+                # A go opens the send to check; unsure, it stays theirs to tap.
+                note = NOTE_CONFIRM_SEND if go else NOTE_TAP_SEND
+            except replan.ReplanError as exc:
+                note = exc.message if exc.code == "too_many" else NOTE_TAP_SEND
+        noted = send_from.say(instance, note, asked=text)
+        # A card that changed meanwhile isn't the one they said it of: no go.
+        return noted or payload, [], go and noted is not None
+    if asked:
+        current = get_decision_instance(instance.id) or instance
+        try:
+            saved = await send_from.switch(
+                current, caller=caller, resolver=resolver, executive=asked[0] == "executive", gmail=gmail,
+            )
+        except SendRefused:
+            # The words changed and were saved; only who it goes from didn't.
+            saved = send_from.say(get_decision_instance(instance.id) or current, send_from.NOTE_NOT_SWITCHED) or saved
+    return saved, changed, False
+
+
+async def to_work(
+    instance: Any, *, caller: Any, resolver: int | None, text: str, now: datetime | None = None,
+) -> bool:
+    """Give the person's words straight to the card's work: a next step
+    they tapped, or new words while it works ("no, do it this way"). The
+    same checks as a change by hand (``card_drafts.check``) and the same
+    hourly limit, then ``card_work.redirect``. False when the card isn't
+    waiting any more. Raises ``SendRefused``."""
+    from openexecutive.delegation import card_drafts, card_work
+
+    card_drafts.owner(instance, caller=caller, resolver=resolver)
+    taking = getattr(instance, "gate_mode", "") == "auto_execute" and card_work.running(instance.id)
+    # A reply set to go on its own whose work is still running: checked as
+    # it will be once their words take it back to wait for them, and taken
+    # back only once every check has passed.
+    person = card_drafts.check(
+        instance.model_copy(update={"gate_mode": "propose"}) if taking else instance,
+        caller=caller, resolver=resolver,
+    )
+    _check_rate(person.id, now or datetime.now(UTC))
+    if taking:
+        card_work.take_back(instance.id)
+    return await card_work.redirect(person, instance.id, text)
+
+
+@dataclass(frozen=True)
+class Taken:
+    """What the person's words on their reply card did (``take``): the
+    sentences that are new and whether they said to send it (a change of
+    words), or that they went to the card's work (``worked``). ``started``
+    is False when they weren't taken: the card isn't waiting, or the run
+    going now hasn't let go yet."""
+
+    changed: list[str]
+    go: bool = False
+    worked: bool = False
+    started: bool = True
+
+
+async def take(
+    instance: Any, *, person: Any, caller: Any, resolver: int | None, text: str, work: bool = False,
+) -> Taken:
+    """The person's words on their own reply card, taken the card's way, one
+    place for the card on a page and its card in a chat app: to the work
+    while it runs or when they tapped one of its next steps (``work``,
+    ``to_work``); else as a change of the reply (``change``), or as work
+    for the Executive's tools when that is what they ask
+    (``card_work.redirect``, after the change's checks and hourly limit).
+    Raises ``SendRefused``. Sends nothing."""
+    from openexecutive.delegation import card_work
+
+    try:
+        if work or card_work.running(instance.id):
+            # A next step they tapped, or new words while it works ("no, do
+            # it this way"): the work takes them, and the run going now stops.
+            started = await to_work(instance, caller=caller, resolver=resolver, text=text)
+            return Taken([], worked=True, started=started)
+        _, changed, go = await change(instance, caller=caller, resolver=resolver, text=text)
+        return Taken(changed, go=go)
+    except NeedsWork:
+        # Work for the Executive's tools (reading her files, making a
+        # spreadsheet): it does it on the card, as when the email came in.
+        # The change already passed the card's checks and hourly limit.
+        return Taken([], worked=True, started=await card_work.redirect(person, instance.id, text))
+
+
+def news_of(messages: list[Any]) -> list[dict[str, Any]]:
+    """Newer email as turns of a card's conversation ("news"): who, when,
+    their new words and their files' names."""
+    from openexecutive.delegation.ghostwriter import one_line
+    from openexecutive.integrations.email_poller import sender_new_text
+
+    return [
+        {
+            "id": str(m.id),
+            "from_name": one_line(m.from_name or "", 120),
+            "from_email": str(m.from_addr or ""),
+            "at": str(m.received_at or ""),
+            "text": sender_new_text(m.text or "")[:NEWS_CHARS],
+            "subject": one_line(getattr(m, "subject", "") or "", 200),
+            "files": [
+                one_line(a.name, 120) for a in getattr(m, "attachments", None) or [] if getattr(a, "name", "")
+            ][:10],
+        }
+        for m in messages
+    ]
+
+
+def add_news(card_id: int, messages: list[Any]) -> bool:
+    """Show ``messages`` on the card's conversation as newer mail, without
+    rewriting the reply (the Executive's work, which reads them, does). The
+    ones it already shows are left out. Never raises."""
+    from openexecutive.delegation.inbox import card_payload
+    from openexecutive.memory.decision_ledger import (
+        STATUS_PROPOSED,
+        get_decision_instance,
+        update_open_payload,
+    )
+
+    try:
+        for _ in range(3):
+            card = get_decision_instance(card_id)
+            if card is None or card.status != STATUS_PROPOSED:
+                return False
+            payload = card_payload(card)
+            turns = payload.get(CONVERSATION_KEY)
+            turns = list(turns) if isinstance(turns, list) else []
+            shown = {t.get("id") for t in turns if isinstance(t, dict) and t.get("kind") == "news"}
+            news = [{**n, "kind": "news"} for n in news_of([m for m in messages if str(m.id) not in shown])]
+            if not news:
+                return True
+            changed = {**payload, CONVERSATION_KEY: [*turns, *news][-CONVERSATION_MAX:]}
+            if update_open_payload(card_id, changed, expected_json=card.proposed_payload_json):
+                return True
+    except Exception:
+        logger.warning("delegation.answers: couldn't show newer mail on card %s", card_id, exc_info=True)
+    return False
 
 
 async def catch_up(
@@ -713,8 +989,6 @@ async def catch_up(
     a busy card, a failed rewrite): the card then only warns, as before.
     Never raises; sends nothing."""
     from openexecutive.delegation import card_drafts
-    from openexecutive.delegation.ghostwriter import one_line
-    from openexecutive.integrations.email_poller import sender_new_text
 
     shown = {t.get("id") for t in conversation(payload) if t.get("kind") == "news"}
     fresh = [m for m in newer if getattr(m, "id", "") not in shown]
@@ -727,16 +1001,7 @@ async def catch_up(
     tried = _CATCH_UP_FAILED.setdefault(card.id, set())
     if all(str(m.id) in tried for m in fresh):
         return False
-    news = [
-        {
-            "id": str(m.id),
-            "from_name": one_line(m.from_name or "", 120),
-            "from_email": str(m.from_addr or ""),
-            "at": str(m.received_at or ""),
-            "text": sender_new_text(m.text or "")[:NEWS_CHARS],
-        }
-        for m in fresh
-    ]
+    news = news_of(fresh)
     # By the instant, not the string: mailboxes write times in more than one
     # form, and inbox.later_messages compares them parsed.
     times = [t for t in (_moment(n["at"]) for n in news if n["at"]) if t is not None]

@@ -46,6 +46,7 @@ from openexecutive.config import get_settings
 from openexecutive.onboarding.interview import Turn, replay_transcript, transcript_chars
 from openexecutive.orchestrator.workflow_authoring_tools import DEFINITION_SCHEMA
 from openexecutive.providers.translator import reasoning_replay_block
+from openexecutive.utils.public_errors import PublicError
 from openexecutive.workflows import tool_catalog
 from openexecutive.workflows.base import WorkflowSection
 from openexecutive.workflows.dynamic_models import DynamicWorkflowDef, validate_definition
@@ -88,7 +89,7 @@ _CONTINUE_PROMPT = (
 _EXCLUDED_SPECIALISTS = frozenset({"triage"})
 
 
-class WorkflowDesignerError(RuntimeError):
+class WorkflowDesignerError(PublicError):
     """The designer could not produce a question or a draft.
 
     The message is always a fixed, input-free string safe to return to the
@@ -330,7 +331,7 @@ def build_context_block(*, as_me: bool = False, user_email: str = "") -> str:
         "People on the roster (the only valid person_id values):\n"
         + ("\n".join(roster) if roster else "- (nobody yet — no approval gates or schedules)")
         + "\n\n"
-        f"The user's timezone: {get_user_timezone().key}. Cadences are in UTC.\n\n"
+        f"The user's timezone: {get_user_timezone().key}. Cadences are in that timezone.\n\n"
         "Sections:\n" + "\n".join(sections) + "\n\n"
         f"External tool gateway (email, sheets, files, etc.): {gateway}.\n"
         "Built-in tools (always available; the oe__ tools are the same tools "

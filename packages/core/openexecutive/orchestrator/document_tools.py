@@ -30,6 +30,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _PAGES_RE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
+# What the "from character" and "cut off" notes on a part need.
+_NOTES_ROOM = 200
 
 READ_DOCUMENT_TOOL: dict[str, Any] = {
     "name": "read_document",
@@ -43,7 +45,8 @@ READ_DOCUMENT_TOOL: dict[str, Any] = {
         "get_drive_file_download_url for a Drive PDF whose content could not be "
         "read — or `filename` for a company document, or `file` for any file by "
         "its handle (mail:<message_id>#<n>, drive:<file_id>, file:<name>). For a long PDF, pass "
-        "`pages` (e.g. '1-20') to read part of it."
+        "`pages` (e.g. '1-20') to read part of it. A long file of any kind comes back in parts: "
+        "pass the `start` its cut-off note gives to read on."
     ),
     "input_schema": {
         "type": "object",
@@ -63,6 +66,10 @@ READ_DOCUMENT_TOOL: dict[str, Any] = {
             "pages": {
                 "type": "string",
                 "description": "PDF page range to read, e.g. '5' or '1-20'. Default: all.",
+            },
+            "start": {
+                "type": "integer",
+                "description": "Character to start from, to read on where the last read was cut off. Default: 0.",
             },
         },
     },
@@ -95,22 +102,13 @@ def _parse_pages(raw: str) -> tuple[int, int] | str:
 
 async def _read_pages(path: Path, first: int, last: int) -> tuple[Any, str]:
     """Read pages ``[first, last)`` of a PDF. Returns ``(result, range_label)``."""
-    from pypdf import PdfReader
-
-    from openexecutive.knowledge.pdf_reader import read_pdf_text, slice_pdf
+    from openexecutive.knowledge.pdf_reader import page_range, read_pdf_text
 
     data = await asyncio.to_thread(path.read_bytes)
-
-    def _count() -> int:
-        import io
-
-        return len(PdfReader(io.BytesIO(data)).pages)
-
-    total = await asyncio.to_thread(_count)
-    if first >= total:
+    total, part = await page_range(data, first, last)
+    if part is None:
         raise ValueError(f"that PDF has only {total} pages")
     last = min(last, total)
-    part = await asyncio.to_thread(slice_pdf, data, first, last)
     result = await read_pdf_text(part, filename=path.name)
     return result, f"pages {first + 1}-{last} of {total}"
 
@@ -164,10 +162,14 @@ async def _read_handle(tool_input: dict[str, Any]) -> str:
 
 
 async def _read_path(resolved: Path, tool_input: dict[str, Any]) -> str:
-    from openexecutive.config import get_settings
+    from openexecutive.knowledge.isolated import ParserBusy
     from openexecutive.knowledge.loader import read_document_text
+    from openexecutive.providers.registry import reading_limits_for
 
     pages_raw = str(tool_input.get("pages") or "").strip()
+    start = tool_input.get("start") or 0
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        return _err("start must be a whole number, 0 or more")
     scope = ""
     try:
         if pages_raw and resolved.suffix.lower() == ".pdf":
@@ -179,6 +181,8 @@ async def _read_path(resolved: Path, tool_input: dict[str, Any]) -> str:
             result = await read_document_text(resolved)
     except ValueError as exc:
         return _err(str(exc))
+    except ParserBusy:
+        return _err("the document reader is busy right now; try again in a minute")
     except Exception as exc:
         logger.warning("read_document: extraction failed (%s)", type(exc).__name__)
         return _err("could not read that file")
@@ -195,11 +199,31 @@ async def _read_path(resolved: Path, tool_input: dict[str, Any]) -> str:
         header.append(f" — {result.note}")
     header.append("]")
 
-    text = result.text
-    cap = get_settings().tool_result_max_chars
-    if len(text) > cap:
-        text = text[:cap] + "\n…[truncated — pass `pages` to read the rest]"
-    return "".join(header) + "\n" + text
+    # A long file comes back in parts, whatever its kind: the note names
+    # where to read on, so the rest is one more call (not a Python job). A
+    # part leaves room under the turn's per-result cap for the header and the
+    # notes, so a part never cuts the note off. The part is what one read of
+    # the turn's model holds (reading.turn_limits; the default model's
+    # outside a turn), counting text written about one token a character
+    # three times its length.
+    total = len(result.text)
+    if start >= total:
+        return _err(f"that file has only {total} characters")
+    head = "".join(header)
+    from openexecutive.orchestrator.reading import text_weight, turn_limits
+
+    per_read = (turn_limits() or reading_limits_for()).per_read
+    weight = text_weight(result.text[start:])
+    end = start + max(1, int(per_read / weight) - len(head) - _NOTES_ROOM)
+    text = result.text[start:end]
+    if start:
+        text = f"…[from character {start} of {total}]\n" + text
+    if end < total:
+        # ``start`` counts into the text of the pages read, so the same pages
+        # go with it.
+        again = f"pages='{pages_raw}' and start={end}" if scope else f"start={end}"
+        text += f"\n…[cut off at character {end} of {total} — call again with {again} to read on]"
+    return head + "\n" + text
 
 
 DOCUMENT_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = {

@@ -392,15 +392,16 @@ def test_a_signal_cannot_close_the_triage_event_block() -> None:
     assert "<\\/event" in block
 
 
-def test_the_principals_own_authenticated_mail_is_a_verified_surface() -> None:
-    """Mail the mail service proved came from the principal's address is them
-    signed in; any other mail, or an unproven From, is not."""
+def test_proven_mail_from_anyone_on_the_team_is_a_verified_surface() -> None:
+    """Mail the mail service proved came from the sender's own address is them
+    signed in, the owner and a teammate alike; an unproven From is not."""
     from openexecutive.orchestrator.people_tools import _is_verified_speaker_surface
 
     assert _is_verified_speaker_surface(
         Session(origin_channel="email", caller_person_id=1, email_authenticated=True)
     )
     assert not _is_verified_speaker_surface(Session(origin_channel="email", caller_person_id=1))
-    assert not _is_verified_speaker_surface(
+    assert _is_verified_speaker_surface(
         Session(origin_channel="email", caller_person_id=2, email_sender_authenticated=True)
     )
+    assert not _is_verified_speaker_surface(Session(origin_channel="email", caller_person_id=2))

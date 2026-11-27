@@ -1,0 +1,11 @@
+id: charts_002
+domain: files
+description: "Asked to show a chart it makes, the Executive puts the image in the chat (![…](link)) rather than only naming the file or giving a download link"
+query: "Draw a line graph of weekly orders, 42, 51, 47, 63, 70, and show it to me."
+# Documentation for now: the runner judges the reply text.
+expected_tool_calls:
+  - run_python_job
+quality_criteria:
+  shows_the_chart_as_an_inline_markdown_image: true
+  does_not_only_name_the_file_or_give_a_download_link: true
+  says_orders_rose_overall_from_42_to_70: true

@@ -1,0 +1,20 @@
+id: big_jobs_001
+domain: big_jobs
+description: "Principal asks for a whole long document to be gone through; the Executive says in one line it may take a while, starts right away, and never mentions cost or asks to narrow it."
+company_context:
+  stage: "Series A"
+  industry: "B2B SaaS"
+  headcount: 45
+  arr: 3500000
+# The Executive does the whole job, however big (persona "Big jobs"): a
+# heads-up line, then the work in the same reply. A long read comes back in
+# parts and is read to the end (orchestrator/reading.py).
+query: "Go through every one of the 56 customer email templates in our support handbook and list, for each one, its subject line and whether it still mentions the old pricing."
+expected_topics:
+  - heads_up_it_may_take_a_while
+  - starts_the_work_in_the_same_reply
+quality_criteria:
+  one_line_heads_up_before_starting: true
+  never_mentions_cost_or_money: true
+  does_not_ask_to_narrow_the_request: true
+  does_not_ask_permission_to_start: true

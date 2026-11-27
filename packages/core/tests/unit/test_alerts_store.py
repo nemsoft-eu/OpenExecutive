@@ -119,6 +119,22 @@ def test_idempotent_on_source_external_id(db: Path) -> None:
     assert listed[0].severity == "medium"  # original preserved
 
 
+def test_cards_with_no_upstream_id_are_never_taken_for_a_replay(db: Path) -> None:
+    # Cards raised outside a mail thread carry no id of their own: each one
+    # is a card, not a repeat of the first.
+    ids = [
+        insert_alert(
+            source="executive", external_id="", severity="medium",
+            headline=f"Question {n}", body="", db_path=db,
+        )
+        for n in range(3)
+    ]
+    assert None not in ids and len(set(ids)) == 3
+    listed = list_alerts(db_path=db)
+    assert sorted(a.headline for a in listed) == ["Question 0", "Question 1", "Question 2"]
+    assert all(a.external_id.startswith("card:") for a in listed)
+
+
 def test_status_transitions_and_delete(db: Path) -> None:
     aid = insert_alert(
         source="slack",
@@ -282,3 +298,34 @@ def test_list_artifact_alerts_keeps_to_one_owner(db: Path) -> None:
     assert heads(owner_person_id=7) == {"mine"}
     assert heads(owner_person_id=7, include_unowned=True) == {"mine", "unowned"}
     assert heads(owner_person_id=None) == set()
+
+
+def test_the_button_label_is_short_one_line_and_follows_its_step(db: Path) -> None:
+    from openexecutive.alerts import store
+
+    assert store.clean_label("  Email   Dana.  ") == "Email Dana"
+    assert store.clean_label("Reply!") == "Reply"
+    assert store.clean_label("x" * 41) == ""
+    assert store.clean_label("...") == ""
+    aid = store.insert_alert(
+        source="triage", external_id="lbl-1", severity="medium", headline="h", body="",
+        suggested_action="Email Dana to renew", action_label="Email Dana.", db_path=db,
+    )
+    assert aid is not None
+    card = store.get_alert(aid, db_path=db)
+    assert card is not None and card.action_label == "Email Dana"
+    # No step: no button words.
+    bare = store.insert_alert(
+        source="triage", external_id="lbl-2", severity="medium", headline="h", body="",
+        action_label="Email Dana", db_path=db,
+    )
+    assert bare is not None
+    bare_card = store.get_alert(bare, db_path=db)
+    assert bare_card is not None and bare_card.action_label == ""
+    # A new step without new words clears the old ones.
+    store.update_alert_content(aid, suggested_action="Call Dana instead", db_path=db)
+    card = store.get_alert(aid, db_path=db)
+    assert card is not None and card.action_label == ""
+    store.update_alert_content(aid, suggested_action="Call Dana", action_label="Call Dana", db_path=db)
+    card = store.get_alert(aid, db_path=db)
+    assert card is not None and card.action_label == "Call Dana"

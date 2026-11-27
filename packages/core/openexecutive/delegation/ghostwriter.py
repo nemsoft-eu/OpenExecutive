@@ -414,7 +414,7 @@ def writer_memory(
 
         return (
             build_draft_lessons(person_id, both),
-            render_facts_for_draft(both if facts_from_others else own_words),
+            render_facts_for_draft(both if facts_from_others else own_words, reader=person_id),
         )
     except Exception:
         logger.warning("ghostwriter: couldn't read the writer's memory", exc_info=True)

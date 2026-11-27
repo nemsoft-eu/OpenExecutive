@@ -306,3 +306,27 @@ def test_anthropic_provider_fits_the_request_before_calling_the_sdk() -> None:
     ))
     assert "temperature" not in seen
     assert seen["thinking"] == {"type": "disabled"}
+
+
+def test_output_cap_lowers_max_tokens_and_leaves_the_rest() -> None:
+    spec = FeatureSpec(max_output_tokens=8192)
+    kwargs = {"model": "m", "max_tokens": 32_000, "messages": []}
+    out = apply_feature_gates(spec, kwargs)
+    assert out["max_tokens"] == 8192
+    assert kwargs["max_tokens"] == 32_000, "the caller's dict is never changed"
+    assert apply_feature_gates(spec, {"max_tokens": 4096})["max_tokens"] == 4096
+    assert apply_feature_gates(FeatureSpec(), kwargs) is kwargs
+
+
+def test_non_claude_models_are_asked_for_at_most_16000() -> None:
+    from openexecutive.providers.feature_gate import NON_CLAUDE_MAX_OUTPUT_TOKENS
+    from openexecutive.providers.registry import (
+        _CLAUDE_FEATURE_SPEC,
+        _DEFAULT_NON_CLAUDE_SPEC,
+        _NON_CLAUDE_REASONING_SPEC,
+    )
+
+    kwargs = {"model": "m", "max_tokens": 32_000, "messages": []}
+    for spec in (_DEFAULT_NON_CLAUDE_SPEC, _NON_CLAUDE_REASONING_SPEC):
+        assert apply_feature_gates(spec, kwargs)["max_tokens"] == NON_CLAUDE_MAX_OUTPUT_TOKENS == 16_000
+    assert apply_feature_gates(_CLAUDE_FEATURE_SPEC, kwargs)["max_tokens"] == 32_000

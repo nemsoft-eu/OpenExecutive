@@ -170,6 +170,7 @@ def _settings_stub(
     local_include_usage_accounting: bool = False,
     local_temperature: float | None = None,
     local_top_p: float | None = None,
+    local_max_output_tokens: int = 8192,
 ) -> Any:
     return SimpleNamespace(
         anthropic_api_key=anthropic_key,
@@ -188,6 +189,7 @@ def _settings_stub(
         local_include_usage_accounting=local_include_usage_accounting,
         local_temperature=local_temperature,
         local_top_p=local_top_p,
+        local_max_output_tokens=local_max_output_tokens,
     )
 
 
@@ -623,3 +625,28 @@ def test_model_options_local_wins_over_vendor_shaped_slug(
         assert by_id[slug]["provider"] == "local"
         assert by_id[slug]["route"] == "local"
         assert by_id[slug]["label"] == slug
+
+
+@pytest.mark.parametrize(
+    ("setting", "sent"),
+    [(8192, 8192), (32_000, 32_000), (0, 32_000)],
+    ids=["default", "raised", "zero-is-no-cap"],
+)
+def test_local_max_output_tokens_sets_what_the_local_server_is_asked_for(
+    monkeypatch: pytest.MonkeyPatch, setting: int, sent: int
+) -> None:
+    from openexecutive.providers.feature_gate import apply_feature_gates
+
+    monkeypatch.setattr(
+        "openexecutive.providers.registry.get_settings",
+        lambda: _settings_stub(
+            local_enabled=True,
+            local_base_url="http://localhost:8001/v1",
+            local_models=["local/llama"],
+            local_max_output_tokens=setting,
+        ),
+    )
+    registry_mod._reset_for_tests()
+    spec = registry_mod._local()._spec_lookup["local/llama"]
+
+    assert apply_feature_gates(spec, {"max_tokens": 32_000})["max_tokens"] == sent

@@ -484,13 +484,8 @@ def test_every_tool_loop_replays_reasoning() -> None:
     helper, so continuity isn't a research-loop-only property."""
     import inspect
 
-    from openexecutive.orchestrator import executive
-    from openexecutive.workflows import (
-        action_step,
-        designer,
-        executive_reflection,
-        executive_research,
-    )
+    from openexecutive.orchestrator import executive, rounds
+    from openexecutive.workflows import action_step, designer
 
-    for mod in (executive, executive_research, executive_reflection, action_step, designer):
+    for mod in (executive, rounds, action_step, designer):
         assert "reasoning_replay_block(block)" in inspect.getsource(mod), mod.__name__

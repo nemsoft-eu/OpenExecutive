@@ -472,10 +472,10 @@ export default function ArtifactsPage() {
         <div className="max-w-5xl mx-auto">
           <div className="mb-6 min-w-0 max-w-2xl">
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-fg mb-2">
-              {view === "archived" ? "Archived documents" : "Your documents"}
+              {view === "archived" ? "Archived documents" : "Made for you"}
             </h1>
             <p className="text-[15px] text-fg-muted">
-              What the Executive made for you. Archive what you&apos;re done with.
+              Documents, drafts and workflow outputs the Executive made for you. Archive what you&apos;re done with.
             </p>
           </div>
           <div className="mb-6 flex flex-wrap items-center gap-2">

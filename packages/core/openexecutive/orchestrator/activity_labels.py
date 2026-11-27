@@ -93,6 +93,7 @@ _LABELS: dict[str, str] = {
     "create_goal": "Adding a goal…",
     "record_decision_outcome": "Recording how a decision turned out…",
     "remember_fact": "Noting that for good…",
+    "keep_figure": "Keeping that figure…",
     "forget_fact": "Dropping an old fact…",
     "update_company_profile": "Updating the company profile…",
 
@@ -103,6 +104,7 @@ _LABELS: dict[str, str] = {
     # Watchlist
     "add_watchlist_entry": "Adding to the watchlist…",
     "list_watchlist": "Checking the watchlist…",
+    "list_my_activity": "Checking what I did…",
     "remove_watchlist_entry": "Updating the watchlist…",
     "tune_watchlist_entry": "Tuning the watchlist…",
 
@@ -130,12 +132,12 @@ _LABELS: dict[str, str] = {
     # Act as me: a draft in the speaker's own Gmail (never sent)
     "ghostwrite_email": "Drafting an email in your voice…",
     # Act as me: reads of the speaker's own mailbox
-    "search_my_email": "Searching your email…",
-    "read_my_email": "Reading your email…",
-    "read_my_email_attachment": "Reading an attachment…",
+    # (their wording is shared with the Executive's own mailbox's, `mail_labels`)
+    "search_my_email": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'search')[1]}…",
+    "read_my_email": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'read')[1]}…",
+    "read_my_email_attachment": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'attachment')[1]}…",
     "save_my_email_attachment": "Saving a file from your email…",
     "remind_me": "Setting a reminder…",
-    "watch_for_email": "Watching for that email…",
     "propose_actions": "Leaving you a card to approve…",
     "find_in_app": "Looking that up in the app…",
     "do_in_app": "Making that change…",
@@ -199,6 +201,7 @@ _PRIORITY: tuple[frozenset[str], ...] = (
         "remember_fact",
         "forget_fact",
         "update_company_profile",
+        "keep_figure",
         "close_open_loop",
         "reopen_open_loop",
         "update_open_loop",
@@ -255,17 +258,17 @@ def _label_for(tool_use: dict[str, Any]) -> tuple[str, str]:
         return FALLBACK_LABEL, ""
     if name == "call_tool":
         return _mcp_label(tool_use.get("input"))
-    return _LABELS.get(name) or _extension_label(name) or FALLBACK_LABEL, name
+    return _LABELS.get(name) or _extension_label(name, tool_use.get("input")) or FALLBACK_LABEL, name
 
 
-def _extension_label(name: Any) -> str | None:
-    """The activity line an installed extension's tool registered
-    (orchestrator/extensions.py), if any."""
+def _extension_label(name: Any, arguments: Any = None) -> str | None:
+    """The activity line of an installed extension's tool
+    (orchestrator/extensions.py) for this call, if it has one."""
     if not isinstance(name, str) or name in _LABELS:
         return None
     from openexecutive.orchestrator import extensions
 
-    return extensions.activity_label(name)
+    return extensions.activity_label(name, arguments)
 
 
 def _is_nameable(tool_use: dict[str, Any]) -> bool:

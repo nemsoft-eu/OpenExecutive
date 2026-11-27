@@ -203,7 +203,7 @@ export default function RunDetailPage() {
                 {run.title}
               </h1>
               <div className="text-sm text-fg-muted">
-                {run.workflow_name} · created {formatTimestamp(run.created_at)} ·
+                {run.workflow_title} · created {formatTimestamp(run.created_at)} ·
                 status <StatusPill status={run.status} />
               </div>
             </div>

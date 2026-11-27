@@ -29,10 +29,8 @@ are those of the person the run is for (``artifact_records.current_viewer``),
 and a tool the workspace mode doesn't offer is refused
 (``filter_tools_for_workspace_mode``). Take the lead does not gate these
 calls: a saved workflow is its creator's own instruction, approved tool by
-tool when they saved it, as for the gateway tools. A workflow a team member
-created goes through their department's approval level, as their own chat
-turn would (``department_gate``). One with no creator on record (saved
-before creators were) runs as the principal's, as its tools always did.
+tool when they saved it, as for the gateway tools, whether the owner or a
+teammate made it.
 
 **Long and nested runs.** ``run_workflow`` and ``run_executive_research``
 get a longer timeout than other calls (``TIMEOUT_S``), and a workflow may not
@@ -100,6 +98,7 @@ ACCESS: dict[str, tuple[str, str]] = {
     "list_open_loops": (USE, "list tasks"),
     "list_department_goals": (USE, "list goals"),
     "list_watchlist": (USE, "list the watchlist"),
+    "list_my_activity": (USE, "read what the Executive did on its own"),
     "add_watchlist_entry": (USE, "watch something new"),
     "tune_watchlist_entry": (USE, "tune what is watched"),
     "remove_watchlist_entry": (USE, "stop watching something"),
@@ -114,7 +113,6 @@ ACCESS: dict[str, tuple[str, str]] = {
     "my_email_read_before": (AS_ME, "mail opened for the person before"),
     "my_calendar": (AS_ME, "the person's own calendar"),
     "remind_me": (AS_ME, "a reminder for the person"),
-    "watch_for_email": (AS_ME, "a watch on the person's own mailbox"),
     "propose_actions": (AS_ME, "an approval card from the person's mail"),
     "recall_history": (AS_ME, "the person's own conversation notes"),
     "search_past_chats": (AS_ME, "the person's own earlier chats"),
@@ -132,6 +130,7 @@ ACCESS: dict[str, tuple[str, str]] = {
     "remember_fact": (CHAT_ONLY, "changes what the Executive takes as fact"),
     "forget_fact": (CHAT_ONLY, "changes what the Executive takes as fact"),
     "update_company_profile": (CHAT_ONLY, "changes the company profile"),
+    "keep_figure": (CHAT_ONLY, "keeps a figure for the person in their own conversation"),
     "create_goal": (CHAT_ONLY, "only the principal starts a goal"),
     "record_decision_outcome": (CHAT_ONLY, "only the principal records an outcome"),
     "assign_open_loop": (CHAT_ONLY, "takes the task in the speaker's own words"),
@@ -260,24 +259,6 @@ def _nested_run_refusal(tool_input: dict[str, Any]) -> str | None:
     return None
 
 
-def _seen_channel_refs() -> set[tuple[str, str]]:
-    """The roster's own channels, as the reflection seeds them, so
-    ``schedule_followup`` reaches only a real person's channel."""
-    from openexecutive.people.store import list_people
-
-    seen: set[tuple[str, str]] = set()
-    for person in list_people():
-        if person.slack_user_id:
-            seen.add(("slack_dm", person.slack_user_id))
-        if person.discord_user_id:
-            seen.add(("discord_dm", person.discord_user_id))
-        if person.telegram_chat_id:
-            seen.add(("telegram", person.telegram_chat_id))
-        if person.email:
-            seen.add(("email", person.email))
-    return seen
-
-
 def _session(mode: str) -> Any:
     from openexecutive.memory.workspace_settings import effective_principal_role
     from openexecutive.onboarding.profile_builder import load_or_create_profile
@@ -287,7 +268,6 @@ def _session(mode: str) -> Any:
     profile = load_or_create_profile()
     return Session(
         company_profile=profile if not profile.is_empty() else None,
-        seen_channel_refs=_seen_channel_refs(),
         turn_workspace_mode=mode,
         turn_principal_role=effective_principal_role(None),
         unattended=True,
@@ -295,22 +275,9 @@ def _session(mode: str) -> Any:
     )
 
 
-def _team_member(person_id: int | None) -> Any:
-    """The creator when they are a team member other than the principal."""
-    from openexecutive.people.store import get_person
-
-    if person_id is None:
-        return None
-    person = get_person(person_id)
-    if person is None or person.is_principal or person.kind != "team":
-        return None
-    return person
-
-
 async def run_chat_tool(name: str, tool_input: dict[str, Any]) -> str:
     """Run the chat tool ``name`` for a workflow step (module docstring)."""
     from openexecutive.memory.workspace_settings import effective_workspace_mode
-    from openexecutive.orchestrator import department_gate
     from openexecutive.orchestrator.schedule_tools import (
         current_session,
         filter_tools_for_workspace_mode,
@@ -331,9 +298,6 @@ async def run_chat_tool(name: str, tool_input: dict[str, Any]) -> str:
         return withheld_tool_error(name, mode)
     session = _session(mode)
     handlers: dict[str, Any] = {name: handler}
-    seat = _team_member(_creator.get())
-    if seat is not None:
-        handlers = department_gate.gated_handlers(handlers, seat, session_id=session.session_id)
     token = current_session.set(session)
     try:
         return str(await handlers[name](tool_input))

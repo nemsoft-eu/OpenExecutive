@@ -38,7 +38,7 @@ def setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
     monkeypatch.delenv("OE_PUBLIC_DEPLOYMENT", raising=False)
     monkeypatch.delenv("CALLER_ASSERTION_PUBLIC_KEYS", raising=False)
-    monkeypatch.setattr(invites, "_tz", lambda: UTC)
+    monkeypatch.setattr("openexecutive.memory.workspace_settings.get_user_timezone", lambda: UTC)
     monkeypatch.setattr(invites, "_now", lambda: NOW)
 
 
@@ -273,16 +273,12 @@ def test_handle_it_leaves_a_card_when_something_is_against_it(
         assert card.can_answer is False and "--calendar" in card.connect_command
 
 
-def test_it_never_declines_on_its_own_and_counts_the_daily_limit(
-    person: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_an_accept_on_its_own_has_no_daily_limit(person: Any, models: dict[str, Any]) -> None:
     _on(person)
-    monkeypatch.setenv("DELEGATION_HANDLE_IT_MAX_SENDS_PER_DAY", "1")
-    handle_it.record_handled(person.id, "t-earlier", None, "s1", now=NOW - timedelta(hours=1))
+    for n in range(25):
+        handle_it.record_handled(person.id, f"t-earlier-{n}", None, f"s{n}", now=NOW - timedelta(hours=1))
     mailbox = _mailbox()
-    _scan(person, mailbox)
-    (card,) = invites.cards(person)
-    assert card.waited_because == handle_it.REASONS["daily_limit"] and mailbox.answers == []
+    assert _scan(person, mailbox).handled == 1 and mailbox.answers == [("ev1", True)]
 
 
 def test_an_accept_that_fails_hands_the_card_back(person: Any, models: dict[str, Any]) -> None:
@@ -383,7 +379,7 @@ def test_a_settled_card_under_the_key_doesnt_block_a_new_one(db: Path, decision_
     assert second != first and ledger.get_decision_instance(second).status == "proposed"  # type: ignore[union-attr]
     with sqlite3.connect(db) as conn:
         keys = [r[0] for r in conn.execute("SELECT idempotency_key FROM decision_instances ORDER BY id")]
-    assert keys[0] == key and keys[1].startswith(f"{key}:")
+    assert keys == [None, key]
 
 
 @pytest.mark.parametrize("decision_class", [invites.DECISION_CLASS, inbox.DECISION_CLASS])
@@ -463,12 +459,12 @@ def test_a_goes_company_rule_lets_a_sensitive_title_go(person: Any, models: dict
     from openexecutive.orchestrator import take_the_lead as ttl
 
     _on(person)
-    wire = _mailbox(event=_event(title="Wire approval"))
+    wire = _mailbox(event=_event(title="Wire approval for $5,000"))
     assert _scan(person, wire).handled == 0
     (card,) = invites.cards(person)
     assert card.waited_because == handle_it.REASONS["sensitive"]
     ttl.add_rule(ttl.SCOPE_COMPANY, "domain", DANA.split("@")[1], created_by="t", effect=ttl.EFFECT_GO)
-    again = _mailbox(_invite("i2", "ti2"), event=_event("ev2", title="Wire approval"))
+    again = _mailbox(_invite("i2", "ti2"), event=_event("ev2", title="Wire approval for $5,000"))
     assert _scan(person, again).handled == 1 and again.answers == [("ev2", True)]
 
 

@@ -25,3 +25,10 @@ test("Home checks again only while something is working", () => {
   assert.equal(anyWorking([{ kind: "a", status: "failed" }]), false);
   assert.equal(anyWorking([]), false);
 });
+
+test("a row's tag says whose name it went out in", async () => {
+  const { asTagTone } = await import("../src/lib/doneForYou.ts");
+  assert.equal(asTagTone("Sent as you"), "you");
+  assert.equal(asTagTone("Sent as OE"), "executive");
+  assert.equal(asTagTone("Done as Open Executive"), "executive");
+});

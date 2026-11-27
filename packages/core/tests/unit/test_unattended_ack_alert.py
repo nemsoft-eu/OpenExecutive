@@ -41,7 +41,9 @@ def test_google_chat_session_declares_its_origin() -> None:
     Google, not the sender."""
     import inspect
 
-    from openexecutive.integrations import google_chat
+    from openexecutive.integrations import channel_turn, google_chat
 
-    src = inspect.getsource(google_chat)
-    assert 'origin_channel="google_chat"' in src
+    # The adapter names its channel on the turn, and the one turn runner
+    # puts that on the session.
+    assert 'channel="google_chat"' in inspect.getsource(google_chat)
+    assert "origin_channel=turn.channel" in inspect.getsource(channel_turn)

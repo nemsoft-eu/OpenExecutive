@@ -14,11 +14,8 @@ import pytest
 
 from openexecutive.knowledge import retriever
 from openexecutive.memory import episodic
-from openexecutive.orchestrator.knowledge_tools import (
-    RESULT_CHARS,
-    handle_search_knowledge,
-)
-from openexecutive.workflows._synthesis import execute_tool_calls
+from openexecutive.orchestrator.knowledge_tools import handle_search_knowledge
+from openexecutive.workflows._synthesis import execute_tool_call
 from openexecutive.workflows.executive_reflection import (
     ExecutiveReflectionInput,
     ExecutiveReflectionWorkflow,
@@ -71,14 +68,31 @@ async def test_search_failure_is_an_error_not_a_crash(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_search_result_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(retriever, "retrieve", lambda query, **_kw: "x" * (RESULT_CHARS * 2))
+async def test_a_long_search_result_comes_back_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(retriever, "retrieve", lambda query, **_kw: "x" * 50_000)
     out = await handle_search_knowledge({"query": "fleet discount"})
-    assert len(out) == RESULT_CHARS
+    assert len(out) == 50_000
 
 
 # --------------------------------------------------------------------------
-# Wide results in the shared tool loop
+# One call of a pass
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_call_gives_the_model_its_whole_result_and_the_log_a_short_one() -> None:
+    long = "y" * 1000
+
+    async def handler(_input: dict[str, Any]) -> str:
+        return long
+
+    summary, result = await execute_tool_call("search_knowledge", {}, {"search_knowledge": handler})
+    assert result == long
+    assert len(summary["result_preview"]) == 160 and summary["ok"] is True
+
+
+# --------------------------------------------------------------------------
+# The reflection pass
 # --------------------------------------------------------------------------
 
 
@@ -94,30 +108,6 @@ class _Response:
     def __init__(self, blocks: list[Any]) -> None:
         self.content = blocks
         self.stop_reason = "tool_use"
-
-
-@pytest.mark.asyncio
-async def test_wide_results_only_widen_the_named_tool() -> None:
-    long = "y" * 1000
-
-    async def handler(_input: dict[str, Any]) -> str:
-        return long
-
-    response = _Response([_Block("search_knowledge", {}, "a"), _Block("lookup_person", {}, "b")])
-    summaries = await execute_tool_calls(
-        response,
-        {"search_knowledge": handler, "lookup_person": handler},
-        result_chars=160,
-        wide_results={"search_knowledge": 4000},
-    )
-    by_tool = {s["tool"]: s["result_preview"] for s in summaries}
-    assert len(by_tool["search_knowledge"]) == 1000
-    assert len(by_tool["lookup_person"]) == 160
-
-
-# --------------------------------------------------------------------------
-# The reflection pass
-# --------------------------------------------------------------------------
 
 
 class _Text:
@@ -140,7 +130,7 @@ class _Recorder:
         self.calls: list[dict[str, Any]] = []
 
     async def messages_create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
+        self.calls.append({**kwargs, "messages": list(kwargs["messages"])})
         return self._responses.pop(0)
 
 

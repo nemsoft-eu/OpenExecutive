@@ -133,8 +133,10 @@ def _materialize_layer(layer: DependencyLayer, directory: Path) -> None:
 def _dry_run(layer: DependencyLayer, cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the Dockerfile's sync as a dry run, with its environment redirected away from /usr/local."""
     env = {**os.environ, **layer.env, "UV_PROJECT_ENVIRONMENT": str(cwd / "planned-env")}
+    # The dry run still downloads package metadata; on a slower connection
+    # with a cold cache it took over two minutes.
     return subprocess.run(
-        [*layer.sync, "--dry-run"], cwd=cwd, env=env, capture_output=True, text=True, timeout=120
+        [*layer.sync, "--dry-run"], cwd=cwd, env=env, capture_output=True, text=True, timeout=600
     )
 
 

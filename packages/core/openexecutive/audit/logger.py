@@ -101,9 +101,6 @@ EVENT_TYPES: tuple[str, ...] = (
     "delegation_chat_draft_edited", # the person changed a chat draft on its card, by hand or by asking (no text in the row)
     "delegation_reminder_set",      # remind_me stored a reminder for the person who asked (no text in the row)
     "delegation_reminder_sent",     # a reminder went to the person who set it, as its stored text
-    "delegation_mail_watch_set",    # watch_for_email set a watch on the person's own mailbox (no address in the row)
-    "delegation_mail_watch_found",  # the awaited email landed and the person was told (sender name + subject only)
-    "delegation_mail_watch_expired",  # nothing came before the watch ran out; the person was told
     "delegation_actions_proposed",  # propose_actions left a person a card of actions to approve (kinds only)
     "delegation_actions_approved",  # the person approved an action card; details.outcomes says what each did
     "delegation_actions_dismissed", # the person dismissed an action card
@@ -118,8 +115,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "delegation_invite_handled",    # Handle it for me accepted an invite on its own (no clash, a sender they know)
     "delegation_invite_dismissed",  # the person dismissed an invite card (nothing answered)
     "fact_retired",                 # the principal (or the teammate who recorded it) retired a standing fact from the Pulse page (memory/facts.py)
-    "fact_reviewed",                # the principal approved or declined a teammate's proposed standing fact
-    "fact_approval_changed",        # the principal turned "needs my approval" on or off for a teammate's standing facts
+    "fact_reviewed",                # the principal approved or declined a proposed standing fact (a decision copied in from mail)
     "fact_confirmation",            # an emailed standing-fact change held, confirmed, cancelled or refused (integrations/fact_confirmation.py)
     "content_flagged",  # the content check flagged something a chat turn read (orchestrator/outside_content.py), with which item it was
     "grounding",  # unattended prose held back / refused / rewritten for naming people or figures not in its inputs

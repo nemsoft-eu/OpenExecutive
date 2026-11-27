@@ -1,9 +1,9 @@
 """Standing facts from teammates (``memory.facts`` / ``orchestrator.fact_tools``).
 
 A rostered teammate on a verified surface can record a fact. It is attributed
-to them ("(per Sam Lee)"), it never replaces one the principal set (that is
-held as a proposal), and when the principal marked them "needs my approval"
-every fact of theirs waits for the principal on the Pulse page.
+to them ("(per Sam Lee)") and in force at once, as the principal's is: it
+replaces what it names, the principal's own included. A fact about the speaker
+alone (``about_me``) is kept private to them.
 """
 from __future__ import annotations
 
@@ -48,10 +48,6 @@ def roster(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNa
     )
     people_store.archive_person(ids.gone)
     people_registry.invalidate()
-    # Teammates' facts wait for approval by default; most tests here are
-    # about what happens once one applies, so Sam is trusted. Tests of the
-    # default use someone else.
-    facts.set_needs_approval(ids.sam, False)
     token = current_session.set(None)
     yield ids
     current_session.reset(token)
@@ -155,32 +151,28 @@ def test_forget_and_profile_edits_stay_the_principals(roster: SimpleNamespace) -
 # --------------------------------------------------------------------------- #
 
 
-def test_a_teammate_cannot_replace_the_principals_fact(roster: SimpleNamespace) -> None:
+def test_a_teammate_corrects_the_principals_fact(roster: SimpleNamespace) -> None:
     mine, _ = facts.record_fact(subject="Cedar Court unit count", statement="Cedar Court has 36 units.",
                                 source_quote="q", recorded_by_person_id=roster.owner)
     _speak(roster.sam)
     out = _remember()
-    assert out["status"] == "awaiting_approval" and "set themselves" in out["message"]
-    # The principal's fact still stands and renders; the proposal does not.
-    assert [f.id for f in facts.list_facts()] == [mine.id]
+    assert out["status"] == "ok" and [r["fact_id"] for r in out["replaced"]] == [mine.id]
+    assert facts.get_fact(mine.id).status == "superseded"  # type: ignore[union-attr]
     rendered = facts.render_facts_for_prompt()
-    assert "36 units" in rendered and "38 units" not in rendered
-    [proposal] = [f for f in facts.list_facts(include_inactive=True) if f.status == "proposed"]
-    assert proposal.replaces_fact_id == mine.id and proposal.previous_statement == "Cedar Court has 36 units."
+    assert "Cedar Court has 38 units. (corrects: Cedar Court has 36 units.) (per Sam Lee)" in rendered
 
 
-def test_naming_the_principals_fact_by_id_is_held_too(roster: SimpleNamespace) -> None:
+def test_naming_the_principals_fact_by_id_replaces_it(roster: SimpleNamespace) -> None:
     mine, _ = facts.record_fact(subject="Cedar Court", statement="Cedar Court has 36 units.", source_quote="q")
     _speak(roster.sam)
     out = _remember(subject="Cedar Court size", replaces_fact_id=mine.id)
-    assert out["status"] == "awaiting_approval"
-    assert facts.get_fact(mine.id).status == "active"  # type: ignore[union-attr]
+    assert out["status"] == "ok"
+    assert facts.get_fact(mine.id).status == "superseded"  # type: ignore[union-attr]
 
 
 def test_teammates_replace_each_others_facts(roster: SimpleNamespace) -> None:
     kim = people_store.upsert_person(full_name="Kim Park", email="kim@northwind.test")
     people_registry.invalidate()
-    facts.set_needs_approval(kim, False)
     _speak(kim)
     assert _remember(statement="Cedar Court has 38 units.")["status"] == "ok"
     _speak(roster.sam, said="Cedar Court is 38 units now, 2 of them are offices")
@@ -200,42 +192,147 @@ def test_the_principal_replaces_a_teammates_fact(roster: SimpleNamespace) -> Non
     assert facts.list_facts()[0].recorded_by_role == "principal"
 
 
-def test_needs_my_approval_holds_every_fact_of_that_teammate(roster: SimpleNamespace) -> None:
-    facts.set_needs_approval(roster.sam, True)
-    assert facts.approval_rules() == {roster.sam: True}
-    _speak(roster.sam)
+def test_a_new_teammates_fact_is_in_force_at_once(roster: SimpleNamespace) -> None:
+    kim = people_store.upsert_person(full_name="Kim Park", email="kim@northwind.test")
+    people_registry.invalidate()
+    _speak(kim)
     out = _remember()
-    assert out["status"] == "awaiting_approval" and "approves this teammate's" in out["message"]
-    assert facts.list_facts() == [] and facts.render_facts_for_prompt() == ""
-    facts.set_needs_approval(roster.sam, False)
-    assert _remember(subject="Maple House unit count", statement="Maple House has 48 units.",
-                     source_quote="Maple House is 48 units")["status"] == "ok"
+    assert out["status"] == "ok"
+    assert "Cedar Court has 38 units. (per Kim Park)" in facts.render_facts_for_prompt()
 
 
-def test_approving_a_proposal_replaces_what_it_named(roster: SimpleNamespace) -> None:
+def test_about_me_keeps_a_fact_for_the_speaker_alone(roster: SimpleNamespace) -> None:
+    said = "When you send an email from me please add a line at the bottom saying Head of Sales"
+    _speak(roster.sam, said=said)
+    out = _remember(subject="Sign-off on Sam's emails", about_me=True,
+                    statement="Emails sent from Sam's mailbox end with a line saying Head of Sales.",
+                    source_quote="please add a line at the bottom saying Head of Sales")
+    assert out["status"] == "ok" and out["private"] is True
+    [fact] = facts.list_facts(reader=roster.sam)
+    assert fact.private_to_person_id == roster.sam and not fact.decision
+    assert "Head of Sales" in facts.render_facts_for_prompt(reader=roster.sam)
+    assert facts.render_facts_for_prompt(reader=roster.owner) == ""
+    assert facts.render_facts_for_prompt() == ""
+    assert facts.render_teammate_changes(datetime.now(UTC) - timedelta(minutes=1)) == ""
+    # It rides on every email written as Sam, matching or not; never on anyone else's.
+    assert "Head of Sales" in facts.render_facts_for_draft("Lunch on Friday?", reader=roster.sam)
+    assert facts.render_facts_for_draft("Lunch on Friday?", reader=roster.owner) == ""
+    # The principal's own about-me fact is theirs alone too.
+    _speak(roster.owner, said="Sign my emails as Olivia from Northwind please")
+    out = _remember(subject="Sign-off", about_me=True, statement="Olivia signs her emails as Olivia from Northwind.",
+                    source_quote="Sign my emails as Olivia from Northwind")
+    assert out["status"] == "ok" and out["private"] is True
+    assert "Olivia from Northwind" not in facts.render_facts_for_prompt(reader=roster.sam)
+
+
+def test_an_edit_of_an_about_me_fact_stays_private(roster: SimpleNamespace) -> None:
+    """The principal's edit has no person id to match; the row still stays
+    with the person it was about."""
+    mine, _ = facts.record_fact(subject="Sign-off", statement="Olivia signs as Olivia.", source_quote="q",
+                                private_to_person_id=roster.owner)
+    edited, replaced = facts.record_fact(subject="Sign-off", statement="Olivia signs as O. Owner.",
+                                         source_quote="q", kind="correction", replaces_fact_id=mine.id,
+                                         recorded_by_role="principal")
+    assert edited.private_to_person_id == roster.owner and [f.id for f in replaced] == [mine.id]
+    assert facts.render_facts_for_prompt(reader=roster.sam) == ""
+    assert facts.render_facts_for_prompt() == ""
+
+
+def test_about_me_is_refused_when_the_speaker_cant_be_told(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _speak(roster.owner, said="Sign my emails as Olivia from Northwind please")
+    monkeypatch.setattr(fact_tools, "_speaker_id", lambda teammate: None)
+    out = _remember(subject="Sign-off", about_me=True, statement="Olivia signs as Olivia from Northwind.",
+                    source_quote="Sign my emails as Olivia from Northwind")
+    assert "error" in out
+    assert facts.list_facts() == []
+
+
+def test_newer_team_facts_never_crowd_out_an_about_me_fact(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    facts.record_fact(subject="Sign-off", statement="Sam signs as Sam, Head of Sales.", source_quote="q",
+                      private_to_person_id=roster.sam)
+    for n in range(3):
+        facts.record_fact(subject=f"Site {n}", statement=f"Site {n} has {n} units.", source_quote="q")
+    monkeypatch.setattr(facts, "RANK_POOL_FACTS", 2)
+    assert "Head of Sales" in facts.render_facts_for_draft("Lunch on Friday?", reader=roster.sam)
+
+
+def _waiting(conn: sqlite3.Connection, **row: Any) -> int:
+    cols = {"kind": "fact", "subject": "Cedar Court unit count", "subject_key": "cedar court unit count",
+            "statement": "Cedar Court has 38 units.", "created_at": datetime.now(UTC).isoformat(),
+            "status": "proposed", **row}
+    cur = conn.execute(
+        f"INSERT INTO facts ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",  # noqa: S608
+        tuple(cols.values()),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def test_proposals_still_waiting_are_put_in_force(roster: SimpleNamespace) -> None:
+    """Facts held under the old per-teammate approval switch go live on the
+    next open, replacing what they would have on approval; the switch table
+    goes."""
     mine, _ = facts.record_fact(subject="Cedar Court unit count", statement="Cedar Court has 36 units.",
                                 source_quote="q")
-    _speak(roster.sam)
-    proposal_id = _remember()["fact_id"]
-    approved = facts.approve_fact(proposal_id)
+    with sqlite3.connect(str(roster.db)) as conn:
+        old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        conn.execute("UPDATE facts SET created_at=? WHERE id=?", (old, mine.id))
+        held = _waiting(conn, recorded_by_role="teammate", recorded_by_name="Sam Lee",
+                        recorded_by_person_id=roster.sam, replaces_fact_id=mine.id)
+        # Older than a fact the team has kept since: it does not win.
+        stale = _waiting(conn, subject="Maple House", subject_key="maple house", created_at=old,
+                         recorded_by_role="teammate", recorded_by_person_id=roster.sam)
+        conn.execute("INSERT INTO facts (kind, subject, subject_key, statement, created_at, status) "
+                     "VALUES ('fact', 'Maple House', 'maple house', 'Maple House has 48 units.', ?, 'active')",
+                     (datetime.now(UTC).isoformat(),))
+        # Someone no longer on the team: dropped.
+        gone = _waiting(conn, subject="Oak Row", subject_key="oak row",
+                        recorded_by_role="teammate", recorded_by_person_id=roster.gone)
+        copied = _waiting(conn, subject="Hire", subject_key="decision 1", statement="We hire in Q1.",
+                          decision=1, source_channel="decisions:email")
+        conn.execute("CREATE TABLE fact_approval_rules (person_id INTEGER PRIMARY KEY, "
+                     "needs_approval INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)")
+    live = facts.get_fact(held)
+    assert live is not None and live.status == "active" and live.kind == "correction"
+    assert facts.get_fact(stale).status == "declined"  # type: ignore[union-attr]
+    assert facts.get_fact(gone).status == "declined"  # type: ignore[union-attr]
+    # Dated now, so the next brief lists it.
+    assert "Sam Lee recorded Cedar Court unit count" in facts.render_teammate_changes(
+        datetime.now(UTC) - timedelta(minutes=1))
+    assert live.approved_at is None and not live.principal_owned
+    assert facts.get_fact(mine.id).status == "superseded"  # type: ignore[union-attr]
+    # A decision copied in from mail still waits for the principal.
+    assert facts.get_fact(copied).status == "proposed"  # type: ignore[union-attr]
+    with sqlite3.connect(str(roster.db)) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='fact_approval_rules'"
+        ).fetchone() is None
+
+
+def test_approving_a_copied_decision_makes_it_the_principals(roster: SimpleNamespace) -> None:
+    with sqlite3.connect(str(roster.db)) as conn:
+        facts.ensure_ready(roster.db)
+        copied = _waiting(conn, subject="Hire", subject_key="decision 1", statement="We hire in Q1.",
+                          decision=1, source_channel="decisions:email")
+    approved = facts.approve_fact(copied)
     assert approved is not None
-    fact, superseded = approved
-    assert fact.status == "active" and fact.kind == "correction"
-    assert [f.id for f in superseded] == [mine.id]
-    assert "Cedar Court has 38 units. (corrects: Cedar Court has 36 units.) (per Sam Lee)" in (
-        facts.render_facts_for_prompt()
-    )
-    assert facts.approve_fact(proposal_id) is None  # only once
+    fact, _ = approved
+    assert fact.status == "active" and fact.approved_at and fact.principal_owned
+    assert facts.approve_fact(copied) is None  # only once
 
 
-def test_declining_a_proposal_drops_it(roster: SimpleNamespace) -> None:
-    facts.set_needs_approval(roster.sam, True)
-    _speak(roster.sam)
-    proposal_id = _remember()["fact_id"]
-    declined = facts.decline_fact(proposal_id, reason="not yet signed")
+def test_declining_a_copied_decision_drops_it(roster: SimpleNamespace) -> None:
+    with sqlite3.connect(str(roster.db)) as conn:
+        facts.ensure_ready(roster.db)
+        copied = _waiting(conn, subject="Hire", subject_key="decision 1", statement="We hire in Q1.",
+                          decision=1, source_channel="decisions:email")
+    declined = facts.decline_fact(copied, reason="never said that")
     assert declined is not None and declined.status == "declined"
-    assert facts.approve_fact(proposal_id) is None and facts.render_facts_for_prompt() == ""
-    assert facts.decline_fact(proposal_id) is None
+    assert facts.approve_fact(copied) is None and facts.render_facts_for_prompt() == ""
+    assert facts.decline_fact(copied) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -252,16 +349,12 @@ def test_the_brief_lists_teammate_changes_since_the_last_one(roster: SimpleNames
     facts.record_fact(subject="Mine", statement="The principal's own.", source_quote="q")
     _speak(roster.sam)
     _remember()
-    facts.set_needs_approval(roster.sam, True)
-    _remember(subject="Maple House unit count", statement="Maple House has 48 units.",
-              source_quote="Maple House is 48 units")
     block = facts.render_teammate_changes(since)
     lines = block.splitlines()
     assert lines[0].startswith("TEAMMATE CORRECTIONS SINCE LAST BRIEF")
-    assert len(lines) == 3
-    assert "Sam Lee proposed Maple House unit count: Maple House has 48 units." in lines[1]
-    assert "waiting for your approval" in lines[1]
-    assert "Sam Lee recorded Cedar Court unit count: Cedar Court has 38 units." in lines[2]
+    assert len(lines) == 2
+    assert "Sam Lee recorded Cedar Court unit count: Cedar Court has 38 units." in lines[1]
+    assert "in use now" in lines[1]
     assert "Old" not in block and "principal's own" not in block
     assert facts.render_teammate_changes(datetime.now(UTC) + timedelta(minutes=1)) == ""
 
@@ -286,7 +379,6 @@ def test_a_database_from_before_attribution_still_renders(tmp_path: Path) -> Non
     assert "Maple House has 48 units. — 2026-09-01" in facts.render_facts_for_prompt(db_path=old)
     assert facts.render_teammate_changes(datetime(2026, 1, 1, tzinfo=UTC), db_path=old) == ""
     # ...and the first write adds the columns; the old row stays the principal's.
-    facts.set_needs_approval(99, False, db_path=old)
     facts.record_fact(subject="Cedar Court", statement="Cedar Court has 38 units.", source_quote="q",
                       recorded_by_role="teammate", recorded_by_name="Sam Lee",
                       recorded_by_person_id=99, db_path=old)
@@ -304,22 +396,8 @@ def test_a_teammates_name_is_rendered_as_data(roster: SimpleNamespace) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Security review: an approved fact is the principal's; no forged markers
+# Security review: no forged markers
 # --------------------------------------------------------------------------- #
-
-
-def test_an_approved_fact_outranks_teammates_like_the_principals_own(roster: SimpleNamespace) -> None:
-    facts.record_fact(subject="Cedar Court unit count", statement="Cedar Court has 36 units.", source_quote="q")
-    _speak(roster.sam)
-    proposal_id = _remember()["fact_id"]
-    approved = facts.approve_fact(proposal_id)
-    assert approved is not None and approved[0].approved_at and approved[0].principal_owned
-    # Neither Sam nor another teammate can now replace it without approval.
-    _speak(roster.sam, said="Cedar Court is 50 units now, not 38")
-    out = _remember(statement="Cedar Court has 50 units.", source_quote="Cedar Court is 50 units now")
-    assert out["status"] == "awaiting_approval"
-    [active] = facts.list_facts()
-    assert active.id == proposal_id
 
 
 @pytest.mark.parametrize(
@@ -372,63 +450,10 @@ def test_an_ordinary_date_is_not_a_marker(roster: SimpleNamespace) -> None:
     assert _remember(statement="Cedar Court has 38 units; its lease ends 2031-03-31.")["status"] == "ok"
 
 
-def test_proposals_are_left_out_unless_asked_for(roster: SimpleNamespace) -> None:
-    since = datetime.now(UTC) - timedelta(minutes=1)
-    facts.set_needs_approval(roster.sam, True)
-    _speak(roster.sam)
-    _remember()
-    assert "proposed" in facts.render_teammate_changes(since)
-    assert facts.render_teammate_changes(since, include_proposed=False) == ""
-
-
-def test_the_approval_rule_is_read_in_the_write_itself(roster: SimpleNamespace) -> None:
-    """The store, not the tool, applies "needs my approval", inside the
-    write's transaction: turning it on just before a write still holds it."""
-    facts.set_needs_approval(roster.sam, True)
-    row, superseded = facts.record_fact(
-        subject="Oak Row", statement="Oak Row has 12 units.", source_quote="q",
-        recorded_by_role="teammate", recorded_by_name="Sam Lee", recorded_by_person_id=roster.sam,
-    )
-    assert row.status == "proposed" and superseded == []
-    # The principal's own writes are never held.
-    mine, _ = facts.record_fact(subject="Elm Yard", statement="Elm Yard has 9 units.", source_quote="q",
-                                recorded_by_person_id=roster.owner)
-    assert mine.status == "active"
-
-
-def test_a_teammates_facts_wait_for_approval_by_default(roster: SimpleNamespace) -> None:
-    kim = people_store.upsert_person(full_name="Kim Park", email="kim@northwind.test")
-    people_registry.invalidate()
-    assert facts.needs_approval(kim) is True and kim not in facts.approval_rules()
-    _speak(kim)
-    out = _remember()
-    assert out["status"] == "awaiting_approval" and "approves this teammate's" in out["message"]
-    assert facts.list_facts() == [] and facts.render_facts_for_prompt() == ""
-    # Trusted, theirs apply at once.
-    facts.set_needs_approval(kim, False)
-    assert _remember(subject="Maple House unit count", statement="Maple House has 48 units.",
-                     source_quote="Maple House is 48 units")["status"] == "ok"
-
-
-def test_a_teammate_write_naming_no_one_is_never_trusted(roster: SimpleNamespace) -> None:
+def test_a_teammate_write_naming_no_one_is_in_force(roster: SimpleNamespace) -> None:
     row, _ = facts.record_fact(subject="Oak Row", statement="Oak Row has 12 units.", source_quote="q",
                                recorded_by_role="teammate", recorded_by_name="Someone")
-    assert row.status == "proposed"
-
-
-def test_one_teammate_cannot_bury_the_principal_in_proposals(roster: SimpleNamespace) -> None:
-    facts.set_needs_approval(roster.sam, True)
-    for n in range(facts.MAX_PENDING_PROPOSALS_PER_PERSON):
-        facts.record_fact(subject=f"Held {n}", statement="x.", source_quote="q", proposed=True,
-                          recorded_by_role="teammate", recorded_by_person_id=roster.sam)
-    _speak(roster.sam)
-    out = _remember(subject="Cedar Court unit count")
-    assert "already waiting" in out["error"]
-    # Someone else's proposals still go through.
-    kim = people_store.upsert_person(full_name="Kim Park", email="kim@northwind.test")
-    people_registry.invalidate()
-    _speak(kim)
-    assert _remember()["status"] == "awaiting_approval"
+    assert row.status == "active"
 
 
 def test_retire_checks_ownership_in_the_write_itself(roster: SimpleNamespace) -> None:

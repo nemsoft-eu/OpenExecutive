@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -57,8 +58,25 @@ def _as(who: Caller) -> Any:
     return patch.object(mcp_server, "_who", return_value=who)
 
 
+class _Today:
+    """Stand-in for Home's snapshot: dumps, and has no cards."""
+
+    proposals: list[Any] = []
+    caller_person_id: int | None = None
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def model_dump(self, mode: str = "python") -> dict[str, Any]:
+        return self._payload
+
+
 class _Dumpable:
-    """Stand-in for a Pydantic model: only ``model_dump`` is exercised."""
+    """Stand-in for a Pydantic model: ``model_dump``, and the chat and
+    department a memory row is read by (none: the team's)."""
+
+    session_id = ""
+    department = ""
 
     def __init__(self, payload: dict[str, Any]) -> None:
         self._payload = payload
@@ -86,6 +104,8 @@ async def test_registered_tools() -> None:
         "search_knowledge",
         "list_workflows",
         "ask_executive",
+        "answer_card",
+        "run_workflow",
         "post_progress_update",
     }
 
@@ -96,7 +116,11 @@ async def test_registered_resources() -> None:
     assert {str(r.uri) for r in resources} == {
         "oe://company/profile",
         "oe://today/briefing",
-        "oe://today/activity",
+        "oe://today/done-for-you",
+        "oe://cards/needs-you",
+        "oe://tasks",
+        "oe://watches",
+        "oe://approvals",
         "oe://people/roster",
         "oe://departments/state",
         "oe://memory/decisions",
@@ -152,14 +176,63 @@ async def test_today_briefing_resource_serializes_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_today_activity_resource_serializes_model() -> None:
-    with patch(
-        "openexecutive.api.routes.today._build_activity",
-        return_value=_Dumpable({"items": []}),
-    ) as build:
-        out = await mcp_server.today_activity()
-    assert json.loads(out) == {"items": []}
-    build.assert_called_once_with(20)
+async def test_done_for_you_reads_homes_own_route() -> None:
+    request = object()
+    route = AsyncMock(return_value=[_Dumpable({"title": "Sent the recap"})])
+    with patch.object(mcp_server, "_http_request", return_value=request), patch(
+        "openexecutive.api.routes.today.get_today_done", new=route
+    ):
+        out = await mcp_server.done_for_you()
+    assert json.loads(out) == [{"title": "Sent the recap"}]
+    route.assert_awaited_once_with(request)
+
+
+@pytest.mark.asyncio
+async def test_tasks_and_approvals_read_the_web_apps_routes() -> None:
+    from fastapi import HTTPException
+
+    request = object()
+    tasks = Mock(return_value=_Dumpable({"tasks": [], "total": 0}))
+    with patch.object(mcp_server, "_http_request", return_value=request), patch(
+        "openexecutive.api.routes.people.list_tasks_route", new=tasks
+    ):
+        assert json.loads(await mcp_server.tasks()) == {"tasks": [], "total": 0}
+    tasks.assert_called_once_with(request, limit=200)
+    refused = Mock(side_effect=HTTPException(status_code=403, detail="Sign in to see what it may do."))
+    with patch.object(mcp_server, "_http_request", return_value=request), patch(
+        "openexecutive.api.routes.may_do.get_what_it_may_do", new=refused
+    ), pytest.raises(mcp_server.CallerRefused, match="Sign in"):
+        await mcp_server.approvals_summary()
+
+
+@pytest.mark.asyncio
+async def test_a_route_read_needs_a_request() -> None:
+    with pytest.raises(mcp_server.CallerRefused):
+        await mcp_server.done_for_you()
+
+
+@pytest.mark.asyncio
+async def test_needs_you_is_homes_cards_for_the_caller() -> None:
+    today = SimpleNamespace(proposals=[_Dumpable({"alert_id": 4, "headline": "Approve the PO"})])
+    with patch.object(mcp_server, "_today_for", AsyncMock(return_value=today)), patch.object(
+        mcp_server, "_require_person", AsyncMock(return_value=mcp_server.McpCaller(1, True))
+    ):
+        out = await mcp_server.needs_you()
+    assert json.loads(out) == [{"alert_id": 4, "headline": "Approve the PO"}]
+
+
+@pytest.mark.asyncio
+async def test_watches_list_the_watchlist_through_its_route() -> None:
+    # Through the route, so an email watch shows to its owner alone.
+    request = object()
+    route = Mock(return_value=[_Dumpable({"slug": "acme"})])
+    with patch.object(
+        mcp_server, "_require_person", AsyncMock(return_value=mcp_server.McpCaller(1, True))
+    ), patch.object(mcp_server, "_http_request", return_value=request), patch(
+        "openexecutive.api.routes.watchlist.list_watchlist", new=route
+    ):
+        assert json.loads(await mcp_server.watches()) == [{"slug": "acme"}]
+    route.assert_called_once_with(request)
 
 
 @pytest.mark.asyncio
@@ -346,8 +419,9 @@ def test_with_no_request_the_caller_is_who_a_request_naming_no_one_would_be(
 # ---------------------------------------------------------------------------
 # Who may read what.
 # ---------------------------------------------------------------------------
-_OWNER_ONLY = ["memory_decisions", "memory_initiatives", "memory_advice", "today_activity"]
-_ROSTER_ONLY = ["today_briefing", "people_roster"]
+_ROSTER_ONLY = [
+    "today_briefing", "needs_you", "people_roster", "memory_decisions", "memory_initiatives", "memory_advice",
+]
 
 
 def _read(name: str, who: Caller) -> str:
@@ -360,12 +434,8 @@ def _read(name: str, who: Caller) -> str:
             patch("openexecutive.memory.episodic.list_initiatives", return_value=[]),
             patch("openexecutive.memory.episodic.list_advice", return_value=[]),
             patch(
-                "openexecutive.api.routes.today._build_activity",
-                return_value=_Dumpable({"items": []}),
-            ),
-            patch(
                 "openexecutive.api.routes.today._build_today",
-                return_value=_Dumpable({"people": []}),
+                return_value=_Today({"people": []}),
             ),
             patch("openexecutive.departments.store.list_departments", return_value=[]),
         ):
@@ -374,33 +444,16 @@ def _read(name: str, who: Caller) -> str:
     return asyncio.run(_go())
 
 
-@pytest.mark.parametrize("name", _OWNER_ONLY)
+@pytest.mark.parametrize("name", _ROSTER_ONLY)
 @pytest.mark.parametrize(
     "who", [Caller("open"), Caller("operator"), Caller("user", OWNER), Caller("open", OWNER)]
 )
-def test_the_owner_reads_their_own_records(roster: dict[str, int], name: str, who: Caller) -> None:
+def test_the_owner_reads_their_records(roster: dict[str, int], name: str, who: Caller) -> None:
     json.loads(_read(name, who))
 
 
-@pytest.mark.parametrize("name", _OWNER_ONLY)
-@pytest.mark.parametrize(
-    "who",
-    [
-        Caller("user", TEAMMATE),
-        Caller("open", TEAMMATE),
-        Caller("user", "stranger@else.example"),
-        Caller("service"),
-    ],
-)
-def test_no_one_else_reads_the_owners_records(
-    roster: dict[str, int], name: str, who: Caller
-) -> None:
-    with pytest.raises(mcp_server.CallerRefused, match="Only the owner can read this."):
-        _read(name, who)
-
-
 @pytest.mark.parametrize("name", _ROSTER_ONLY)
-def test_a_teammate_reads_the_briefing_and_roster_but_a_service_does_not(
+def test_a_teammate_reads_them_but_a_service_does_not(
     roster: dict[str, int], name: str
 ) -> None:
     json.loads(_read(name, Caller("user", TEAMMATE)))
@@ -409,8 +462,55 @@ def test_a_teammate_reads_the_briefing_and_roster_but_a_service_does_not(
             _read(name, nobody)
 
 
+def test_a_service_reads_no_watches(roster: dict[str, int]) -> None:
+    rows = [_Dumpable({"slug": "acme"})]
+    with patch("openexecutive.api.routes.watchlist.list_watchlist", return_value=rows), patch.object(
+        mcp_server, "_http_request", return_value=object()
+    ):
+        assert json.loads(_read("watches", Caller("user", TEAMMATE))) == [{"slug": "acme"}]
+        for nobody in (Caller("service"), Caller("user", "stranger@else.example")):
+            with pytest.raises(mcp_server.CallerRefused):
+                _read("watches", nobody)
+
+
 def test_anyone_reads_the_departments(roster: dict[str, int]) -> None:
     assert json.loads(_read("departments_state", Caller("service"))) == []
+
+
+def test_departments_say_their_approvals_level_by_name(roster: dict[str, int]) -> None:
+    """The level each department's work runs at, named as the product names
+    it, with its lead by name and no ids or channel settings."""
+    from openexecutive.departments.models import (
+        AuthorityLevel,
+        DepartmentCharter,
+        DepartmentConfig,
+        DepartmentState,
+        Goal,
+    )
+
+    state = DepartmentState(
+        config=DepartmentConfig(
+            slug="marketing", title="Marketing", charter=DepartmentCharter(mission="Grow"),
+            authority_level=AuthorityLevel.AUTO_EXECUTE, head_person_id=roster["teammate"],
+            slack_channel_id="C123", cadences={"check_in": "weekly@mon@09:00"},
+        ),
+        goals=[Goal(period_value="Q4 2026", key_result="Sign-ups", target="100")],
+    )
+
+    async def _go() -> str:
+        with patch("openexecutive.departments.store.list_departments", return_value=[state]):
+            return await mcp_server.departments_state()
+
+    import asyncio
+
+    [dept] = json.loads(asyncio.run(_go()))
+    assert dept["approvals"] == "Hands-off"
+    assert dept["lead"] == "Ben Teammate"
+    assert dept["check_in"] == "weekly@mon@09:00"
+    assert dept["goals"] == [
+        {"goal": "Sign-ups", "target": "100", "current": "", "status": "on_track", "period": "Q4 2026"}
+    ]
+    assert "C123" not in json.dumps(dept) and "authority_level" not in dept
 
 
 def test_the_briefing_is_narrowed_as_get_today_narrows_it(roster: dict[str, int]) -> None:
@@ -444,12 +544,14 @@ async def test_tools_carry_titles_and_annotations() -> None:
         ann = tools[name].annotations
         assert tools[name].title
         assert ann is not None and ann.readOnlyHint is True and ann.openWorldHint is False
-    ask = tools["ask_executive"]
-    assert ask.title and ask.annotations is not None
-    assert ask.annotations.readOnlyHint is False
-    assert ask.annotations.destructiveHint is False
-    assert ask.annotations.idempotentHint is False
-    assert ask.annotations.openWorldHint is False
+    for name in ("ask_executive", "answer_card", "run_workflow"):
+        acts = tools[name]
+        assert acts.title and acts.annotations is not None
+        assert acts.annotations.readOnlyHint is False
+        assert acts.annotations.destructiveHint is True
+        assert acts.annotations.idempotentHint is False
+        # It can reach people outside, under the person's Approvals.
+        assert acts.annotations.openWorldHint is True
     post = tools["post_progress_update"]
     assert post.title and post.annotations is not None
     assert post.annotations.readOnlyHint is False
@@ -513,6 +615,34 @@ def test_an_mcp_call_with_no_http_request_names_no_one(monkeypatch: pytest.Monke
     context = SimpleNamespace(request_context=SimpleNamespace(request=None))
     with patch.object(mcp_server.mcp, "get_context", return_value=context):
         assert mcp_server._who() == Caller("service")
+
+
+def test_a_caller_who_is_no_one_sees_no_names_in_the_departments(roster: dict[str, int]) -> None:
+    """Who leads a department is the team's to know, as the People list is."""
+    import asyncio
+
+    from openexecutive.departments.models import (
+        DepartmentCharter,
+        DepartmentConfig,
+        DepartmentState,
+    )
+
+    state = DepartmentState(
+        config=DepartmentConfig(
+            slug="ops", title="Ops", charter=DepartmentCharter(mission="Run"),
+            head_person_id=roster["teammate"],
+        ),
+    )
+
+    async def _go() -> str:
+        with (
+            patch("openexecutive.departments.store.list_departments", return_value=[state]),
+            patch.object(mcp_server, "_who", return_value=Caller("service")),
+        ):
+            return await mcp_server.departments_state()
+
+    [dept] = json.loads(asyncio.run(_go()))
+    assert dept["lead"] is None and dept["people"] == []
 
 
 # ---------------------------------------------------------------------------

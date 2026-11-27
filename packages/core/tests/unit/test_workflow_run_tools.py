@@ -196,6 +196,21 @@ def test_run_workflow_happy_path(monkeypatch: pytest.MonkeyPatch, run_db: Path) 
     assert run["status"] == "done"
 
 
+def test_run_workflow_shows_each_step_in_the_chat_that_started_it(
+    monkeypatch: pytest.MonkeyPatch, run_db: Path
+) -> None:
+    from openexecutive import workflows as wf_pkg
+    from openexecutive.orchestrator import turn_live
+
+    monkeypatch.setattr(wf_pkg, "get_workflow", lambda name: _StubWorkflow())
+    shown: list[str] = []
+    monkeypatch.setattr(turn_live, "say", lambda line: shown.append(line) or True)
+
+    out = _call(handle_run_workflow, {"workflow": "stub", "inputs": {"topic": "x"}})
+    assert out["ok"] is True
+    assert shown == ["Work"]
+
+
 def test_run_workflow_awaiting_human(monkeypatch: pytest.MonkeyPatch, run_db: Path) -> None:
     from openexecutive import workflows as wf_pkg
     from openexecutive.workflows import persistence

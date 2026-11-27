@@ -64,3 +64,28 @@ async def test_a_notice_that_cant_go_is_tried_on_the_next_check(
 async def test_someone_not_in_people_is_told_nothing(tmp_path: Path, sent: list[tuple[Any, str]]) -> None:
     await sign_in_notice.note("stranger@x.example", "needs_reconnect", db_path=tmp_path / "e.db")
     assert sent == []
+
+
+async def test_the_break_is_readable_until_it_is_settled(tmp_path: Path, sent: list[tuple[Any, str]]) -> None:
+    db = tmp_path / "e.db"
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is None
+    await sign_in_notice.note(OWNER, "needs_reconnect", db_path=db)
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is not None
+    # A passing failure keeps it; disconnecting on purpose ends it.
+    await sign_in_notice.note(OWNER, "error", db_path=db)
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is not None
+    await sign_in_notice.note(OWNER, "not_configured", db_path=db)
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is None
+
+
+async def test_a_sign_in_that_opens_another_mailbox_is_a_break_too(
+    tmp_path: Path, sent: list[tuple[Any, str]],
+) -> None:
+    # The web and the phone show "mismatch" as Needs reconnecting, so Home
+    # and the one notice do too.
+    db = tmp_path / "e.db"
+    assert await sign_in_notice.note(OWNER, "mismatch", db_path=db)
+    assert len(sent) == 1
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is not None
+    await sign_in_notice.note(OWNER, "connected", db_path=db)
+    assert sign_in_notice.broken_since(OWNER, db_path=db) is None

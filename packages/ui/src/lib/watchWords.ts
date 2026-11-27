@@ -13,6 +13,7 @@ export const KIND_LABELS: Record<string, string> = {
   edgar: "SEC filings",
   page_watch: "Page change",
   query: "Web search",
+  mailbox: "Email",
 };
 
 /** The filing types the "Tells you when" editor offers, with what each is. */
@@ -79,6 +80,16 @@ function triggerBase(signalType: string, t: Record<string, unknown>): string {
       return `The page changes${keywords.length ? ` and mentions ${quoted}` : ""}`;
     case "query":
       return `A new result turns up${mention}`;
+    case "mailbox": {
+      // It reads the Executive's inbox, and theirs when it is connected.
+      const senders = strings(t.from);
+      if (senders.length) {
+        return `${joinOr(senders)} emails the Executive or you${keywords.length ? ` about ${quoted}` : ""}`;
+      }
+      return keywords.length
+        ? `An email that mentions ${quoted} reaches the Executive or you`
+        : "An email reaches the Executive or you";
+    }
     default:
       return "Something new turns up";
   }
@@ -113,6 +124,8 @@ export function raiseTheBar(watch: {
   trigger_json: Record<string, unknown> | null | undefined;
 }): RaiseTheBar | null {
   const trigger = watch.trigger_json ?? {};
+  // An email watch matches the person's own words; it has no "big" to raise to.
+  if (watch.signal_type === "mailbox") return null;
   if (watch.signal_type === "stock") {
     const now = pctOf(trigger);
     const next = Math.min(100, Math.max(Math.round(now * 2), Math.floor(now) + 1));

@@ -1,5 +1,5 @@
 // The Approvals level (Careful / Balanced / Hands-off) in a few words, for
-// the sidebar's quick picker. Settings → Your Executive keeps the full card
+// the sidebar's quick picker and every level picker (LevelPicker). Settings → Your Executive keeps the full card
 // with examples (components/settings/OutsideContentCard.tsx); both save the
 // same setting (/executive/outside-content, orchestrator/levels.py).
 
@@ -33,3 +33,25 @@ export function onApprovalsChanged<T>(fn: (saved: T) => void): () => void {
 export function approvalsTitle(level: string): string {
   return APPROVALS_LEVELS.find((l) => l.value === level)?.title ?? "Careful";
 }
+
+// The one source for the level names and their order, for every picker:
+// the company's level, a teammate's, a department's, onboarding's.
+export const LEVEL_ORDER: ApprovalsLevel[] = APPROVALS_LEVELS.map((l) => l.value);
+export const LEVEL_NAMES = Object.fromEntries(APPROVALS_LEVELS.map((l) => [l.value, l.title])) as Record<
+  ApprovalsLevel,
+  string
+>;
+
+// Whether `level` is no further than `limit` (Careful < Balanced < Hands-off).
+export function atMost(level: ApprovalsLevel, limit: ApprovalsLevel): boolean {
+  return LEVEL_ORDER.indexOf(level) <= LEVEL_ORDER.indexOf(limit);
+}
+
+// A department's stored authority_level ("How it acts") under the level
+// names, for onboarding's draft: escalate is Careful, propose_only (the
+// default) Balanced, auto_execute Hands-off.
+export const AUTHORITY_LEVELS: { value: "escalate" | "propose_only" | "auto_execute"; label: string }[] = [
+  { value: "escalate", label: LEVEL_NAMES.ask },
+  { value: "propose_only", label: LEVEL_NAMES.outsiders },
+  { value: "auto_execute", label: LEVEL_NAMES.trust },
+];

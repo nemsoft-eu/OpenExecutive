@@ -16,6 +16,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -23,6 +24,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from openexecutive.api import caller as api_caller
+from openexecutive.utils.public_errors import public_error
 from openexecutive.workflows import (
     get_workflow,
     list_workflows,
@@ -77,12 +79,13 @@ async def list_workflow_runs(
     """Recent runs across all workflows (or filtered by workflow name) that
     the caller may see (``persistence.run_visible_to``): the team's, and
     their own."""
+    from openexecutive.workflows.run_outcome import shown_title
+
     initialize_runs_db()
-    return {
-        "runs": list_runs(
-            workflow_name=workflow, limit=limit, visible_to=_caller_person_id(request)
-        )
-    }
+    runs = list_runs(workflow_name=workflow, limit=limit, visible_to=_caller_person_id(request))
+    for run in runs:
+        run["title"] = shown_title(str(run.get("title") or ""))
+    return {"runs": runs}
 
 
 def _caller_person_id(request: Request) -> int | None:
@@ -110,7 +113,12 @@ async def get_workflow_run(run_id: str, request: Request) -> dict[str, Any]:
     returning it would re-send the whole run body every few seconds to render
     a progress list that only needs the step ids.
     """
+    from openexecutive.workflows import workflow_label
+    from openexecutive.workflows.run_outcome import shown_title
+
     run = _visible_run(run_id, request)
+    run["title"] = shown_title(str(run.get("title") or ""))
+    run["workflow_title"] = workflow_label(str(run.get("workflow_name") or ""))
     run["resume_progress"] = _resume_progress(run.pop("resume_state_json", None))
     run["rerunnable"] = _rerunnable(run)
     return run
@@ -334,10 +342,64 @@ def _refuse_unless_creator(
         raise HTTPException(status_code=403, detail=refused)
 
 
+def _keeps_approvals(name: str, request: Request) -> bool:
+    """Whether the caller's edit keeps the workflow's approved targets
+    (``approved_targets.kept_on_edit_by``): theirs to approve, or not."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.workflows.approved_targets import kept_on_edit_by
+
+    try:
+        editor = _resolve_caller_person_id(request)
+    except Exception:
+        logger.exception("workflows: caller lookup failed, approvals not kept")
+        editor = None
+    return kept_on_edit_by(name, editor)
+
+
+def _delete_rule(request: Request) -> Callable[[int | None], bool]:
+    """The delete rule for this caller, with the caller looked up once: given
+    a workflow's creator, whether the caller may delete it. The person who
+    created it may, and so may the principal. One with no recorded creator is
+    the principal's to delete, and an install with no principal yet is never
+    locked out (``chat._caller_is_principal_or_unclaimed``). Workflows stay
+    shared for editing and running; one teammate doesn't remove another's.
+    Fails closed."""
+    from openexecutive.api.routes.chat import (
+        _caller_is_principal_or_unclaimed,
+        _resolve_caller_person_id,
+    )
+
+    if _caller_is_principal_or_unclaimed(request):
+        return lambda _owner: True
+    try:
+        caller = _resolve_caller_person_id(request)
+    except Exception:
+        logger.exception("workflows: caller lookup failed, delete refused")
+        caller = None
+    return lambda owner: caller is not None and owner is not None and caller == owner
+
+
+def _may_delete(name: str, request: Request) -> bool:
+    """Whether the caller may delete the custom workflow ``name``
+    (``_delete_rule``). Fails closed."""
+    rule = _delete_rule(request)
+    try:
+        return rule(get_owner(name))
+    except Exception:
+        logger.exception("workflows: creator lookup failed, delete refused")
+        return False
+
+
 @router.get("/workflows/custom")
-async def list_custom_workflows() -> dict[str, Any]:
-    """All dynamic definitions (active and inactive) for the builder UI."""
-    return {"definitions": [_with_owner(d) for d in list_definitions(active_only=False)]}
+async def list_custom_workflows(request: Request) -> dict[str, Any]:
+    """All dynamic definitions (active and inactive) for the builder UI, each
+    with ``can_delete`` for this caller (``_delete_rule``)."""
+    rule = _delete_rule(request)
+    definitions = []
+    for d in list_definitions(active_only=False):
+        row = _with_owner(d)
+        definitions.append({**row, "can_delete": rule(row["owner_person_id"])})
+    return {"definitions": definitions}
 
 
 @router.post("/workflows/custom", status_code=201)
@@ -393,15 +455,22 @@ async def update_custom_workflow(name: str, request: Request) -> dict[str, Any]:
     current = get_definition(name)
     if current is not None:
         _refuse_unless_creator(current, request, owner, stored=True)
-    stored = upsert_definition(defn)
+    stored = upsert_definition(defn, keep_approvals=_keeps_approvals(name, request))
     _sync_cadence(stored)
     return stored.model_dump()
 
 
 @router.delete("/workflows/custom/{name}")
-async def delete_custom_workflow(name: str) -> dict[str, str]:
+async def delete_custom_workflow(name: str, request: Request) -> dict[str, str]:
     from openexecutive.workflows.dynamic_cadence import cancel_cadence_rows
 
+    if get_definition(name) is None:
+        raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
+    if not _may_delete(name, request):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the person who created this workflow or the principal can delete it.",
+        )
     cancel_cadence_rows(name)
     if not delete_definition(name):
         raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
@@ -488,7 +557,7 @@ async def save_designer_edit(name: str, request: Request) -> dict[str, Any]:
         owner = get_owner(name)
         _refuse_unless_creator(defn, request, owner)
         _refuse_unless_creator(original, request, owner, stored=True)
-        stored = save_if_unchanged(defn, original)
+        stored = save_if_unchanged(defn, original, keep_approvals=_keeps_approvals(name, request))
         if stored is None:
             raise HTTPException(
                 status_code=409,
@@ -557,7 +626,13 @@ async def apply_chat_change(
         refused = save_refusal(checked, who, owner, check_tools=not stored)
         if refused is not None:
             raise HTTPException(status_code=403, detail=refused)
-    saved = save_if_unchanged(defn, current)
+    from openexecutive.workflows.approved_targets import kept_on_edit_by
+
+    # A creator who no longer approves its targets may still tap the card:
+    # the steps they change go back to the approver on the next run.
+    saved = save_if_unchanged(
+        defn, current, keep_approvals=kept_on_edit_by(name, _tapper_person_id(who)),
+    )
     if saved is None:
         raise HTTPException(
             status_code=409,
@@ -798,8 +873,8 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
             # ordinary as the client disconnecting while we yield the frame.
             # The run is safely parked; only the stream broke.
             if not paused:
-                fail_run(run_id=run_id, error=str(exc))
-            yield _sse({"type": "error", "run_id": run_id, "message": str(exc)})
+                fail_run(run_id=run_id, error=public_error(exc))
+            yield _sse({"type": "error", "run_id": run_id, "message": public_error(exc)})
         finally:
             logger.info(
                 "workflow.run_complete run_id=%s workflow=%s duration_s=%.2f",

@@ -19,9 +19,9 @@ produces can reach other people, so it is fenced in code, as chat is:
   history, its report (a scheduled one is delivered to them, never to
   someone else) and every audit row the read writes. A run started from chat
   marks the conversation as one that read their mail.
-- **The run is locked down.** As a chat turn that read the mail is for the
-  rest of the turn (``delegation.lockdown``), a workflow that reads is for
-  all of its steps: it may only list tools ``MAIL_TOUCHED_ALLOWED_TOOLS``
+- **The run is locked down below Hands-off.** As a chat turn that read the
+  mail is for the rest of the turn (``delegation.lockdown``), a workflow that
+  reads is for all of its steps unless Approvals is on Hands-off: it may only list tools ``MAIL_TOUCHED_ALLOWED_TOOLS``
   lets run after a read, email as them (``workflow_email.TOOLS``) and these
   reads; no gateway tool, web search, script or workflow run; no approval
   gate asking anyone but its creator. An email it sends goes without asking
@@ -57,6 +57,19 @@ TOOLS = frozenset(_CHAT_NAMES)
 _FALL_BACK = " Say in your report that it couldn't be read, and carry on without it."
 
 
+BROWSER_PREFIX = "oe__browser_"
+
+
+def uses_browser(defn: Any) -> bool:
+    """Whether a workflow definition has a step that uses its creator's own
+    browser (``browser.tools``). Like one that reads their mail, only its
+    creator may save it or start a run of it (``owns_runs``)."""
+    return any(
+        str(t).startswith(BROWSER_PREFIX)
+        for step in getattr(defn, "steps", []) for t in (getattr(step, "tools", None) or [])
+    )
+
+
 def reads(defn: Any) -> bool:
     """Whether a workflow definition has a step that reads its creator's mail."""
     return any(TOOLS & set(getattr(step, "tools", None) or []) for step in getattr(defn, "steps", []))
@@ -77,6 +90,17 @@ def _allowed_alongside(tool: str) -> bool:
     return entry is not None and entry[0] == USE and name in MAIL_TOUCHED_ALLOWED_TOOLS
 
 
+def hands_off() -> bool:
+    """Whether Approvals is on Hands-off. Never raises: unreadable is no."""
+    try:
+        from openexecutive.orchestrator import outside_mode
+
+        return outside_mode.get_mode() == outside_mode.TRUST
+    except Exception:
+        logger.warning("workflow reads: couldn't read Approvals — checking as usual", exc_info=True)
+        return False
+
+
 def definition_refusal(defn: Any, owner_id: int | None) -> str | None:
     """Why ``defn``, created by ``owner_id``, may not read its creator's mail
     as it stands, or None (also when it doesn't read). Plain code: fails closed."""
@@ -84,7 +108,10 @@ def definition_refusal(defn: Any, owner_id: int | None) -> str | None:
         return None
     if owner_id is None:
         return "A workflow that reads someone's email needs a creator on record."
-    outside = sorted({
+    # Below Hands-off, Approvals keeps the lockdown a chat turn gets after a
+    # mail read (delegation.lockdown) for every step; on Hands-off it lifts,
+    # as it does in chat.
+    outside = [] if hands_off() else sorted({
         t for step in getattr(defn, "steps", []) for t in (getattr(step, "tools", None) or [])
         if not _allowed_alongside(t)
     })
@@ -123,13 +150,13 @@ def run_rules(workflow_name: str) -> tuple[bool, str | None]:
 
 def owns_runs(workflow_name: str) -> int | None:
     """The person a run of ``workflow_name`` must belong to (its creator) when
-    it reads their mail, or None. Never raises: None on a lookup that fails,
+    it reads their mail or uses their browser, or None. Never raises: None on a lookup that fails,
     and the reads then refuse on the run."""
     from openexecutive.workflows.dynamic_store import get_definition, get_owner
 
     try:
         defn = get_definition(workflow_name)
-        return get_owner(workflow_name) if defn is not None and reads(defn) else None
+        return get_owner(workflow_name) if defn is not None and (reads(defn) or uses_browser(defn)) else None
     except Exception:
         logger.warning("workflow reads: couldn't read %r", workflow_name, exc_info=True)
         return None
@@ -144,7 +171,7 @@ def run_refusal(creator_id: int, runner_id: int | None, caller: Any) -> str | No
     from openexecutive.delegation.verified import caller_refusal
     from openexecutive.people.store import get_person
 
-    only_them = "This workflow reads its creator's email, so only they can run it."
+    only_them = "This workflow reads its creator's email or uses their browser, so only they can run it."
     if runner_id != creator_id:
         return only_them
     try:

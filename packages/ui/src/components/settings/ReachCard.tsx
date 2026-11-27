@@ -3,12 +3,9 @@
 import { useState, type ReactNode } from "react";
 
 import SettingsCard from "@/components/settings/SettingsCard";
-import { LearnedSection } from "@/components/settings/TrainingCard";
-import Switch from "@/components/Switch";
 import {
   getDelegation,
   setReach,
-  setTraining,
   type DelegationSettings,
   type OutsideContentMode,
   type ReachStep,
@@ -249,66 +246,6 @@ export function ReachCard({
         />
       )}
       {current === "inbox" && inbox && <div className="mt-4">{inbox}</div>}
-      {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
-    </SettingsCard>
-  );
-}
-
-// In training for As you (PUT /delegation/training {training}): while it is
-// on, nothing goes out as you on its own, on any Approvals level, until you
-// tick "Send to them on its own next time" on a card. Its own card at the top
-// of the As you tab's second column, the way As me shows its In training:
-// the switch, who goes on their own (with Remove) and Learn from my edits.
-// Shown once it writes as you at all, or while someone is still on its list.
-export function AsYouTrainingCard({
-  settings,
-  onSettings,
-}: {
-  settings: DelegationSettings;
-  onSettings: (next: DelegationSettings) => void;
-}) {
-  const { busy, error, save } = useReachSave(onSettings);
-  const training = settings.training;
-  if (!training) return null;
-  if (!settings.enabled && !training.learned.some((item) => item.setting === "training")) return null;
-  const on = Boolean(training.training);
-  return (
-    <SettingsCard
-      tone="accent"
-      title="In training"
-      titleId="as-you-training-label"
-      description={
-        on
-          ? "Everything it would send as you comes to you first as a card on Home, whatever Approvals says. Tick “on its own next time” when you send one and that person goes on their own from then on."
-          : "Off: Approvals alone decides what goes on its own as you."
-      }
-      action={
-        <Switch
-          checked={on}
-          disabled={busy}
-          labelledBy="as-you-training-label"
-          onChange={(next) => void save(() => setTraining({ training: next }))}
-        />
-      }
-    >
-      <div className="space-y-5">
-        <LearnedSection
-          training={training}
-          onSettings={onSettings}
-          setting="training"
-          title="Goes on its own"
-          empty="Nobody yet. Tick “on its own next time” when you send one."
-        />
-        <div className="border-t border-line pt-5">
-          <Check
-            checked={Boolean(training.drafts)}
-            disabled={busy}
-            onChange={(learn) => void save(() => setTraining({ drafts: learn }))}
-            label="Learn from my edits"
-            help="Change a draft, tick Do it like this next time, and it learns how you write to that person."
-          />
-        </div>
-      </div>
       {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
     </SettingsCard>
   );

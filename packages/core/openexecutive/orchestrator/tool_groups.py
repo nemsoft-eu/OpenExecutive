@@ -61,13 +61,15 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "watch_and_alerts": (
-        "keep an eye on topics, people or competitors (the watch list), alerts, executive research runs",
+        "keep an eye on topics, people or competitors (the watch list), alerts, executive research runs, "
+        "what you did on your own lately (your activity)",
         (
             "ack_alert",
             "add_watchlist_entry",
             "answer_card",
             "create_alert",
             "find_alerts",
+            "list_my_activity",
             "list_watchlist",
             "remove_watchlist_entry",
             "run_executive_research",
@@ -75,13 +77,15 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "workflows": (
-        "draft, save, list, suggest or run workflows",
+        "draft, save, list, suggest or run workflows; anything the person wants done again "
+        "and again on a schedule (a recap every Friday, a check each morning)",
         ("draft_workflow", "list_workflows", "run_workflow", "save_workflow", "suggest_workflow"),
     ),
     "files": (
         "work on any file (an email attachment, a Drive file, one sent in chat): split, merge or "
-        "convert PDFs and spreadsheets, analysis, charts, documents (Python jobs); save a file "
-        "into a Drive or OneDrive folder",
+        "convert PDFs and spreadsheets, analysis, documents (Python jobs); any chart, graph or plot "
+        "the person asks for, drawn as an image to show in the answer (never as text bars); save a "
+        "file into a Drive or OneDrive folder",
         ("run_python_job", "save_file"),
     ),
     "documents": (

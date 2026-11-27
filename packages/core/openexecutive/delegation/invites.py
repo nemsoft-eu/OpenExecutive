@@ -53,11 +53,12 @@ import asyncio
 import json
 import logging
 import sqlite3
-import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
 from email.utils import parseaddr
 from typing import Any
+
+from openexecutive.memory import workspace_settings
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,6 @@ DECLINED = "declined"
 # Who an invite is accepted from with no tap and no allowance: their team and
 # contacts, never a sender known only from their Sent mail.
 ON_ITS_OWN_RELATIONS = frozenset({"team", "contact"})
-RENEW_AFTER = frozenset({"rejected", "auto_no_response"})
 _FILED = frozenset({"SPAM", "TRASH"})
 _NO_REPLY_SENDERS = ("noreply", "no-reply", "do-not-reply", "donotreply", "mailer-daemon", "postmaster")
 
@@ -139,19 +139,10 @@ def _moment(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _tz() -> tzinfo:
-    try:
-        from openexecutive.memory.workspace_settings import get_user_timezone
-
-        return get_user_timezone()
-    except Exception:
-        return UTC
-
-
 def when_text(start: str, end: str, all_day: bool, tz: tzinfo | None = None) -> str:
     """When the meeting is, as the person reads it: "Wed 21 Oct, 14:30–15:00",
     or "Wed 21 Oct, all day"."""
-    zone = tz or _tz()
+    zone = tz or workspace_settings.get_user_timezone()
     if all_day:
         try:
             day = datetime.fromisoformat(start[:10])
@@ -269,10 +260,10 @@ def create_once(
     confidence: float | None = None,
 ) -> int | None:
     """Create a card under idempotency ``key``: the open one already under it,
-    if any, else a new one. When a settled card holds the key, a new one is
-    made (under the key with a fresh suffix) only if that card was dismissed
-    or left to lapse: one that was sent, answered or settled in the mailbox
-    means the message is done, and the answer is None. One scan per person
+    if any, else a new one. A card that was dismissed, left to lapse or
+    failed gave the key up (``create_decision_instance``), so a new one is
+    made; one that was sent, answered or settled in the mailbox keeps it,
+    meaning the message is done, and the answer is None. One scan per person
     at a time, so two new cards never race for one message."""
     from openexecutive.memory.decision_ledger import create_decision_instance, get_live_by_idem
 
@@ -287,24 +278,7 @@ def create_once(
         return make(key)
     except sqlite3.IntegrityError:
         existing = get_live_by_idem(key)
-        if existing is not None:
-            return existing.id
-    if _last_status(key) not in RENEW_AFTER:
-        return None
-    return make(f"{key}:{uuid.uuid4().hex[:12]}")
-
-
-def _last_status(key: str) -> str | None:
-    """The status of the newest card under ``key`` (or its suffixed ones)."""
-    from openexecutive.memory.decision_ledger import _db_path, _get_conn
-
-    with _get_conn(_db_path()) as conn:
-        row = conn.execute(
-            "SELECT status FROM decision_instances WHERE idempotency_key = ? "
-            "OR substr(idempotency_key, 1, ?) = ? ORDER BY id DESC LIMIT 1",
-            (key, len(key) + 1, f"{key}:"),
-        ).fetchone()
-    return str(row[0]) if row is not None else None
+        return existing.id if existing is not None else None
 
 
 def cards(person: Any, *, now: datetime | None = None) -> list[InviteCard]:
@@ -385,7 +359,7 @@ async def clashes(mailbox: Any, event: Any, *, tz: tzinfo | None = None) -> list
     start, end = _moment(event.start), _moment(event.end)
     if start is None or end is None or end <= start:
         return []
-    zone = tz or _tz()
+    zone = tz or workspace_settings.get_user_timezone()
     try:
         found = await asyncio.wait_for(calendar.events_for(mailbox, start, end), timeout=_CALENDAR_TIMEOUT_S)
     except Exception as exc:
@@ -520,7 +494,7 @@ async def consider(
         if start is None or start <= now:
             skip("invite_past")
             return
-        tz = _tz()
+        tz = workspace_settings.get_user_timezone()
         clash = await clashes(client, event, tz=tz)
         try:
             granted = await client.calendar_write_granted()
@@ -846,7 +820,7 @@ def handled(person_id: int, *, since: str, limit: int = 50) -> list[Any]:
     from openexecutive.memory.decision_ledger import STATUS_EXECUTED, list_instances
 
     out: list[Any] = []
-    tz = _tz()
+    tz = workspace_settings.get_user_timezone()
     for card in list_instances(
         DECISION_CLASS, status=STATUS_EXECUTED, approver_person_id=person_id, resolved_since=since, limit=limit,
     ):

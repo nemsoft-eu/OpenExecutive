@@ -733,13 +733,14 @@ def post_message_feedback(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# (session_id, last assistant message id) -> (monotonic ts, suggestion).
+# (session_id, last assistant message id, reader in a shared chat) ->
+# (monotonic ts, suggestion).
 # Keyed on the reply being followed up on, so reopening a session or
 # remounting the composer does not re-bill the fast model; a new reply is a
 # new key. Single-process, like `_suggested_prompts_cache`.
 _FOLLOWUP_TTL_S = 3600
 _FOLLOWUP_CACHE_MAX = 512
-_followup_cache: dict[tuple[str, int], tuple[float, str]] = {}
+_followup_cache: dict[tuple[str, int, int | None, tuple[int, ...]], tuple[float, str]] = {}
 
 
 @router.get("/sessions/{session_id:session}/followup")
@@ -751,20 +752,27 @@ async def get_followup_suggestion(session_id: str, request: Request) -> dict[str
     composer then falls back to its static placeholder. Only someone in the
     chat may ask: the suggestion paraphrases the conversation.
     """
-    _require_chat_access(request, session_id)
+    caller, _ = _require_chat_access(request, session_id)
 
-    messages = load_messages(session_id)
+    # In a shared chat the suggestion is the reader's own next message, so
+    # it knows who is in it and who is asking (and is kept per reader).
+    people = chat_people(session_id)
+    names = {pid: name for pid, name, _ in people}
+    owner_id = next((pid for pid, _, is_owner in people if is_owner), None)
+    messages = load_messages(session_id, with_senders=bool(names))
     last = messages[-1] if messages else None
     if last is None or last.get("role") != "assistant" or not last.get("id"):
         return {"suggestion": None}
 
-    key = (session_id, int(last["id"]))
+    # Who is in the chat is part of the key: sharing or removing someone
+    # changes who the suggestion may name, with no new reply.
+    key = (session_id, int(last["id"]), caller if names else None, tuple(sorted(names)))
     now = time.monotonic()
     hit = _followup_cache.get(key)
     if hit is not None and (now - hit[0]) < _FOLLOWUP_TTL_S:
         return {"suggestion": hit[1]}
 
-    transcript = chat_route._build_followup_transcript(messages)
+    transcript = chat_route._build_followup_transcript(messages, names, caller, owner_id)
     suggestion = await chat_route._generate_followup_via_llm(transcript)
     if suggestion is not None:
         # Failures are not cached: a transient blip should not pin the

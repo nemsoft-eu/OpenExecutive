@@ -124,17 +124,10 @@ def test_a_failed_audit_row_is_logged_not_swallowed(monkeypatch: pytest.MonkeyPa
 
 
 # --------------------------------------------------------------------------- #
-# Teammates' facts: attribution, their own retires, proposals, the switch
+# Teammates' facts: attribution, their own retires, waiting decisions
 # --------------------------------------------------------------------------- #
 
 SAM, KIM = 7, 8
-
-
-@pytest.fixture(autouse=True)
-def _trusted_teammates(db: list[dict[str, Any]]) -> None:
-    # Approval is on by default; these tests store active teammate facts.
-    for person in (SAM, KIM):
-        facts.set_needs_approval(person, False)
 
 
 def _as_teammate(monkeypatch: pytest.MonkeyPatch, person_id: int) -> TestClient:
@@ -142,27 +135,34 @@ def _as_teammate(monkeypatch: pytest.MonkeyPatch, person_id: int) -> TestClient:
     return _client(monkeypatch, principal=False)
 
 
-def _teammate_fact(person_id: int, name: str, *, subject: str = "Cedar Court",
-                   proposed: bool = False) -> int:
+def _teammate_fact(person_id: int, name: str, *, subject: str = "Cedar Court") -> int:
     row, _ = facts.record_fact(
         subject=subject, statement=f"{subject} per {name}.", source_quote=f"{name} said it",
         recorded_by_person_id=person_id, recorded_by_role="teammate", recorded_by_name=name,
-        session_id=f"s-{name}", proposed=proposed,
+        session_id=f"s-{name}",
     )
     return row.id
 
 
-def test_a_teammate_sees_attribution_their_own_proposals_and_what_they_may_retire(
+def _copied_decision(subject: str) -> int:
+    """A decision copied in from mail, which waits for the principal's OK."""
+    row, _ = facts.record_fact(subject=subject, statement=f"{subject} decided.", source_quote="q",
+                               decision=True, source_channel="decisions:email")
+    with facts._conn() as conn:
+        conn.execute("UPDATE facts SET status='proposed' WHERE id=?", (row.id,))
+    return row.id
+
+
+def test_a_teammate_sees_attribution_and_what_they_may_retire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, principals, _ = _seed()
     sams = _teammate_fact(SAM, "Sam Lee")
     kims = _teammate_fact(KIM, "Kim Park", subject="Maple House")
-    sams_proposal = _teammate_fact(SAM, "Sam Lee", subject="Oak Row", proposed=True)
-    kims_proposal = _teammate_fact(KIM, "Kim Park", subject="Elm Yard", proposed=True)
+    waiting = _copied_decision("Elm Yard")
     body = _as_teammate(monkeypatch, SAM).get("/memories/facts").json()
     by_id = {f["id"]: f for f in body["facts"]}
-    assert sams_proposal in by_id and kims_proposal not in by_id
+    assert waiting not in by_id
     assert by_id[kims]["recorded_by_name"] == "Kim Park" and by_id[kims]["recorded_by_role"] == "teammate"
     # Their own quote is theirs to see; nobody's ids or anyone else's quote.
     assert by_id[sams]["source_quote"] == "Sam Lee said it" and by_id[kims]["source_quote"] == ""
@@ -183,18 +183,24 @@ def test_a_teammate_retires_only_their_own(monkeypatch: pytest.MonkeyPatch, db: 
     assert row["private"] is True and row["details"]["by"] == "teammate"
 
 
-def test_the_principal_approves_and_declines_proposals(
+def test_a_teammates_fact_replaces_the_principals_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    mine, _ = facts.record_fact(subject="Cedar Court", statement="Cedar Court has 36 units.", source_quote="q")
+    sams = _teammate_fact(SAM, "Sam Lee")
+    assert facts.get_fact(sams).status == "active"  # type: ignore[union-attr]
+    assert facts.get_fact(mine.id).status == "superseded"  # type: ignore[union-attr]
+    assert _as_teammate(monkeypatch, SAM).get("/memories/facts").json()["retirable_ids"] == [sams]
+
+
+def test_the_principal_approves_and_declines_copied_decisions(
     monkeypatch: pytest.MonkeyPatch, db: list[dict[str, Any]],
 ) -> None:
-    mine, _ = facts.record_fact(subject="Cedar Court", statement="Cedar Court has 36 units.", source_quote="q")
-    first = _teammate_fact(SAM, "Sam Lee", proposed=True)
-    second = _teammate_fact(SAM, "Sam Lee", subject="Oak Row", proposed=True)
+    first = _copied_decision("Cedar Court")
+    second = _copied_decision("Oak Row")
     assert _as_teammate(monkeypatch, SAM).post(f"/memories/facts/{first}/approve").status_code == 403
     client = _client(monkeypatch, principal=True)
     assert client.get("/memories/facts").json()["can_review"] is True
     approved = client.post(f"/memories/facts/{first}/approve")
     assert approved.status_code == 200 and approved.json()["status"] == "active"
-    assert facts.get_fact(mine.id).status == "superseded"  # type: ignore[union-attr]
     assert client.post(f"/memories/facts/{first}/approve").status_code == 409
     declined = client.post(f"/memories/facts/{second}/decline", json={"reason": "not signed yet"})
     assert declined.json()["status"] == "declined"
@@ -203,42 +209,12 @@ def test_the_principal_approves_and_declines_proposals(
     assert all(r["private"] is True for r in reviews)
 
 
-def test_the_principal_sets_who_needs_approval(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db: list[dict[str, Any]],
-) -> None:
-    from openexecutive.people import registry as people_registry
-    from openexecutive.people import store as people_store
-
-    monkeypatch.setattr(people_store, "DB_PATH", tmp_path / "facts.db")
-    people_store.initialize_db()
-    people_registry.invalidate()
-    people_store.upsert_person(full_name="Olivia Owner", is_principal=True, email="o@n.test")
-    sam = people_store.upsert_person(full_name="Sam Lee", email="sam@n.test")
-    carl = people_store.upsert_person(full_name="Carl Contact", email="c@else.test", kind="contact")
-    people_registry.invalidate()
-    assert _as_teammate(monkeypatch, sam).get("/memories/facts/approval").status_code == 403
-    assert _as_teammate(monkeypatch, sam).put(
-        f"/memories/facts/approval/{sam}", json={"needs_approval": False},
-    ).status_code == 403
-    client = _client(monkeypatch, principal=True)
-    # On by default: a teammate's facts wait for the principal until trusted.
-    assert client.get("/memories/facts/approval").json() == [
-        {"person_id": sam, "full_name": "Sam Lee", "needs_approval": True},
-    ]
-    assert facts.needs_approval(sam) is True
-    res = client.put(f"/memories/facts/approval/{sam}", json={"needs_approval": False})
-    assert res.json()["needs_approval"] is False and facts.needs_approval(sam) is False
-    assert client.put(f"/memories/facts/approval/{carl}", json={"needs_approval": False}).status_code == 404
-    [row] = [r for r in db if r["event_type"] == "fact_approval_changed"]
-    assert row["details"] == {"person_id": sam, "needs_approval": False} and row["private"] is True
-    people_registry.invalidate()
-
-
 def test_an_approved_fact_is_the_principals_to_retire(
     monkeypatch: pytest.MonkeyPatch, db: list[dict[str, Any]],
 ) -> None:
-    sams = _teammate_fact(SAM, "Sam Lee", proposed=True)
-    facts.approve_fact(sams)
+    sams = _teammate_fact(SAM, "Sam Lee")
+    with facts._conn() as conn:
+        conn.execute("UPDATE facts SET approved_at='2026-09-29' WHERE id=?", (sams,))
     client = _as_teammate(monkeypatch, SAM)
     assert client.get("/memories/facts").json()["retirable_ids"] == []
     assert client.post(f"/memories/facts/{sams}/retire").status_code == 403
@@ -256,15 +232,6 @@ def test_history_does_not_crowd_out_a_teammates_active_facts(monkeypatch: pytest
     ids = [f["id"] for f in body["facts"]]
     assert len(ids) == 2 and all(facts.get_fact(i).status == "active" for i in ids)  # type: ignore[union-attr]
     assert live in ids
-
-
-def test_others_proposals_cannot_crowd_out_a_teammates_view(monkeypatch: pytest.MonkeyPatch) -> None:
-    live = _teammate_fact(SAM, "Sam Lee", subject="Oak Row")
-    for n in range(5):
-        _teammate_fact(KIM, "Kim Park", subject=f"Kim {n}", proposed=True)
-    mine = _teammate_fact(SAM, "Sam Lee", subject="Elm Yard", proposed=True)
-    body = _as_teammate(monkeypatch, SAM).get("/memories/facts?limit=2").json()
-    assert {f["id"] for f in body["facts"]} == {live, mine}
 
 
 # --------------------------------------------------------------------------- #

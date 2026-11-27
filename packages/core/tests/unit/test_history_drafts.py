@@ -59,6 +59,9 @@ def test_a_correction_is_used_and_the_switch_off_reads_nothing() -> None:
     h.correct_note(1, nid, "the pilot starts Oct 19")
     out = notes_for_draft(1, ["dana@acme.example"])
     assert out is not None and "Oct 19" in out and "Oct 12" not in out
+    # Typed over the shown "You told …", it reaches the writer as a note.
+    h.correct_note(1, nid, "You said Dana the pilot starts Oct 26")
+    assert '"Said Dana the pilot starts Oct 26"' in (notes_for_draft(1, ["dana@acme.example"]) or "")
     h.set_person_settings(1, by="t", reply_notes=False)
     assert notes_for_draft(1, ["dana@acme.example"]) is None
     assert notes_for_draft(None, ["dana@acme.example"]) is None

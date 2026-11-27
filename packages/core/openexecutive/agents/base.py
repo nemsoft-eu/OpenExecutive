@@ -9,9 +9,19 @@ from openexecutive.agents.tool_outcome import unwrap_tool_outcome
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.providers import get_provider, model_supports_deep_reasoning
+from openexecutive.providers.feature_gate import SPECIALIST_MAX_TOKENS
 from openexecutive.providers.translator import reasoning_replay_block
 
 _SPECIALIST_TIMEOUT = 180.0
+# The slowest a specialist's answer is taken to be written, in tokens a
+# second: a request's timeout leaves room to write all it may (max_tokens),
+# so a long analysis is never lost to the clock halfway through.
+_WRITE_TOKENS_PER_SECOND = 40
+
+
+def specialist_timeout(max_tokens: int) -> float:
+    """Seconds a specialist request may take to write ``max_tokens``."""
+    return max(_SPECIALIST_TIMEOUT, max_tokens / _WRITE_TOKENS_PER_SECOND)
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +200,12 @@ class BaseAgent(ABC):
 
         create_kwargs: dict = {
             "model": model,
-            "max_tokens": 4096,
+            # What a specialist's analysis may write (feature_gate).
+            "max_tokens": SPECIALIST_MAX_TOKENS,
             # Per-request timeout — keeps cancellation semantics aligned with
             # the previous per-client timeout, but the provider singleton no
             # longer needs to recreate the SDK client to set it.
-            "timeout": _SPECIALIST_TIMEOUT,
+            "timeout": specialist_timeout(SPECIALIST_MAX_TOKENS),
             "system": [
                 {
                     "type": "text",
@@ -213,7 +224,6 @@ class BaseAgent(ABC):
             # Tune via SPECIALIST_EFFORT (low / medium / high / xhigh / max).
             create_kwargs["thinking"] = {"type": "adaptive"}
             create_kwargs["output_config"] = {"effort": settings.specialist_effort}
-            create_kwargs["max_tokens"] = 16000
 
         # Resolve provider per-call by model so a Council UI override that
         # flips this agent to a non-Anthropic slug routes correctly. Today
@@ -244,8 +254,8 @@ class BaseAgent(ABC):
         *,
         tools: list[dict[str, Any]],
         system_addendum: str = "",
-        max_tokens: int = 4096,
-        timeout_seconds: float = _SPECIALIST_TIMEOUT,
+        max_tokens: int = SPECIALIST_MAX_TOKENS,
+        timeout_seconds: float | None = None,
         model_override: str | None = None,
         deep_reasoning_override: bool | None = None,
         actor: str = "specialist_tools",
@@ -310,7 +320,9 @@ class BaseAgent(ABC):
         create_kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
-            "timeout": timeout_seconds,
+            # Room to write all of max_tokens unless the caller set its own
+            # (set again below if thinking raises max_tokens).
+            "timeout": timeout_seconds if timeout_seconds is not None else specialist_timeout(max_tokens),
             "system": [
                 {
                     "type": "text",
@@ -326,6 +338,8 @@ class BaseAgent(ABC):
             create_kwargs["thinking"] = {"type": "adaptive"}
             create_kwargs["output_config"] = {"effort": settings.specialist_effort}
             create_kwargs["max_tokens"] = max(max_tokens, 16000)
+        if timeout_seconds is None:
+            create_kwargs["timeout"] = specialist_timeout(create_kwargs["max_tokens"])
 
         provider = get_provider(model)
         if not client_tool_handlers:

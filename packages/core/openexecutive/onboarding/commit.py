@@ -337,6 +337,23 @@ def owner_email_blocked(email: str | None, caller_person_id: int | None, caller_
     return email != caller_email
 
 
+def links_own_owner_email(
+    email: str | None, caller_person_id: int | None, caller_email: str
+) -> bool:
+    """Whether this save is someone on no People entry putting the address
+    they signed in with on the owner's entry, which has none yet: how an
+    owner who set up with local login links theirs, and it makes them the
+    owner (docs/auth.md). So it isn't People administration they lack.
+    Lookup errors propagate (the route answers 503).
+    """
+    from openexecutive.people.store import find_principal_person
+
+    if caller_person_id is not None or not email or email != caller_email:
+        return False
+    current = find_principal_person()
+    return current is not None and not (current.email or "").strip()
+
+
 def link_owner_email(person_id: int, email: str) -> bool:
     """Fill in the principal's sign-in email.
 

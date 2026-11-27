@@ -21,8 +21,6 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -36,6 +34,7 @@ from openexecutive.people.models import (
     PersonKind,
     PreferredChannel,
 )
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +50,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path, foreign_keys=True)
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:

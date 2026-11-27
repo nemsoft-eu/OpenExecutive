@@ -47,3 +47,16 @@ test("raiseTheBar asks for big changes only otherwise, through the trigger", () 
   assert.equal(r?.done, "You'll only hear about big changes from this.");
   assert.equal(raiseTheBar({ signal_type: "query", trigger_json: { only_big: true } }), null);
 });
+
+test("an email watch says who it is from and what its subject mentions, and has no bar to raise", () => {
+  assert.equal(triggerInWords("mailbox", { from: ["pat@example.com"] }), "pat@example.com emails the Executive or you");
+  assert.equal(
+    triggerInWords("mailbox", { from: ["pat@example.com", "sam@example.com"], keywords: ["contract"] }),
+    "pat@example.com or sam@example.com emails the Executive or you about “contract”",
+  );
+  assert.equal(
+    triggerInWords("mailbox", { keywords: ["sign up"] }),
+    "An email that mentions “sign up” reaches the Executive or you",
+  );
+  assert.equal(raiseTheBar({ signal_type: "mailbox", trigger_json: { keywords: ["sign up"] } }), null);
+});

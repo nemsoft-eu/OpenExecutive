@@ -1,18 +1,20 @@
 """A change to a saved workflow that waits for its person's tap.
 
-Chat can't change a workflow a person already approved the tools of (one
-switched on with action steps), nor one that reads or sends email as its
-creator, by saving over it: the save would put tools nobody looked at under a
-familiar name. So ``save_workflow`` stages such a change as a card instead
-(decision class ``app_action``, hidden action ``change_workflow``) that spells
-out every step it adds, removes or changes, tools included. Tapping Approve is
-the person seeing the change, as turning it on from its review card is: the
-change is saved and the workflow keeps its on/off state.
+A person's own ask in chat is their yes, for a change as for a new workflow
+(``workflow_authoring_tools._person_asked``): on any surface that verified it
+is them (``orchestrator.speaker``) the change is saved in the turn, and each
+step still goes through the three checks when it runs. A change waits on a
+card only when nobody on the team asked for it this turn (say, it came from
+mail it read), below Hands-off, for a switched-on workflow with action steps;
+and, at every level, when the workflow reads or sends email as its creator
+or uses their browser and its creator didn't ask for the change themselves.
 
-The card goes where the chat is: under the reply in the web chat, and with
-Approve and Skip buttons in a chat app that proves who taps
-(``integrations.channel_cards``). A chat that can show neither gets no card:
-the person is asked to ask again where one shows. On the tap:
+The card (decision class ``app_action``, hidden action ``change_workflow``)
+spells out every step it adds, removes or changes, tools included. It goes
+where every app card goes (``app_control.leave_card``): under the reply in a
+chat that shows cards, else on the person's Needs you. Tapping Approve is the
+person seeing the change, as turning it on from its review card is: the
+change is saved and the workflow keeps its on/off state. On the tap:
 
 - the workflow must still be the version the card was made from, else
   nothing changes and the person is asked to look again;
@@ -36,20 +38,44 @@ ACTION = "change_workflow"
 MAX_CARD_CHARS = 1800
 
 
-def needs_card(existing: Any, defn: Any) -> bool:
-    """Whether replacing ``existing`` with ``defn`` from chat waits for a tap:
-    one that reads or sends as its creator (before or after), whom chat
-    can't verify, at every level; below Hands-off also a switched-on
-    workflow with action steps."""
+def needs_card(existing: Any, defn: Any, *, asked: bool = False) -> bool:
+    """Whether replacing ``existing`` with ``defn`` from chat waits for a tap.
+    ``asked``: a person on the team asked for this change themselves this
+    turn, verified (``workflow_authoring_tools._asked_by_its_owner``).
+
+    - A workflow that reads or sends email as its creator or uses their
+      browser (before or after the change) runs as that person: only their
+      own ask saves it, at every level; anyone else's waits on a card.
+    - Below Hands-off, a switched-on workflow with action steps waits when
+      nobody asked for the change this turn."""
     from openexecutive.delegation.workflow_email import as_creator
     from openexecutive.workflows.dynamic_models import ActionStepSpec
 
     if existing is None:
         return False
-    approved = existing.is_active and any(isinstance(s, ActionStepSpec) for s in existing.steps)
     if as_creator(existing) or as_creator(defn):
-        return True
-    return bool(approved) and not hands_off()
+        return not (asked and _asked_by_creator(existing.name))
+    approved = existing.is_active and any(isinstance(s, ActionStepSpec) for s in existing.steps)
+    return bool(approved) and not asked and not hands_off()
+
+
+def _asked_by_creator(name: str) -> bool:
+    """Whether the person asking this turn is workflow ``name``'s creator
+    (the account owner for one saved before creators were recorded). Never
+    raises: an error is no."""
+    from openexecutive.workflows.dynamic_store import get_owner
+
+    try:
+        person = _speaker()
+        if person is None or getattr(person, "id", None) is None:
+            return False
+        owner = get_owner(name)
+        if owner is None:
+            return bool(getattr(person, "is_principal", False))
+        return bool(owner == person.id)
+    except Exception:
+        logger.warning("workflow_change: couldn't tell who created %r", name, exc_info=True)
+        return False
 
 
 def hands_off() -> bool:
@@ -143,7 +169,7 @@ def card_text(old: Any, new: Any) -> str:
 
 
 def _speaker() -> Any:
-    from openexecutive.orchestrator.correction_tools import _speaker as speaker
+    from openexecutive.orchestrator.speaker import speaker
 
     return speaker()
 
@@ -152,37 +178,20 @@ def may_read(name: str) -> str | None:
     """Why this turn may not read or change workflow ``name``, or None: it
     needs a verified speaker, in a conversation only they read, who is the
     account owner or the workflow's creator."""
-    from openexecutive.orchestrator.app_control import _NOT_PRIVATE, _private_here
+    from openexecutive.orchestrator.app_control import _NOT_PRIVATE
+    from openexecutive.orchestrator.speaker import own_private_speaker
     from openexecutive.workflows.dynamic_store import get_owner
 
     person = _speaker()
     if person is None or getattr(person, "id", None) is None:
         return (
             "I can only do this with a saved workflow when I know who is asking: in the web "
-            "app signed in, or your own chat app."
+            "app signed in, a call with me, or your own chat app."
         )
-    if not _private_here():
+    if own_private_speaker() is None:
         return _NOT_PRIVATE
     if not getattr(person, "is_principal", False) and get_owner(name) != person.id:
         return "Only the account owner or the person who created this workflow can do that."
-    return None
-
-
-def may_stage(name: str) -> str | None:
-    """Why this turn can't leave a change card for workflow ``name``, or None:
-    as ``may_read``, in a chat that shows the card."""
-    from openexecutive.integrations.channel_cards import card_here
-    from openexecutive.orchestrator.app_control import _session
-
-    refused = may_read(name)
-    if refused is not None:
-        return refused
-    if not card_here(_session()):
-        return (
-            "I can't show the change for your OK in this chat. Ask me in the web app, or in "
-            "your own chat with me on Telegram, Slack or Discord, and I'll leave it there for "
-            "you to approve."
-        )
     return None
 
 
@@ -192,7 +201,7 @@ def stage(defn: Any, existing: Any) -> dict[str, Any]:
     from openexecutive.orchestrator import app_control, app_control_catalog
 
     app_control_catalog.install()  # where the hidden action is registered
-    refused = may_stage(defn.name)
+    refused = may_read(defn.name)
     if refused is not None:
         return {"error": refused}
     person = _speaker()
@@ -212,9 +221,8 @@ def stage(defn: Any, existing: Any) -> dict[str, Any]:
         "decision_id": decision_id,
         "card": text,
         "note": (
-            "Nothing has changed yet. A card showing the change goes with this reply, with "
-            "Approve and Skip: it is saved when they tap Approve, keeping the workflow on or "
-            "off as it is. Tell them it is waiting for their OK."
+            app_control.waiting_note()
+            + " It is saved when they tap Approve, keeping the workflow on or off as it is."
         ),
     }
 
@@ -242,4 +250,4 @@ async def run(request: Any, name: str, value: str) -> str:
     return f"Changed the workflow “{stored.title}”"
 
 
-__all__ = ["ACTION", "card_text", "change_lines", "may_read", "may_stage", "needs_card", "run", "stage"]
+__all__ = ["ACTION", "card_text", "change_lines", "may_read", "needs_card", "run", "stage"]

@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openexecutive.attunement.outcomes import SOURCE_PROGRESS_UPDATE
+from openexecutive.utils import db
 
 if TYPE_CHECKING:
     from openexecutive.people.models import Person
@@ -82,12 +83,7 @@ class HeldMessage:
     attempts: int = 0
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:

@@ -81,7 +81,7 @@ MAX_ACTOR_LEN = 200
 # these lines).
 ASSERTION_VERSION = "v1"
 AUDIENCE = "openexecutive-api"
-MAX_LIFETIME_S = 120
+MAX_LIFETIME_S = 300
 # How far ahead of this clock the signer's may run.
 CLOCK_SKEW_S = 30
 

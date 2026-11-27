@@ -87,6 +87,7 @@ export const APP_ROUTES = [
   "onboard",
   "people",
   "review",
+  "schedule",
   "settings",
   "shared",
   "signin",

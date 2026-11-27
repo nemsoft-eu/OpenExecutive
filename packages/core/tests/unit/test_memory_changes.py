@@ -56,11 +56,11 @@ def _since(minutes: int = 5) -> str:
 
 
 def _remember(statement: str, *, session: str, person: int | None, role: str = "principal",
-              decision: bool = False, proposed: bool = False) -> int:
+              decision: bool = False) -> int:
     fact, _ = facts.record_fact(
         subject=statement[:30], statement=statement, source_quote=statement,
         session_id=session, recorded_by_person_id=person, recorded_by_role=role,  # type: ignore[arg-type]
-        decision=decision, proposed=proposed,
+        decision=decision,
     )
     return fact.id
 
@@ -87,6 +87,7 @@ def test_each_kind_shows_up_newest_first_for_its_own_person(client: TestClient, 
     }
     assert all(c["can_undo"] for c in got)
     assert [c["created_at"] for c in got] == sorted((c["created_at"] for c in got), reverse=True)
+    assert next(c for c in got if c["kind"] == "note")["title"] == "You told Kyle the scans come Friday"
     figure_row = next(c for c in got if c["kind"] == "worked_out")
     assert figure_row["title"] == "Reserves held: $330,241" and figure_row["source"] == "DCA statement"
 
@@ -107,14 +108,14 @@ def test_nothing_before_since_and_nothing_retired(client: TestClient, ids: dict[
     assert client.get("/memories/changes", params={"since": _since()}, headers=OWNER).json() == {"changes": []}
 
 
-def test_a_decision_and_a_waiting_fact(client: TestClient, ids: dict[str, int]) -> None:
+def test_a_decision_and_a_teammates_fact(client: TestClient, ids: dict[str, int]) -> None:
     since = _since()
     _remember("We hire a second analyst in Q1", session="s1", person=None, decision=True)
-    _remember("Ben's guess at headcount", session="s1", person=ids["teammate"], role="teammate", proposed=True)
+    _remember("Ben's guess at headcount", session="s1", person=ids["teammate"], role="teammate")
     mine = client.get("/memories/changes", params={"since": since}, headers=OWNER).json()["changes"]
     assert [(c["kind"], c["can_undo"]) for c in mine] == [("decision", True)]
     theirs = client.get("/memories/changes", params={"since": since}, headers=TEAMMATE).json()["changes"]
-    assert [(c["status"], c["can_undo"]) for c in theirs] == [("proposed", False)]
+    assert [(c["status"], c["can_undo"]) for c in theirs] == [("active", True)]
 
 
 def test_refusals(client: TestClient, ids: dict[str, int]) -> None:

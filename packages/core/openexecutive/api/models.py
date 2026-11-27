@@ -75,6 +75,12 @@ class ChatRequest(BaseModel):
     # the shared memory of each department consulted that turn; it is not in
     # the transcript, so the chat_turn audit row keeps it next to `message`.
     memory_text: str | None = Field(None, min_length=1, max_length=2000)
+    # A card under a reply in this chat that the person tapped Approve on:
+    # it is approved as its own button does, and this turn carries on from
+    # there (`decisions.approve_in_chat`). `approve_input` is the card's
+    # changed fields, as its Edit sends them.
+    approve_card: int | None = Field(None, ge=1)
+    approve_input: dict[str, Any] | None = None
 
 
 class BackgroundChatRequest(BaseModel):
@@ -204,7 +210,7 @@ class HealthResponse(BaseModel):
     # gateway failed to start used to look healthy here while no email went
     # out or came in.
     gateway: GatewayHealth | None = None
-    version: str = "0.7.2"  # x-release-please-version
+    version: str = "0.7.8"  # x-release-please-version
 
 
 class VersionResponse(BaseModel):
@@ -577,6 +583,22 @@ class OnboardCommitRequest(BaseModel):
     # history stays empty until they add it on the People page. Never taken
     # from the model's draft — the people drafts above still drop emails.
     owner_email: str | None = None
+    # The company's time zone: the IANA zone of the device setup runs on
+    # (the web sends the browser's). Saved as the workspace's zone when it
+    # has none, so every time the Executive sets is on the company's clock
+    # from the first day. A zone this server can't load is dropped, never a
+    # reason setup fails.
+    timezone: str | None = None
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _known_zone_or_none(cls, v: object) -> str | None:
+        from openexecutive.memory.workspace_settings import validate_timezone
+
+        try:
+            return validate_timezone(v if isinstance(v, str) else None)
+        except ValueError:
+            return None
 
 
 # ── /workflows/designer/* (conversational "New workflow" wizard) ─────────────

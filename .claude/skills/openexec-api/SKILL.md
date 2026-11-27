@@ -37,7 +37,7 @@ Rules:
 
 ## Safety tiers
 
-- **Green — auto-run.** All `GET` requests, and the cheap idempotent regenerate POSTs.
+- **Green — auto-run.** All `GET` requests.
 - **Yellow — confirm once per session.** Writes that change durable state but are reversible (e.g. archiving a Person, deleting a scheduled action).
 - **Red — print the curl, wait for explicit "go," no chaining.** `POST /fixtures/reset`, `POST /fixtures/{name}/load`, `POST /fixtures/unload`, `POST /fixtures/snapshot`, `POST /chat` (impersonates the user — generally don't invoke from Claude).
 
@@ -64,17 +64,6 @@ curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/architecture/sections | j
 
 # One section
 curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/architecture/sections/honcho | jq
-
-# Cache key debug (per-component hashes feeding FactsBundle.core_hash)
-curl -s -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/architecture/debug/bundle | jq
-```
-
-## Green/Yellow: force regenerate a section
-
-Cheap, idempotent, but it does call Claude and write to disk — treat as **yellow** (one confirm per session is enough).
-
-```bash
-curl -sX POST -H "x-api-key: $BACKEND_SHARED_SECRET" $OE_API/architecture/sections/honcho/regenerate | jq
 ```
 
 Replace `honcho` with any section id from `sections.py`: `overview`, `lifecycle`, `agents`, `caching`, `rag`, `review`, `memory`, `honcho`, `org`, `audit`, `schemas`, `workflows`, `scheduler`, `integrations`, `today`, `api`.

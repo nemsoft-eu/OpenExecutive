@@ -11,6 +11,7 @@ import type { ActionTaken, FormPatch } from "@/lib/api";
 import { FALLBACK_ACTIVITY_LABEL, setMessageFeedback, streamChat } from "@/lib/api";
 import { turnStatus } from "@/lib/turnStatus";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
+import { isImeComposing } from "@/lib/imeComposing";
 
 // One proposal card per form_patch event: what was applied/skipped, the
 // Executive's rationale, and an Undo that restores the pre-patch values.
@@ -176,6 +177,10 @@ export default function AskOEPanel() {
             content += item.content;
             setActivityLabel(null);
             setStreamingContent(content);
+          } else if (item.type === "rewrite") {
+            // Written again whole: the next chunks replace what came so far.
+            content = "";
+            setStreamingContent("");
           } else if (item.type === "activity") {
             setActivityLabel(item.label);
           } else if (item.type === "form_patch") {
@@ -424,7 +429,7 @@ export default function AskOEPanel() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && !isImeComposing(e) && !e.shiftKey) {
                   e.preventDefault();
                   void send(input);
                 }

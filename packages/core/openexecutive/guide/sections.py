@@ -57,8 +57,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="artifacts",
-        title="Documents",
-        sub="Your library of finished documents — drafts and workflow outputs in one place.",
+        title="Made for you",
+        sub="What the Executive made for you — documents, drafts and workflow outputs in one place.",
     ),
     GuideSection(
         id="watchlist",
@@ -82,8 +82,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="knowledge",
-        title="Knowledge Base",
-        sub="Upload company documents so the Executive can ground its answers in your context.",
+        title="Knowledge",
+        sub="Your company files, so the Executive can ground its answers in your context.",
     ),
     GuideSection(
         id="skills",

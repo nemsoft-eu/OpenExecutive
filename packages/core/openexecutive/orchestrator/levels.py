@@ -7,7 +7,7 @@ AI app, a shared chat and scheduled work.
 
 The checks that notice why a step might wait (a read that tried to give
 orders, the owner's own mail read this turn, a turn private to the owner,
-a shared chat a teammate wrote into, an AI app's turn, a tool that changes
+a shared chat a teammate wrote into, a page in another app, a tool that changes
 the install) only *detect*. This module decides, in one place
 (``decide``), and the dispatch guard in ``orchestrator.executive`` does what
 it says:
@@ -17,10 +17,18 @@ it says:
   card (``hold``). Careful detects more (any outside read), Balanced less
   (only a read the check flagged): the outside-content check is the
   level's.
-- **Every level**: a tool only the owner may use never runs on someone
-  else's turn, and what mail from someone not in People asks for is never
-  done on that mail's say-so. The Executive answers them, and anything else
-  comes to the owner as an Approve card.
+- **Whose level**: the level belongs to whoever is asking. The owner's
+  turns and a teammate's turns (a shared chat they wrote in included, and
+  an AI app they signed in to, which is them) run at the company's level.
+  Someone not in People (mail from a stranger, a page in another app, an AI
+  app signed in as no one) gives no one's
+  level: what they ask for comes to the owner as an Approve card on every
+  level, as does a tool only the owner may use on anyone else's turn.
+
+These are the only holds. Nothing outside this module refuses or holds a
+step on its own: a check elsewhere only *notices* a reason, and
+``decide`` turns it into run or card (``scripts/pr_checks.py`` fails a
+change that adds a refusal anywhere else).
 
 A step that waits is never dropped. The card is a decision with a card on
 Today, under the reply in the web chat, and in the owner's chat app
@@ -45,38 +53,50 @@ CARD = "card"
 # Why a step was noticed. Each is detected where it always was; only
 # ``decide`` turns it into run or card.
 OUTSIDE = "outside_content"
+# Careful waits after any read from outside the company: one the check didn't
+# flag is said as it is, never as an attempt to give instructions.
+OUTSIDE_READ = "outside_read"
 OWN_MAIL = "mail_touched"
 # The owner's own mail was read this turn and the content check flagged some
 # of what it read: Balanced holds then too, and the card says why.
 MAIL_FLAGGED = "mail_flagged"
 PRIVATE = "private_turn"
 SHARED = "shared_chat"
-AI_APP = "mcp_client"
+# A turn that may only read and advise (``schedule_tools.read_only_turn``):
+# a page in another app, or a scheduled run a teammate queued.
+READ_ONLY = "read_only_turn"
 NOT_OWNER = "not_principal"
 UNATTENDED = "unattended"
 STRANGER = "stranger_mail"
 NEW_PERSON = "new_person"
 FILE_PLACE = "file_place"
 URL_FETCH = "url_fetch"
+SCRIPT = "apps_script"
+# A click or typing on an email or chat site in the person's own browser
+# (``browser.tools``), where it can send a message.
+SEND_SITE = "send_site"
 REASONS: frozenset[str] = frozenset({
-    OUTSIDE, OWN_MAIL, MAIL_FLAGGED, PRIVATE, SHARED, AI_APP, NOT_OWNER, UNATTENDED, STRANGER, NEW_PERSON,
-    FILE_PLACE, URL_FETCH,
+    OUTSIDE, OUTSIDE_READ, OWN_MAIL, MAIL_FLAGGED, PRIVATE, SHARED, READ_ONLY, NOT_OWNER, UNATTENDED, STRANGER,
+    NEW_PERSON, FILE_PLACE, URL_FETCH, SCRIPT, SEND_SITE,
 })
 
 # What the card says it waited for, in the owner's words.
 _WHY: dict[str, str] = {
     OUTSIDE: "it read something from outside the company that tried to give it instructions",
+    OUTSIDE_READ: "it read something from outside the company first",
     OWN_MAIL: "it read your own mail first",
     MAIL_FLAGGED: "something it read looked like it was trying to give it instructions",
     PRIVATE: "it came from mail that's private to you",
     SHARED: "someone else wrote in this shared chat",
-    AI_APP: "another AI app asked for it",
+    READ_ONLY: "it was asked from a page in another app or a run queued for someone else",
     NOT_OWNER: "it changes how your Executive is set up",
     UNATTENDED: "it came up while nobody was chatting",
-    STRANGER: "someone who isn't in People asked for it by email",
+    STRANGER: "someone outside your team asked for it",
     NEW_PERSON: "it goes to someone who isn't in People",
     FILE_PLACE: "the folder it goes in is shared outside the company",
     URL_FETCH: "it has a service fetch a web address",
+    SCRIPT: "it runs a script as your Executive's Google account",
+    SEND_SITE: "it clicks or types on an email or chat site, where that can send a message",
 }
 
 # A step the owner approved on a card is being carried out
@@ -87,16 +107,27 @@ NOT_RELAXED_SKILLS: frozenset[str] = frozenset({
     "run_workflow", "run_executive_research", "run_script", "run_python_job", "suggest_workflow",
 })
 _APPROVED: contextvars.ContextVar[bool] = contextvars.ContextVar("levels_approved", default=False)
+# Who asked for the approved step (the card's requester on People).
+_APPROVED_FOR: contextvars.ContextVar[int | None] = contextvars.ContextVar("levels_approved_for", default=None)
 
 
 @contextlib.contextmanager
-def approved() -> Iterator[None]:
-    """Carry out a step the owner approved: inside it, ``relaxed`` is true."""
+def approved(requester: int | None = None) -> Iterator[None]:
+    """Carry out a step the owner approved: inside it, ``relaxed`` is true.
+    ``requester`` is the person on People who asked for it."""
     token = _APPROVED.set(True)
+    who = _APPROVED_FOR.set(requester if isinstance(requester, int) and not isinstance(requester, bool) else None)
     try:
         yield
     finally:
+        _APPROVED_FOR.reset(who)
         _APPROVED.reset(token)
+
+
+def approved_requester() -> int | None:
+    """Inside an approved step, the person who asked for it (their own
+    browser is the one it uses, ``browser.tools``); else None."""
+    return _APPROVED_FOR.get() if _APPROVED.get() else None
 
 
 def is_approved() -> bool:
@@ -180,19 +211,30 @@ def mail_reason() -> str:
     return OWN_MAIL
 
 
+def outside_reason() -> str:
+    """Why a step waits after the turn read something from outside the
+    company: ``OUTSIDE`` when the content check flagged any read this turn
+    (an email included), else ``OUTSIDE_READ``. Never raises."""
+    try:
+        from openexecutive.orchestrator import outside_content
+
+        state = outside_content.current()
+        if not (getattr(state, "flags", None) or []):
+            return OUTSIDE_READ
+    except Exception:
+        logger.debug("levels: couldn't tell whether an outside read was flagged", exc_info=True)
+    return OUTSIDE
+
+
 def decide(reason: str, *, mode: str | None = None) -> str:
     """``RUN`` or ``CARD`` for a step noticed for ``reason``. Never raises:
     an error is a card."""
     from openexecutive.orchestrator import outside_mode
 
     try:
-        # Hands-off is the owner's trust in their own Executive: it gives no
-        # one else the owner's powers, and no stranger's mail its say-so.
-        if reason in (STRANGER, NOT_OWNER, SHARED):
-            return CARD
-        if reason == AI_APP and not _owners_ai_app():
-            # The owner's own AI app, signed in as them and allowed to act,
-            # follows their level like the web app; any other is a card.
+        # Someone not in People has no level of their own, and a tool only
+        # the owner may use is theirs alone: a card on every level.
+        if reason in (STRANGER, NOT_OWNER, READ_ONLY):
             return CARD
         current = mode if mode is not None else turn_level()
         if current == outside_mode.TRUST:
@@ -203,11 +245,56 @@ def decide(reason: str, *, mode: str | None = None) -> str:
         return CARD
 
 
-def _owners_ai_app() -> bool:
-    from openexecutive.orchestrator import outside_mode
-    from openexecutive.orchestrator.schedule_tools import current_session
+def unrostered_speaker(session: Any) -> bool:
+    """Whether someone not in People is speaking on this turn: a web sign-in
+    on nobody's People entry (or an archived one), an AI app signed in as no
+    one, or a chat-app sender matched to no one. They have no level of their own, so what they ask to
+    send or change is the owner's to approve (``STRANGER``). Email is left
+    out: its sender is marked by ``outside_content`` instead. Never raises:
+    an error is someone not in People."""
+    try:
+        if session is None or getattr(session, "unattended", False) is True:
+            return False
+        if getattr(session, "private_to_principal", False) is True:
+            return False
+        if getattr(session, "replay", False) is True:
+            # A graded turn replayed: its acting tools are faked.
+            return False
+        person_id = getattr(session, "caller_person_id", None)
+        if person_id is None:
+            if getattr(session, "from_web_chat", False) is True:
+                return getattr(session, "web_caller_signed_in", False) is True
+            if getattr(session, "from_mcp_client", False) is True:
+                # An AI app signed in as no one (a service, or a sign-in on
+                # nobody's entry): ``mcp_server`` names the principal itself
+                # when the request names no one in open mode.
+                return True
+            channel = str(getattr(session, "origin_channel", "") or "")
+            return bool(channel) and channel != "email"
+        from openexecutive.people.store import get_person
 
-    return outside_mode.owners_ai_app(current_session.get())
+        person = get_person(int(person_id))
+        return person is None or person.archived or (not person.is_principal and person.kind != "team")
+    except Exception:
+        logger.warning("levels: couldn't tell who is speaking — treating them as not in People", exc_info=True)
+        return True
+
+
+def acts(tool: str, tool_input: Any) -> bool:
+    """Whether a step sends or changes something: an acting tool, or a
+    connected app's tool that may change something. Fails closed."""
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        if tool in take_the_lead.ACTING_TOOLS:
+            return True
+        if tool == "call_tool":
+            named = tool_input.get("name") if isinstance(tool_input, dict) else None
+            return take_the_lead.mcp_tool_acts(str(named or ""))
+        return False
+    except Exception:
+        return True
+
 
 
 _OWNER_SEND_TOOLS = frozenset({"google_workspace__send_gmail_message"})
@@ -256,17 +343,60 @@ def only_to_owner(tool_name: str, tool_input: Any) -> bool:
         return False
 
 
+# Steps whose result is only for the turn that asked: it reads the answer
+# and goes on. By the time anyone taps Approve that turn has ended, so a card
+# could only show the output to someone who never asked for it. Held, the
+# turn is told instead (``not_carriable_error``) and works without it.
+TURN_OWN: frozenset[str] = frozenset({
+    # A card asking to make a card helps no one: the reader would approve
+    # a note to themselves.
+    "create_alert",
+    "find_in_app",
+    "list_saved_tools",
+    "read_document",
+    "run_python_job",
+    # The person's own words, said in their own conversation: a figure kept
+    # from the reply they are reading, a fact or correction they stated, a
+    # card they answered, an app they are using. Each of these but
+    # open_in_app checks who is speaking when it runs, and a tap carries it
+    # out with nobody speaking, so an Approve card for it could only fail.
+    # open_in_app checks no one: its link is for the turn that asked, like
+    # the reads above, and would reach nobody from a card.
+    "answer_card",
+    "cancel_followup",
+    "do_in_app",
+    "forget_fact",
+    "keep_figure",
+    "leave_out_of_brief",
+    "mark_draft_sent",
+    "move_followup",
+    "open_in_app",
+    "record_decision_outcome",
+    "remember_fact",
+    "update_company_profile",
+})
+
+
 def carriable(tool: str, *, mcp: bool) -> bool:
     """Whether an Approve tap can carry out ``tool`` exactly: a connected
-    app's call, or a skill the Executive runs. A script or a new server is
-    the turn's own and can't wait on a card."""
+    app's call that sends or changes something, or a skill the Executive
+    runs. A script, a new server, a connected app's look-up ("Search gmail
+    messages": its answer is for the turn that asked, which has ended by the
+    time anyone taps) or a step only the turn reads (``TURN_OWN``) is the
+    turn's own and can't wait on a card. An extension's tool marked ``card``
+    too (``extensions.card_handler``)."""
     if mcp:
-        return True
+        from openexecutive.orchestrator import take_the_lead
+
+        return take_the_lead.mcp_tool_acts(tool)
+    if tool in TURN_OWN:
+        return False
     try:
+        from openexecutive.orchestrator import extensions
         from openexecutive.orchestrator.executive import _ALL_SKILL_HANDLERS
     except Exception:
         return False
-    return tool in _ALL_SKILL_HANDLERS
+    return tool in _ALL_SKILL_HANDLERS or extensions.card_handler(tool) is not None
 
 
 def _requester(session: Any) -> Any:
@@ -292,6 +422,29 @@ def _requester(session: Any) -> Any:
     return owner if owner is not None else Person(id=None, full_name="You")
 
 
+def _approver(requester: Any, reason: str, tool: str, tool_input: dict[str, Any]) -> int | None:
+    """Who taps Approve: the teammate who asked, on their own turn, for a
+    step that stays inside the team (their level is theirs, like the
+    owner's); the owner for anything someone not in People asked, a tool
+    only the owner may use, or a step that reaches outside the team. Never
+    raises: an error is the owner."""
+    from openexecutive.orchestrator import take_the_lead
+
+    try:
+        if (
+            reason not in (STRANGER, NOT_OWNER, READ_ONLY)
+            and getattr(requester, "id", None) is not None
+            and getattr(requester, "is_principal", False) is not True
+            and getattr(requester, "kind", "") == "team"
+            and getattr(requester, "archived", False) is not True
+            and take_the_lead._team_only(tool, tool_input)
+        ):
+            return int(requester.id)
+    except Exception:
+        logger.debug("levels: couldn't tell who approves — the owner", exc_info=True)
+    return take_the_lead._principal_id()
+
+
 def hold(
     tool: str,
     tool_input: dict[str, Any],
@@ -306,6 +459,16 @@ def hold(
     return hold_many(tool, [tool_input], mcp=mcp, reason=reason, session=session)
 
 
+def _rule_offers(tool: str, tool_input: dict[str, Any], reason: str, *, mcp: bool) -> list[dict[str, str]]:
+    """Goes rules the card may offer: only for someone new, the one reason
+    here a Goes rule can let go (``take_the_lead.rule_offers``)."""
+    if reason != NEW_PERSON:
+        return []
+    from openexecutive.orchestrator import take_the_lead
+
+    return take_the_lead.rule_offers(tool, tool_input, take_the_lead.SOMEONE_NEW, mcp=mcp, asked=True)
+
+
 def hold_many(
     tool: str,
     tool_inputs: list[dict[str, Any]],
@@ -317,9 +480,18 @@ def hold_many(
     """``hold`` for several calls of one tool held together (fourteen
     renames in one round): one Approve card that lists them all, and one tap
     carries out each, in order. The tool result is the same for each call."""
-    from openexecutive.orchestrator import department_gate, take_the_lead
+    from openexecutive.orchestrator import department_gate
 
     steps = [dict(i or {}) for i in tool_inputs] or [{}]
+    if not mcp and reason != SEND_SITE:
+        from openexecutive.orchestrator import extensions
+
+        if extensions.card_handler(tool) is not None:
+            # An extension card tool's "_" keys (the page a browser step was
+            # held on) are its own handler's, set only on its SEND_SITE hold:
+            # held anywhere else they came from the model, and the card and
+            # its tap would trust them.
+            steps = [{k: v for k, v in s.items() if not str(k).startswith("_")} for s in steps]
     if mcp and not str(tool or "").strip():
         # Nothing anyone could approve (no tool named).
         return json.dumps({"error": "call_tool needs the tool's name: find it with search_tools first."})
@@ -328,14 +500,15 @@ def hold_many(
 
         session = current_session.get()
     why = _WHY.get(reason, "it needs your OK")
+    requester = _requester(session)
     verdict = department_gate.Verdict(
         run=False,
-        approver_person_id=take_the_lead._principal_id(),
+        approver_person_id=_approver(requester, reason, tool, steps[0]),
         reason=why,
     )
     try:
         decision_id = department_gate.hold(
-            _requester(session),
+            requester,
             tool,
             steps[0],
             verdict,
@@ -343,6 +516,7 @@ def hold_many(
             session_id=getattr(session, "session_id", None),
             held=True,
             more=steps[1:],
+            offers=_rule_offers(tool, steps[0], reason, mcp=mcp) if len(steps) == 1 else None,
         )
     except Exception:
         logger.exception("levels: couldn't put %s on a card", tool)
@@ -353,15 +527,61 @@ def hold_many(
         f" It is one card for all {len(steps)} of these {tool} calls: one tap does them all."
         if len(steps) > 1 else ""
     )
+    return waiting_result(decision_id, why, together=together)
+
+
+def waiting_result(decision_id: int, why: str, *, together: str = "") -> str:
+    """What the model is told about a step held on an Approve card, the same
+    wherever it was held (here and ``take_the_lead``). Nothing went yet, so
+    every word about it is what happens once it's approved: a reply that
+    said "waiting for your tap" and then "I sent it from my own account"
+    told the person it went. Whose tap it waits on is the card's own
+    approver: the one speaking here, or someone else (a contact's or an
+    unattended run's step waits on a teammate who isn't in this chat)."""
+    whose = _card_approver_name(decision_id)
+    if whose is None:
+        where = "it's on an Approve card for them (in this chat, on Today and in their chat app)"
+        tell = "Tell them in one line it's waiting for their tap."
+    else:
+        where = f"it's on an Approve card for {whose} (on their Today and in their chat app)"
+        tell = f"Tell them in one line it's waiting on {whose}'s OK: they have no card to tap themselves."
     return json.dumps({
         "status": "waiting_for_approval",
         "decision_instance_id": decision_id,
         "message": (
-            "Not done yet: it's on an Approve card for them (in this chat, on Today and in their chat app), "
-            f"because {why}. Tapping Approve does exactly this.{together} Tell them in one line it's "
-            "waiting for their tap. Do not retry or work around it."
+            f"Not done yet: {where}, because {why}. Tapping Approve does exactly this.{together} {tell} "
+            "Say what it does only as what happens once it's approved "
+            "(\"it will go from my account\"), never as sent or done. Do not retry or work around it."
         ),
     })
+
+
+def _card_approver_name(decision_id: int) -> str | None:
+    """The name of the person card ``decision_id`` waits on, when that isn't
+    the one speaking this turn; None when it is them (or it can't be told,
+    which reads as theirs, as before). Never raises."""
+    try:
+        from openexecutive.memory.decision_ledger import get_decision_instance
+        from openexecutive.orchestrator import speaker as speaker_mod
+        from openexecutive.people.registry import get_principal
+        from openexecutive.people.store import get_person
+
+        row = get_decision_instance(decision_id)
+        if row is None:
+            return None
+        approver_id = row.approver_person_id
+        if approver_id is None:
+            principal = get_principal()
+            approver_id = principal.id if principal is not None else None
+        here = speaker_mod.speaker()
+        if approver_id is None or (here is not None and here.id == approver_id):
+            return None
+        approver = get_person(int(approver_id))
+        name = (approver.full_name or "").strip() if approver is not None else ""
+        return name or "the owner"
+    except Exception:
+        logger.warning("levels: couldn't tell whose card %s is", decision_id, exc_info=True)
+        return None
 
 
 def waiting_chip(result: str, *, label: str, iteration: int | None = None) -> dict[str, Any] | None:

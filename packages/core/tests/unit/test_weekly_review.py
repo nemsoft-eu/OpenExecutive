@@ -692,3 +692,23 @@ def test_co_principals_do_not_see_each_others_commitments(
     assert "Send Ada's revised invoice" not in artifact
     # The section keeps its shape rather than vanishing.
     assert "_Nothing overdue or due in the next week._" in artifact
+
+
+def test_every_review_grades_goals_without_a_number_and_closes_finished_ones() -> None:
+    """11-13: a goal with no number was skipped (never reviewed), and a goal
+    whose progress said "Done" stayed open. All three reviews share the rules."""
+    import inspect
+
+    from openexecutive.departments import goal_review
+    from openexecutive.workflows import department_check_in, weekly_review
+
+    rules = department_check_in.GRADING_RULES
+    assert "One with no number" in rules and "Use done only when" in rules
+    for module in (department_check_in, weekly_review, goal_review):
+        source = inspect.getsource(module)
+        assert "GRADING_RULES" in source and "VERDICT_STATUS_SHAPE" in source
+        assert "Skip goals you cannot grade" not in source
+    verdicts, _ = department_check_in._parse_verdicts(
+        '{"verdicts": [{"goal_id": 2, "status": "done", "rationale": "Stripe is finished."}], "narrative": ""}'
+    )
+    assert verdicts == [{"goal_id": 2, "status": "done", "rationale": "Stripe is finished."}]

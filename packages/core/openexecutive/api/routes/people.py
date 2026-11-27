@@ -135,6 +135,22 @@ def caller_is_principal(request: Request) -> bool:
         return False
 
 
+def caller_on_team(request: Request) -> bool:
+    """Whether the caller is the principal or someone on the team (not
+    archived). Fails closed."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    if caller_is_principal(request):
+        return True
+    try:
+        caller = _resolve_caller_person_id(request)
+        person = people_store.get_person(caller) if caller is not None else None
+    except Exception:
+        logger.exception("people: team check failed")
+        return False
+    return person is not None and person.kind == "team" and not person.archived
+
+
 def _visible_person(person_id: int, request: Request) -> Person:
     """The person, or 404 — also for a contact when the caller is not the
     principal, exactly as for an id that does not exist."""
@@ -392,6 +408,16 @@ def _require_roster_owner(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Only the principal can change the People list")
 
 
+def require_people_admin(request: Request) -> None:
+    """People administration as a whole: the principal, or anyone while there
+    is none yet (``_require_roster_owner``). Setup's saves (the form and the
+    interview) write every person and role, the departments and the company
+    profile in one go, so they ask this rather than a rule of their own. Who
+    holds the owner seat and the owner's sign-in address stay the owner's
+    (``onboarding.commit``)."""
+    _require_roster_owner(request)
+
+
 @router.post("/people", response_model=Person, status_code=status.HTTP_201_CREATED)
 def create_person(body: PersonCreate, request: Request) -> Person:
     _require_roster_owner(request)
@@ -589,7 +615,7 @@ def get_person_open_loops(person_id: int, request: Request) -> list[OpenLoopOut]
     from openexecutive.attunement.open_loops import list_open_loops
 
     _visible_person(person_id, request)
-    _require_principal_or(person_id, request)
+    caller = _require_principal_or(person_id, request)
     return [
         OpenLoopOut(
             loop_id=loop.id,
@@ -599,7 +625,7 @@ def get_person_open_loops(person_id: int, request: Request) -> list[OpenLoopOut]
             due_at=loop.due_at,
             created_at=loop.created_at,
         )
-        for loop in list_open_loops(person_id=person_id, limit=100)
+        for loop in list_open_loops(person_id=person_id, limit=100, reader=caller)
     ]
 
 
@@ -680,9 +706,11 @@ async def assign_person_open_loop(
 @router.post("/open-loops/{loop_id}/close", status_code=status.HTTP_204_NO_CONTENT)
 def close_open_loop_route(loop_id: int, body: OpenLoopClose, request: Request) -> Response:
     """Close one open loop. Only the principal or the loop's owner may."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
     from openexecutive.attunement.open_loops import close_open_loop, get_open_loop
 
-    loop = get_open_loop(loop_id)
+    # Someone else's private task reads like none.
+    loop = get_open_loop(loop_id, reader=_resolve_caller_person_id(request))
     if loop is None:
         raise HTTPException(status_code=404, detail="Task not found")
     caller = _require_principal_or(loop.owner_person_id, request)
@@ -1001,7 +1029,8 @@ def _own_task(task_id: int, request: Request) -> tuple[OpenLoopRecord, int]:
     from openexecutive.attunement.open_loops import get_task
 
     viewer, is_principal = _task_viewer(request)
-    loop = get_task(task_id)
+    # Someone else's private task (``open_loops.visible_to``) reads like none.
+    loop = get_task(task_id, reader=viewer)
     if loop is None or not (is_principal or loop.owner_person_id == viewer):
         raise HTTPException(status_code=404, detail="Task not found")
     return loop, viewer
@@ -1019,7 +1048,8 @@ def list_tasks_route(
     """Tasks, a page at a time. ``state`` is ``open`` (soonest due first;
     ``status_filter`` narrows to open / in_progress / waiting) or ``done``
     (most recently closed first). The principal sees everyone's and may pass
-    ``owner_person_id``; anyone else sees only their own."""
+    ``owner_person_id``; anyone else sees only their own. Nobody sees a task
+    from someone else's own chat (``open_loops.visible_to``)."""
     from openexecutive.attunement.open_loops import list_tasks
 
     if state not in ("open", "done"):
@@ -1028,7 +1058,7 @@ def list_tasks_route(
     owner = owner_person_id if is_principal else viewer
     loops, total = list_tasks(
         owner_person_id=owner, state=state, status=status_filter,
-        limit=max(1, min(limit, 200)), offset=max(0, offset),
+        limit=max(1, min(limit, 200)), offset=max(0, offset), reader=viewer,
     )
     return TaskList(tasks=[_task_out(loop, viewer) for loop in loops], total=total)
 

@@ -38,14 +38,16 @@ from urllib.parse import urlsplit
 ARTIFACT_FORMAT_NAMES: tuple[str, ...] = ("docx", "html", "link", "markdown", "xlsx")
 DEFAULT_FORMAT = "markdown"
 
-# Largest document (Markdown / HTML) the tool accepts. A drafted artifact is
-# echoed into the chat transcript as a tool input, so this also bounds how
-# much one draft can grow the conversation.
-MAX_DOCUMENT_CHARS = 60_000
+# A sheet holds what Excel holds: its rows below the header row, and its
+# columns. What one artifact can hold in all is sized to the server's
+# memory, not to what a model writes: no draft a model writes comes near it,
+# but a script (run_script) can hand draft_artifact a list repeated a million
+# times, which the server would expand cell by cell, store and render.
 MAX_SHEETS = 20
-MAX_ROWS_PER_SHEET = 5_000
-MAX_COLUMNS = 200
-MAX_TOTAL_CELLS = 200_000
+MAX_ROWS_PER_SHEET = 1_048_575
+MAX_COLUMNS = 16_384
+MAX_TOTAL_CELLS = 1_000_000
+MAX_DOCUMENT_CHARS = 2_000_000
 MAX_URL_CHARS = 2_000
 MAX_LINK_LABEL_CHARS = 60
 # Rows per sheet shown in the on-screen / read-back table preview. The full
@@ -95,9 +97,10 @@ def _document(tool_input: dict[str, Any], *, required: bool = True) -> str:
     doc = str(tool_input.get("document") or "").strip()
     if required and not doc:
         raise ArtifactInputError("document is required for this format")
-    if len(doc) > MAX_DOCUMENT_CHARS:
+    if len(doc) > MAX_DOCUMENT_CHARS:  # input-safety
         raise ArtifactInputError(
-            f"document is {len(doc)} chars; the limit is {MAX_DOCUMENT_CHARS}"
+            f"document is {len(doc):,} characters, more than one artifact holds "
+            f"({MAX_DOCUMENT_CHARS:,}): split it into several"
         )
     return doc
 
@@ -533,10 +536,14 @@ def _normalize_sheets(raw: Any) -> list[dict[str, Any]]:
                 cells = row if isinstance(row, list) else [row]
             if len(cells) > MAX_COLUMNS:
                 raise ArtifactInputError(f"sheet {idx + 1}: at most {MAX_COLUMNS} columns")
-            norm_rows.append([_cell(v) for v in cells])
+            # Counted before a row is expanded, so a repeated list is
+            # refused before it fills memory.
             total_cells += len(cells)
-        if total_cells > MAX_TOTAL_CELLS:
-            raise ArtifactInputError(f"at most {MAX_TOTAL_CELLS} cells in total")
+            if total_cells > MAX_TOTAL_CELLS:  # input-safety
+                raise ArtifactInputError(
+                    f"more than {MAX_TOTAL_CELLS:,} cells in one artifact: split it into several"
+                )
+            norm_rows.append([_cell(v) for v in cells])
         sheets.append({
             "name": _sheet_name(sheet.get("name"), idx, seen),
             "columns": [xml_safe(str(c)) for c in columns],
@@ -611,39 +618,52 @@ def sheets_to_xlsx(stored: str) -> bytes:
     starts with '=' must not execute in the reader's spreadsheet app.
     """
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
     data = _load_workbook_json(stored)
-    wb = Workbook()
-    default = wb.active
-    sheets = data.get("sheets") or []
-    if default is not None and sheets:
-        wb.remove(default)
+    # Written as it goes (write_only): a cell costs a few bytes of the file,
+    # not an object held in memory until the end, so the biggest sheet an
+    # artifact holds renders in its own size.
+    wb = Workbook(write_only=True)
     seen: set[str] = set()
-    for sheet in sheets:
+    bold = Font(bold=True)
+    for sheet in data.get("sheets") or []:
         ws = wb.create_sheet(title=_sheet_name(sheet.get("name"), len(seen), seen))
         columns = sheet.get("columns") or []
         rows = sheet.get("rows") or []
+        # Widths come first: a write-only sheet sets them before its rows.
         widths: dict[int, int] = {}
-        start = 1
-        if columns:
-            for c, name in enumerate(columns, start=1):
-                cell = ws.cell(row=1, column=c, value=xml_safe(str(name)))
-                cell.data_type = "s"
-                cell.font = Font(bold=True)
-                widths[c] = max(widths.get(c, 0), len(str(name)))
-            ws.freeze_panes = "A2"
-            start = 2
-        for r, row in enumerate(rows, start=start):
+        for c, name in enumerate(columns, start=1):
+            widths[c] = max(widths.get(c, 0), len(str(name)))
+        for row in rows:
             for c, value in enumerate(row, start=1):
-                value = _cell(value)
-                cell = ws.cell(row=r, column=c, value=value)
-                if isinstance(value, str):
-                    cell.data_type = "s"
                 widths[c] = max(widths.get(c, 0), len("" if value is None else str(value)))
         for c, width in widths.items():
             ws.column_dimensions[get_column_letter(c)].width = min(max(width + 2, 8), 60)
+        if columns:
+            ws.freeze_panes = "A2"
+            header = []
+            for name in columns:
+                cell = WriteOnlyCell(ws, value=xml_safe(str(name)))
+                cell.data_type = "s"
+                cell.font = bold
+                header.append(cell)
+            ws.append(header)
+        for row in rows:
+            out: list[Any] = []
+            for value in row:
+                value = _cell(value)
+                if isinstance(value, str):
+                    cell = WriteOnlyCell(ws, value=value)
+                    cell.data_type = "s"
+                    out.append(cell)
+                else:
+                    out.append(value)
+            ws.append(out)
+    if not wb.worksheets:
+        wb.create_sheet()
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

@@ -10,8 +10,12 @@ from typing import TYPE_CHECKING, Any
 
 from openexecutive.alerts import dispatcher, preferences, store
 from openexecutive.alerts.models import (
+    PERSONAL_SOURCES,
+    PRIVATE_ALERT_TAG,
+    TEAM_RAISED_SOURCE,
     AlertChannel,
     AlertEvent,
+    AlertSeverity,
     TriageDecision,
 )
 
@@ -24,11 +28,17 @@ logger = logging.getLogger(__name__)
 # mid-flight (mirrors memory.episodic._background_tasks).
 _background_tasks: set[asyncio.Task[Any]] = set()
 
-# Simple rolling-window rate limiter on event evaluations. Cost guard against
-# runaway cost from a misbehaving integration. Single-process only.
+# Simple rolling-window pacing of event evaluations (``_wait_for_slot``).
+# Cost guard against runaway cost from a misbehaving integration: a burst
+# waits its turn, a flood past ``_MAX_WAITING`` is dropped. Single-process only.
 _RATE_LIMIT_PER_MIN = 60
 _recent_event_ts: deque[float] = deque(maxlen=_RATE_LIMIT_PER_MIN)
 _rate_lock = threading.Lock()
+
+# Where a personal card (``PERSONAL_SOURCES``) may go: to its person only.
+# Not WEB: ``dispatch_web`` pushes the whole card to every open browser
+# (``_make_private`` leaves it out for the same reason).
+_PERSONAL_CHANNELS = frozenset({AlertChannel.PERSISTED, AlertChannel.SLACK_DM})
 
 
 # Severities that justify re-dispatching a coalesced alert (a repeat that
@@ -62,17 +72,49 @@ def _with_department_tag(tags: list[str], channel: str | None) -> list[str]:
     return list(tags) if tag in tags else [*tags, tag]
 
 
-def _rate_limited() -> bool:
-    """Returns True when the per-minute cap has been hit."""
+def _take_slot() -> float:
+    """Take one of the minute's evaluations: 0 when taken, else the seconds
+    until one frees up."""
     now = time.monotonic()
     with _rate_lock:
         cutoff = now - 60.0
         while _recent_event_ts and _recent_event_ts[0] < cutoff:
             _recent_event_ts.popleft()
         if len(_recent_event_ts) >= _RATE_LIMIT_PER_MIN:
-            return True
+            return max(_recent_event_ts[0] - cutoff, 0.01)
         _recent_event_ts.append(now)
-        return False
+        return 0.0
+
+
+# Evaluations past the cap that may wait for the next minutes' room; past
+# that, a runaway source is dropped (the cost guard).
+_MAX_WAITING = 2 * _RATE_LIMIT_PER_MIN
+_waiting = 0
+
+
+async def _wait_for_slot(*, bounded: bool = True) -> bool:
+    """Pace evaluations to ``_RATE_LIMIT_PER_MIN``: a burst past the cap
+    waits for the next minute's room, as a dropped event never comes back
+    (its source has marked it handed over: an email watch's email, a watch's
+    change). False, dropped, only when ``_MAX_WAITING`` already wait: a
+    flood (a looping bot) still costs at most a few minutes of triage.
+    Not ``bounded``: a source that limits itself (an email watch tells at
+    most ``PER_POLL`` a poll) always waits, never dropped."""
+    global _waiting
+    if (wait := _take_slot()) <= 0:
+        return True
+    with _rate_lock:
+        if bounded and _waiting >= _MAX_WAITING:
+            return False
+        _waiting += 1
+    try:
+        while wait > 0:
+            await asyncio.sleep(wait)
+            wait = _take_slot()
+        return True
+    finally:
+        with _rate_lock:
+            _waiting -= 1
 
 
 def _make_private(
@@ -82,8 +124,6 @@ def _make_private(
     stored but never pushed live or broadcast, and deduplicated only against
     other private alerts (coalescing into a shared card would copy its body
     there)."""
-    from openexecutive.alerts.models import PRIVATE_ALERT_TAG
-
     principal_id: int | None = None
     try:
         from openexecutive.people.store import find_principal_person
@@ -131,52 +171,35 @@ def _ground_decision(
     )
     if not changed:
         return decision
+    # A step the check rewrote no longer matches its button's words.
+    label = decision.action_label if action == decision.suggested_action else ""
     return decision.model_copy(
-        update={"headline": headline, "body": body, "suggested_action": action}
+        update={"headline": headline, "body": body, "suggested_action": action, "action_label": label}
     )
+
+
+def _raised_label(name: str) -> str:
+    """How a card a team member raised opens: who raised it."""
+    return f"Raised by {name}."
 
 
 def _label_team_raised(decision: TriageDecision, name: str) -> TriageDecision:
     """``decision`` with its body led by who raised it, so a card a team
     member raised from chat never reads as news from anywhere else."""
-    label = f"Raised by {name}."
+    label = _raised_label(name)
     body = decision.body.strip()
     if body.startswith(label):
         return decision
     return decision.model_copy(update={"body": f"{label} {body}".strip()})
 
 
-async def evaluate_and_dispatch(
-    event: AlertEvent,
-    db_path: Path | None = None,
-) -> tuple[TriageDecision, int | None]:
-    """Run triage on a single event and dispatch the alert.
-
-    Returns (decision, alert_id). alert_id is None when the alert is
-    suppressed or a duplicate.
-    """
+async def _triage(event: AlertEvent, path: Path) -> TriageDecision:
+    """The triage model's decision on ``event``, mute-checked and grounded
+    in what the event (or the profile, or the initiatives) supports."""
     from openexecutive.agents.triage import TriageAgent
     from openexecutive.memory.episodic import get_active_initiatives
 
-    path = db_path or store.DB_PATH
-
-    if _rate_limited():
-        logger.warning(
-            "alerts.pipeline rate-limited: dropping event source=%s ext_id=%s",
-            event.source,
-            event.external_id,
-        )
-        return (
-            TriageDecision(
-                alert=False,
-                dedup_key=f"rate-limited-{event.source}-{event.external_id}",
-                reason_if_suppressed="rate_limited",
-            ),
-            None,
-        )
-
     # Cheap pre-checks: load context for the triage prompt + post-decision mute.
-    prefs = preferences.get_preferences(db_path=path)
     mutes = [m.pattern for m in store.list_mutes(db_path=path)]
     recent = [
         {
@@ -185,8 +208,10 @@ async def evaluate_and_dispatch(
             "dedup_key": a.dedup_key,
             "topic_tags": a.topic_tags,
         }
-        # Never anyone's drafted documents: they are their owners' alone.
+        # Never anyone's drafted documents or personal cards: they are their
+        # owners' alone (``models.visible_alert``).
         for a in store.recent_alerts(limit=20, db_path=path, exclude_source="artifact")
+        if a.source not in PERSONAL_SOURCES
     ]
     try:
         initiatives = get_active_initiatives()
@@ -217,12 +242,75 @@ async def evaluate_and_dispatch(
         # We still persist a low-severity record so the UI can show "23 events
         # triaged, 1 surfaced" if we ever want it. For now keep it simple:
         # only persist when the decision says alert=true.
-        return decision, None
+        return decision
 
     # Triage rewrote the event into a headline and body nobody reads before
     # dispatch: keep only what the event itself (or the profile, or the
     # initiatives triage was shown) supports.
-    decision = _ground_decision(decision, event, initiatives)
+    return _ground_decision(decision, event, initiatives)
+
+
+def _as_written_decision(event: AlertEvent) -> TriageDecision:
+    """A card for a message passed on to one person: its subject and body
+    as written, with no model call. Triage would rewrite them with the
+    recent cards and initiatives in view, adding to the message things its
+    sender never asked to pass on. The same text to the same person again
+    folds into their open card; to someone else it is a card of its own.
+    Mute patterns don't apply: they silence topics triage tags, and this
+    is a message for one person, not a topic."""
+    import hashlib
+
+    text = f"{_person_id_from_event(event)}\n{event.subject}\n{event.body}"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return TriageDecision(
+        alert=True,
+        severity=AlertSeverity.MEDIUM,
+        channels=[AlertChannel.WEB, AlertChannel.PERSISTED],
+        headline=event.subject,
+        body=event.body,
+        dedup_key=f"message:{digest}",
+    )
+
+
+async def evaluate_and_dispatch(
+    event: AlertEvent,
+    db_path: Path | None = None,
+) -> tuple[TriageDecision, int | None]:
+    """Run triage on a single event and dispatch the alert.
+
+    Returns (decision, alert_id). alert_id is None when the alert is
+    suppressed or a duplicate.
+    """
+    path = db_path or store.DB_PATH
+
+    if not await _wait_for_slot(bounded=event.source not in PERSONAL_SOURCES):
+        logger.warning(
+            "alerts.pipeline rate-limited: dropping event source=%s ext_id=%s",
+            event.source,
+            event.external_id,
+        )
+        return (
+            TriageDecision(
+                alert=False,
+                dedup_key=f"rate-limited-{event.source}-{event.external_id}",
+                reason_if_suppressed="rate_limited",
+            ),
+            None,
+        )
+
+    prefs = preferences.get_preferences(db_path=path)
+    if event.as_written:
+        decision = _as_written_decision(event)
+    else:
+        triaged = await _triage(event, path)
+        if not triaged.alert:
+            return triaged, None
+        # Whether a card is the principal's alone is the producer's to say
+        # (``event.private``), never triage's: it reads words from outside
+        # (an email's subject, a web page), which must not route a card.
+        decision = triaged.model_copy(update={
+            "topic_tags": [t for t in triaged.topic_tags if t != PRIVATE_ALERT_TAG],
+        })
     if event.raised_by:
         decision = _label_team_raised(decision, event.raised_by)
 
@@ -235,17 +323,28 @@ async def evaluate_and_dispatch(
         effective_channels = [
             c for c in effective_channels if c != AlertChannel.COMPANY_BROADCAST
         ]
+    if event.source in PERSONAL_SOURCES:
+        # A card that is one person's alone (an email watch's sender and
+        # subject, say) reaches only them: their page, their own DM. Never a
+        # room, and never the Executive's own mailbox, whatever triage made
+        # of its words.
+        effective_channels = [c for c in effective_channels if c in _PERSONAL_CHANNELS]
 
     # A producer that knows the stable identity of the situation (a watch
     # slug) wins over the model's free-text key.
     dedup_key = event.dedup_hint or decision.dedup_key
-    if event.raised_by:
-        # One team member's alert never folds into another's card.
-        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{dedup_key}"
     topic_tags = _with_department_tag(
         decision.topic_tags, event.department or event.channel,
     )
     routed_to = _person_id_from_event(event)
+    if event.raised_by:
+        # One team member's alert never folds into another's card, nor into
+        # one of theirs for someone else: it shows only to them and whom it
+        # is for (``models._team_card_reader``).
+        for_whom = routed_to if routed_to is not None else ",".join(
+            sorted(t for t in topic_tags if t.startswith("department:"))
+        )
+        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{for_whom}:{dedup_key}"
     if event.private:
         topic_tags, routed_to, dedup_key, effective_channels = _make_private(
             topic_tags, dedup_key
@@ -296,23 +395,23 @@ async def evaluate_and_dispatch(
         )
         return decision, existing_id
 
-    alert_id = store.insert_alert(
-        source=event.source,
-        external_id=event.external_id,
-        severity=decision.severity.value,
-        headline=decision.headline or (event.subject or event.title or event.source),
-        body=decision.body,
-        suggested_action=decision.suggested_action,
-        # Only an extension's own code files a document in its collection
-        # (orchestrator/extensions.py): a triaged alert never claims one.
-        topic_tags=[t for t in topic_tags if not t.startswith("collection:")],
-        dedup_key=dedup_key,
-        routed_to_person_id=routed_to,
-        needs=event.needs,
-        question=event.question,
-        choices=event.choices,
-        db_path=path,
-    )
+    from openexecutive.alerts import one_card
+
+    # Every card a turn raises takes part in the one card per topic check. A
+    # message passed on to one person keeps its words and joins the open card
+    # of an earlier message from the same chat to the same person, so a
+    # correction lands under what it corrects rather than beside it. A
+    # teammate's own message joins only that way: never a card the Executive
+    # wrote on the same turn.
+    own_words = event.as_written and bool(event.raised_by)
+    conversation = one_card.chat_conversation(own_words=own_words) if event.as_written else ""
+    with one_card.about(
+        thread=conversation or one_card.mail_thread(event.mail_thread), joins=event.joins_alert_id, raised=True,
+        own_words=own_words,
+        label=_raised_label(event.raised_by) if event.raised_by else "",
+        person=one_card.mail_person(event.mail_from) if event.mail_thread else "",
+    ):
+        alert_id = _insert(event, decision, topic_tags, dedup_key, routed_to, path)
     if alert_id is None:
         logger.info(
             "alerts.pipeline duplicate suppressed source=%s ext_id=%s",
@@ -325,6 +424,16 @@ async def evaluate_and_dispatch(
     if alert is None:
         logger.error("alerts.pipeline could not re-read alert id=%s", alert_id)
         return decision, alert_id
+    if alert.superseded_by_alert_id is not None:
+        # It joined an open card on its topic (alerts.one_card). A grave one
+        # (a fraud warning), or a message passed on to its reader, still
+        # reaches them, on the card it joined.
+        logger.info("alerts.pipeline alert=%d joined alert=%d", alert_id, alert.superseded_by_alert_id)
+        survivor = store.get_alert(alert.superseded_by_alert_id, db_path=path)
+        notify = event.as_written or decision.severity.value in _REDISPATCH_SEVERITIES
+        if not notify or survivor is None:
+            return decision, alert_id
+        alert = survivor
 
     await dispatcher.dispatch_all(
         alert,
@@ -338,6 +447,33 @@ async def evaluate_and_dispatch(
         broadcast_integration=decision.broadcast_integration,
     )
     return decision, alert_id
+
+
+def _insert(
+    event: AlertEvent, decision: TriageDecision, topic_tags: list[str], dedup_key: str,
+    routed_to: int | None, path: Path,
+) -> int | None:
+    return store.insert_alert(
+        source=event.source,
+        external_id=event.external_id,
+        severity=decision.severity.value,
+        headline=decision.headline or (event.subject or event.title or event.source),
+        body=decision.body,
+        suggested_action=decision.suggested_action,
+        action_label=decision.action_label,
+        # Only an extension's own code files a document in its collection
+        # (orchestrator/extensions.py): a triaged alert never claims one.
+        topic_tags=[t for t in topic_tags if not t.startswith("collection:")],
+        dedup_key=dedup_key,
+        routed_to_person_id=routed_to,
+        # A card a team member raised is theirs and its reader's
+        # (``models.visible_alert``): who raised it is kept beside whom it is for.
+        owner_person_id=event.raised_by_person_id if event.source == TEAM_RAISED_SOURCE else None,
+        needs=event.needs,
+        question=event.question,
+        choices=event.choices,
+        db_path=path,
+    )
 
 
 def schedule_chat_message_evaluation(

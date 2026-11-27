@@ -370,12 +370,10 @@ def test_a_stranger_gets_the_reply_on_hands_off(
 
 
 @pytest.mark.parametrize(("body", "code"), [
-    ("The agenda is at https://docs.example.com/agenda.", "link"),
-    ("Sure, we can do it for $4,000.", "amount"),
+    ("Sure, we can do it for $4,000.", "sensitive"),
     ("Yes, I'll sign the contract tomorrow.", "sensitive"),
-    ("Here's the new password for the portal.", "sensitive"),
 ])
-def test_below_hands_off_a_reply_with_a_link_amount_or_topic_waits(
+def test_below_hands_off_a_reply_about_a_topic_waits(
     switched_on: Any, monkeypatch: pytest.MonkeyPatch, body: str, code: str,
 ) -> None:
     assert _check(switched_on, reply=_reply(body=body)) == code
@@ -383,15 +381,29 @@ def test_below_hands_off_a_reply_with_a_link_amount_or_topic_waits(
     assert _check(switched_on, reply=_reply(body=body)) is None
 
 
-def test_an_email_address_in_the_signature_is_not_a_link(switched_on: Any) -> None:
-    signed = "Got it, thanks.\n\nJordan Lee\nExample Co\njordan@example.com\nmailto:help@example.co"
-    assert _check(switched_on, reply=_reply(body=signed)) is None
-    with_link = signed + "\nexample.com/start"
-    assert _check(switched_on, reply=_reply(body=with_link)) == "link"
+@pytest.mark.parametrize("body", [
+    "The agenda is at https://docs.example.com/agenda.",
+    "Sure, the board deck is on its way.",
+])
+def test_only_the_topics_hold_a_reply(switched_on: Any, body: str) -> None:
+    """A link or a word like "board" is no topic: on Balanced only the
+    topics wait, as for any other step."""
+    assert _check(switched_on, reply=_reply(body=body)) is None
+
+
+def test_handing_over_a_password_is_sharing(switched_on: Any) -> None:
+    """A password is handed over like anything else shared: it waits on
+    Balanced, and a Sharing Goes rule lets it go."""
+    from openexecutive.orchestrator import take_the_lead as ttl
+
+    password = _reply(body="Here's the new password for the portal.")
+    assert _check(switched_on, reply=password) == "sensitive"
+    ttl.add_rule(ttl.SCOPE_COMPANY, "topic", ttl.SHARE, created_by="t", effect=ttl.EFFECT_GO)
+    assert _check(switched_on, reply=password) is None
 
 
 def test_below_hands_off_the_email_s_own_topic_holds_the_reply(switched_on: Any) -> None:
-    message = _msg("m1", "t1", text="Can you approve the invoice before Friday?")
+    message = _msg("m1", "t1", text="Can you approve the $1,200 invoice before Friday?")
     assert _check(switched_on, message=message) == "sensitive"
 
 
@@ -418,16 +430,15 @@ def test_one_reply_on_its_own_per_conversation_a_day(owner: Any, models: dict[st
     assert inbox.open_cards(owner.id)[0].gate_mode == "propose"
 
 
-def test_the_daily_limit_holds(owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_there_is_no_daily_limit(owner: Any, models: dict[str, Any]) -> None:
     _on(owner)
-    monkeypatch.setenv("DELEGATION_HANDLE_IT_MAX_SENDS_PER_DAY", "1")
     mailbox = FakeInbox()
     mailbox.add(_msg("m1", "t1"), _msg("m2", "t2", sender="lee@co.example", name="Lee", minutes_ago=40))
     people_store.upsert_person(full_name="Lee", email="lee@co.example", kind="contact")
     people_registry.invalidate()
     result = _scan(owner, mailbox)
-    assert result.drafted == 2 and result.handled == 1
-    assert len(mailbox.sent) == 1
+    assert result.drafted == 2 and result.handled == 2
+    assert len(mailbox.sent) == 2
 
 
 def test_turning_it_off_before_the_send_leaves_the_card(
@@ -569,7 +580,6 @@ def test_a_plain_reply_passes(switched_on: Any) -> None:
     # The Executive's own address is never a recipient of a reply sent as them.
     ({"cc": ["exec@co.example"]}, "recipients"),
     # Long replies say more than an acknowledgement should.
-    ({"body": "word " * 1000}, "long"),
     # Anything the writer flagged.
     ({"flags": ["asks_if_ai"]}, "flagged"),
     ({"flags": ["names_the_executive"]}, "flagged"),
@@ -897,18 +907,19 @@ def test_a_goes_rule_lets_a_small_amount_go_below_hands_off(switched_on: Any) ->
 
     small = _reply(body="Sure, we can do it for $300.")
     big = _reply(body="Sure, we can do it for $4,000.")
-    assert _check(switched_on, reply=small) == "amount"
+    assert _check(switched_on, reply=small) == "sensitive"
     ttl.add_rule(ttl.SCOPE_COMPANY, "amount", "500", created_by="t", effect=ttl.EFFECT_GO)
     assert _check(switched_on, reply=small) is None
-    assert _check(switched_on, reply=big) == "amount"
+    assert _check(switched_on, reply=big) == "sensitive"
 
 
-def test_a_goes_rule_never_lets_a_link_go(switched_on: Any) -> None:
+def test_a_company_rule_lets_a_topic_go(switched_on: Any) -> None:
     from openexecutive.orchestrator import take_the_lead as ttl
 
+    invoice = _reply(body="Here's the invoice for $450.")
+    assert _check(switched_on, reply=invoice) == "sensitive"
     ttl.add_rule(ttl.SCOPE_COMPANY, "domain", "northpeak.example", created_by="t", effect=ttl.EFFECT_GO)
-    assert _check(switched_on, reply=_reply(body="Here's the invoice.")) is None
-    assert _check(switched_on, reply=_reply(body="The agenda is at https://docs.example.com/a.")) == "link"
+    assert _check(switched_on, reply=invoice) is None
 
 
 def test_a_words_rule_can_only_wait(switched_on: Any) -> None:
@@ -917,9 +928,9 @@ def test_a_words_rule_can_only_wait(switched_on: Any) -> None:
     from openexecutive.orchestrator import take_the_lead as ttl
 
     with pytest.raises(ttl.RuleError):
-        ttl.add_rule(ttl.SCOPE_COMPANY, "words", "board deck", created_by="t", effect=ttl.EFFECT_GO)
-    board = _msg("m1", "t1", text="Can you send the board deck before Thursday?")
-    assert _check(switched_on, message=board, reply=_reply(body="Sure, the board deck is on its way.")) == "sensitive"
+        ttl.add_rule(ttl.SCOPE_COMPANY, "words", "contract", created_by="t", effect=ttl.EFFECT_GO)
+    signed = _msg("m1", "t1", text="Can you send the signed contract before Thursday?")
+    assert _check(switched_on, message=signed, reply=_reply(body="Sure, the contract is on its way.")) == "sensitive"
 
 
 def test_a_goes_amount_rule_needs_the_amount_in_the_reply(switched_on: Any) -> None:

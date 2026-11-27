@@ -37,12 +37,48 @@ def artifact_visible_to(
     return person_id is not None and person_id == owner_person_id
 
 
-def visible_alert(alert: object, viewer: object | None) -> bool:
+# Sources of cards that belong to the one person they are routed to: a
+# browser hand-over ("Waiting on you: sign in to ...", with the task from that
+# person's own chat). Only that person sees one, not even the principal, and
+# no surface shared by everyone (``visible_alert``).
+# An email watch's card (``monitoring.mailbox``) names a sender and a subject
+# from one person's own inbox: theirs alone.
+MAILBOX_SOURCE = "mailbox"
+PERSONAL_SOURCES: frozenset[str] = frozenset({"browser_handover", MAILBOX_SOURCE})
+
+
+def visible_alert(
+    alert: object,
+    viewer: object | None,
+    *,
+    chat_reader: int | None = None,
+    own_chat_readers: dict[int, frozenset[int]] | None = None,
+) -> bool:
     """Whether ``alert`` may be shown to ``viewer`` (anything with
     ``person_id`` and ``is_principal``, e.g. ``artifact_records.Viewer``).
-    Every alert but a drafted artifact may; an artifact only to its owner,
-    and to no one when there is no viewer (a surface shared by everyone)."""
-    if getattr(alert, "source", None) != ARTIFACT_SOURCE:
+    Every alert but a drafted artifact, a personal card or a card from
+    someone's own chat may; an artifact only to its owner, a personal card
+    (``PERSONAL_SOURCES``) only to the person it is routed to, a card a held
+    step raised from one person's own chat only to them and its approver
+    (``alerts.own_chat``), and none of them to anyone when there is no viewer
+    (a surface shared by everyone). ``chat_reader`` names whose own-chat
+    cards a build with no viewer keeps (the principal's own brief). A caller
+    filtering a whole list passes ``own_chat_readers`` (``own_chat.readers``
+    of that list) so the lookup runs once, not per card."""
+    from openexecutive.alerts import own_chat
+
+    reader = getattr(viewer, "person_id", None) if viewer is not None else chat_reader
+    if own_chat_readers is None:
+        own_chat_readers = own_chat.readers([alert])
+    if not own_chat.shown_to(alert, reader, own_chat_readers):
+        return False
+    source = getattr(alert, "source", None)
+    if source in PERSONAL_SOURCES:
+        routed = getattr(alert, "routed_to_person_id", None)
+        return viewer is not None and routed is not None and getattr(viewer, "person_id", None) == routed
+    if source == TEAM_RAISED_SOURCE:
+        return _team_card_reader(alert, reader, viewer)
+    if source != ARTIFACT_SOURCE:
         return True
     if viewer is None:
         return False
@@ -51,6 +87,35 @@ def visible_alert(alert: object, viewer: object | None) -> bool:
         getattr(viewer, "person_id", None),
         is_principal=bool(getattr(viewer, "is_principal", False)),
     )
+
+
+def _team_card_reader(alert: object, reader: int | None, viewer: object | None) -> bool:
+    """Whether ``reader`` reads a card a team member raised from their own
+    chat (``TEAM_RAISED_SOURCE``): the one who raised it, and whom it is
+    for: the person it is routed to, else the people of its department (when
+    anyone is in it), else the principal, who owns an unrouted card. Nobody else on the team: it
+    carries one person's ask. ``viewer`` None is a build for ``reader``
+    alone (the principal's own brief) or, with no reader, for everyone."""
+    if reader is None:
+        return False
+    routed = getattr(alert, "routed_to_person_id", None)
+    if reader in (getattr(alert, "owner_person_id", None), routed):
+        return True
+    if routed is not None:
+        return False
+    from openexecutive.people import registry as people_registry
+
+    slugs = {t.split(":", 1)[1] for t in getattr(alert, "topic_tags", None) or [] if t.startswith("department:")}
+    # Its department's people, when it has any: a department nobody is in
+    # (new, or a slug the model got wrong) leaves the card to the principal,
+    # so the ask still reaches someone.
+    members = {p.id for p in people_registry.list_people() if slugs & set(p.department_slugs or [])} if slugs else set()
+    if members:
+        return reader in members
+    if viewer is not None:
+        return bool(getattr(viewer, "is_principal", False))
+    principal = people_registry.get_principal()
+    return principal is not None and principal.id == reader
 
 
 class AlertSeverity(StrEnum):
@@ -109,9 +174,12 @@ class AlertEvent(BaseModel):
     dedup_hint: str = ""
     # With ``dedup_hint``: a later event folds into the open card by adding
     # its words under the earlier ones ("Then: ..."), not replacing them, so
-    # a follow-up never erases what was first asked (one card per sender's
-    # mail, see ``orchestrator.alert_tools``).
+    # a follow-up never erases what was first asked.
     follow_up: bool = False
+    # The open card the turn said this is the same matter as
+    # (``create_alert``'s ``joins_card``): it joins that card when it goes to
+    # the same reader (``alerts.one_card``).
+    joins_alert_id: int | None = None
     # Person the alert should be routed to (assigned_to_person_id from the
     # Executive's create_alert tool). Lands on the row so the "principal
     # owns unrouted" rule stops sweeping every triage-born alert to them.
@@ -131,10 +199,31 @@ class AlertEvent(BaseModel):
     # turn asked, and never goes out as a company-wide broadcast — a person
     # or department only (alerts/pipeline.py).
     raised_by: str = ""
+    # Who that team member is (their People id), with ``raised_by``: their
+    # card is theirs and its reader's, not the whole team's
+    # (``visible_alert``).
+    raised_by_person_id: int | None = None
+    # Set only by the create_alert tool: the Executive itself chose to raise
+    # this card. When review makes no decision on it (the call failed, or its
+    # answer was cut off), the card is kept as raised instead of dropped
+    # (agents.triage). Other events (chat lines, polled mail, monitors) keep
+    # the quiet fallback.
+    from_executive: bool = False
+    # A message passed on to one person (``message_person`` with no chat
+    # app to reach them): the card shows the subject and body as written,
+    # with no triage rewrite, so nothing from other cards is added to what
+    # the sender asked to pass on. Set only by server code, never the model.
+    as_written: bool = False
     # What the card needs from its reader (``Alert.needs``).
     needs: str = ""
     question: str = ""
     choices: list[str] = Field(default_factory=list)
+    # An email watch's card for one email that reached the Executive: its
+    # mail thread and sender, so it joins the card the Executive's handling
+    # of that email made for the same person (``alerts.one_card``). Set only
+    # by server code (``monitoring.pipeline``).
+    mail_thread: str = ""
+    mail_from: str = ""
 
 
 # The source of every alert a team member raises from chat (see
@@ -154,6 +243,8 @@ class TriageDecision(BaseModel):
     headline: str = ""
     body: str = ""
     suggested_action: str = ""
+    # The step in ``suggested_action`` in a few words, for its button.
+    action_label: str = ""
     topic_tags: list[str] = Field(default_factory=list)
     dedup_key: str = ""
     reason_if_suppressed: str = ""
@@ -234,6 +325,13 @@ class Alert(BaseModel):
     needs: str = ""
     question: str = ""
     choices: list[str] = Field(default_factory=list)
+    # The step Approve does, in a few words for its button ("Send the
+    # reply"); "" keeps Approve (alerts.store.clean_label).
+    action_label: str = ""
+    # When the tidy-up settled this card on its own, and why
+    # (``alerts.lifecycle.settle``). None / '' otherwise.
+    tidied_at: str | None = None
+    tidied_reason: str = ""
 
 
 class UserPreferences(BaseModel):

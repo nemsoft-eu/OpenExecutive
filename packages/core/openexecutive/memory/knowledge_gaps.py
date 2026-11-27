@@ -51,6 +51,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 TABLE = "knowledge_gaps"
@@ -81,14 +83,12 @@ _STOPWORDS = frozenset(
     ["a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "by", "with", "from", "about", "as", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "done", "have", "has", "had", "i", "me", "my", "we", "our", "us", "you", "your", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom", "whose", "when", "where", "why", "how", "there", "here", "can", "could", "would", "should", "will", "shall", "may", "might", "must", "any", "some", "all", "please", "tell", "know", "let", "lets", "get", "got", "just", "not", "no", "yes", "so", "if", "than", "then", "them", "they", "their", "he", "she", "his", "her", "one"]
 )
 _WORD_RE = re.compile(r"[a-z0-9$%][a-z0-9$%.,'-]*")
+# A question still pointing at someone named only earlier in the chat ("does
+# he have any open items?") means nothing on the list, so it isn't kept.
+_UNNAMED_RE = re.compile(r"\b(he|she|him|his|her|hers)\b", re.IGNORECASE)
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:
@@ -156,16 +156,32 @@ def same_question(a: str, b: str) -> bool:
     return small >= 3 and shared / small >= _CONTAINED
 
 
+def _names(text: str, said: set[str]) -> set[str]:
+    """The content words of the names in a question (a capitalised word after
+    its first) that the message doesn't say: who or what the grader named from
+    the turns before."""
+    tokens = text.split()[1:]
+    return {w for t in tokens if t[:1].isupper() for w in _words(t)} - said
+
+
 def clean_question(question: str, message: str) -> str:
     """The grader's question, if the person's own message backs it: one line,
     capped, and at least half its content words in what they wrote, so the
-    list never shows a question nobody asked. Empty otherwise."""
+    list never shows a question nobody asked. A name the grader filled in from
+    the turns before ("is she remote?" read as "Is Maria Gonzalez remote?")
+    isn't counted against it. Empty otherwise, and empty when it still says he
+    or she and names no one, since nobody reading the list could tell who it
+    means."""
     text = " ".join(str(question or "").split())[:QUESTION_MAX].strip()
     words = _words(text)
     if len(words) < _MIN_WORDS:
         return ""
     said = _words(message)
-    if len(words & said) * 2 < len(words):
+    names = _names(text, said)
+    if _UNNAMED_RE.search(text) and not names:
+        return ""
+    own = words - names
+    if not own or len(own & said) * 2 < len(own):
         return ""
     return text
 
